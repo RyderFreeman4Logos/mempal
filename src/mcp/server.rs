@@ -968,6 +968,7 @@ impl MempalMcpServer {
             crate::observability::IngestWorkerBackoffSnapshot::default(),
         );
         let mut retry_count = 0_u64;
+        let mut idle_count = 0_u64;
 
         loop {
             if let Some(shutdown_rx) = shutdown_rx.as_ref()
@@ -976,16 +977,10 @@ impl MempalMcpServer {
                 break;
             }
 
-            match queue
-                .claim_next_by_kind(
-                    worker_id.clone(),
-                    INGEST_CLAIM_TTL_SECS,
-                    INGEST_ASYNC_KIND.to_string(),
-                )
-                .await
-            {
+            match claim_next_ingest_with_io(&queue, &worker_id).await {
                 Ok(Some(claim)) => {
                     retry_count = 0;
+                    idle_count = 0;
                     crate::observability::record_ingest_worker_backoff(
                         crate::observability::IngestWorkerBackoffSnapshot::default(),
                     );
@@ -995,25 +990,21 @@ impl MempalMcpServer {
                 }
                 Ok(None) => {
                     retry_count = 0;
-                    crate::observability::record_ingest_worker_backoff(
-                        crate::observability::IngestWorkerBackoffSnapshot::default(),
-                    );
-                    if !Self::sleep_ingest_worker_delay(INGEST_POLL_INTERVAL, shutdown_rx.as_mut())
-                        .await
-                    {
+                    idle_count = idle_count.saturating_add(1);
+                    let next_delay = ingest_worker_backoff_delay(idle_count);
+                    record_ingest_worker_backoff_snapshot(idle_count, next_delay, None);
+                    if !Self::sleep_ingest_worker_delay(next_delay, shutdown_rx.as_mut()).await {
                         break;
                     }
                 }
                 Err(error) if error.is_sqlite_lock() => {
+                    idle_count = 0;
                     retry_count = retry_count.saturating_add(1);
-                    let next_delay = INGEST_CLAIM_LOCK_RETRY_DELAY;
-                    crate::observability::record_ingest_worker_backoff(
-                        crate::observability::IngestWorkerBackoffSnapshot {
-                            retry_count,
-                            next_delay_ms: u64::try_from(next_delay.as_millis())
-                                .unwrap_or(u64::MAX),
-                            last_error_class: Some("sqlite_locked".to_string()),
-                        },
+                    let next_delay = ingest_worker_backoff_delay(retry_count);
+                    record_ingest_worker_backoff_snapshot(
+                        retry_count,
+                        next_delay,
+                        Some("sqlite_locked"),
                     );
                     if !Self::sleep_ingest_worker_delay(next_delay, shutdown_rx.as_mut()).await {
                         break;
@@ -3580,7 +3571,6 @@ struct PreparedIngestOperation {
 const INGEST_ASYNC_KIND: &str = "ingest_async";
 const INGEST_CLAIM_TTL_SECS: i64 = 300;
 const INGEST_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const INGEST_CLAIM_LOCK_RETRY_DELAY: Duration = INGEST_POLL_INTERVAL;
 const INGEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const INGEST_DRAIN_RESTART_BACKOFF_INITIAL_MS: u64 = 250;
 const INGEST_DRAIN_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
@@ -3664,6 +3654,41 @@ fn ingest_worker_backoff_delay(retry_count: u64) -> Duration {
         4 => Duration::from_secs(16),
         _ => Duration::from_secs(30),
     }
+}
+
+async fn claim_next_ingest_with_io(
+    queue: &AsyncPendingMessageStore,
+    worker_id: &str,
+) -> crate::core::queue::Result<Option<ClaimedMessage>> {
+    let io_guard =
+        crate::observability::IoBurstGuard::start(crate::observability::IoOperationPath::Queue);
+    let result = queue
+        .claim_next_by_kind(
+            worker_id.to_string(),
+            INGEST_CLAIM_TTL_SECS,
+            INGEST_ASYNC_KIND.to_string(),
+        )
+        .await;
+    io_guard.finish();
+    result
+}
+
+fn record_ingest_worker_backoff_snapshot(
+    retry_count: u64,
+    next_delay: Duration,
+    last_error_class: Option<&str>,
+) {
+    crate::observability::record_ingest_worker_backoff(
+        crate::observability::IngestWorkerBackoffSnapshot {
+            retry_count,
+            next_delay_ms: duration_millis_u64(next_delay),
+            last_error_class: last_error_class.map(str::to_string),
+        },
+    );
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn ingest_worker_error_is_terminal(error: &anyhow::Error) -> bool {
@@ -14686,7 +14711,8 @@ pattern_boost = 0.2
         expected_next_delay_ms: u64,
         expected_error_class: Option<&str>,
     ) {
-        for _ in 0..32 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
             let snapshot = crate::observability::ingest_worker_backoff_snapshot();
             if snapshot.retry_count == expected_retry_count
                 && snapshot.next_delay_ms == expected_next_delay_ms
@@ -14695,6 +14721,13 @@ pattern_boost = 0.2
                 return;
             }
 
+            if Instant::now() >= deadline {
+                break;
+            }
+
+            // These tests pause Tokio time. A wall-clock retry window lets
+            // spawn_blocking queue claims complete without advancing virtual
+            // time past the snapshot under assertion.
             tokio::task::yield_now().await;
         }
 
@@ -15349,7 +15382,7 @@ pattern_boost = 0.2
     }
 
     #[tokio::test(start_paused = true, flavor = "current_thread")]
-    async fn test_mcp_async_ingest_worker_uses_short_retry_when_claim_is_locked() {
+    async fn test_mcp_async_ingest_worker_backs_off_when_claim_is_locked() {
         crate::observability::reset_ingest_worker_backoff_for_tests();
         let (_tempdir, db_path, server) = setup_server();
         let queue = AsyncPendingMessageStore::from_store(
@@ -15359,22 +15392,57 @@ pattern_boost = 0.2
         let server = server.with_async_queue_for_test(queue);
         let handle = server.spawn_scoped_ingest_drain_worker();
 
-        let expected_delay_ms =
-            u64::try_from(INGEST_CLAIM_LOCK_RETRY_DELAY.as_millis()).unwrap_or(u64::MAX);
-        for expected_retry_count in 1..=5 {
+        let expected_delays = [
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+            Duration::from_secs(8),
+            Duration::from_secs(16),
+            Duration::from_secs(30),
+        ];
+        for (expected_retry_count, expected_delay) in (1_u64..=5).zip(expected_delays) {
             wait_for_ingest_worker_backoff_snapshot(
                 expected_retry_count,
-                expected_delay_ms,
+                duration_millis_u64(expected_delay),
                 Some("sqlite_locked"),
             )
             .await;
-            assert_ne!(
-                crate::observability::ingest_worker_backoff_snapshot().next_delay_ms,
-                30_000,
-                "queue-claim locks must not use capped ingest write backoff"
-            );
-            tokio::time::advance(INGEST_CLAIM_LOCK_RETRY_DELAY).await;
+            tokio::time::advance(expected_delay).await;
         }
+
+        handle.shutdown_and_drain().await;
+        assert_ingest_worker_backoff_snapshot(0, 0, None);
+    }
+
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn test_mcp_async_ingest_worker_backs_off_when_idle() {
+        crate::observability::reset_ingest_worker_backoff_for_tests();
+        crate::observability::reset_io_burst_for_tests();
+        let (_tempdir, db_path, server) = setup_server();
+        let queue = AsyncPendingMessageStore::from_store(
+            crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path),
+        );
+        let server = server.with_async_queue_for_test(queue);
+        let before_queue = io_burst_path(
+            &crate::observability::io_burst_snapshot(),
+            crate::observability::IoOperationPath::Queue,
+        );
+        let handle = server.spawn_scoped_ingest_drain_worker();
+
+        wait_for_ingest_worker_backoff_snapshot(1, 2_000, None).await;
+        #[cfg(target_os = "linux")]
+        {
+            let after_queue = io_burst_path(
+                &crate::observability::io_burst_snapshot(),
+                crate::observability::IoOperationPath::Queue,
+            );
+            assert!(
+                after_queue.sample_count > before_queue.sample_count,
+                "idle queue claims must be visible in IO burst telemetry"
+            );
+        }
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        wait_for_ingest_worker_backoff_snapshot(2, 4_000, None).await;
 
         handle.shutdown_and_drain().await;
         assert_ingest_worker_backoff_snapshot(0, 0, None);

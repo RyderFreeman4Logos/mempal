@@ -2735,6 +2735,37 @@ mod tests {
     }
 
     #[test]
+    fn claim_next_by_kind_reuses_persistent_claim_connection_across_idle_polls() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let store = PendingMessageStore::new(&db_path).expect("open queue");
+        let cloned_store = store.clone();
+
+        assert_eq!(store.claim_connection_open_count(), 0);
+        for _ in 0..3 {
+            assert!(
+                cloned_store
+                    .claim_next_by_kind("ingest-worker", 60, "ingest_async")
+                    .expect("idle ingest claim")
+                    .is_none()
+            );
+            assert_eq!(store.claim_connection_open_count(), 1);
+        }
+
+        let ingest_id = store
+            .enqueue("ingest_async", r#"{"request":{}}"#)
+            .expect("enqueue async ingest");
+        let claimed = cloned_store
+            .claim_next_by_kind("ingest-worker", 60, "ingest_async")
+            .expect("claim ingest")
+            .expect("ingest row should be claimed");
+
+        assert_eq!(claimed.id, ingest_id);
+        assert_eq!(store.claim_connection_open_count(), 1);
+    }
+
+    #[test]
     fn confirm_and_enqueue_reuse_cached_writer_connection() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");

@@ -67,8 +67,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - `mempal ingest --stdin --wait` now uses daemon/queue admission when the
   daemon or MCP ingest worker owns the SQLite writer lease, returning the
   existing wait receipt instead of failing with a writer-lease conflict.
-- Daemon ingest queue-claim SQLite lock retries now stay on the short poll
-  delay instead of escalating to the post-claim write-failure backoff loop.
+- Daemon/MCP ingest queue-claim idle and SQLite-lock retries now use the
+  bounded backoff loop, record queue IO burst samples, and index stale-claim
+  heartbeat checks so idle large databases stop sustained logical reads (#684).
 - Project resume timestamp ordering now uses ISO 8601 string comparison
   instead of `CAST(added_at AS INTEGER)`, which collapsed RFC 3339 timestamps
   to their year prefix.
