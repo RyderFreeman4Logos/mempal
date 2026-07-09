@@ -99,6 +99,17 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     };
     global_embed_status().set_audit_db_path(Some(db_path.clone()));
     let writer_lease = acquire_daemon_writer_lease(context, &db_path).await?;
+    let requeued_writer_lease_failures = context
+        .store
+        .requeue_writer_lease_failures_for_daemon_start(writer_lease.lease().owner.clone())
+        .await
+        .context("failed to requeue previous daemon writer lease failures")?;
+    if requeued_writer_lease_failures > 0 {
+        tracing::info!(
+            requeued = requeued_writer_lease_failures,
+            "requeued hook work blocked by the previous daemon writer lease"
+        );
+    }
     {
         let db = context.db.lock().await;
         db.prune_expired_audit_logs()
@@ -413,10 +424,9 @@ async fn acquire_daemon_writer_lease(
     .to_string();
     let lease = {
         let db = context.db.lock().await;
-        db.runtime_writer_lease_acquire(
+        db.runtime_writer_lease_acquire_for_daemon_start(
             SQLITE_WRITER_LEASE_NAME,
             &owner,
-            "daemon",
             DAEMON_WRITER_LEASE_TTL_SECS,
             Some(&metadata),
         )

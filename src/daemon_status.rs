@@ -96,9 +96,30 @@ pub fn read_embedder_status(mempal_home: &Path) -> io::Result<Option<DaemonEmbed
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(io::Error::other)
+    let status =
+        serde_json::from_slice::<DaemonEmbedderRuntimeStatus>(&bytes).map_err(io::Error::other)?;
+    Ok(process_is_running(status.pid).then_some(status))
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: kill(pid, 0) checks process existence and permissions without
+    // delivering a signal or dereferencing Rust memory.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_running(pid: u32) -> bool {
+    pid == std::process::id()
 }
 
 fn unix_secs() -> u64 {
@@ -116,7 +137,7 @@ mod tests {
     fn test_daemon_embedder_status_round_trips_without_raw_content() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let status = DaemonEmbedderRuntimeStatus {
-            pid: 42,
+            pid: std::process::id(),
             updated_at_unix_secs: 123,
             cache_loaded: true,
             mode: "remote".to_string(),
@@ -136,5 +157,28 @@ mod tests {
         let raw = std::fs::read_to_string(embedder_status_path(tmp.path())).expect("raw status");
         assert!(!raw.contains("Bearer"));
         assert!(!raw.contains("prompt"));
+    }
+
+    #[test]
+    fn test_dead_daemon_embedder_status_is_ignored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let status = DaemonEmbedderRuntimeStatus {
+            pid: u32::MAX,
+            updated_at_unix_secs: 123,
+            cache_loaded: true,
+            mode: "remote".to_string(),
+            backend: "openai_compat".to_string(),
+            model: Some("legacy=Qwen/Qwen3-Embedding-8B".to_string()),
+            dimensions: Some(4096),
+            fallback: None,
+            source: "daemon-rest".to_string(),
+        };
+
+        write_embedder_status_atomic(tmp.path(), &status).expect("write stale status");
+
+        assert_eq!(
+            read_embedder_status(tmp.path()).expect("read stale status"),
+            None
+        );
     }
 }

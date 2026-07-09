@@ -606,6 +606,14 @@ impl AsyncPendingMessageStore {
             .await
     }
 
+    pub async fn requeue_writer_lease_failures_for_daemon_start(
+        &self,
+        daemon_owner: String,
+    ) -> Result<u64> {
+        self.run(move |store| store.requeue_writer_lease_failures_for_daemon_start(&daemon_owner))
+            .await
+    }
+
     pub async fn release_claim(&self, claim: ClaimedMessage) -> Result<()> {
         #[cfg(any(test, feature = "db-test-seam"))]
         if self
@@ -1337,6 +1345,48 @@ impl PendingMessageStore {
                 )?;
             }
             Ok(updated)
+        })
+    }
+
+    /// Make hook work blocked by a dead previous daemon identity immediately
+    /// runnable under the newly acquired daemon writer lease.
+    pub fn requeue_writer_lease_failures_for_daemon_start(
+        &self,
+        daemon_owner: &str,
+    ) -> Result<u64> {
+        let now = now_secs();
+        let current_owner_error = format!(" for {daemon_owner} was lost before ");
+        self.with_connection(|conn| {
+            let updated = conn.execute(
+                r#"
+                UPDATE pending_messages
+                SET retry_count = 0,
+                    retry_backoff_ms = 0,
+                    next_attempt_at = MIN(created_at, ?1),
+                    claim_token = NULL,
+                    claimed_at = NULL,
+                    heartbeat_at = NULL,
+                    last_error = NULL,
+                    op_state = 'queued',
+                    failure_class = NULL
+                WHERE status = 'pending'
+                  AND kind IN (
+                      'hook_event',
+                      'hook_post_tool',
+                      'hook_user_prompt',
+                      'hook_session_start',
+                      'hook_session_end',
+                      'hook:post-tool-use',
+                      'hook:user-prompt-submit',
+                      'hook:session-start',
+                      'hook:session-end'
+                  )
+                  AND last_error LIKE '%SQLite writer lease `sqlite-writer` for mempal-daemon-% was lost before build daemon hook drawer records%'
+                  AND instr(last_error, ?2) = 0
+                "#,
+                params![now, current_owner_error],
+            )?;
+            Ok(updated as u64)
         })
     }
 
@@ -2340,6 +2390,11 @@ fn queue_failure_reason_code(kind: &str, last_error: &str) -> String {
         || lower.contains("failed to merge drawer")
     {
         "storage_merge_reopen".to_string()
+    } else if lower.contains("sqlite writer lease")
+        && lower.contains("for mempal-daemon-")
+        && lower.contains("was lost before")
+    {
+        "writer_lease_lost".to_string()
     } else if lower.contains("database is locked")
         || lower.contains("database locked")
         || lower.contains("database is busy")
@@ -2383,6 +2438,7 @@ fn queue_failure_message_summary(reason_code: &str, last_error: &str) -> String 
         "automatic_hook_llm_gate" => "automatic hook LLM gate failed before durable insert",
         "invalid_hook_envelope" => "invalid or legacy hook envelope",
         "storage_merge_reopen" => "failed to reopen db for merge",
+        "writer_lease_lost" => "daemon SQLite writer lease lost",
         "storage_locked_or_busy" => "database locked or busy",
         "model_rate_limited" => "model endpoint rate limited",
         "model_timeout" => "model endpoint timeout",

@@ -204,6 +204,51 @@ fn runtime_writer_lease_conflicts_until_expiry() {
 }
 
 #[test]
+fn runtime_writer_lease_daemon_start_rebinds_previous_daemon_identity() {
+    let db = open_test_db();
+
+    let previous = db
+        .runtime_writer_lease_acquire("sqlite-writer", "mempal-daemon-1000", "daemon", 300, None)
+        .unwrap()
+        .expect("previous daemon lease");
+    assert!(
+        db.runtime_writer_lease_acquire_for_daemon_start(
+            "sqlite-writer",
+            "mempal-daemon-2000",
+            300,
+            None,
+        )
+        .unwrap()
+        .is_none(),
+        "daemon start must not replace a live previous daemon identity"
+    );
+    db.conn()
+        .execute(
+            "UPDATE runtime_writer_leases SET pid = ?2 WHERE name = ?1",
+            rusqlite::params![previous.name, i64::from(u32::MAX)],
+        )
+        .expect("simulate previous daemon pid");
+
+    let rebound = db
+        .runtime_writer_lease_acquire_for_daemon_start(
+            "sqlite-writer",
+            "mempal-daemon-2000",
+            300,
+            None,
+        )
+        .unwrap()
+        .expect("new daemon must replace the previous daemon identity");
+
+    assert_eq!(rebound.owner, "mempal-daemon-2000");
+    assert_eq!(rebound.pid, std::process::id());
+    assert_ne!(rebound.session_id, previous.session_id);
+    let active = db
+        .runtime_writer_lease_status(Some("sqlite-writer"))
+        .unwrap();
+    assert_eq!(active, vec![rebound]);
+}
+
+#[test]
 fn runtime_writer_lease_different_names_do_not_collide() {
     let db = open_test_db();
 

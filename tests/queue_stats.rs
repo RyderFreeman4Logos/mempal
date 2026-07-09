@@ -766,6 +766,9 @@ fn test_queue_stats_classifies_failed_reasons_and_retrying_backoff() {
     let storage_retrying = store
         .enqueue("hook_post_tool", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
         .expect("enqueue storage retrying");
+    let writer_lease_retrying = store
+        .enqueue("hook_post_tool", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue writer lease retrying");
     let now = now_secs();
 
     let conn = Connection::open(&db_path).expect("open sqlite");
@@ -815,6 +818,15 @@ fn test_queue_stats_classifies_failed_reasons_and_retrying_backoff() {
             now + 60,
             "failed to reopen db for merge drawer_hooks_raw_bash_69633781",
         ),
+        (
+            writer_lease_retrying.as_str(),
+            "hook_post_tool",
+            "pending",
+            None,
+            3_i64,
+            now + 120,
+            "SQLite writer lease `sqlite-writer` for mempal-daemon-1000 was lost before build daemon hook drawer records",
+        ),
     ] {
         conn.execute(
             r#"
@@ -846,7 +858,7 @@ fn test_queue_stats_classifies_failed_reasons_and_retrying_backoff() {
     assert_eq!(stats.failed, 4);
     assert_eq!(stats.failed_retryable, 0);
     assert_eq!(stats.failed_terminal, 4);
-    assert_eq!(stats.retrying, 1);
+    assert_eq!(stats.retrying, 2);
     assert_eq!(stats.next_retry_at_unix_secs, Some((now + 60) as u64));
 
     let failed_reason_count = |reason: &str| -> u64 {
@@ -867,6 +879,13 @@ fn test_queue_stats_classifies_failed_reasons_and_retrying_backoff() {
         .expect("retrying storage bucket");
     assert_eq!(retrying_storage.retry_class, "retrying_backoff");
     assert_eq!(retrying_storage.count, 1);
+    let retrying_writer_lease = stats
+        .retrying_buckets
+        .iter()
+        .find(|bucket| bucket.reason_code == "writer_lease_lost")
+        .expect("retrying writer lease bucket");
+    assert_eq!(retrying_writer_lease.retry_class, "retrying_backoff");
+    assert_eq!(retrying_writer_lease.count, 1);
     for bucket in stats
         .failed_buckets
         .iter()
@@ -879,6 +898,59 @@ fn test_queue_stats_classifies_failed_reasons_and_retrying_backoff() {
             "{bucket:?}"
         );
     }
+}
+
+#[test]
+fn test_daemon_start_requeues_previous_identity_writer_lease_failures() {
+    let (_tmp, _db_path, store) = new_store(QueueConfig {
+        base_delay_ms: 60_000,
+        max_delay_ms: 60_000,
+        ..QueueConfig::default()
+    });
+    let id = store
+        .enqueue("hook_post_tool", r#"{"event":"PostToolUse"}"#)
+        .expect("enqueue hook");
+    let claim = store
+        .claim_next("mempal-daemon-1000", 60)
+        .expect("claim hook")
+        .expect("hook available");
+    store
+        .mark_failed(
+            &claim,
+            "SQLite writer lease `sqlite-writer` for mempal-daemon-1000 was lost before build daemon hook drawer records",
+        )
+        .expect("record previous identity lease loss");
+    store
+        .enqueue("hook_post_tool", r#"{"event":"PostToolUseCurrent"}"#)
+        .expect("enqueue current daemon hook");
+    let current_claim = store
+        .claim_next("mempal-daemon-2000", 60)
+        .expect("claim current daemon hook")
+        .expect("current daemon hook available");
+    store
+        .mark_failed(
+            &current_claim,
+            "SQLite writer lease `sqlite-writer` for mempal-daemon-2000 was lost before build daemon hook drawer records",
+        )
+        .expect("record current identity lease loss");
+
+    assert_eq!(
+        store
+            .requeue_writer_lease_failures_for_daemon_start("mempal-daemon-2000")
+            .expect("requeue previous identity failures"),
+        1
+    );
+    let reclaimed = store
+        .claim_next("mempal-daemon-2000", 60)
+        .expect("claim rebound hook")
+        .expect("rebound hook must be runnable immediately");
+    assert_eq!(reclaimed.id, id);
+    assert_eq!(reclaimed.retry_count, 0);
+    assert_eq!(
+        store.stats().expect("stats after daemon rebind").retrying,
+        1,
+        "current daemon identity failure must retain its retry backoff"
+    );
 }
 
 #[test]

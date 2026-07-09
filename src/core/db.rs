@@ -87,6 +87,13 @@ const MCP_INGEST_BACKGROUND_WORKER_OWNER_PREFIX: &str = "mcp-ingest-worker-";
 const MCP_INGEST_SCOPED_WORKER_OWNER_PREFIX: &str = "mcp-ingest-scoped-worker-";
 const MCP_INGEST_SCOPED_WAIT_OWNER_PREFIX: &str = "mcp-ingest-scoped-wait-";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeWriterLeaseAcquirePolicy {
+    Standard,
+    PreserveLiveHolders,
+    RebindDeadDaemon,
+}
+
 fn runtime_writer_lease_is_durable_ingest_worker(
     owner: &str,
     mode: &str,
@@ -5333,7 +5340,7 @@ impl Database {
             mode,
             ttl_secs,
             metadata_json,
-            false,
+            RuntimeWriterLeaseAcquirePolicy::Standard,
         )
     }
 
@@ -5351,7 +5358,28 @@ impl Database {
             mode,
             ttl_secs,
             metadata_json,
-            true,
+            RuntimeWriterLeaseAcquirePolicy::PreserveLiveHolders,
+        )
+    }
+
+    /// Acquire the daemon writer lease after removing a dead previous daemon
+    /// identity for the same lease name.
+    ///
+    /// Live daemon holders and non-daemon holders are never replaced.
+    pub fn runtime_writer_lease_acquire_for_daemon_start(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl_secs: u64,
+        metadata_json: Option<&str>,
+    ) -> Result<Option<RuntimeWriterLease>, DbError> {
+        self.runtime_writer_lease_acquire_with_cleanup_policy(
+            name,
+            owner,
+            "daemon",
+            ttl_secs,
+            metadata_json,
+            RuntimeWriterLeaseAcquirePolicy::RebindDeadDaemon,
         )
     }
 
@@ -5362,7 +5390,7 @@ impl Database {
         mode: &str,
         ttl_secs: u64,
         metadata_json: Option<&str>,
-        preserve_live_holders: bool,
+        policy: RuntimeWriterLeaseAcquirePolicy,
     ) -> Result<Option<RuntimeWriterLease>, DbError> {
         let mut session_id = String::new();
         let mut acquired = false;
@@ -5371,7 +5399,43 @@ impl Database {
         let pid = std::process::id();
         let boot_id = runtime_boot_id();
         self.with_immediate_tx(|| {
-            self.runtime_writer_lease_cleanup_expired_tx(preserve_live_holders)?;
+            self.runtime_writer_lease_cleanup_expired_tx(!matches!(
+                policy,
+                RuntimeWriterLeaseAcquirePolicy::Standard
+            ))?;
+            if policy == RuntimeWriterLeaseAcquirePolicy::RebindDeadDaemon {
+                let previous_daemon = self
+                    .conn
+                    .query_row(
+                        "SELECT owner, pid, boot_id, session_id \
+                         FROM runtime_writer_leases \
+                         WHERE name = ?1 AND mode = 'daemon'",
+                        [name],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some((previous_owner, previous_pid, previous_boot_id, previous_session_id)) =
+                    previous_daemon
+                {
+                    let previous_is_live = u32::try_from(previous_pid).ok().is_some_and(|pid| {
+                        runtime_writer_process_is_live_holder(pid, previous_boot_id.as_deref())
+                    });
+                    if !previous_is_live {
+                        self.conn.execute(
+                            "DELETE FROM runtime_writer_leases \
+                             WHERE name = ?1 AND owner = ?2 AND session_id = ?3",
+                            params![name, previous_owner, previous_session_id],
+                        )?;
+                    }
+                }
+            }
             session_id = runtime_writer_session_id(name, owner);
             let now_time = SystemTime::now();
             acquired_at = crate::cowork::peek::format_rfc3339(now_time);
