@@ -14711,7 +14711,8 @@ pattern_boost = 0.2
         expected_next_delay_ms: u64,
         expected_error_class: Option<&str>,
     ) {
-        for _ in 0..4096 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
             let snapshot = crate::observability::ingest_worker_backoff_snapshot();
             if snapshot.retry_count == expected_retry_count
                 && snapshot.next_delay_ms == expected_next_delay_ms
@@ -14720,6 +14721,13 @@ pattern_boost = 0.2
                 return;
             }
 
+            if Instant::now() >= deadline {
+                break;
+            }
+
+            // These tests pause Tokio time. A wall-clock retry window lets
+            // spawn_blocking queue claims complete without advancing virtual
+            // time past the snapshot under assertion.
             tokio::task::yield_now().await;
         }
 
