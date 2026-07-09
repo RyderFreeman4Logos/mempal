@@ -4931,6 +4931,10 @@ impl MempalMcpServer {
             sqlite: sqlite_resource,
             counters: ResourceCounterDto::from(crate::observability::resource_counters()),
         };
+        let hook_admission = crate::hook_diagnostics::hook_admission_stats(
+            self.db_path.parent().unwrap_or_else(|| Path::new(".")),
+            crate::hook::MAX_INLINE_PAYLOAD_BYTES as u64,
+        );
 
         Ok(Json(StatusResponse {
             schema_version: db_snapshot.schema_version,
@@ -5080,6 +5084,7 @@ impl MempalMcpServer {
                     .map(queue_failure_bucket_dto)
                     .collect(),
             },
+            hook_admission,
             db_holders,
             resource_usage,
             io_burst: crate::observability::io_burst_snapshot(),

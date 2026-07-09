@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
@@ -77,12 +77,15 @@ fn run_hook(home: &TempDir, command: &str, payload: &[u8]) -> std::process::Outp
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn hook command");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(payload)
-        .expect("write payload");
+    let mut stdin = child.stdin.take().expect("stdin");
+    if let Err(error) = stdin.write_all(payload) {
+        assert_eq!(
+            error.kind(),
+            ErrorKind::BrokenPipe,
+            "unexpected hook stdin write failure: {error}"
+        );
+    }
+    drop(stdin);
     child.wait_with_output().expect("wait output")
 }
 
@@ -545,12 +548,15 @@ fn test_hook_envelopes_oversized_payload() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn hook command");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(oversized.as_bytes())
-        .expect("write payload");
+    let mut stdin = child.stdin.take().expect("stdin");
+    if let Err(error) = stdin.write_all(oversized.as_bytes()) {
+        assert_eq!(
+            error.kind(),
+            ErrorKind::BrokenPipe,
+            "unexpected oversized hook stdin write failure: {error}"
+        );
+    }
+    drop(stdin);
     let output = child.wait_with_output().expect("wait output");
 
     assert_eq!(output.status.code(), Some(0));
@@ -561,8 +567,8 @@ fn test_hook_envelopes_oversized_payload() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("payload envelope-wrapped"),
-        "stderr should mention envelope-wrapped, got: {stderr}"
+        stderr.contains("hook payload exceeded inline limit"),
+        "stderr should mention bounded oversized admission, got: {stderr}"
     );
 
     let conn = Connection::open(db_path).expect("open sqlite");
@@ -580,20 +586,82 @@ fn test_hook_envelopes_oversized_payload() {
         envelope_json["original_size_bytes"]
             .as_u64()
             .expect("original size")
-            > 10_000_000
+            == 10_485_761
     );
-    let preview = envelope_json["payload_preview"]
-        .as_str()
-        .expect("preview string");
-    assert!(preview.len() <= 4096);
+    assert!(envelope_json["payload"].is_null());
+    assert!(envelope_json["payload_preview"].is_null());
     assert!(
         envelope_json["payload_path"].is_null(),
         "oversized automatic hook capture must not persist raw payload before LLM gate"
     );
     assert!(
+        envelope.len() < 4096,
+        "oversized hook queue envelope must stay aggregate-only"
+    );
+    assert!(
+        !envelope.contains("\"payload\":\""),
+        "oversized hook queue envelope must not carry raw body"
+    );
+    assert!(
         !home.path().join(".mempal").join("hook-oversize").exists(),
         "oversized automatic hook capture must not create hook-oversize files"
     );
+}
+
+#[test]
+fn test_hook_spools_medium_payload_without_queueing_raw_body() {
+    let (home, db_path) = setup_home();
+    let raw_marker = "MEDIUM_QUEUE_BODY_MARKER";
+    let payload = format!(
+        r#"{{"tool_name":"Bash","input":"printf medium","output":"{}","exit_code":0}}"#,
+        raw_marker.repeat(4 * 1024)
+    );
+    assert!(payload.len() < mempal::hook::MAX_INLINE_PAYLOAD_BYTES);
+    assert!(payload.len() > mempal::hook::MAX_ENVELOPE_INLINE_PAYLOAD_BYTES);
+
+    let output = run_hook(&home, "hook_post_tool", payload.as_bytes());
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(
+        output.stderr.is_empty(),
+        "spooled hook admission should stay quiet"
+    );
+
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let envelope: String = conn
+        .query_row(
+            "SELECT payload FROM pending_messages ORDER BY created_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query queue");
+    let envelope_json: Value = serde_json::from_str(&envelope).expect("envelope json");
+
+    assert_eq!(envelope_json["truncated"], false);
+    assert!(envelope_json["payload"].is_null());
+    assert_eq!(
+        envelope_json["original_size_bytes"].as_u64(),
+        Some(payload.len() as u64)
+    );
+    assert!(
+        !envelope.contains(raw_marker),
+        "queue envelope must not contain raw medium body"
+    );
+    let payload_path = envelope_json["payload_path"]
+        .as_str()
+        .expect("spool payload path");
+    assert!(payload_path.contains(mempal::hook::HOOK_SPOOL_DIR));
+    assert_eq!(
+        fs::read_to_string(payload_path).expect("read spooled payload"),
+        payload
+    );
+
+    let stats = mempal::hook_diagnostics::hook_admission_stats(
+        &home.path().join(".mempal"),
+        mempal::hook::MAX_INLINE_PAYLOAD_BYTES as u64,
+    );
+    assert_eq!(stats.spooled_count, 1);
 }
 
 #[test]

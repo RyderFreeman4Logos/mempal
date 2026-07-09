@@ -2091,6 +2091,9 @@ pub struct StatusResponse {
     /// Runtime write-admission gate state for passive ingest and explicit writes.
     pub ingest_gating_status: GatingRuntimeStatusDto,
     pub queue_stats: QueueStatsDto,
+    /// Aggregate hook stdin admission counters from local diagnostics. Contains
+    /// only counts, byte limits, and sanitized classes; never raw hook payloads.
+    pub hook_admission: crate::hook_diagnostics::HookAdmissionStats,
     /// Live processes holding `palace.db`, `palace.db-wal`, or
     /// `palace.db-shm` open, classified as current daemon/MCP server versus
     /// stale or extra holders.

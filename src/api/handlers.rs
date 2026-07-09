@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -533,6 +533,7 @@ struct StatusResponse {
     search_mode: String,
     embedder_circuit: EmbedderCircuitStatus,
     queue_stats: ApiQueueStats,
+    hook_admission: crate::hook_diagnostics::HookAdmissionStats,
     resource_usage: ResourceUsageStatus,
     io_burst: crate::observability::IoBurstSnapshot,
     write_queue: WriteQueueStats,
@@ -1863,6 +1864,10 @@ async fn status_handler(
             .to_string(),
         embedder_circuit: vector_search_circuit.into(),
         queue_stats: queue_stats_report,
+        hook_admission: crate::hook_diagnostics::hook_admission_stats(
+            state.db_path.parent().unwrap_or_else(|| Path::new(".")),
+            crate::hook::MAX_INLINE_PAYLOAD_BYTES as u64,
+        ),
         resource_usage,
         io_burst: crate::observability::io_burst_snapshot(),
         write_queue: state.write_queue().stats(),
