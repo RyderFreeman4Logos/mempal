@@ -254,6 +254,58 @@ fn test_fork_ext_v23_to_v24_adds_pending_heartbeat_index() {
 }
 
 #[test]
+fn test_fork_ext_v24_to_v25_indexes_archived_failure_stats() {
+    let conn = Connection::open_in_memory().expect("open sqlite connection");
+    let schema_version = current_schema_version();
+    conn.execute_batch(&format!(
+        r#"
+        CREATE TABLE fork_ext_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT INTO fork_ext_meta (key, value) VALUES ('fork_ext_version', '24');
+        CREATE TABLE pending_message_completions (
+            message_id TEXT PRIMARY KEY,
+            op_state TEXT NOT NULL,
+            rejected_reason TEXT
+        );
+        PRAGMA user_version = {schema_version};
+        "#
+    ))
+    .expect("create v24 schema");
+
+    apply_fork_ext_migrations_to(&conn, 25).expect("first v25 migration");
+    apply_fork_ext_migrations_to(&conn, 25).expect("second v25 migration");
+
+    let sql = index_sql(&conn, "idx_pending_completions_op_state_rejected_reason");
+    assert!(sql.contains("pending_message_completions"));
+    assert!(sql.contains("op_state"));
+    assert!(sql.contains("rejected_reason"));
+
+    let plan = conn
+        .prepare(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT COUNT(*)
+            FROM pending_message_completions
+            WHERE op_state = 'failed'
+              AND rejected_reason LIKE 'queue_archive:%'
+            "#,
+        )
+        .expect("prepare archived failure query plan")
+        .query_map([], |row| row.get::<_, String>(3))
+        .expect("query archived failure plan")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect archived failure plan");
+    assert!(
+        plan.iter()
+            .any(|detail| { detail.contains("idx_pending_completions_op_state_rejected_reason") }),
+        "archived failure count must use the v25 covering index: {plan:?}"
+    );
+    assert_eq!(read_fork_ext_version(&conn).expect("read version"), 25);
+}
+
+#[test]
 fn test_fork_ext_v18_to_v19_adds_async_ingest_columns_idempotently() {
     let conn = Connection::open_in_memory().expect("open sqlite connection");
     let schema_version = current_schema_version();
