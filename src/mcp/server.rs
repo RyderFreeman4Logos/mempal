@@ -291,6 +291,8 @@ pub struct MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     daemon_writer_lease_check_error: Option<String>,
     #[cfg(any(test, feature = "db-test-seam"))]
+    ingest_admission_current_mcp_holder_for_test: bool,
+    #[cfg(any(test, feature = "db-test-seam"))]
     async_db_open_lock_failures: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "db-test-seam"))]
     sync_db_open_lock_failures: Arc<AtomicUsize>,
@@ -568,6 +570,8 @@ impl MempalMcpServer {
             #[cfg(any(test, feature = "db-test-seam"))]
             daemon_writer_lease_check_error: None,
             #[cfg(any(test, feature = "db-test-seam"))]
+            ingest_admission_current_mcp_holder_for_test: false,
+            #[cfg(any(test, feature = "db-test-seam"))]
             async_db_open_lock_failures: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "db-test-seam"))]
             sync_db_open_lock_failures: Arc::new(AtomicUsize::new(0)),
@@ -663,6 +667,12 @@ impl MempalMcpServer {
         error: impl Into<String>,
     ) -> Self {
         self.daemon_writer_lease_check_error = Some(error.into());
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_ingest_admission_current_mcp_holder_for_test(mut self) -> Self {
+        self.ingest_admission_current_mcp_holder_for_test = true;
         self
     }
 
@@ -806,6 +816,16 @@ impl MempalMcpServer {
 
     fn daemon_ingest_ipc_available(&self) -> bool {
         daemon_ingest_ipc_available_for_db(&self.db_path)
+    }
+
+    fn ingest_admission_current_mcp_server_holder_visible(&self) -> bool {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if self.ingest_admission_current_mcp_holder_for_test {
+            return true;
+        }
+
+        let report = crate::process_diagnostics::inspect_db_holders(&self.db_path);
+        ingest_admission_report_includes_current_mcp_server_only(&report)
     }
 
     fn current_vector_dim(db: &Database) -> anyhow::Result<Option<usize>> {
@@ -6432,12 +6452,25 @@ impl MempalMcpServer {
         let queue_admission = match self.enqueue_ingest_operation(payload).await {
             Ok(admission) => admission,
             Err(error) => {
-                if let Some(error) = maybe_database_write_refused_error(
+                let diagnostic = status_database_diagnostic(
                     &self.db_path,
                     "enqueue_ingest_operation",
                     error.as_ref(),
-                ) {
-                    return Err(error);
+                );
+                if diagnostic.failure_kind == "locked_or_busy"
+                    && self.ingest_admission_current_mcp_server_holder_visible()
+                {
+                    let response = self
+                        .recover_mcp_ingest_after_self_held_queue_lock(
+                            prepared,
+                            request_system_warnings,
+                            diagnostic,
+                        )
+                        .await?;
+                    return Ok(Json(response));
+                }
+                if diagnostic.failure_kind != "unknown" {
+                    return Err(database_write_refused_error_from_diagnostic(diagnostic));
                 }
                 return Err(ErrorData::internal_error(
                     format!("failed to enqueue ingest operation: {error}"),
@@ -6581,6 +6614,66 @@ impl MempalMcpServer {
         Ok(Json(queued_response))
     }
 
+    async fn recover_mcp_ingest_after_self_held_queue_lock(
+        &self,
+        prepared: PreparedIngestOperation,
+        mut system_warnings: Vec<SystemWarning>,
+        diagnostic: DatabaseDiagnosticDto,
+    ) -> std::result::Result<IngestResponse, ErrorData> {
+        let mut database_diagnostic = None;
+        record_status_database_diagnostic(
+            &mut system_warnings,
+            &mut database_diagnostic,
+            diagnostic,
+        );
+        tracing::warn!("recovering MCP ingest synchronously after self-held queue admission lock");
+
+        let started = Instant::now();
+        loop {
+            let outcome = self
+                .run_prepared_ingest_off_runtime(
+                    prepared.request.clone(),
+                    prepared.controls,
+                    None,
+                    prepared.superseded_drawer_id.clone(),
+                )
+                .await;
+            match outcome {
+                Ok(Ok(response)) => {
+                    return Ok(finalize_self_recovered_ingest_response(
+                        response,
+                        system_warnings,
+                    ));
+                }
+                Ok(Err(error))
+                    if mcp_error_data_is_transient_database_lock(&error)
+                        && started.elapsed() < MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE
+                        && self.ingest_admission_current_mcp_server_holder_visible() =>
+                {
+                    let remaining =
+                        MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE.saturating_sub(started.elapsed());
+                    tokio::time::sleep(MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DELAY.min(remaining)).await;
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(error)
+                    if anyhow_chain_contains_sqlite_lock(&error)
+                        && started.elapsed() < MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE
+                        && self.ingest_admission_current_mcp_server_holder_visible() =>
+                {
+                    let remaining =
+                        MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE.saturating_sub(started.elapsed());
+                    tokio::time::sleep(MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DELAY.min(remaining)).await;
+                }
+                Err(error) => {
+                    return Err(ErrorData::internal_error(
+                        format!("self-held MCP ingest recovery failed: {error}"),
+                        None,
+                    ));
+                }
+            }
+        }
+    }
+
     async fn enqueue_ingest_operation(
         &self,
         payload: String,
@@ -6716,6 +6809,9 @@ impl MempalMcpServer {
             {
                 Ok(operation_id) => return Ok(operation_id),
                 Err(error) if error.is_sqlite_lock() => {
+                    if self.ingest_admission_current_mcp_server_holder_visible() {
+                        return Err(error);
+                    }
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Err(error);
@@ -11169,18 +11265,6 @@ fn degraded_write_error() -> ErrorData {
     ErrorData::internal_error(message, data)
 }
 
-fn maybe_database_write_refused_error(
-    db_path: &Path,
-    stage: &str,
-    error: &(dyn std::error::Error + 'static),
-) -> Option<ErrorData> {
-    let diagnostic = status_database_diagnostic(db_path, stage, error);
-    if diagnostic.failure_kind == "unknown" {
-        return None;
-    }
-    Some(database_write_refused_error_from_diagnostic(diagnostic))
-}
-
 fn database_write_refused_error(
     db_path: &Path,
     stage: &str,
@@ -11267,6 +11351,15 @@ fn ingest_admission_report_is_known_runtime_holder_only(
         return false;
     }
     has_known_holder
+}
+
+fn ingest_admission_report_includes_current_mcp_server_only(
+    report: &crate::process_diagnostics::DbHolderReport,
+) -> bool {
+    ingest_admission_report_is_known_runtime_holder_only(report)
+        && report.holders.iter().any(|holder| {
+            holder.current_mcp_server || holder.classification == "current_mcp_server"
+        })
 }
 
 fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDto) -> ErrorData {
@@ -11427,18 +11520,26 @@ fn mcp_stage_timeout_error(operation: &str, stage: &str, deadline: Duration) -> 
     )
 }
 
-fn mcp_operation_wait_error_is_transient_lookup(error: &ErrorData) -> bool {
-    let message = error.message.to_ascii_lowercase();
-    let operation_lookup = message.contains("queue lookup")
-        || message.contains("mempal_operation_status")
-        || message.contains("operation status");
-    let transient = message.contains("database is locked")
+fn mcp_error_message_is_transient_database_lock(message: &str) -> bool {
+    message.contains("database is locked")
         || message.contains("database locked")
         || message.contains("database is busy")
         || message.contains("database busy")
         || message.contains("sqlite_busy")
         || message.contains("sqlite_locked")
         || message.contains("locked_or_busy")
+}
+
+fn mcp_error_data_is_transient_database_lock(error: &ErrorData) -> bool {
+    mcp_error_message_is_transient_database_lock(&error.message.to_ascii_lowercase())
+}
+
+fn mcp_operation_wait_error_is_transient_lookup(error: &ErrorData) -> bool {
+    let message = error.message.to_ascii_lowercase();
+    let operation_lookup = message.contains("queue lookup")
+        || message.contains("mempal_operation_status")
+        || message.contains("operation status");
+    let transient = mcp_error_message_is_transient_database_lock(&message)
         || (message.contains("exceeded") && message.contains("queue lookup"));
     operation_lookup && transient
 }
@@ -11731,6 +11832,21 @@ fn finalize_ingest_response(
     response.state = Some(state);
     response.rejected_reason = rejected_reason;
     response.failure_detail = failure_detail;
+    response
+}
+
+fn finalize_self_recovered_ingest_response(
+    mut response: IngestResponse,
+    system_warnings: Vec<SystemWarning>,
+) -> IngestResponse {
+    if response.state.is_none() {
+        response.state = Some(if response.dropped {
+            IngestOperationState::Rejected
+        } else {
+            IngestOperationState::Completed
+        });
+    }
+    response.system_warnings = system_warnings;
     response
 }
 
@@ -12706,16 +12822,25 @@ mod tests {
         assert!(ingest_admission_report_is_known_runtime_holder_only(
             &current_mcp
         ));
+        assert!(ingest_admission_report_includes_current_mcp_server_only(
+            &current_mcp
+        ));
 
         let current_daemon =
             db_holder_report_for_ingest_retry(vec![db_holder_for_ingest_retry("current_daemon")]);
         assert!(ingest_admission_report_is_known_runtime_holder_only(
             &current_daemon
         ));
+        assert!(!ingest_admission_report_includes_current_mcp_server_only(
+            &current_daemon
+        ));
 
         let current_process =
             db_holder_report_for_ingest_retry(vec![db_holder_for_ingest_retry("current_process")]);
         assert!(ingest_admission_report_is_known_runtime_holder_only(
+            &current_process
+        ));
+        assert!(!ingest_admission_report_includes_current_mcp_server_only(
             &current_process
         ));
 
@@ -12726,12 +12851,18 @@ mod tests {
         assert!(!ingest_admission_report_is_known_runtime_holder_only(
             &extra_with_current
         ));
+        assert!(!ingest_admission_report_includes_current_mcp_server_only(
+            &extra_with_current
+        ));
 
         let readonly_cli_with_current = db_holder_report_for_ingest_retry(vec![
             db_holder_for_ingest_retry("current_mcp_server"),
             db_holder_for_ingest_retry_with_role("extra_holder", "mempal_readonly_cli"),
         ]);
         assert!(ingest_admission_report_is_known_runtime_holder_only(
+            &readonly_cli_with_current
+        ));
+        assert!(ingest_admission_report_includes_current_mcp_server_only(
             &readonly_cli_with_current
         ));
 
@@ -14064,6 +14195,57 @@ quality_policy = "llm_required_for_keep"
             ),
             "unexpected operation state after self-held lock retry: {}",
             record.op_state
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_recovers_synchronously_when_current_mcp_holds_queue_lock() {
+        let (_tempdir, db_path, server) = setup_server();
+        let queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+            .with_enqueue_lock_failures_for_test(100);
+        let server = server
+            .with_async_queue_for_test(queue)
+            .with_ingest_admission_current_mcp_holder_for_test();
+
+        let response = server
+            .mempal_ingest_with_controls(
+                IngestRequest {
+                    content: "current MCP holder should recover without queue admission"
+                        .to_string(),
+                    wing: "mcp".to_string(),
+                    room: Some("self-holder".to_string()),
+                    wait: Some(false),
+                    ..IngestRequest::default()
+                },
+                side_effect_controls(),
+            )
+            .await
+            .expect("current MCP holder should recover synchronously")
+            .0;
+
+        assert_eq!(response.state, Some(IngestOperationState::Completed));
+        assert!(
+            response.operation_id.is_none(),
+            "self-recovery must not invent a queue operation id without a durable row"
+        );
+        assert!(!response.drawer_id.is_empty());
+        assert!(!response.created_drawer_ids.is_empty());
+        assert!(response.system_warnings.iter().any(|warning| {
+            warning.source == "database" && warning.message.contains("locked_or_busy")
+        }));
+
+        let stats = PendingMessageStore::new_without_reclaim(&db_path)
+            .stats()
+            .expect("queue stats");
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.claimed, 0);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(
+            Database::open(&db_path)
+                .expect("open db")
+                .drawer_count()
+                .expect("drawer count"),
+            1
         );
     }
 
