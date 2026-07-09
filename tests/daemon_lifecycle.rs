@@ -68,6 +68,38 @@ impl DaemonCommandExt for Command {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn status_commands_exit_successfully_when_stdout_pipe_is_closed() {
+    let (home, _db_path, _config_path) = setup_daemon_home();
+
+    for args in [&["daemon", "status"][..], &["status"][..]] {
+        let command = args.join(" ");
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("create stdout pipe");
+        drop(reader);
+        let writer: std::os::fd::OwnedFd = writer.into();
+
+        let child = Command::new(mempal_bin())
+            .args(args)
+            .daemon_home(home.path())
+            .stdout(Stdio::from(writer))
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn {command}: {error}"));
+        let output = child
+            .wait_with_output()
+            .unwrap_or_else(|error| panic!("wait for {command}: {error}"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "{command} should treat a closed stdout pipe as success: status={:?}, stderr={stderr}",
+            output.status
+        );
+        assert!(!stderr.contains("panicked"), "unexpected panic: {stderr}");
+    }
+}
+
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct EnvVarGuard {
