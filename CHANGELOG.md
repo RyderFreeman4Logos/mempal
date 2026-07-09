@@ -36,6 +36,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - **Daemon/Queue**: archived queue-failure stats now use a covering completion
   index, eliminating the idle stall detector's repeated full-table page-cache
   scans on large completion histories (#687).
+- **Observability**: daemon stall checks now record Queue IO burst samples, so
+  cached SQLite read regressions remain attributable without syscall tracing.
 - **Daemon**: writer-lease recovery now binds daemon PIDs to process-start
   identities on every liveness path. Embedder status validates the Linux
   process-start identity plus daemon pidfile and fails closed elsewhere (#685).

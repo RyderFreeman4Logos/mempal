@@ -102,6 +102,8 @@ impl DaemonWriteObserver {
     }
 
     pub async fn maybe_log_stall(&self, store: &AsyncPendingMessageStore) {
+        let _io_burst =
+            crate::observability::IoBurstGuard::start(crate::observability::IoOperationPath::Queue);
         let now = unix_secs();
         let Some(diagnostic) = self.stall_diagnostic(store, now).await else {
             return;
@@ -828,6 +830,29 @@ mod tests {
         observer.force_last_successful_write_for_test(now.saturating_sub(DAEMON_STALL_SECONDS));
 
         assert_eq!(observer.stall_diagnostic(&store, now).await, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn write_observer_stall_checks_record_queue_io_burst() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let store = AsyncPendingMessageStore::from_store(
+            PendingMessageStore::new(&db_path).expect("open queue"),
+        );
+        let queue_sample_count = || {
+            crate::observability::io_burst_snapshot()
+                .paths
+                .into_iter()
+                .find(|path| path.path == crate::observability::IoOperationPath::Queue)
+                .map_or(0, |path| path.sample_count)
+        };
+        let before = queue_sample_count();
+
+        DaemonWriteObserver::new().maybe_log_stall(&store).await;
+
+        assert!(queue_sample_count() > before);
     }
 
     #[test]
