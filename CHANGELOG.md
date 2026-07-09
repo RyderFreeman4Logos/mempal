@@ -33,6 +33,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **MCP**: `mempal_ingest` now performs bounded synchronous self-recovery when
+  queue admission is blocked by the current MCP server's own SQLite holder,
+  avoiding self-deadlock without inventing a durable operation row (#681).
 - **Hooks**: passive hook stdin admission now reads at most the 10 MiB inline
   limit plus one sentinel byte, records only aggregate oversized-payload
   diagnostics, spools accepted payloads above 64 KiB by handle, and keeps
