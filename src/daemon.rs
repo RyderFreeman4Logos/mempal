@@ -99,6 +99,17 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     };
     global_embed_status().set_audit_db_path(Some(db_path.clone()));
     let writer_lease = acquire_daemon_writer_lease(context, &db_path).await?;
+    let requeued_writer_lease_failures = context
+        .store
+        .requeue_writer_lease_failures_for_daemon_start(writer_lease.lease().owner.clone())
+        .await
+        .context("failed to requeue previous daemon writer lease failures")?;
+    if requeued_writer_lease_failures > 0 {
+        tracing::info!(
+            requeued = requeued_writer_lease_failures,
+            "requeued hook work blocked by the previous daemon writer lease"
+        );
+    }
     {
         let db = context.db.lock().await;
         db.prune_expired_audit_logs()
@@ -211,7 +222,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
             }
         });
     }
-    let worker_id = format!("mempal-daemon-{}", std::process::id());
+    let worker_id = writer_lease.lease().owner.clone();
     let claim_ttl_secs = context.config.hooks.daemon_claim_ttl_secs as i64;
     let poll_interval = Duration::from_millis(context.config.hooks.daemon_poll_interval_ms);
     let reclaimed = context
@@ -405,7 +416,6 @@ async fn acquire_daemon_writer_lease(
     context: &DaemonContext,
     db_path: &Path,
 ) -> Result<RuntimeWriterLeaseHandle> {
-    let owner = format!("mempal-daemon-{}", std::process::id());
     let metadata = json!({
         "command": "daemon",
         "db_path": db_path.to_string_lossy(),
@@ -413,10 +423,8 @@ async fn acquire_daemon_writer_lease(
     .to_string();
     let lease = {
         let db = context.db.lock().await;
-        db.runtime_writer_lease_acquire(
+        db.runtime_writer_lease_acquire_for_daemon_start(
             SQLITE_WRITER_LEASE_NAME,
-            &owner,
-            "daemon",
             DAEMON_WRITER_LEASE_TTL_SECS,
             Some(&metadata),
         )
@@ -4056,6 +4064,11 @@ mod tests {
         };
         config.embed.backend = "model2vec".to_string();
         config.embed.model = Some("explicit-model2vec-not-loaded-at-startup".to_string());
+        std::fs::write(
+            tmp.path().join("daemon.pid"),
+            std::process::id().to_string(),
+        )
+        .expect("write daemon pidfile");
 
         let _embedder = DaemonEmbedder::from_config(&config, tmp.path())
             .await
@@ -4105,6 +4118,11 @@ mod tests {
         };
         config.embed.backend = "stub".to_string();
         config.embed.openai_compat.dim = Some(7);
+        std::fs::write(
+            tmp.path().join("daemon.pid"),
+            std::process::id().to_string(),
+        )
+        .expect("write daemon pidfile");
 
         let embedder = DaemonEmbedder::from_config(&config, tmp.path())
             .await

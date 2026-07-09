@@ -204,6 +204,82 @@ fn runtime_writer_lease_conflicts_until_expiry() {
 }
 
 #[test]
+fn runtime_writer_lease_daemon_start_rebinds_previous_daemon_identity() {
+    let db = open_test_db();
+
+    let previous = db
+        .runtime_writer_lease_acquire_for_daemon_start("sqlite-writer", 300, None)
+        .unwrap()
+        .expect("previous daemon lease");
+    assert!(
+        db.runtime_writer_lease_acquire_for_daemon_start("sqlite-writer", 300, None)
+            .unwrap()
+            .is_none(),
+        "daemon start must not replace a live previous daemon identity"
+    );
+    let reused_pid_owner = format!("mempal-daemon-{}-previous-start", std::process::id());
+    db.conn()
+        .execute(
+            "UPDATE runtime_writer_leases SET owner = ?2 WHERE name = ?1",
+            rusqlite::params![previous.name, reused_pid_owner],
+        )
+        .expect("simulate PID reuse by a later daemon process");
+
+    let rebound = db
+        .runtime_writer_lease_acquire_for_daemon_start("sqlite-writer", 300, None)
+        .unwrap()
+        .expect("new daemon must replace the previous start identity for the reused PID");
+
+    assert_eq!(rebound.owner, previous.owner);
+    assert_eq!(rebound.pid, std::process::id());
+    assert_ne!(rebound.session_id, previous.session_id);
+    let active = db
+        .runtime_writer_lease_status(Some("sqlite-writer"))
+        .unwrap();
+    assert_eq!(active, vec![rebound]);
+}
+
+#[test]
+fn runtime_writer_daemon_liveness_rejects_reused_pid_identity() {
+    let db = open_test_db();
+    let lease = db
+        .runtime_writer_lease_acquire_for_daemon_start("sqlite-writer", 300, None)
+        .unwrap()
+        .expect("daemon lease");
+    let reused_pid_owner = format!("mempal-daemon-{}-previous-start", std::process::id());
+    db.conn()
+        .execute(
+            "UPDATE runtime_writer_leases SET owner = ?2 WHERE name = ?1",
+            rusqlite::params![lease.name, reused_pid_owner],
+        )
+        .expect("simulate PID reuse by another mempal process");
+
+    assert!(
+        !db.runtime_writer_lease_has_live_daemon("sqlite-writer")
+            .unwrap(),
+        "reused PID must not make a stale daemon lease live"
+    );
+    assert!(
+        !db.runtime_writer_lease_has_live_durable_ingest_worker("sqlite-writer")
+            .unwrap(),
+        "reused PID must not route durable ingest work to a stale daemon"
+    );
+
+    db.conn()
+        .execute(
+            "UPDATE runtime_writer_leases SET expires_at = '1970-01-01T00:00:00.000Z' WHERE name = ?1",
+            [&lease.name],
+        )
+        .expect("expire stale daemon lease");
+    assert!(
+        db.runtime_writer_lease_status(Some("sqlite-writer"))
+            .unwrap()
+            .is_empty(),
+        "expired stale daemon lease must not be preserved"
+    );
+}
+
+#[test]
 fn runtime_writer_lease_different_names_do_not_collide() {
     let db = open_test_db();
 

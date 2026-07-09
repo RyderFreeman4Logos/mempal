@@ -24796,10 +24796,8 @@ api_model = "text-embedding-3-large"
     }
 
     fn hold_daemon_writer_lease(db: &Database) -> RuntimeWriterLease {
-        db.runtime_writer_lease_acquire(
+        db.runtime_writer_lease_acquire_for_daemon_start(
             SQLITE_WRITER_LEASE_NAME,
-            "test-daemon-writer",
-            "daemon",
             MAINTENANCE_WRITER_LEASE_TTL_SECS,
             None,
         )
@@ -25834,10 +25832,8 @@ mod historical_rejudge_tests {
     }
 
     fn hold_test_daemon_writer_lease(db: &Database) -> RuntimeWriterLease {
-        db.runtime_writer_lease_acquire(
+        db.runtime_writer_lease_acquire_for_daemon_start(
             SQLITE_WRITER_LEASE_NAME,
-            "test-daemon-writer",
-            "daemon",
             MAINTENANCE_WRITER_LEASE_TTL_SECS,
             None,
         )

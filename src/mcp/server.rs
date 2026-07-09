@@ -14525,15 +14525,9 @@ quality_policy = "llm_required_for_keep"
 
     fn hold_daemon_writer_lease(db_path: &Path) -> RuntimeWriterLease {
         let db = Database::open(db_path).expect("open db");
-        db.runtime_writer_lease_acquire(
-            SQLITE_WRITER_LEASE_NAME,
-            "daemon-owner",
-            "daemon",
-            300,
-            None,
-        )
-        .expect("acquire daemon writer lease")
-        .expect("daemon writer lease")
+        db.runtime_writer_lease_acquire_for_daemon_start(SQLITE_WRITER_LEASE_NAME, 300, None)
+            .expect("acquire daemon writer lease")
+            .expect("daemon writer lease")
     }
 
     fn assert_writer_lease_conflict(error: &ErrorData) {
@@ -20292,13 +20286,7 @@ prototypes = ["keep"]
         let (_tempdir, db_path, server) = setup_server();
         let db = Database::open(&db_path).expect("open db");
         let daemon_lease = db
-            .runtime_writer_lease_acquire(
-                SQLITE_WRITER_LEASE_NAME,
-                "daemon-owner",
-                "daemon",
-                1,
-                None,
-            )
+            .runtime_writer_lease_acquire_for_daemon_start(SQLITE_WRITER_LEASE_NAME, 1, None)
             .expect("acquire daemon lease")
             .expect("daemon lease");
         db.conn()
@@ -20340,7 +20328,7 @@ prototypes = ["keep"]
             .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
             .expect("load writer lease status");
         assert_eq!(active.len(), 1);
-        assert_eq!(active[0].owner, "daemon-owner");
+        assert_eq!(active[0].owner, daemon_lease.owner);
     }
 
     #[tokio::test]
