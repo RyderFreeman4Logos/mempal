@@ -46,6 +46,15 @@ fn has_column(columns: &[(String, String)], name: &str, ty: &str) -> bool {
         .any(|(column_name, column_ty)| column_name == name && column_ty.eq_ignore_ascii_case(ty))
 }
 
+fn index_sql(conn: &Connection, name: &str) -> String {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        [name],
+        |row| row.get(0),
+    )
+    .expect("index exists")
+}
+
 #[test]
 fn test_fork_ext_version_is_current_after_audit_project_scope_phase() {
     let (_tmp, _db_path, db) = new_test_db();
@@ -211,6 +220,37 @@ fn test_new_database_has_async_ingest_columns_after_v19() {
 
     let version = read_fork_ext_version(db.conn()).expect("read fork-ext version");
     assert_eq!(version, CURRENT_FORK_EXT_VERSION);
+}
+
+#[test]
+fn test_fork_ext_v23_to_v24_adds_pending_heartbeat_index() {
+    let conn = Connection::open_in_memory().expect("open sqlite connection");
+    let schema_version = current_schema_version();
+    conn.execute_batch(&format!(
+        r#"
+        CREATE TABLE fork_ext_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT INTO fork_ext_meta (key, value) VALUES ('fork_ext_version', '23');
+        CREATE TABLE pending_messages (
+            id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            heartbeat_at INTEGER
+        );
+        PRAGMA user_version = {schema_version};
+        "#
+    ))
+    .expect("create v23 schema");
+
+    apply_fork_ext_migrations_to(&conn, 24).expect("first v24 migration");
+    apply_fork_ext_migrations_to(&conn, 24).expect("second v24 migration");
+
+    let sql = index_sql(&conn, "idx_pending_status_heartbeat_at");
+    assert!(sql.contains("pending_messages"));
+    assert!(sql.contains("status"));
+    assert!(sql.contains("heartbeat_at"));
+    assert_eq!(read_fork_ext_version(&conn).expect("read version"), 24);
 }
 
 #[test]

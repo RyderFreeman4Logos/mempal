@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 23;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 24;
 
 // Partial indexes on the most expensive GROUP BY + COUNT(*) paths used by `mempal status`.
 // idx_drawers_project_id_active is a partial replacement for the non-partial
@@ -153,6 +153,11 @@ CREATE INDEX IF NOT EXISTS idx_operation_telemetry_source_operation
     ON operation_telemetry(source, operation, started_at_unix_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_operation_telemetry_call_site
     ON operation_telemetry(call_site, started_at_unix_ms DESC);
+"#;
+
+pub const FORK_EXT_V24_SCHEMA_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_pending_status_heartbeat_at
+    ON pending_messages(status, heartbeat_at);
 "#;
 
 pub const FORK_EXT_V15_SCHEMA_SQL: &str = r#"
@@ -489,6 +494,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 23,
             up: apply_v23,
         },
+        Migration {
+            version: 24,
+            up: apply_v24,
+        },
     ]
 }
 
@@ -739,6 +748,10 @@ fn apply_v22(conn: &Connection) -> rusqlite::Result<()> {
 
 fn apply_v23(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(FORK_EXT_V23_SCHEMA_SQL)
+}
+
+fn apply_v24(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(FORK_EXT_V24_SCHEMA_SQL)
 }
 
 fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {
