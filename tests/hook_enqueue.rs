@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
@@ -77,12 +77,15 @@ fn run_hook(home: &TempDir, command: &str, payload: &[u8]) -> std::process::Outp
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn hook command");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(payload)
-        .expect("write payload");
+    let mut stdin = child.stdin.take().expect("stdin");
+    if let Err(error) = stdin.write_all(payload) {
+        assert_eq!(
+            error.kind(),
+            ErrorKind::BrokenPipe,
+            "unexpected hook stdin write failure: {error}"
+        );
+    }
+    drop(stdin);
     child.wait_with_output().expect("wait output")
 }
 
@@ -545,12 +548,15 @@ fn test_hook_envelopes_oversized_payload() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn hook command");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(oversized.as_bytes())
-        .expect("write payload");
+    let mut stdin = child.stdin.take().expect("stdin");
+    if let Err(error) = stdin.write_all(oversized.as_bytes()) {
+        assert_eq!(
+            error.kind(),
+            ErrorKind::BrokenPipe,
+            "unexpected oversized hook stdin write failure: {error}"
+        );
+    }
+    drop(stdin);
     let output = child.wait_with_output().expect("wait output");
 
     assert_eq!(output.status.code(), Some(0));
@@ -561,8 +567,8 @@ fn test_hook_envelopes_oversized_payload() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("payload envelope-wrapped"),
-        "stderr should mention envelope-wrapped, got: {stderr}"
+        stderr.contains("hook payload exceeded inline limit"),
+        "stderr should mention bounded oversized admission, got: {stderr}"
     );
 
     let conn = Connection::open(db_path).expect("open sqlite");
@@ -580,15 +586,21 @@ fn test_hook_envelopes_oversized_payload() {
         envelope_json["original_size_bytes"]
             .as_u64()
             .expect("original size")
-            > 10_000_000
+            == 10_485_761
     );
-    let preview = envelope_json["payload_preview"]
-        .as_str()
-        .expect("preview string");
-    assert!(preview.len() <= 4096);
+    assert!(envelope_json["payload"].is_null());
+    assert!(envelope_json["payload_preview"].is_null());
     assert!(
         envelope_json["payload_path"].is_null(),
         "oversized automatic hook capture must not persist raw payload before LLM gate"
+    );
+    assert!(
+        envelope.len() < 4096,
+        "oversized hook queue envelope must stay aggregate-only"
+    );
+    assert!(
+        !envelope.contains("\"payload\":\""),
+        "oversized hook queue envelope must not carry raw body"
     );
     assert!(
         !home.path().join(".mempal").join("hook-oversize").exists(),

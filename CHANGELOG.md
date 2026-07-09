@@ -33,6 +33,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **Hooks**: passive hook stdin admission now reads at most the 10 MiB inline
+  limit plus one sentinel byte, records only aggregate oversized-payload
+  diagnostics, and keeps oversized raw bodies out of queue/IPC envelopes (#676).
 - **Queue**: `PendingMessageStore` now reuses cached writer and reader SQLite
   connections across enqueue, confirm, status, retry, and archive paths,
   eliminating non-claim connection churn under WAL mode (#674).

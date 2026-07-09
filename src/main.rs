@@ -13130,6 +13130,11 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
             |row| row.get::<_, Option<i64>>(0),
         )
         .context("failed to query daemon heartbeat")?;
+    let mempal_home = daemon_home_from_db_path(db.path());
+    let hook_admission = mempal::hook_diagnostics::hook_admission_stats(
+        &mempal_home,
+        mempal::hook::MAX_INLINE_PAYLOAD_BYTES as u64,
+    );
     println!("schema_version: {schema_version}");
     println!("fork_ext_version: {fork_ext_version}");
     println!(
@@ -13361,7 +13366,7 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         Some(hb) => println!("  last_heartbeat_unix_secs: {hb}"),
         None => println!("  last_heartbeat_unix_secs: none"),
     }
-    print_daemon_embedder_status(&daemon_home_from_db_path(db.path()), "  ");
+    print_daemon_embedder_status(&mempal_home, "  ");
     let db_holders = mempal::process_diagnostics::inspect_db_holders(db.path());
     print_db_holder_report("DB Holders", &db_holders, "  ");
     println!("Queue:");
@@ -13407,6 +13412,28 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         &queue_stats.retrying_buckets,
         false,
     );
+    println!("Hook Admission:");
+    println!(
+        "  oversize_truncated_count: {}",
+        hook_admission.oversize_truncated_count
+    );
+    println!(
+        "  oversize_dropped_count: {}",
+        hook_admission.oversize_dropped_count
+    );
+    println!("  spooled_count: {}", hook_admission.spooled_count);
+    println!(
+        "  inline_limit_bytes: {}",
+        hook_admission.inline_limit_bytes
+    );
+    match hook_admission.last_lower_bound_bytes {
+        Some(bytes) => println!("  last_lower_bound_bytes: {bytes}"),
+        None => println!("  last_lower_bound_bytes: none"),
+    }
+    match hook_admission.last_error_class.as_deref() {
+        Some(class) => println!("  last_error_class: {class}"),
+        None => println!("  last_error_class: none"),
+    }
     println!("Historical Rejudge:");
     if let Some(checkpoint) = historical_rejudge_checkpoint.as_ref() {
         let backlog_counts = historical_rejudge_backlog_counts(db, &checkpoint.run_id)

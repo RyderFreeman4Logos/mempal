@@ -2140,7 +2140,11 @@ fn build_audit_drawer_record(
 ) -> Result<DrawerRecord> {
     let project_id = resolve_hook_project_id(envelope, config)?;
     if envelope.truncated {
-        let preview = config.scrub_content(envelope.payload_preview.as_deref().unwrap_or_default());
+        let preview = envelope
+            .payload_preview
+            .as_deref()
+            .map(|preview| config.scrub_content(preview));
+        let payload_omitted = envelope.payload.is_none() && envelope.payload_path.is_none();
         tracing::warn!(
             event = %envelope.event,
             original_size_bytes = envelope.original_size_bytes,
@@ -2153,6 +2157,8 @@ fn build_audit_drawer_record(
             "captured_at": envelope.captured_at,
             "claude_cwd": envelope.claude_cwd,
             "original_size_bytes": envelope.original_size_bytes,
+            "original_size_bytes_lower_bound": payload_omitted,
+            "payload_omitted": payload_omitted,
             "payload_preview": preview,
             "payload_path": envelope.payload_path,
         }))

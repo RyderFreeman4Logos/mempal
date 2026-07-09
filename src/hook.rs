@@ -15,8 +15,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::hook_install::{self, HookInstallTarget};
 
-const MAX_INLINE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
-const PREVIEW_MAX_BYTES: usize = 4 * 1024;
+/// Maximum hook stdin payload size admitted inline into the hook envelope.
+///
+/// The hook process reads at most one byte past this limit so oversized streams
+/// can be detected without draining or buffering unbounded stdin.
+pub const MAX_INLINE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+const MAX_STDIN_READ_BYTES: usize = MAX_INLINE_PAYLOAD_BYTES + 1;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum HookCommands {
@@ -100,6 +104,7 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
 
     let db_path = expand_home_path(&config.db_path);
     let mempal_home = mempal_home_from_db(&db_path);
+    let event_name = event.display_name();
 
     let captured = capture_stdin_payload(stdin, &mempal_home)?;
     let envelope = CapturedHookEnvelope {
@@ -123,15 +128,27 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
     };
 
     if envelope.truncated {
+        let size_label = if captured.original_size_is_lower_bound {
+            format!(">= {} bytes", MAX_INLINE_PAYLOAD_BYTES)
+        } else {
+            format!("{} bytes", envelope.original_size_bytes)
+        };
         eprintln!(
-            "payload envelope-wrapped for {} ({} bytes)",
-            envelope.event, envelope.original_size_bytes
+            "hook payload exceeded inline limit for {}; raw body omitted ({})",
+            envelope.event, size_label
+        );
+        crate::hook_diagnostics::log_hook_failure(
+            &mempal_home,
+            event_name,
+            &crate::hook_diagnostics::HookOutcome::Truncated {
+                lower_bound_bytes: envelope.original_size_bytes as u64,
+                inline_limit_bytes: MAX_INLINE_PAYLOAD_BYTES as u64,
+            },
         );
     }
 
     let payload =
         serde_json::to_string(&envelope).context("failed to serialize hook capture envelope")?;
-    let event_name = event.display_name();
     let fallback = match try_enqueue_via_daemon(&mempal_home, event.queue_kind(), &payload) {
         DaemonEnqueueOutcome::Accepted => return Ok(()),
         DaemonEnqueueOutcome::Fallback(fallback) => fallback,
@@ -284,8 +301,13 @@ fn raw_turn_target_for_hook_event(event: HookEvent, bytes: &[u8]) -> (&'static s
 }
 
 fn stdin_bytes() -> Result<Vec<u8>> {
+    stdin_bytes_from(io::stdin().lock())
+}
+
+fn stdin_bytes_from(reader: impl Read) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
-    io::stdin()
+    reader
+        .take(MAX_STDIN_READ_BYTES as u64)
         .read_to_end(&mut buf)
         .context("failed to read hook stdin payload")?;
     Ok(buf)
@@ -297,6 +319,7 @@ struct CapturedPayload {
     payload_path: Option<PathBuf>,
     preview: Option<String>,
     original_size_bytes: usize,
+    original_size_is_lower_bound: bool,
     truncated: bool,
 }
 
@@ -308,6 +331,7 @@ fn capture_stdin_payload(bytes: Vec<u8>, _mempal_home: &Path) -> Result<Captured
             payload_path: None,
             preview: None,
             original_size_bytes,
+            original_size_is_lower_bound: false,
             truncated: false,
         });
     }
@@ -315,28 +339,11 @@ fn capture_stdin_payload(bytes: Vec<u8>, _mempal_home: &Path) -> Result<Captured
     Ok(CapturedPayload {
         inline_payload: None,
         payload_path: None,
-        preview: Some(safe_preview(&bytes)),
-        original_size_bytes,
+        preview: None,
+        original_size_bytes: MAX_STDIN_READ_BYTES,
+        original_size_is_lower_bound: true,
         truncated: true,
     })
-}
-
-fn safe_preview(bytes: &[u8]) -> String {
-    let preview_bytes = &bytes[..bytes.len().min(PREVIEW_MAX_BYTES)];
-    let lossy = String::from_utf8_lossy(preview_bytes);
-    truncate_to_byte_boundary(lossy.as_ref(), PREVIEW_MAX_BYTES).to_string()
-}
-
-fn truncate_to_byte_boundary(input: &str, max_bytes: usize) -> &str {
-    if input.len() <= max_bytes {
-        return input;
-    }
-
-    let mut index = max_bytes;
-    while !input.is_char_boundary(index) {
-        index -= 1;
-    }
-    &input[..index]
 }
 
 fn decode_stdin_bytes(bytes: &[u8]) -> String {
@@ -433,9 +440,43 @@ impl HookEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct CountingReader {
+        remaining: usize,
+        read_bytes: Rc<Cell<usize>>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Ok(0);
+            }
+            let len = buf.len().min(self.remaining);
+            buf[..len].fill(b'x');
+            self.remaining -= len;
+            self.read_bytes.set(self.read_bytes.get() + len);
+            Ok(len)
+        }
+    }
 
     #[test]
-    fn test_oversize_capture_keeps_preview_without_raw_payload_file() {
+    fn test_stdin_reader_stops_at_inline_limit_sentinel() {
+        let read_bytes = Rc::new(Cell::new(0));
+        let reader = CountingReader {
+            remaining: MAX_STDIN_READ_BYTES + (1024 * 1024),
+            read_bytes: Rc::clone(&read_bytes),
+        };
+
+        let bytes = stdin_bytes_from(reader).expect("read bounded stdin");
+
+        assert_eq!(bytes.len(), MAX_STDIN_READ_BYTES);
+        assert_eq!(read_bytes.get(), MAX_STDIN_READ_BYTES);
+    }
+
+    #[test]
+    fn test_oversize_capture_omits_raw_payload_and_preview() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let bytes = vec![b'x'; MAX_INLINE_PAYLOAD_BYTES + 1];
 
@@ -443,12 +484,30 @@ mod tests {
 
         assert!(captured.inline_payload.is_none());
         assert!(captured.payload_path.is_none());
-        assert!(captured.preview.is_some());
+        assert!(captured.preview.is_none());
         assert_eq!(captured.original_size_bytes, MAX_INLINE_PAYLOAD_BYTES + 1);
+        assert!(captured.original_size_is_lower_bound);
         assert!(captured.truncated);
         assert!(
             !tmp.path().join("hook-oversize").exists(),
             "automatic hook capture must not persist oversized raw payload before LLM gate"
         );
+    }
+
+    #[test]
+    fn test_small_capture_preserves_raw_payload() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let bytes = br#"{"prompt":"raw verbatim"}"#.to_vec();
+
+        let captured = capture_stdin_payload(bytes, tmp.path()).expect("capture small payload");
+
+        assert_eq!(
+            captured.inline_payload.as_deref(),
+            Some(r#"{"prompt":"raw verbatim"}"#)
+        );
+        assert!(captured.payload_path.is_none());
+        assert!(captured.preview.is_none());
+        assert!(!captured.original_size_is_lower_bound);
+        assert!(!captured.truncated);
     }
 }
