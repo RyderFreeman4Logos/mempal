@@ -10,6 +10,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
+- Baseline-aware `find-monolith-files` preflight gate that rejects new files
+  above 800 lines or 8000 tokens and ratchets existing monolith debt (#695).
 - `mempal_projects_list` MCP tool to discover all projects with memory,
   their evidence/knowledge counts, last activity, and worktree path.
   Ported from upstream P109 (70727f0).

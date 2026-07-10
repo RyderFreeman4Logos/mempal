@@ -1,0 +1,627 @@
+# Current tracked text files above the 800-line or 8000-token policy.
+# Issue #695 restores the guard with exact no-growth caps; module splits remain
+# separate review work. Token counts use tokuin's gpt-4 model.
+
+[[files]]
+path = "contrib/hermes-agent-plugin/mempal/__init__.py"
+kind = "source"
+baseline_tokens = 11269
+baseline_lines = 1179
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "contrib/hermes-agent-plugin/test_mempal_provider.py"
+kind = "test"
+baseline_tokens = 10487
+baseline_lines = 1081
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "docs/MIND-MODEL-DESIGN.md"
+kind = "doc"
+baseline_tokens = 18883
+baseline_lines = 2205
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "docs/plans/2026-04-13-p6-implementation.md"
+kind = "doc"
+baseline_tokens = 16520
+baseline_lines = 1632
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "docs/plans/2026-04-13-p7-implementation.md"
+kind = "doc"
+baseline_tokens = 13420
+baseline_lines = 1164
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "docs/plans/2026-04-15-p8-implementation.md"
+kind = "doc"
+baseline_tokens = 20765
+baseline_lines = 2100
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "docs/plans/2026-04-17-p9-implementation.md"
+kind = "doc"
+baseline_tokens = 10158
+baseline_lines = 871
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "docs/plans/2026-04-20-fork-ext-p8-implementation.md"
+kind = "doc"
+baseline_tokens = 10956
+baseline_lines = 445
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "docs/plans/2026-05-27-p16-xurl-conversation-recall.md"
+kind = "doc"
+baseline_tokens = 8390
+baseline_lines = 736
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "docs/specs/2026-04-13-p7-search-structured-signals.md"
+kind = "doc"
+baseline_tokens = 8012
+baseline_lines = 465
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "docs/specs/2026-04-14-p8-cowork-inbox-push.md"
+kind = "doc"
+baseline_tokens = 15299
+baseline_lines = 848
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "docs/usage.md"
+kind = "doc"
+baseline_tokens = 11543
+baseline_lines = 1282
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "skills/smoke-test/scripts/full_smoke.py"
+kind = "source"
+baseline_tokens = 20209
+baseline_lines = 2129
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "specs/fork-ext/p8-embed-qwen3-backend.spec.md"
+kind = "doc"
+baseline_tokens = 8414
+baseline_lines = 479
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "specs/fork-ext/p8-hook-passive-capture.spec.md"
+kind = "doc"
+baseline_tokens = 8133
+baseline_lines = 332
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "specs/p8-cowork-inbox-push.spec.md"
+kind = "doc"
+baseline_tokens = 8914
+baseline_lines = 411
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/api/handlers.rs"
+kind = "source"
+baseline_tokens = 19276
+baseline_lines = 2582
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/context.rs"
+kind = "source"
+baseline_tokens = 9212
+baseline_lines = 1271
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/core/async_db.rs"
+kind = "source"
+baseline_tokens = 8242
+baseline_lines = 877
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/core/config.rs"
+kind = "source"
+baseline_tokens = 28956
+baseline_lines = 3688
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/core/db.rs"
+kind = "source"
+baseline_tokens = 73291
+baseline_lines = 9165
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/core/db_fork_ext.rs"
+kind = "source"
+baseline_tokens = 10435
+baseline_lines = 1198
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/core/design_insights.rs"
+kind = "source"
+baseline_tokens = 6687
+baseline_lines = 833
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/core/patterns.rs"
+kind = "source"
+baseline_tokens = 6758
+baseline_lines = 808
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/core/phase3.rs"
+kind = "source"
+baseline_tokens = 8321
+baseline_lines = 1132
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/core/queue.rs"
+kind = "source"
+baseline_tokens = 23869
+baseline_lines = 3140
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/core/types.rs"
+kind = "source"
+baseline_tokens = 6470
+baseline_lines = 928
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/cowork/bus.rs"
+kind = "source"
+baseline_tokens = 14325
+baseline_lines = 1981
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/cowork/inbox.rs"
+kind = "source"
+baseline_tokens = 6357
+baseline_lines = 804
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/crystallize.rs"
+kind = "source"
+baseline_tokens = 6364
+baseline_lines = 861
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/daemon.rs"
+kind = "source"
+baseline_tokens = 52995
+baseline_lines = 6612
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/daemon_bootstrap.rs"
+kind = "source"
+baseline_tokens = 8151
+baseline_lines = 1048
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/daemon_singleton.rs"
+kind = "source"
+baseline_tokens = 10147
+baseline_lines = 1168
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/doctor.rs"
+kind = "source"
+baseline_tokens = 10414
+baseline_lines = 1363
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/ingest/gating.rs"
+kind = "source"
+baseline_tokens = 5967
+baseline_lines = 907
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/ingest/mod.rs"
+kind = "source"
+baseline_tokens = 7267
+baseline_lines = 1023
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/ingest/parsers.rs"
+kind = "source"
+baseline_tokens = 9186
+baseline_lines = 1239
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/llm/worker.rs"
+kind = "source"
+baseline_tokens = 12037
+baseline_lines = 1453
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/longmemeval.rs"
+kind = "source"
+baseline_tokens = 7922
+baseline_lines = 1083
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/main.rs"
+kind = "source"
+baseline_tokens = 256004
+baseline_lines = 33133
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/markdown_export.rs"
+kind = "source"
+baseline_tokens = 8857
+baseline_lines = 1228
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/mcp/server.rs"
+kind = "source"
+baseline_tokens = 173690
+baseline_lines = 21926
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/mcp/tools.rs"
+kind = "source"
+baseline_tokens = 31039
+baseline_lines = 3904
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/observability/mod.rs"
+kind = "source"
+baseline_tokens = 20175
+baseline_lines = 2590
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/observability/operation_telemetry.rs"
+kind = "source"
+baseline_tokens = 7744
+baseline_lines = 1002
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/process_diagnostics.rs"
+kind = "source"
+baseline_tokens = 13370
+baseline_lines = 1644
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/search/mod.rs"
+kind = "source"
+baseline_tokens = 27826
+baseline_lines = 3281
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/sleep.rs"
+kind = "source"
+baseline_tokens = 7899
+baseline_lines = 1072
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/wiki.rs"
+kind = "source"
+baseline_tokens = 12362
+baseline_lines = 1771
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/xurl/parser/hermes.rs"
+kind = "source"
+baseline_tokens = 7238
+baseline_lines = 852
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "src/xurl/store.rs"
+kind = "source"
+baseline_tokens = 6604
+baseline_lines = 814
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/cli_dashboard.rs"
+kind = "test"
+baseline_tokens = 10551
+baseline_lines = 1450
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/config_hot_reload.rs"
+kind = "test"
+baseline_tokens = 8142
+baseline_lines = 967
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/context_assembler.rs"
+kind = "test"
+baseline_tokens = 11129
+baseline_lines = 1484
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/cowork_bus.rs"
+kind = "test"
+baseline_tokens = 15382
+baseline_lines = 2208
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/cowork_inbox.rs"
+kind = "test"
+baseline_tokens = 8914
+baseline_lines = 1060
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/daemon_lifecycle.rs"
+kind = "test"
+baseline_tokens = 7450
+baseline_lines = 947
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/embedder_reindex_scenarios.rs"
+kind = "test"
+baseline_tokens = 12979
+baseline_lines = 1573
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/hermes_integration.rs"
+kind = "test"
+baseline_tokens = 8509
+baseline_lines = 1137
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/hook_passive_capture.rs"
+kind = "test"
+baseline_tokens = 8493
+baseline_lines = 1078
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/ingest_cli_errors.rs"
+kind = "test"
+baseline_tokens = 7302
+baseline_lines = 873
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/judge_gating.rs"
+kind = "test"
+baseline_tokens = 22315
+baseline_lines = 2984
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/knowledge_lifecycle.rs"
+kind = "test"
+baseline_tokens = 11458
+baseline_lines = 1679
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/llm_worker_hot_reload.rs"
+kind = "test"
+baseline_tokens = 6331
+baseline_lines = 831
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/mind_model_bootstrap.rs"
+kind = "test"
+baseline_tokens = 21045
+baseline_lines = 2821
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/normalize_version.rs"
+kind = "test"
+baseline_tokens = 10096
+baseline_lines = 1268
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/novelty_filter.rs"
+kind = "test"
+baseline_tokens = 8610
+baseline_lines = 1108
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/pattern_induction.rs"
+kind = "test"
+baseline_tokens = 7516
+baseline_lines = 1038
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/phase3_runtime.rs"
+kind = "test"
+baseline_tokens = 19163
+baseline_lines = 2730
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/privacy_scrubbing.rs"
+kind = "test"
+baseline_tokens = 6175
+baseline_lines = 802
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/project_vector_isolation.rs"
+kind = "test"
+baseline_tokens = 21335
+baseline_lines = 2719
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/queue_claim_confirm.rs"
+kind = "test"
+baseline_tokens = 7098
+baseline_lines = 828
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/queue_stats.rs"
+kind = "test"
+baseline_tokens = 12418
+baseline_lines = 1480
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/rest_reliability.rs"
+kind = "test"
+baseline_tokens = 10995
+baseline_lines = 1340
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/rest_typed_ingest.rs"
+kind = "test"
+baseline_tokens = 6192
+baseline_lines = 819
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/wiki.rs"
+kind = "test"
+baseline_tokens = 6321
+baseline_lines = 839
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/write_wait_cli.rs"
+kind = "test"
+baseline_tokens = 15490
+baseline_lines = 1967
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/xurl_embed.rs"
+kind = "test"
+baseline_tokens = 8355
+baseline_lines = 1131
+issue = "695"
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
