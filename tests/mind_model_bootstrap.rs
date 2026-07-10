@@ -1795,8 +1795,9 @@ async fn test_git_worktree_derives_worktree_anchor_and_repo_parent() {
 
 #[tokio::test]
 async fn test_non_git_cwd_falls_back_to_standalone_worktree_anchor() {
-    let (tmp, db, server) = setup_mcp_server();
-    let non_git = tmp.path().join("standalone");
+    let (_tmp, db, server) = setup_mcp_server();
+    let non_git_tmp = TempDir::new_in("/tmp").expect("external tempdir");
+    let non_git = non_git_tmp.path().join("standalone");
     fs::create_dir_all(&non_git).expect("create standalone dir");
 
     let response = server

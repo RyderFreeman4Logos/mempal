@@ -194,7 +194,7 @@ async fn ingest_empty_file_succeeds() {
 
 #[tokio::test]
 async fn ingest_cc_single_file_populates_project_path_and_source_path() {
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new_in("/tmp").expect("external tempdir");
     let db = open_temp_db_at_fork_ext(16);
     let cwd = "/home/obj/project/github/RyderFreeman4Logos/mempal";
     let file = write_cc_fixture_under_claude_projects(&dir, "cc-cwd-session", cwd, true);
@@ -244,7 +244,7 @@ async fn ingest_cc_single_file_populates_project_path_and_source_path() {
 
 #[tokio::test]
 async fn ingest_cc_default_scan_populates_project_path_from_parent_dir() {
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new_in("/tmp").expect("external tempdir");
     let db = open_temp_db_at_fork_ext(16);
     let cwd = "/home/obj/project/github/RyderFreeman4Logos/mempal";
     write_cc_fixture_under_claude_projects(&dir, "cc-fallback-session", cwd, false);

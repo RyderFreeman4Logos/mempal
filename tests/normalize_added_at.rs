@@ -14,7 +14,7 @@ fn mempal_bin() -> String {
 }
 
 fn setup() -> (TempDir, std::path::PathBuf) {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = TempDir::new_in("/tmp").expect("external tempdir");
     let mempal_home = tmp.path().join(".mempal");
     std::fs::create_dir_all(&mempal_home).expect("create .mempal dir");
     let db_path = mempal_home.join("palace.db");

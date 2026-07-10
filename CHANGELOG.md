@@ -33,6 +33,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **Tests**: keep daemon IPC and path-sensitive project/provenance fixtures
+  under bounded external paths so the default test suite works with deeply
+  nested, repository-backed `TMPDIR` values (#696).
 - **Security/Dependencies**: upgraded `crossbeam-epoch`, `quick-xml`,
   `quinn-proto`, and `rmcp` past the five affected RustSec versions, and
   upgraded `anyhow` and `rand` to their patched releases. The remaining

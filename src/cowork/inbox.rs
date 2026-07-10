@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn project_identity_falls_back_to_raw_cwd_without_git() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new_in("/tmp").expect("external tempdir");
         let plain = tmp.path().join("no-git-dir");
         fs::create_dir_all(&plain).unwrap();
 

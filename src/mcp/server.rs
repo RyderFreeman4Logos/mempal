@@ -12440,7 +12440,7 @@ mod tests {
     }
 
     fn setup_server() -> (TempDir, PathBuf, MempalMcpServer) {
-        let tempdir = tempfile::tempdir().expect("tempdir");
+        let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
         let db_path = tempdir.path().join("palace.db");
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db fixture");
         let server = MempalMcpServer::new_with_factory(
