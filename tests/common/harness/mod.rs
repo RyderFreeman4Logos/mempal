@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 pub mod bootstrap_observer;
 #[allow(dead_code)]
+pub mod captured_child;
+#[allow(dead_code)]
 pub mod daemon_supervisor;
 #[allow(dead_code)]
 pub mod embed_mock;
@@ -15,6 +17,8 @@ pub mod vec0_snapshot;
 
 #[allow(unused_imports)]
 pub use bootstrap_observer::*;
+#[allow(unused_imports)]
+pub use captured_child::*;
 #[allow(unused_imports)]
 pub use daemon_supervisor::*;
 #[allow(unused_imports)]
