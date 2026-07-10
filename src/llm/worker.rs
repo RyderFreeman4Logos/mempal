@@ -24,6 +24,8 @@ const LLM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const LLM_MAX_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const LLM_VERDICT_KEEP: &str = "keep";
 const LLM_VERDICT_REJECT: &str = "reject";
+/// Maximum UTF-8 bytes copied into one LLM gating task or request.
+pub const MAX_LLM_GATE_CONTENT_BYTES: usize = 64 * 1024;
 
 pub const DEFAULT_GATING_JUDGE_PROMPT: &str = "You are a memory importance judge for a software engineering project memory system.\n\nGiven a piece of content captured from a coding session, determine if it contains IMPORTANT information worth storing long-term. Score from 0.0 to 1.0.\n\nIMPORTANT (score >= 0.7):\n- Architecture or design decisions and their rationale\n- Bug root cause analysis and fix strategies\n- User preferences, workflow choices, or explicit feedback\n- Configuration decisions and why they were made\n- Trade-off evaluations between approaches\n- Security concerns or mitigation strategies\n- Project milestones, status changes, or completion records\n- Integration decisions (which tools, which APIs, why)\n\nNOT IMPORTANT (score < 0.4):\n- Raw tool output (file listings, grep results, git status)\n- Routine code edits without design rationale\n- Build/test output logs\n- Boilerplate file content\n- Simple command execution without decision context\n- Repetitive status checks\n\nRespond with ONLY a JSON object: {\"score\": 0.0-1.0, \"reason\": \"brief explanation\"}";
 
@@ -147,6 +149,42 @@ pub struct LlmTaskPayload {
     pub drawer_ids: Vec<String>,
     pub content: String,
     pub system_prompt: Option<String>,
+}
+
+impl LlmTaskPayload {
+    pub(crate) fn for_gating(
+        drawer_ids: Vec<String>,
+        content: &str,
+        system_prompt: Option<String>,
+    ) -> Self {
+        let drawer_id = drawer_ids.first().cloned().unwrap_or_default();
+        Self {
+            task_type: "gating".to_string(),
+            drawer_id,
+            drawer_ids,
+            content: bounded_llm_gate_content(content),
+            system_prompt,
+        }
+    }
+}
+
+fn bounded_llm_gate_content(content: &str) -> String {
+    if content.len() <= MAX_LLM_GATE_CONTENT_BYTES {
+        return content.to_string();
+    }
+    let marker = format!(
+        "\n\n[LLM gate content truncated; original_content_bytes={} limit_bytes={MAX_LLM_GATE_CONTENT_BYTES}]",
+        content.len()
+    );
+    let prefix_limit = MAX_LLM_GATE_CONTENT_BYTES.saturating_sub(marker.len());
+    let mut prefix_end = prefix_limit.min(content.len());
+    while prefix_end > 0 && !content.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+    let mut bounded = String::with_capacity(prefix_end.saturating_add(marker.len()));
+    bounded.push_str(&content[..prefix_end]);
+    bounded.push_str(&marker);
+    bounded
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -537,7 +575,7 @@ fn gating_request(task: &LlmTaskPayload) -> LlmRequest {
             },
             LlmMessage {
                 role: "user".to_string(),
-                content: task.content.clone(),
+                content: bounded_llm_gate_content(&task.content),
             },
         ],
         model: None,
@@ -1012,6 +1050,42 @@ threshold = 0.5
             content: "judge me".to_string(),
             system_prompt: None,
         }
+    }
+
+    #[test]
+    fn gating_task_constructor_bounds_utf8_content_and_records_original_size() {
+        let content = "界".repeat((MAX_LLM_GATE_CONTENT_BYTES / 3) + 100);
+        let task = LlmTaskPayload::for_gating(vec!["drawer-bounded".to_string()], &content, None);
+
+        assert!(task.content.len() <= MAX_LLM_GATE_CONTENT_BYTES);
+        assert!(task.content.is_char_boundary(task.content.len()));
+        assert!(
+            task.content
+                .contains(&format!("original_content_bytes={}", content.len()))
+        );
+        assert!(
+            task.content
+                .contains(&format!("limit_bytes={MAX_LLM_GATE_CONTENT_BYTES}"))
+        );
+    }
+
+    #[test]
+    fn gating_request_bounds_legacy_unbounded_task_content() {
+        let secret = "LEGACY_LLM_GATE_SECRET_DO_NOT_COPY";
+        let mut content = "x".repeat(MAX_LLM_GATE_CONTENT_BYTES);
+        content.push_str(secret);
+        let task = LlmTaskPayload {
+            task_type: "gating".to_string(),
+            drawer_id: "legacy-drawer".to_string(),
+            drawer_ids: vec!["legacy-drawer".to_string()],
+            content,
+            system_prompt: None,
+        };
+
+        let request = gating_request(&task);
+        let user_content = &request.messages[1].content;
+        assert!(user_content.len() <= MAX_LLM_GATE_CONTENT_BYTES);
+        assert!(!user_content.contains(secret));
     }
 
     fn llm_audit_verdict(db: &Database, id: &str) -> (String, f64) {

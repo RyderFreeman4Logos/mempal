@@ -425,6 +425,7 @@ fn test_queue_stats_reflects_current_state() {
         base_delay_ms: 0,
         max_delay_ms: 0,
         max_retries: 0,
+        ..QueueConfig::default()
     });
 
     let pending_id = store.enqueue("hook_event", r#"{"n":1}"#).expect("enqueue");
@@ -508,6 +509,7 @@ fn test_status_command_shows_queue_stats() {
             base_delay_ms: 0,
             max_delay_ms: 0,
             max_retries: 0,
+            ..QueueConfig::default()
         },
     )
     .expect("create store");
@@ -557,6 +559,13 @@ fn test_status_command_shows_queue_stats() {
     assert!(stdout.contains("embed_fail_count: 1"), "{stdout}");
     assert!(stdout.contains("pending: 1"), "{stdout}");
     assert!(stdout.contains("claimed: 1"), "{stdout}");
+    assert!(stdout.contains("active_payload_bytes:"), "{stdout}");
+    assert!(
+        stdout.contains("active_ingest_payload_bytes: 0"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("ingest_payload_limit_bytes:"), "{stdout}");
+    assert!(stdout.contains("rejected_oversize: 0"), "{stdout}");
     assert!(stdout.contains("failed: 1"), "{stdout}");
     assert!(stdout.contains("rate_per_min: 0.1"), "{stdout}");
     assert!(stdout.contains("avg_processing_ms:"), "{stdout}");
@@ -1048,6 +1057,37 @@ fn test_queue_failed_preview_retry_and_archive_are_filtered() {
 }
 
 #[test]
+fn test_manual_failed_ingest_requeue_respects_active_byte_budget() {
+    let (_tmp, _db_path, store) = new_store(QueueConfig {
+        max_ingest_active_bytes: 1_000,
+        ..QueueConfig::default()
+    });
+    for _ in 0..2 {
+        let id = store
+            .enqueue("ingest_async", &"m".repeat(600))
+            .expect("enqueue failed ingest candidate");
+        store
+            .mark_model_task_failed_retryable(&id, "temporary embedding outage")
+            .expect("mark ingest candidate failed");
+    }
+
+    let outcome = store
+        .retry_failed_messages(QueueFailureFilter {
+            kind: Some("ingest_async".to_string()),
+            retry_class: None,
+            reason_code: None,
+        })
+        .expect("retry failed ingest rows");
+
+    assert_eq!(outcome.matched, 2);
+    assert_eq!(outcome.changed, 1);
+    let stats = store.stats().expect("queue stats after manual retry");
+    assert_eq!(stats.pending, 1);
+    assert_eq!(stats.failed, 1);
+    assert_eq!(stats.active_ingest_payload_bytes, 600);
+}
+
+#[test]
 fn test_queue_retry_and_archive_revalidate_filter_at_execute_time() {
     let (_tmp, db_path, store) = new_store(QueueConfig::default());
     let retry_target = store
@@ -1343,11 +1383,12 @@ fn test_auto_requeue_model_tasks_only_requeues_retryable_failed_kind() {
         )
         .expect("mark terminal failed");
 
-    let requeued = store
+    let outcome = store
         .auto_requeue_failed_model_tasks("embedding")
         .expect("auto requeue embedding");
 
-    assert_eq!(requeued, 1);
+    assert_eq!(outcome.requeued, 1);
+    assert_eq!(outcome.skipped, 0);
     let conn = Connection::open(&db_path).expect("open sqlite");
     let status_for = |id: &str| -> (String, i64, Option<String>) {
         conn.query_row(
@@ -1391,6 +1432,33 @@ fn test_auto_requeue_model_tasks_only_requeues_retryable_failed_kind() {
             .is_ok_and(|value| value > 0),
         "{last_auto_requeue_at}"
     );
+}
+
+#[test]
+fn test_auto_failed_ingest_requeue_respects_active_byte_budget() {
+    let (_tmp, _db_path, store) = new_store(QueueConfig {
+        max_ingest_active_bytes: 1_000,
+        ..QueueConfig::default()
+    });
+    for _ in 0..2 {
+        let id = store
+            .enqueue("ingest_async", &"m".repeat(600))
+            .expect("enqueue failed ingest candidate");
+        store
+            .mark_model_task_failed_retryable(&id, "temporary embedding outage")
+            .expect("mark ingest candidate failed");
+    }
+
+    let outcome = store
+        .auto_requeue_failed_model_tasks("embedding")
+        .expect("auto requeue failed ingest rows");
+
+    assert_eq!(outcome.requeued, 1);
+    assert_eq!(outcome.skipped, 1);
+    let stats = store.stats().expect("queue stats after automatic retry");
+    assert_eq!(stats.pending, 1);
+    assert_eq!(stats.failed, 1);
+    assert_eq!(stats.active_ingest_payload_bytes, 600);
 }
 
 #[test]

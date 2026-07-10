@@ -45,10 +45,10 @@ use crate::search::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State, rejection::JsonRejection},
     http::{
-        HeaderMap, HeaderValue, Method, Request, StatusCode, header::CONTENT_TYPE,
-        header::USER_AGENT,
+        HeaderMap, HeaderValue, Method, Request, StatusCode, header::CONTENT_LENGTH,
+        header::CONTENT_TYPE, header::USER_AGENT,
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -67,6 +67,8 @@ const REST_SEARCH_WARNING_HEADER: &str = "mempal-warnings";
 const STATUS_DB_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(1);
 const REST_WRITE_RESTART_HINT: &str = "Restart the mempal daemon after upgrading so REST writes use a binary that supports this palace.db schema.";
 const REST_WRITE_DATABASE_BUSY_HINT: &str = "SQLite is temporarily locked by another writer; retry after the current write or maintenance job releases palace.db.";
+pub const MAX_REST_INGEST_BODY_BYTES: usize =
+    crate::ingest::admission::MAX_INGEST_REQUEST_BYTES + (2 * 1024 * 1024);
 static REST_WRITE_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub async fn serve(listener: tokio::net::TcpListener, state: ApiState) -> std::io::Result<()> {
@@ -119,7 +121,10 @@ pub fn router(state: ApiState) -> Router {
     let telemetry_state = state.clone();
     Router::new()
         .route("/api/search", get(search_handler))
-        .route("/api/ingest", post(ingest_handler))
+        .route(
+            "/api/ingest",
+            post(ingest_handler).layer(DefaultBodyLimit::max(MAX_REST_INGEST_BODY_BYTES)),
+        )
         .route("/api/taxonomy", get(taxonomy_handler))
         .route("/api/status", get(status_handler))
         .route("/api/pinned_facts", get(pinned_facts_handler))
@@ -453,6 +458,8 @@ struct ValidatedIngestRequest {
 }
 
 fn validate_ingest_request(request: &IngestRequest) -> Result<ValidatedIngestRequest, ApiError> {
+    crate::ingest::admission::validate_ingest_request_bytes(&request.content)
+        .map_err(ApiError::payload_too_large)?;
     validate_temporal_param("valid_from", request.valid_from.as_deref())?;
     validate_temporal_param("valid_until", request.valid_until.as_deref())?;
     let source_type = parse_source_type_param(request.source_type.as_deref())?;
@@ -673,6 +680,10 @@ struct ApiEmbedStatus {
 struct ApiQueueStats {
     pending: u64,
     claimed: u64,
+    active_payload_bytes: u64,
+    active_ingest_payload_bytes: u64,
+    ingest_payload_limit_bytes: u64,
+    rejected_oversize: u64,
     failed: u64,
     failed_retryable: u64,
     failed_terminal: u64,
@@ -685,6 +696,10 @@ impl From<&QueueStats> for ApiQueueStats {
         Self {
             pending: value.pending,
             claimed: value.claimed,
+            active_payload_bytes: value.active_payload_bytes,
+            active_ingest_payload_bytes: value.active_ingest_payload_bytes,
+            ingest_payload_limit_bytes: value.ingest_payload_limit_bytes,
+            rejected_oversize: value.rejected_oversize,
             failed: value.failed,
             failed_retryable: value.failed_retryable,
             failed_terminal: value.failed_terminal,
@@ -1299,10 +1314,45 @@ async fn search_handler(
 
 async fn ingest_handler(
     State(state): State<ApiState>,
-    Json(request): Json<IngestRequest>,
+    headers: HeaderMap,
+    request: Result<Json<IngestRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            let request_bytes = headers
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(MAX_REST_INGEST_BODY_BYTES as u64 + 1);
+            state
+                .write_queue()
+                .record_oversize_rejection(
+                    "rest_request_body",
+                    request_bytes,
+                    MAX_REST_INGEST_BODY_BYTES as u64,
+                )
+                .await;
+            return Err(ApiError::rest_body_too_large(request_bytes));
+        }
+        Err(rejection) => {
+            return Err(ApiError::new(rejection.status(), rejection.body_text()));
+        }
+    };
+    if let Err(error) = validate_ingest_request(&request) {
+        if error.kind == "payload_too_large" {
+            state
+                .write_queue()
+                .record_oversize_rejection(
+                    "rest_request",
+                    u64::try_from(request.content.len()).unwrap_or(u64::MAX),
+                    crate::ingest::admission::MAX_INGEST_REQUEST_BYTES as u64,
+                )
+                .await;
+        }
+        return Err(error);
+    }
     validate_rest_write_runtime(&state.db_path)?;
-    validate_ingest_request(&request)?;
     if global_embed_status().should_block_writes() {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1975,6 +2025,44 @@ impl ApiError {
             retryable: Some(true),
         }
     }
+
+    fn payload_too_large(error: crate::ingest::admission::IngestRequestTooLarge) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: error.to_string(),
+            kind: "payload_too_large",
+            schema_skew: None,
+            recovery_hint: None,
+            retryable: Some(false),
+        }
+    }
+
+    fn rest_body_too_large(request_bytes: u64) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: format!(
+                "REST ingest request body is too large: {request_bytes} bytes exceeds {} byte limit",
+                MAX_REST_INGEST_BODY_BYTES
+            ),
+            kind: "payload_too_large",
+            schema_skew: None,
+            recovery_hint: None,
+            retryable: Some(false),
+        }
+    }
+
+    fn queue_byte_budget(request_bytes: u64, pending_bytes: u64, limit_bytes: u64) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "REST write queue byte budget exceeded: request_bytes={request_bytes} pending_bytes={pending_bytes} limit_bytes={limit_bytes}"
+            ),
+            kind: "queue_byte_budget",
+            schema_skew: None,
+            recovery_hint: None,
+            retryable: Some(true),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2014,6 +2102,9 @@ impl IntoResponse for ApiError {
 pub(crate) struct WriteQueueStats {
     pub queued: u64,
     pub pending: u64,
+    pub pending_bytes: u64,
+    pub byte_capacity: u64,
+    pub rejected_oversize: u64,
     pub completed: u64,
     pub failed: u64,
 }
@@ -2021,6 +2112,8 @@ pub(crate) struct WriteQueueStats {
 pub(crate) struct WriteQueue {
     sender: mpsc::Sender<WriteJob>,
     stats: Arc<WriteQueueCounters>,
+    db_path: PathBuf,
+    byte_capacity: u64,
     accepting: Arc<AtomicBool>,
     drain_timeout: Duration,
     drained: Arc<Notify>,
@@ -2029,6 +2122,8 @@ pub(crate) struct WriteQueue {
 struct WriteQueueCounters {
     queued: AtomicU64,
     pending: AtomicU64,
+    pending_bytes: AtomicU64,
+    rejected_oversize: AtomicU64,
     completed: AtomicU64,
     failed: AtomicU64,
 }
@@ -2036,6 +2131,7 @@ struct WriteQueueCounters {
 struct WriteJob {
     request_id: u64,
     request: IngestRequest,
+    content_bytes: u64,
     respond_to: oneshot::Sender<Result<IngestResponse, ApiError>>,
 }
 
@@ -2044,19 +2140,22 @@ impl WriteQueue {
         db_path: PathBuf,
         embedder_factory: Arc<dyn crate::embed::EmbedderFactory>,
         capacity: usize,
+        byte_capacity: u64,
         drain_timeout: Duration,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(capacity);
         let stats = Arc::new(WriteQueueCounters {
             queued: AtomicU64::new(0),
             pending: AtomicU64::new(0),
+            pending_bytes: AtomicU64::new(0),
+            rejected_oversize: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             failed: AtomicU64::new(0),
         });
         let accepting = Arc::new(AtomicBool::new(true));
         let drained = Arc::new(Notify::new());
         tokio::spawn(write_worker(
-            db_path,
+            db_path.clone(),
             embedder_factory,
             receiver,
             Arc::clone(&stats),
@@ -2065,6 +2164,8 @@ impl WriteQueue {
         Self {
             sender,
             stats,
+            db_path,
+            byte_capacity,
             accepting,
             drain_timeout,
             drained,
@@ -2079,10 +2180,31 @@ impl WriteQueue {
             ));
         }
 
+        let content_bytes = u64::try_from(request.content.len()).unwrap_or(u64::MAX);
+        let reservation = self.stats.pending_bytes.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |pending_bytes| {
+                pending_bytes
+                    .checked_add(content_bytes)
+                    .filter(|next| *next <= self.byte_capacity)
+            },
+        );
+        if let Err(pending_bytes) = reservation {
+            self.record_oversize_rejection("rest_write_queue", content_bytes, self.byte_capacity)
+                .await;
+            return Err(ApiError::queue_byte_budget(
+                content_bytes,
+                pending_bytes,
+                self.byte_capacity,
+            ));
+        }
+
         let (respond_to, response_rx) = oneshot::channel();
         let job = WriteJob {
             request_id: next_rest_write_request_id(),
             request,
+            content_bytes,
             respond_to,
         };
         match self.sender.try_send(job) {
@@ -2091,12 +2213,18 @@ impl WriteQueue {
                 self.stats.pending.fetch_add(1, Ordering::SeqCst);
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
+                self.stats
+                    .pending_bytes
+                    .fetch_sub(content_bytes, Ordering::SeqCst);
                 return Err(ApiError::new(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "REST write queue is full",
                 ));
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.stats
+                    .pending_bytes
+                    .fetch_sub(content_bytes, Ordering::SeqCst);
                 return Err(ApiError::new(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "REST write queue is closed",
@@ -2130,8 +2258,45 @@ impl WriteQueue {
         WriteQueueStats {
             queued: self.stats.queued.load(Ordering::SeqCst),
             pending: self.stats.pending.load(Ordering::SeqCst),
+            pending_bytes: self.stats.pending_bytes.load(Ordering::SeqCst),
+            byte_capacity: self.byte_capacity,
+            rejected_oversize: self.stats.rejected_oversize.load(Ordering::SeqCst),
             completed: self.stats.completed.load(Ordering::SeqCst),
             failed: self.stats.failed.load(Ordering::SeqCst),
+        }
+    }
+
+    async fn record_oversize_rejection(
+        &self,
+        surface: &'static str,
+        request_bytes: u64,
+        limit_bytes: u64,
+    ) {
+        self.stats.rejected_oversize.fetch_add(1, Ordering::SeqCst);
+        tracing::warn!(
+            surface,
+            request_bytes,
+            limit_bytes,
+            "rejecting oversized ingest admission"
+        );
+        let db_path = self.db_path.clone();
+        let recorded = tokio::task::spawn_blocking(move || {
+            crate::core::queue::PendingMessageStore::new_without_reclaim(db_path)
+                .record_oversize_rejection_fail_fast()
+        })
+        .await;
+        match recorded {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    ?error,
+                    surface,
+                    "failed to persist oversize rejection counter"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(?error, surface, "oversize counter task failed");
+            }
         }
     }
 }
@@ -2158,6 +2323,9 @@ async fn write_worker(
             }
         }
         stats.pending.fetch_sub(1, Ordering::SeqCst);
+        stats
+            .pending_bytes
+            .fetch_sub(job.content_bytes, Ordering::SeqCst);
         drained.notify_waiters();
         let _ = job.respond_to.send(result);
     }

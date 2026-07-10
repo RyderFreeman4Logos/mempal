@@ -115,6 +115,20 @@ search_db_deadline_secs = {api_search_deadline_secs}
     fn state(&self, factory: Arc<dyn EmbedderFactory>) -> ApiState {
         ApiState::with_write_queue_config(self.db_path.clone(), factory, 10, Duration::from_secs(2))
     }
+
+    fn state_with_write_queue_byte_capacity(
+        &self,
+        factory: Arc<dyn EmbedderFactory>,
+        byte_capacity: u64,
+    ) -> ApiState {
+        ApiState::with_write_queue_limits(
+            self.db_path.clone(),
+            factory,
+            10,
+            byte_capacity,
+            Duration::from_secs(2),
+        )
+    }
 }
 
 impl Drop for TestEnv {
@@ -316,6 +330,136 @@ async fn post_json(state: ApiState, uri: &str, body: Value) -> (StatusCode, Valu
         .expect("read body");
     let body = serde_json::from_slice(&bytes).expect("parse json");
     (status, body)
+}
+
+#[tokio::test]
+async fn test_ingest_rejects_oversized_content_with_413_without_leaking_content() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+    let secret = "REST_OVERSIZE_SECRET_DO_NOT_LEAK";
+    let mut content = "x".repeat(mempal::ingest::admission::MAX_INGEST_REQUEST_BYTES);
+    content.push_str(secret);
+    let content_bytes = content.len();
+
+    let (status, body) = post_json(
+        state.clone(),
+        "/api/ingest",
+        json!({
+            "content": content,
+            "wing": "test",
+            "room": "oversize",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "body={body}");
+    assert_eq!(body["error"]["kind"], "payload_too_large");
+    let rendered = serde_json::to_string(&body).expect("serialize error");
+    assert!(rendered.contains(&content_bytes.to_string()), "{rendered}");
+    assert!(
+        rendered.contains(&mempal::ingest::admission::MAX_INGEST_REQUEST_BYTES.to_string()),
+        "{rendered}"
+    );
+    assert!(!rendered.contains(secret), "{rendered}");
+
+    let (status, _headers, status_body) = get_json(state, "/api/status").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status_body["queue_stats"]["rejected_oversize"], 1);
+    assert_eq!(status_body["write_queue"]["rejected_oversize"], 1);
+}
+
+#[tokio::test]
+async fn test_ingest_body_limit_rejection_uses_product_error_and_metrics() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+    let body_bytes = mempal::api::MAX_REST_INGEST_BODY_BYTES + 1;
+    let response = mempal::api::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ingest")
+                .header(CONTENT_TYPE, "application/json")
+                .header("content-length", body_bytes)
+                .body(Body::from(vec![b'x'; body_bytes]))
+                .expect("build request"),
+        )
+        .await
+        .expect("REST request");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: Value = serde_json::from_slice(&bytes).expect("parse structured error");
+    assert_eq!(body["error"]["kind"], "payload_too_large");
+    assert_eq!(body["error"]["retryable"], false);
+
+    let (status, _headers, status_body) = get_json(state, "/api/status").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status_body["queue_stats"]["rejected_oversize"], 1);
+    assert_eq!(status_body["write_queue"]["rejected_oversize"], 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_concurrent_medium_ingests_respect_write_queue_byte_budget() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    let started = Arc::new(Notify::new());
+    let released = Arc::new(Notify::new());
+    let has_started = Arc::new(AtomicBool::new(false));
+    let state = env.state_with_write_queue_byte_capacity(
+        Arc::new(BlockingEmbedderFactory {
+            started: Arc::clone(&started),
+            released: Arc::clone(&released),
+            has_started: Arc::clone(&has_started),
+        }),
+        1_000,
+    );
+    let content = "m".repeat(600);
+
+    let first = tokio::spawn({
+        let state = state.clone();
+        let content = content.clone();
+        async move {
+            post_json(
+                state,
+                "/api/ingest",
+                json!({"content": content, "wing": "test", "room": "budget"}),
+            )
+            .await
+        }
+    });
+    while !has_started.load(Ordering::SeqCst) {
+        started.notified().await;
+    }
+
+    let (second_status, second_body) = post_json(
+        state.clone(),
+        "/api/ingest",
+        json!({"content": content, "wing": "test", "room": "budget"}),
+    )
+    .await;
+
+    assert_eq!(
+        second_status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "body={second_body}"
+    );
+    assert_eq!(second_body["error"]["kind"], "queue_byte_budget");
+    assert_eq!(second_body["error"]["retryable"], true);
+
+    let (status, _headers, status_body) = get_json(state, "/api/status").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status_body["write_queue"]["pending_bytes"], 600);
+    assert_eq!(status_body["write_queue"]["byte_capacity"], 1_000);
+    assert_eq!(status_body["write_queue"]["rejected_oversize"], 1);
+    assert_eq!(status_body["queue_stats"]["rejected_oversize"], 1);
+
+    released.notify_waiters();
+    let (first_status, first_body) = first.await.expect("join first request");
+    assert_eq!(first_status, StatusCode::CREATED, "body={first_body}");
 }
 
 #[tokio::test]

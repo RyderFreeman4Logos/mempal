@@ -271,6 +271,7 @@ async fn test_mcp_status_surfaces_queue_stats() {
             base_delay_ms: 0,
             max_delay_ms: 0,
             max_retries: 0,
+            ..QueueConfig::default()
         },
     )
     .expect("create store");
@@ -289,6 +290,13 @@ async fn test_mcp_status_surfaces_queue_stats() {
     assert!(response.db_holders.error.is_none());
     assert_eq!(response.queue_stats.pending, 1);
     assert_eq!(response.queue_stats.claimed, 0);
+    assert_eq!(response.queue_stats.active_payload_bytes, 7);
+    assert_eq!(response.queue_stats.active_ingest_payload_bytes, 0);
+    assert_eq!(
+        response.queue_stats.ingest_payload_limit_bytes,
+        mempal::core::queue::DEFAULT_MAX_INGEST_ACTIVE_BYTES
+    );
+    assert_eq!(response.queue_stats.rejected_oversize, 0);
     assert_eq!(response.queue_stats.failed, 0);
     assert_eq!(response.queue_stats.failed_retryable, 0);
     assert_eq!(response.queue_stats.failed_terminal, 0);
@@ -310,6 +318,7 @@ async fn test_mcp_status_headline_reflects_failed_queue() {
             base_delay_ms: 0,
             max_delay_ms: 0,
             max_retries: 0,
+            ..QueueConfig::default()
         },
     )
     .expect("create store");
@@ -445,6 +454,7 @@ async fn test_mcp_status_live_queue_counts_ignore_stale_completion_op_state() {
             base_delay_ms: 0,
             max_delay_ms: 0,
             max_retries: 0,
+            ..QueueConfig::default()
         },
     )
     .expect("create store");

@@ -2418,6 +2418,10 @@ impl From<crate::ingest::chunk::ChunkerStatsSnapshot> for ChunkerStatsDto {
 pub struct QueueStatsDto {
     pub pending: u64,
     pub claimed: u64,
+    pub active_payload_bytes: u64,
+    pub active_ingest_payload_bytes: u64,
+    pub ingest_payload_limit_bytes: u64,
+    pub rejected_oversize: u64,
     pub failed: u64,
     pub failed_retryable: u64,
     pub failed_terminal: u64,

@@ -13402,6 +13402,19 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     println!("Queue:");
     println!("  pending: {}", queue_stats.pending);
     println!("  claimed: {}", queue_stats.claimed);
+    println!(
+        "  active_payload_bytes: {}",
+        queue_stats.active_payload_bytes
+    );
+    println!(
+        "  active_ingest_payload_bytes: {}",
+        queue_stats.active_ingest_payload_bytes
+    );
+    println!(
+        "  ingest_payload_limit_bytes: {}",
+        queue_stats.ingest_payload_limit_bytes
+    );
+    println!("  rejected_oversize: {}", queue_stats.rejected_oversize);
     println!("  failed: {}", queue_stats.failed);
     println!("  failed_retryable: {}", queue_stats.failed_retryable);
     println!("  failed_terminal: {}", queue_stats.failed_terminal);

@@ -1,5 +1,6 @@
 #![warn(clippy::all)]
 
+pub mod admission;
 pub mod chunk;
 pub mod conversation;
 pub mod detect;

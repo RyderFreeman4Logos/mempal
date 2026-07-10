@@ -51,10 +51,28 @@ impl ApiState {
         queue_capacity: usize,
         drain_timeout: Duration,
     ) -> Self {
+        Self::with_write_queue_limits(
+            db_path,
+            embedder_factory,
+            queue_capacity,
+            crate::core::queue::DEFAULT_MAX_INGEST_ACTIVE_BYTES,
+            drain_timeout,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn with_write_queue_limits(
+        db_path: PathBuf,
+        embedder_factory: Arc<dyn EmbedderFactory>,
+        queue_capacity: usize,
+        queue_byte_capacity: u64,
+        drain_timeout: Duration,
+    ) -> Self {
         let write_queue = Arc::new(super::handlers::WriteQueue::spawn(
             db_path.clone(),
             Arc::clone(&embedder_factory),
             queue_capacity,
+            queue_byte_capacity,
             drain_timeout,
         ));
         Self {

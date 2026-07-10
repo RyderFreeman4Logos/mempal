@@ -23,6 +23,7 @@ fn new_store() -> (TempDir, PathBuf, PendingMessageStore) {
             base_delay_ms: 5_000,
             max_delay_ms: 60_000,
             max_retries: 3,
+            ..QueueConfig::default()
         },
     )
     .expect("create store");
