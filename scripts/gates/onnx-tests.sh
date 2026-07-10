@@ -62,6 +62,7 @@ exec 9>&-
 
 export ORT_LIB_PATH="${lib_dir}"
 export ORT_PREFER_DYNAMIC_LINK=1
+export ORT_DYLIB_PATH="${lib_dir}/libonnxruntime.so"
 export LD_LIBRARY_PATH="${lib_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 exec "${cargo_cmd[@]}" test --features onnx "$@"

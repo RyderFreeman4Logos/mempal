@@ -157,13 +157,29 @@ fn just_test_recipe_uses_cargo_test_timeout_wrapper() {
 #[test]
 fn just_onnx_recipe_uses_checksum_pinned_shared_runtime() {
     let justfile = fs::read_to_string(repo_root().join("justfile")).expect("read justfile");
+    let cargo_toml = fs::read_to_string(repo_root().join("Cargo.toml")).expect("read Cargo.toml");
     let script = fs::read_to_string(repo_root().join("scripts/gates/onnx-tests.sh"))
         .expect("read ONNX test gate");
 
     assert!(justfile.contains("bash scripts/gates/onnx-tests.sh"));
+    assert!(
+        justfile.contains(
+            "CARGO_BUILD_JOBS=1 cargo +1.96.0 test --locked --all-features -j 1 --no-run"
+        )
+    );
+    assert!(justfile.contains("just test-onnx-link"));
+    assert!(cargo_toml.contains("default-features = false"));
+    assert!(cargo_toml.contains("\"load-dynamic\""));
     assert!(script.contains("archive_sha256="));
     assert!(script.contains("runtime_sha256="));
     assert!(script.contains("ORT_PREFER_DYNAMIC_LINK=1"));
+    assert!(script.contains("ORT_DYLIB_PATH="));
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn onnx_dynamic_runtime_api_is_loadable() {
+    let _api = ort::api();
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

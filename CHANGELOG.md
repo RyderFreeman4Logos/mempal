@@ -35,11 +35,11 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
-- **Build/ONNX**: pin `ort` and `ort-sys` to `2.0.0-rc.12`, and run the ONNX
-  test gate against a checksum-pinned official ONNX Runtime 1.24.2 shared
-  library. This avoids rc.12's prebuilt static archive, which references glibc
-  2.38 `__isoc23_*` symbols and cannot link on glibc 2.36 with mold or lld
-  (#698).
+- **Build/ONNX**: pin `ort` and `ort-sys` to `2.0.0-rc.12`, configure the ONNX
+  feature for dynamic loading, and run its test gate against a checksum-pinned
+  official ONNX Runtime 1.24.2 shared library. This keeps every ONNX-enabled
+  build away from rc.12's prebuilt static archive, which references glibc 2.38
+  `__isoc23_*` symbols and cannot link on glibc 2.36 with mold or lld (#698).
 - **Tests**: initialize the embedder fallback fixture through the complete
   database migration path before queue admission (#699).
 - **Tests**: keep daemon IPC and path-sensitive project/provenance fixtures

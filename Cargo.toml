@@ -54,7 +54,7 @@ jieba-rs = "0.8"
 libc = "0.2"
 model2vec-rs = { version = "0.1", optional = true }
 notify = "8"
-ort = { version = "=2.0.0-rc.12", optional = true }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["api-24", "load-dynamic", "ndarray", "std", "tracing"], optional = true }
 # ort's own prerelease range permits newer ort-sys release candidates.
 ort-sys = { version = "=2.0.0-rc.12", optional = true }
 percent-encoding = "2"
