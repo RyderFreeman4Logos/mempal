@@ -53,5 +53,6 @@ pub mod repair;
 pub mod search;
 pub mod session_review;
 pub mod sleep;
+pub(crate) mod stale_daemon;
 pub mod wiki;
 pub mod xurl;

@@ -35,6 +35,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **MCP/daemon writes**: detect a live daemon whose executable was deleted or
+  replaced before write routing, and return redacted structured restart and
+  retry-safety diagnostics through REST, MCP, and Hermes `mempal_conclude`
+  instead of a generic unavailable error (#701).
 - **Build/ONNX**: pin `ort` and `ort-sys` to `2.0.0-rc.12`, configure the ONNX
   feature for dynamic loading, and run its test gate against a checksum-pinned
   official ONNX Runtime 1.24.2 shared library. This keeps every ONNX-enabled
