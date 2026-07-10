@@ -156,10 +156,6 @@ fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool
     }
 }
 
-fn should_use_daemon_ingest_worker(socket_exists: bool, daemon_pids: &[i32]) -> bool {
-    socket_exists && !daemon_pids.is_empty()
-}
-
 fn should_continue_ingest_heartbeat_after_error(error: &QueueError) -> bool {
     error.is_sqlite_lock()
 }
@@ -173,7 +169,7 @@ fn daemon_ingest_ipc_available_for_db(db_path: &Path) -> bool {
     let binary =
         crate::daemon_singleton::current_binary_name().unwrap_or_else(|| "mempal".to_string());
     let daemon_pids = crate::daemon_singleton::enumerate_daemon_pids(&binary, db_path);
-    should_use_daemon_ingest_worker(socket_exists, &daemon_pids)
+    super::stale_daemon::should_use_ingest_worker(socket_exists, &daemon_pids)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1742,6 +1738,7 @@ impl MempalMcpServer {
         db: &Database,
         operation: &'static str,
     ) -> std::result::Result<McpContentWriterLeaseGuard, ErrorData> {
+        super::stale_daemon::guard_write(&self.db_path)?;
         let owner = format!("mempal-mcp-{operation}-{}", std::process::id());
         let metadata_json = serde_json::json!({
             "component": "mcp-content-writer",
@@ -1889,6 +1886,7 @@ impl MempalMcpServer {
         &self,
         drawer_id: String,
     ) -> std::result::Result<(bool, Vec<SystemWarning>), ErrorData> {
+        super::stale_daemon::guard_write(&self.db_path)?;
         let system_warnings = current_system_warnings();
         match self.async_db().await {
             Ok(async_db) => {
@@ -6427,6 +6425,9 @@ impl MempalMcpServer {
         }
         let dry_run = request.dry_run.unwrap_or(false);
         let controls = resolve_mcp_ingest_controls(&request, controls)?;
+        if !dry_run {
+            super::stale_daemon::guard_write(&self.db_path)?;
+        }
         if !dry_run && global_embed_status().should_block_writes() {
             return Err(degraded_write_error());
         }
@@ -12979,13 +12980,6 @@ mod tests {
         assert!(!ingest_admission_report_is_known_runtime_holder_only(
             &stale_mcp
         ));
-    }
-
-    #[test]
-    fn test_mcp_stdio_uses_daemon_ingest_worker_only_when_ipc_and_daemon_are_live() {
-        assert!(should_use_daemon_ingest_worker(true, &[1234]));
-        assert!(!should_use_daemon_ingest_worker(false, &[1234]));
-        assert!(!should_use_daemon_ingest_worker(true, &[]));
     }
 
     #[test]

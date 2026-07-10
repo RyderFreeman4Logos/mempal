@@ -2,6 +2,7 @@
 
 mod logging;
 mod server;
+mod stale_daemon;
 mod timeline;
 mod tools;
 

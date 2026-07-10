@@ -34,7 +34,6 @@ use crate::ingest::normalize::CURRENT_NORMALIZE_VERSION;
 use crate::observability::{
     OperationTelemetryRecord, OperationTelemetrySource, OperationTelemetrySpan,
 };
-use crate::process_diagnostics::inspect_process_memory;
 use crate::search::{
     SearchMode, SearchOptions, SearchTelemetryStage, VectorSearchCircuit,
     bm25_fallback_warning_degraded, bm25_fallback_warning_dimension_mismatch,
@@ -66,6 +65,8 @@ const HERMES_COMPAT_VERSION: &str = "mempal-hermes-compat/1";
 const REST_SEARCH_WARNING_HEADER: &str = "mempal-warnings";
 const STATUS_DB_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(1);
 const REST_WRITE_RESTART_HINT: &str = "Restart the mempal daemon after upgrading so REST writes use a binary that supports this palace.db schema.";
+const REST_STALE_DAEMON_RESTART_HINT: &str =
+    "Run `mempal daemon restart`, then retry the write once.";
 const REST_WRITE_DATABASE_BUSY_HINT: &str = "SQLite is temporarily locked by another writer; retry after the current write or maintenance job releases palace.db.";
 pub const MAX_REST_INGEST_BODY_BYTES: usize =
     crate::ingest::admission::MAX_INGEST_REQUEST_BYTES + (2 * 1024 * 1024);
@@ -1977,6 +1978,7 @@ struct ApiError {
     schema_skew: Option<SchemaSkew>,
     recovery_hint: Option<&'static str>,
     retryable: Option<bool>,
+    stale_daemon: Option<crate::stale_daemon::StaleDaemonDiagnostic>,
 }
 
 impl ApiError {
@@ -1988,6 +1990,7 @@ impl ApiError {
             schema_skew: None,
             recovery_hint: None,
             retryable: None,
+            stale_daemon: None,
         }
     }
 
@@ -2001,17 +2004,19 @@ impl ApiError {
             schema_skew: Some(SchemaSkew { current, supported }),
             recovery_hint: Some(REST_WRITE_RESTART_HINT),
             retryable: Some(false),
+            stale_daemon: None,
         }
     }
 
-    fn stale_daemon() -> Self {
+    fn stale_daemon(diagnostic: crate::stale_daemon::StaleDaemonDiagnostic) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: "mempal daemon binary has been deleted or replaced; restart the daemon before retrying REST writes".to_string(),
             kind: "stale_daemon",
             schema_skew: None,
-            recovery_hint: Some(REST_WRITE_RESTART_HINT),
+            recovery_hint: Some(REST_STALE_DAEMON_RESTART_HINT),
             retryable: Some(false),
+            stale_daemon: Some(diagnostic),
         }
     }
 
@@ -2023,6 +2028,7 @@ impl ApiError {
             schema_skew: None,
             recovery_hint: Some(REST_WRITE_DATABASE_BUSY_HINT),
             retryable: Some(true),
+            stale_daemon: None,
         }
     }
 
@@ -2034,6 +2040,7 @@ impl ApiError {
             schema_skew: None,
             recovery_hint: None,
             retryable: Some(false),
+            stale_daemon: None,
         }
     }
 
@@ -2048,6 +2055,7 @@ impl ApiError {
             schema_skew: None,
             recovery_hint: None,
             retryable: Some(false),
+            stale_daemon: None,
         }
     }
 
@@ -2061,6 +2069,7 @@ impl ApiError {
             schema_skew: None,
             recovery_hint: None,
             retryable: Some(true),
+            stale_daemon: None,
         }
     }
 }
@@ -2087,6 +2096,12 @@ impl IntoResponse for ApiError {
         }
         if let Some(retryable) = self.retryable {
             error["retryable"] = json!(retryable);
+        }
+        if let Some(diagnostic) = self.stale_daemon {
+            error["stale_daemon"] = json!(diagnostic.stale_daemon);
+            error["daemon_pid"] = json!(diagnostic.daemon_pid);
+            error["exe_deleted"] = json!(diagnostic.exe_deleted);
+            error["retry_safe_after_restart"] = json!(diagnostic.retry_safe_after_restart);
         }
         (
             self.status,
@@ -2336,17 +2351,18 @@ fn validate_rest_write_runtime(db_path: &std::path::Path) -> Result<(), ApiError
 }
 
 fn open_rest_write_database(db_path: &std::path::Path) -> Result<Database, ApiError> {
-    if current_executable_deleted() {
-        return Err(ApiError::stale_daemon());
+    if let Some(diagnostic) = current_stale_daemon_diagnostic() {
+        return Err(ApiError::stale_daemon(diagnostic));
     }
     Database::open(db_path).map_err(db_error_to_api_error)
 }
 
 fn current_executable_deleted() -> bool {
-    let Ok(pid) = i32::try_from(std::process::id()) else {
-        return false;
-    };
-    inspect_process_memory(pid).exe_deleted
+    current_stale_daemon_diagnostic().is_some()
+}
+
+fn current_stale_daemon_diagnostic() -> Option<crate::stale_daemon::StaleDaemonDiagnostic> {
+    crate::stale_daemon::inspect_current()
 }
 
 fn next_rest_write_request_id() -> u64 {
@@ -2518,65 +2534,4 @@ impl From<TaxonomyEntry> for TaxonomyEntryDto {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sqlite_lock_error(code: rusqlite::ErrorCode, extended_code: i32) -> DbError {
-        DbError::Sqlite(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code,
-                extended_code,
-            },
-            Some("database is locked".to_string()),
-        ))
-    }
-
-    #[test]
-    fn sqlite_busy_maps_to_retryable_503() {
-        let error = db_error_to_api_error(sqlite_lock_error(
-            rusqlite::ErrorCode::DatabaseBusy,
-            rusqlite::ffi::SQLITE_BUSY,
-        ));
-
-        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(error.kind, "database_busy");
-        assert_eq!(error.retryable, Some(true));
-        assert_eq!(error.recovery_hint, Some(REST_WRITE_DATABASE_BUSY_HINT));
-    }
-
-    #[test]
-    fn sqlite_protocol_maps_to_retryable_503() {
-        let error = db_error_to_api_error(sqlite_lock_error(
-            rusqlite::ErrorCode::FileLockingProtocolFailed,
-            rusqlite::ffi::SQLITE_PROTOCOL,
-        ));
-
-        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(error.kind, "database_busy");
-        assert_eq!(error.retryable, Some(true));
-    }
-
-    #[tokio::test]
-    async fn sqlite_busy_response_body_is_retryable_non_500() {
-        let response = db_error_to_api_error(sqlite_lock_error(
-            rusqlite::ErrorCode::DatabaseLocked,
-            rusqlite::ffi::SQLITE_LOCKED,
-        ))
-        .into_response();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
-        assert_eq!(body["error"]["kind"], "database_busy");
-        assert_eq!(body["error"]["retryable"], true);
-        assert_ne!(body["error"]["status"], 500);
-        assert!(
-            body["error"]["recovery_hint"]
-                .as_str()
-                .is_some_and(|hint| hint.contains("retry")),
-            "body={body}"
-        );
-    }
-}
+mod tests;

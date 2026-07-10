@@ -94,6 +94,7 @@ async fn delete_handler(
     State(state): State<ApiState>,
     Json(request): Json<DeleteRequest>,
 ) -> Result<impl IntoResponse, HermesError> {
+    validate_delete_write_runtime()?;
     let db = Database::open(&state.db_path).map_err(hermes_internal)?;
     let config = ConfigHandle::current();
     let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
@@ -110,18 +111,18 @@ async fn delete_handler(
     match scope.mode {
         ProjectFilterMode::ProjectScoped | ProjectFilterMode::ProjectPlusGlobal => {
             if drawer_project.as_deref() != scope.project_id.as_deref() {
-                return Err(HermesError {
-                    status: StatusCode::FORBIDDEN,
-                    message: format!("drawer '{}' belongs to another project", request.drawer_id),
-                });
+                return Err(HermesError::new(
+                    StatusCode::FORBIDDEN,
+                    format!("drawer '{}' belongs to another project", request.drawer_id),
+                ));
             }
         }
         ProjectFilterMode::NullOnly => {
             if drawer_project.is_some() {
-                return Err(HermesError {
-                    status: StatusCode::FORBIDDEN,
-                    message: format!("drawer '{}' belongs to another project", request.drawer_id),
-                });
+                return Err(HermesError::new(
+                    StatusCode::FORBIDDEN,
+                    format!("drawer '{}' belongs to another project", request.drawer_id),
+                ));
             }
         }
         ProjectFilterMode::AllProjects => {}
@@ -132,10 +133,10 @@ async fn delete_handler(
     if deleted {
         Ok((StatusCode::OK, Json(json!({"deleted": true}))))
     } else {
-        Err(HermesError {
-            status: StatusCode::NOT_FOUND,
-            message: format!("drawer '{}' not found", request.drawer_id),
-        })
+        Err(HermesError::new(
+            StatusCode::NOT_FOUND,
+            format!("drawer '{}' not found", request.drawer_id),
+        ))
     }
 }
 
@@ -143,17 +144,47 @@ async fn delete_handler(
 struct HermesError {
     status: StatusCode,
     message: String,
+    stale_daemon: Option<crate::stale_daemon::StaleDaemonDiagnostic>,
+}
+
+impl HermesError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            stale_daemon: None,
+        }
+    }
+
+    fn stale_daemon(diagnostic: crate::stale_daemon::StaleDaemonDiagnostic) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "mempal daemon binary has been deleted or replaced; restart the daemon before retrying REST writes".to_string(),
+            stale_daemon: Some(diagnostic),
+        }
+    }
 }
 
 impl IntoResponse for HermesError {
     fn into_response(self) -> axum::response::Response {
+        let mut error = json!({
+            "message": self.message,
+            "status": self.status.as_u16(),
+        });
+        if let Some(diagnostic) = self.stale_daemon {
+            error["kind"] = json!("stale_daemon");
+            error["stale_daemon"] = json!(diagnostic.stale_daemon);
+            error["daemon_pid"] = json!(diagnostic.daemon_pid);
+            error["exe_deleted"] = json!(diagnostic.exe_deleted);
+            error["retryable"] = json!(false);
+            error["retry_safe_after_restart"] = json!(diagnostic.retry_safe_after_restart);
+            error["recovery_hint"] =
+                json!("Run `mempal daemon restart`, then retry the write once.");
+        }
         (
             self.status,
             Json(json!({
-                "error": {
-                    "message": self.message,
-                    "status": self.status.as_u16(),
-                },
+                "error": error,
             })),
         )
             .into_response()
@@ -161,8 +192,51 @@ impl IntoResponse for HermesError {
 }
 
 fn hermes_internal(error: impl std::fmt::Display) -> HermesError {
-    HermesError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: error.to_string(),
+    HermesError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+fn validate_delete_write_runtime() -> Result<(), HermesError> {
+    validate_delete_write_runtime_with(crate::stale_daemon::inspect_current)
+}
+
+fn validate_delete_write_runtime_with(
+    inspect: impl FnOnce() -> Option<crate::stale_daemon::StaleDaemonDiagnostic>,
+) -> Result<(), HermesError> {
+    match inspect() {
+        Some(diagnostic) => Err(HermesError::stale_daemon(diagnostic)),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delete_write_runtime_returns_structured_stale_daemon_error() {
+        let result = validate_delete_write_runtime_with(|| {
+            Some(crate::stale_daemon::StaleDaemonDiagnostic {
+                stale_daemon: true,
+                daemon_pid: 706_141,
+                exe_deleted: true,
+                retry_safe_after_restart: true,
+            })
+        });
+        let error = result.expect_err("stale daemon must reject /api/delete before DB open");
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read delete stale-daemon response");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse delete stale-daemon response");
+        let error = &body["error"];
+        assert_eq!(error["kind"], "stale_daemon");
+        assert_eq!(error["daemon_pid"], 706_141);
+        assert_eq!(error["exe_deleted"], true);
+        assert_eq!(error["retryable"], false);
+        assert_eq!(error["retry_safe_after_restart"], true);
+        assert!(error.get("exe_path").is_none());
     }
 }
