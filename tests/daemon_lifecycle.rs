@@ -1,12 +1,13 @@
 mod common;
 
-use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::harness::embed_mock::start as start_embed_mock;
+use common::harness::{
+    CapturedChild, embed_mock::start as start_embed_mock, write_daemon_home_diagnostics,
+};
 use mempal::bootstrap_events::BootstrapEvent;
 use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
@@ -251,6 +252,9 @@ struct DaemonHomeCleanup {
 #[cfg(unix)]
 impl Drop for DaemonHomeCleanup {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            write_daemon_home_diagnostics(&self.db_path);
+        }
         let pid_path = self
             .db_path
             .parent()
@@ -297,28 +301,50 @@ fn wait_for_pid_file(pid_path: &std::path::Path, timeout: Duration) -> Option<i3
 }
 
 #[cfg(unix)]
-fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
+fn wait_for_child_exit(child: &mut CapturedChild, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if child.try_wait().expect("poll child exit").is_some() {
-            return true;
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            Err(error) => panic!(
+                "failed to poll child exit: {error}\n{}",
+                child.diagnostics()
+            ),
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     false
 }
 
-fn spawn_db_backed_orphan_daemon(home: &std::path::Path, db_path: &std::path::Path) -> Child {
-    let mempal_home = db_path.parent().expect("db parent");
-    let pid_path = mempal_home.join("daemon.pid");
-    let mut child = Command::new(mempal_bin())
+fn spawn_foreground_daemon(home: &Path, label: &str) -> CapturedChild {
+    let mut command = Command::new(mempal_bin());
+    command
         .args(["daemon", "--foreground"])
         .daemon_home(home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn foreground daemon");
+        .stdin(Stdio::null());
+    CapturedChild::spawn(
+        &mut command,
+        &daemon_runtime_dir(home),
+        label,
+        Some(home.join(".mempal/daemon.log")),
+    )
+    .unwrap_or_else(|error| panic!("spawn foreground daemon {label}: {error}"))
+}
+
+fn spawn_placeholder_daemon(home: &Path, label: &str) -> std::io::Result<CapturedChild> {
+    let mut command = Command::new("sleep");
+    command.arg("120").stdin(Stdio::null());
+    CapturedChild::spawn(&mut command, &daemon_runtime_dir(home), label, None)
+}
+
+fn spawn_db_backed_orphan_daemon(
+    home: &std::path::Path,
+    db_path: &std::path::Path,
+) -> CapturedChild {
+    let mempal_home = db_path.parent().expect("db parent");
+    let pid_path = mempal_home.join("daemon.pid");
+    let child = spawn_foreground_daemon(home, "db-backed-orphan");
     let pid = child.id() as i32;
     let pidfile_pid =
         wait_for_pid_file(&pid_path, Duration::from_secs(10)).expect("daemon pidfile");
@@ -332,9 +358,10 @@ fn spawn_db_backed_orphan_daemon(home: &std::path::Path, db_path: &std::path::Pa
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    panic!("db-backed orphan daemon pid {pid} was not enumerated");
+    panic!(
+        "db-backed orphan daemon pid {pid} was not enumerated\n{}",
+        child.diagnostics()
+    );
 }
 
 #[test]
@@ -507,25 +534,23 @@ fn test_daemon_start_repairs_orphan_pidfile_before_reporting_running() {
 
 #[cfg(unix)]
 #[test]
-fn test_daemon_stop_terminates_pidfile_only_process() -> Result<()> {
+fn test_daemon_stop_terminates_pidfile_only_process() {
     let (tmp, db_path, _config_path) = setup_daemon_home();
     let _cleanup = DaemonHomeCleanup {
         db_path: db_path.clone(),
     };
     let pid_path = tmp.path().join(".mempal/daemon.pid");
 
-    let mut child = Command::new("sleep")
-        .args(["120"]) // no-op placeholder process to exercise pidfile-only flow
-        .spawn()
-        .context("spawn placeholder")?;
-    fs::write(&pid_path, child.id().to_string()).context("write pidfile")?;
+    let mut child = spawn_placeholder_daemon(tmp.path(), "pidfile-only-stop-placeholder")
+        .expect("spawn placeholder");
+    fs::write(&pid_path, child.id().to_string()).expect("write pidfile");
 
     let output = Command::new(mempal_bin())
         .args(["daemon", "stop"])
         .daemon_home(tmp.path())
         .stdin(Stdio::null())
         .output()
-        .context("run daemon stop")?;
+        .expect("run daemon stop");
     assert!(
         output.status.success(),
         "daemon stop failed: status={:?}, stdout={}, stderr={}",
@@ -534,32 +559,33 @@ fn test_daemon_stop_terminates_pidfile_only_process() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    assert!(wait_for_child_exit(&mut child, Duration::from_secs(5)));
-    Ok(())
+    assert!(
+        wait_for_child_exit(&mut child, Duration::from_secs(5)),
+        "pidfile-only placeholder was not terminated\n{}",
+        child.diagnostics()
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn test_daemon_restart_terminates_pidfile_only_process_and_restarts() -> Result<()> {
+fn test_daemon_restart_terminates_pidfile_only_process_and_restarts() {
     let (tmp, db_path, _config_path) = setup_daemon_home();
     let _cleanup = DaemonHomeCleanup {
         db_path: db_path.clone(),
     };
     let pid_path = tmp.path().join(".mempal/daemon.pid");
 
-    let mut child = Command::new("sleep")
-        .args(["120"])
-        .spawn()
-        .context("spawn placeholder")?;
+    let mut child = spawn_placeholder_daemon(tmp.path(), "pidfile-only-restart-placeholder")
+        .expect("spawn placeholder");
     let old_pid = child.id() as i32;
-    fs::write(&pid_path, old_pid.to_string()).context("write pidfile")?;
+    fs::write(&pid_path, old_pid.to_string()).expect("write pidfile");
 
     let output = Command::new(mempal_bin())
         .args(["daemon", "restart"])
         .daemon_home(tmp.path())
         .stdin(Stdio::null())
         .output()
-        .context("run daemon restart")?;
+        .expect("run daemon restart");
     assert!(
         output.status.success(),
         "daemon restart failed: status={:?}, stdout={}, stderr={}",
@@ -569,7 +595,7 @@ fn test_daemon_restart_terminates_pidfile_only_process_and_restarts() -> Result<
     );
 
     let restarted_pid = wait_for_pid_file(&pid_path, Duration::from_secs(10))
-        .context("daemon restart should write pidfile")?;
+        .expect("daemon restart should write pidfile");
     assert_ne!(restarted_pid, old_pid);
     assert!(
         process_is_running_for_test(restarted_pid),
@@ -579,10 +605,6 @@ fn test_daemon_restart_terminates_pidfile_only_process_and_restarts() -> Result<
         wait_for_child_exit(&mut child, Duration::from_secs(5)),
         "old daemon placeholder pid {old_pid} should be terminated by restart"
     );
-
-    child.kill()?;
-    child.wait()?;
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -659,25 +681,23 @@ fn test_status_full_treats_single_orphan_as_running() {
 
 #[cfg(unix)]
 #[test]
-fn test_daemon_reap_keeps_single_pidfile_process() -> Result<()> {
+fn test_daemon_reap_keeps_single_pidfile_process() {
     let (tmp, db_path, _config_path) = setup_daemon_home();
     let _cleanup = DaemonHomeCleanup {
         db_path: db_path.clone(),
     };
     let pid_path = tmp.path().join(".mempal/daemon.pid");
 
-    let mut child = Command::new("sleep")
-        .args(["120"])
-        .spawn()
-        .context("spawn placeholder")?;
-    fs::write(&pid_path, child.id().to_string()).context("write pidfile")?;
+    let mut child = spawn_placeholder_daemon(tmp.path(), "pidfile-only-reap-placeholder")
+        .expect("spawn placeholder");
+    fs::write(&pid_path, child.id().to_string()).expect("write pidfile");
 
     let output = Command::new(mempal_bin())
         .args(["daemon", "reap"])
         .daemon_home(tmp.path())
         .stdin(Stdio::null())
         .output()
-        .context("run daemon reap")?;
+        .expect("run daemon reap");
     assert!(
         output.status.success(),
         "daemon reap failed: status={:?}, stdout={}, stderr={}",
@@ -686,10 +706,13 @@ fn test_daemon_reap_keeps_single_pidfile_process() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    assert!(process_is_running_for_test(child.id() as i32));
-    child.kill()?;
-    child.wait()?;
-    Ok(())
+    assert!(
+        process_is_running_for_test(child.id() as i32),
+        "daemon reap should keep the pidfile-only placeholder alive\n{}",
+        child.diagnostics()
+    );
+    child.kill().expect("kill placeholder");
+    child.wait().expect("wait placeholder");
 }
 
 #[cfg(unix)]
@@ -707,14 +730,7 @@ fn test_daemon_processes_ingest_async_queue_rows() {
         )
         .expect("enqueue async ingest");
 
-    let mut child = Command::new(mempal_bin())
-        .args(["daemon", "--foreground"])
-        .daemon_home(tmp.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn daemon");
+    let mut child = spawn_foreground_daemon(tmp.path(), "process-ingest-async");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut completed = false;
@@ -730,13 +746,12 @@ fn test_daemon_processes_ingest_async_queue_rows() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // SAFETY: this test owns the foreground daemon child process.
-    let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-    assert_eq!(rc, 0, "failed to send SIGTERM");
-    let status = child.wait().expect("wait child");
+    child.signal_or_panic(libc::SIGTERM, "failed to send SIGTERM");
+    let status = child.wait_or_panic("failed to wait for daemon");
     assert!(
         status.success(),
-        "daemon must exit cleanly after SIGTERM: {status:?}"
+        "daemon must exit cleanly after SIGTERM: {status:?}\n{}",
+        child.diagnostics()
     );
 
     assert!(
@@ -771,14 +786,7 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
         )
         .expect("enqueue async ingest");
 
-    let mut child = Command::new(mempal_bin())
-        .args(["daemon", "--foreground"])
-        .daemon_home(tmp.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn daemon");
+    let mut child = spawn_foreground_daemon(tmp.path(), "drain-running-ingest-async");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -797,20 +805,20 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
         .expect("operation record exists");
     assert_eq!(running.op_state, "running");
 
-    // SAFETY: this test owns the foreground daemon child process.
-    let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-    assert_eq!(rc, 0, "failed to send SIGTERM");
+    child.signal_or_panic(libc::SIGTERM, "failed to send SIGTERM");
     assert!(
         !wait_for_child_exit(&mut child, Duration::from_millis(300)),
-        "daemon must not exit while the active ingest_async claim is mid-ingest"
+        "daemon must not exit while the active ingest_async claim is mid-ingest\n{}",
+        child.diagnostics()
     );
 
     handle.resume();
-    let status = child.wait().expect("wait child");
+    let status = child.wait_or_panic("failed to wait for daemon");
     handle.shutdown().await;
     assert!(
         status.success(),
-        "daemon must exit cleanly after draining active ingest: {status:?}"
+        "daemon must exit cleanly after draining active ingest: {status:?}\n{}",
+        child.diagnostics()
     );
 
     let completed = PendingMessageStore::new_without_reclaim(&db_path)
@@ -821,22 +829,14 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
     let db = Database::open(&db_path).expect("open db");
     assert_eq!(db.drawer_count().expect("drawer count"), 1);
 
-    let mut restarted = Command::new(mempal_bin())
-        .args(["daemon", "--foreground"])
-        .daemon_home(tmp.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("restart daemon");
+    let mut restarted = spawn_foreground_daemon(tmp.path(), "restart-after-drain");
     std::thread::sleep(Duration::from_millis(300));
-    // SAFETY: this test owns the restarted foreground daemon child process.
-    let rc = unsafe { libc::kill(restarted.id() as i32, libc::SIGTERM) };
-    assert_eq!(rc, 0, "failed to stop restarted daemon");
-    let restart_status = restarted.wait().expect("wait restarted daemon");
+    restarted.signal_or_panic(libc::SIGTERM, "failed to stop restarted daemon");
+    let restart_status = restarted.wait_or_panic("failed to wait for restarted daemon");
     assert!(
         restart_status.success(),
-        "restarted daemon must exit cleanly: {restart_status:?}"
+        "restarted daemon must exit cleanly: {restart_status:?}\n{}",
+        restarted.diagnostics()
     );
     let db = Database::open(&db_path).expect("open db after restart");
     assert_eq!(
@@ -903,14 +903,7 @@ log_path = "{}"
         .enqueue(HookEvent::SessionStart.queue_kind(), &payload)
         .expect("enqueue");
 
-    let mut child = Command::new(mempal_bin())
-        .args(["daemon", "--foreground"])
-        .daemon_home(tmp.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn daemon");
+    let mut child = spawn_foreground_daemon(tmp.path(), "sigterm-graceful");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -921,12 +914,12 @@ log_path = "{}"
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-    assert_eq!(rc, 0, "failed to send SIGTERM");
-    let status = child.wait().expect("wait child");
+    child.signal_or_panic(libc::SIGTERM, "failed to send SIGTERM");
+    let status = child.wait_or_panic("failed to wait for daemon");
     assert!(
         status.success(),
-        "daemon must exit cleanly after SIGTERM: {status:?}"
+        "daemon must exit cleanly after SIGTERM: {status:?}\n{}",
+        child.diagnostics()
     );
 
     let conn = rusqlite::Connection::open(&db_path).expect("open sqlite");
