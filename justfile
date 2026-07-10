@@ -224,9 +224,9 @@ test-all:
 test-f pattern:
     {{cargo}} test {{pattern}}
 
-# ONNX feature test (opt-in; may fail due to mold linker `__isoc23_strtoull`).
+# ONNX feature test using the checksum-pinned official shared runtime.
 test-onnx:
-    {{cargo}} test --features onnx
+    bash scripts/gates/onnx-tests.sh
 
 # Build release binary.
 build:
