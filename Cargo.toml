@@ -33,7 +33,7 @@ path = "src/main.rs"
 default = []
 integration = []
 model2vec = ["dep:model2vec-rs"]
-onnx = ["dep:ort", "dep:tokenizers"]
+onnx = ["dep:ort", "dep:ort-sys", "dep:tokenizers"]
 rest = ["dep:axum", "dep:tower", "dep:tower-http"]
 # Test-only seam: exposes `AsyncDb::with_read_delay` so the runtime-liveness /
 # read-concurrency regression tests (#345) can inject cold-read latency without
@@ -54,7 +54,9 @@ jieba-rs = "0.8"
 libc = "0.2"
 model2vec-rs = { version = "0.1", optional = true }
 notify = "8"
-ort = { version = "2.0.0-rc.9", optional = true }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["api-24", "load-dynamic", "ndarray", "std", "tracing"], optional = true }
+# ort's own prerelease range permits newer ort-sys release candidates.
+ort-sys = { version = "=2.0.0-rc.12", optional = true }
 percent-encoding = "2"
 quick-xml = "0.41"
 regex = "1"

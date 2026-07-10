@@ -195,6 +195,7 @@ quality-gates:
     just find-monolith-files
     just clippy
     just test
+    just test-onnx-link
 
 # Format code and auto-stage modified .rs files.
 fmt:
@@ -224,9 +225,13 @@ test-all:
 test-f pattern:
     {{cargo}} test {{pattern}}
 
-# ONNX feature test (opt-in; may fail due to mold linker `__isoc23_strtoull`).
-test-onnx:
-    {{cargo}} test --features onnx
+# Regression gate for the exact all-feature linker command from #698.
+test-onnx-link:
+    CARGO_BUILD_JOBS=1 {{cargo}} test --locked --all-features -j 1 --no-run
+
+# ONNX feature test using the checksum-pinned official shared runtime.
+test-onnx: test-onnx-link
+    bash scripts/gates/onnx-tests.sh
 
 # Build release binary.
 build:

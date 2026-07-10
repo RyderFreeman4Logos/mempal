@@ -171,6 +171,11 @@ api_endpoint = "http://localhost:11434/api/embeddings"
 api_model = "nomic-embed-text"
 ```
 
+The `onnx` feature dynamically loads ONNX Runtime 1.24.2. Install the matching
+shared library and set `ORT_DYLIB_PATH` to its full path: `libonnxruntime.so`
+on Linux, `libonnxruntime.dylib` on macOS, or `onnxruntime.dll` on Windows.
+Model assets may download on first use; the ONNX Runtime library does not.
+
 Daemon low-memory mode:
 
 - `[daemon].embedder_mode = "configured"` uses the normal `[embed]` backend.
