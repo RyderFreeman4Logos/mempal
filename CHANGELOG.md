@@ -33,6 +33,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **CLI**: stdout writes now treat a closed downstream pipe as a successful
+  early-consumer exit, preventing `mempal daemon status | head` and sibling
+  CLI output paths from panicking on `BrokenPipe` (#690).
 - **Daemon/Queue**: archived queue-failure stats now use a covering completion
   index, eliminating the idle stall detector's repeated full-table page-cache
   scans on large completion histories (#687).

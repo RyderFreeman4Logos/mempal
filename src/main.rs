@@ -142,6 +142,36 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+// The standard `println!` macro panics when a downstream pipe closes. Keep the
+// CLI's stdout policy at the process boundary so every command treats an early
+// consumer exit consistently without rewriting individual output paths.
+macro_rules! println {
+    () => {
+        crate::write_cli_stdout_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        crate::write_cli_stdout_line(format_args!($($arg)*))
+    };
+}
+
+fn write_cli_stdout_line(args: std::fmt::Arguments<'_>) {
+    let result = {
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        stdout
+            .write_fmt(args)
+            .and_then(|()| stdout.write_all(b"\n"))
+    };
+
+    if let Err(error) = result {
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("error: failed writing to stdout: {error}");
+        std::process::exit(1);
+    }
+}
+
 mod case_skill;
 mod foresight_cli;
 mod insights;
