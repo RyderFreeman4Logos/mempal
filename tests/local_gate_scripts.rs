@@ -163,9 +163,8 @@ fn just_onnx_recipe_uses_checksum_pinned_shared_runtime() {
 
     assert!(justfile.contains("bash scripts/gates/onnx-tests.sh"));
     assert!(
-        justfile.contains(
-            "CARGO_BUILD_JOBS=1 cargo +1.96.0 test --locked --all-features -j 1 --no-run"
-        )
+        justfile
+            .contains("CARGO_BUILD_JOBS=1 {{cargo}} test --locked --all-features -j 1 --no-run")
     );
     assert!(justfile.contains("just test-onnx-link"));
     assert!(cargo_toml.contains("default-features = false"));

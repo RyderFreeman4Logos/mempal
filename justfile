@@ -227,7 +227,7 @@ test-f pattern:
 
 # Regression gate for the exact all-feature linker command from #698.
 test-onnx-link:
-    CARGO_BUILD_JOBS=1 cargo +1.96.0 test --locked --all-features -j 1 --no-run
+    CARGO_BUILD_JOBS=1 {{cargo}} test --locked --all-features -j 1 --no-run
 
 # ONNX feature test using the checksum-pinned official shared runtime.
 test-onnx: test-onnx-link
