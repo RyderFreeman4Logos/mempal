@@ -4,6 +4,7 @@ use std::fs;
 use std::sync::{Arc, OnceLock};
 
 use mempal::core::config::{Config, ConfigHandle};
+use mempal::core::db::Database;
 use mempal::embed::global_embed_status;
 use mempal::mcp::{IngestRequest, MempalMcpServer};
 use tempfile::TempDir;
@@ -65,6 +66,7 @@ async fn test_embedder_fallback_to_model2vec_when_lan_unreachable() {
         std::env::set_var("XDG_CACHE_HOME", &xdg_cache_home);
     }
 
+    Database::open(&db_path).expect("initialize database fixture");
     let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
     let response = server
         .ingest_json_for_test(

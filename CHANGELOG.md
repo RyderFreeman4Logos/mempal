@@ -33,6 +33,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **Tests**: initialize the embedder fallback fixture through the complete
+  database migration path before queue admission (#699).
 - **Tests**: keep daemon IPC and path-sensitive project/provenance fixtures
   under bounded external paths so the default test suite works with deeply
   nested, repository-backed `TMPDIR` values (#696).
