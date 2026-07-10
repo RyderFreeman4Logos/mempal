@@ -45,10 +45,10 @@ use crate::search::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Query, State},
+    extract::{DefaultBodyLimit, Query, State, rejection::JsonRejection},
     http::{
-        HeaderMap, HeaderValue, Method, Request, StatusCode, header::CONTENT_TYPE,
-        header::USER_AGENT,
+        HeaderMap, HeaderValue, Method, Request, StatusCode, header::CONTENT_LENGTH,
+        header::CONTENT_TYPE, header::USER_AGENT,
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -67,7 +67,7 @@ const REST_SEARCH_WARNING_HEADER: &str = "mempal-warnings";
 const STATUS_DB_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(1);
 const REST_WRITE_RESTART_HINT: &str = "Restart the mempal daemon after upgrading so REST writes use a binary that supports this palace.db schema.";
 const REST_WRITE_DATABASE_BUSY_HINT: &str = "SQLite is temporarily locked by another writer; retry after the current write or maintenance job releases palace.db.";
-const MAX_REST_INGEST_BODY_BYTES: usize =
+pub const MAX_REST_INGEST_BODY_BYTES: usize =
     crate::ingest::admission::MAX_INGEST_REQUEST_BYTES + (2 * 1024 * 1024);
 static REST_WRITE_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1314,8 +1314,31 @@ async fn search_handler(
 
 async fn ingest_handler(
     State(state): State<ApiState>,
-    Json(request): Json<IngestRequest>,
+    headers: HeaderMap,
+    request: Result<Json<IngestRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            let request_bytes = headers
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(MAX_REST_INGEST_BODY_BYTES as u64 + 1);
+            state
+                .write_queue()
+                .record_oversize_rejection(
+                    "rest_request_body",
+                    request_bytes,
+                    MAX_REST_INGEST_BODY_BYTES as u64,
+                )
+                .await;
+            return Err(ApiError::rest_body_too_large(request_bytes));
+        }
+        Err(rejection) => {
+            return Err(ApiError::new(rejection.status(), rejection.body_text()));
+        }
+    };
     if let Err(error) = validate_ingest_request(&request) {
         if error.kind == "payload_too_large" {
             state
@@ -2007,6 +2030,20 @@ impl ApiError {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             message: error.to_string(),
+            kind: "payload_too_large",
+            schema_skew: None,
+            recovery_hint: None,
+            retryable: Some(false),
+        }
+    }
+
+    fn rest_body_too_large(request_bytes: u64) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: format!(
+                "REST ingest request body is too large: {request_bytes} bytes exceeds {} byte limit",
+                MAX_REST_INGEST_BODY_BYTES
+            ),
             kind: "payload_too_large",
             schema_skew: None,
             recovery_hint: None,

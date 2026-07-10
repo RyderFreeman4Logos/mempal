@@ -35,8 +35,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ### Fixed
 - **Ingest/Admission**: MCP and REST ingest now reject content above a 10 MiB
   product limit before scrubbing or queue admission, active ingest queues enforce
-  aggregate byte budgets, LLM gate copies are bounded, and status surfaces only
-  content-free byte/rejection counters (#678).
+  aggregate byte budgets, REST extractor-level body rejection returns the same
+  structured `payload_too_large` error and metrics, LLM gate copies are bounded,
+  and status surfaces only content-free byte/rejection counters (#678).
 - **CLI**: stdout writes now treat a closed downstream pipe as a successful
   early-consumer exit, preventing `mempal daemon status | head` and sibling
   CLI output paths from panicking on `BrokenPipe` (#690).

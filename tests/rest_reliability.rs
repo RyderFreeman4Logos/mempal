@@ -369,6 +369,39 @@ async fn test_ingest_rejects_oversized_content_with_413_without_leaking_content(
     assert_eq!(status_body["write_queue"]["rejected_oversize"], 1);
 }
 
+#[tokio::test]
+async fn test_ingest_body_limit_rejection_uses_product_error_and_metrics() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+    let body_bytes = mempal::api::MAX_REST_INGEST_BODY_BYTES + 1;
+    let response = mempal::api::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ingest")
+                .header(CONTENT_TYPE, "application/json")
+                .header("content-length", body_bytes)
+                .body(Body::from(vec![b'x'; body_bytes]))
+                .expect("build request"),
+        )
+        .await
+        .expect("REST request");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: Value = serde_json::from_slice(&bytes).expect("parse structured error");
+    assert_eq!(body["error"]["kind"], "payload_too_large");
+    assert_eq!(body["error"]["retryable"], false);
+
+    let (status, _headers, status_body) = get_json(state, "/api/status").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status_body["queue_stats"]["rejected_oversize"], 1);
+    assert_eq!(status_body["write_queue"]["rejected_oversize"], 1);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_concurrent_medium_ingests_respect_write_queue_byte_budget() {
     let _guard = TEST_LOCK.lock().await;
