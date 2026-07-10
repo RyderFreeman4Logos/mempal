@@ -48,7 +48,7 @@ fn mempal_bin() -> String {
 }
 
 fn setup_home() -> TempDir {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = TempDir::new_in("/tmp").expect("short tempdir");
     fs::create_dir_all(tmp.path().join(".mempal")).expect("create mempal home");
     Database::open(&tmp.path().join(".mempal/palace.db")).expect("open db");
     tmp

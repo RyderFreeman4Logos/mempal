@@ -201,7 +201,7 @@ struct TestEnv {
 
 impl TestEnv {
     fn new(config_body: &str) -> Self {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = TempDir::new_in("/tmp").expect("external tempdir");
         let home = tmp.path().to_path_buf();
         let mempal_home = home.join(".mempal");
         fs::create_dir_all(&mempal_home).expect("create mempal home");
