@@ -129,6 +129,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/taxonomy", get(taxonomy_handler))
         .route("/api/status", get(status_handler))
         .route("/api/pinned_facts", get(pinned_facts_handler))
+        .merge(super::durable::routes())
         .merge(super::hermes_compat::routes())
         .route_layer(middleware::from_fn_with_state(
             telemetry_state,
@@ -195,8 +196,8 @@ struct SearchQuery {
     include_expired: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
-struct IngestRequest {
+#[derive(Debug, Deserialize, Serialize)]
+pub(super) struct IngestRequest {
     content: String,
     wing: String,
     room: Option<String>,
@@ -442,7 +443,7 @@ fn validate_typed_metadata_contract(
     validate_non_knowledge_metadata("typed record", status, tier, ref_groups)
 }
 
-struct ValidatedIngestRequest {
+pub(super) struct ValidatedIngestRequest {
     source_type: SourceType,
     confidence: f64,
     typed_memory_kind: Option<MemoryKind>,
@@ -458,7 +459,9 @@ struct ValidatedIngestRequest {
     typed_verification_refs: Vec<String>,
 }
 
-fn validate_ingest_request(request: &IngestRequest) -> Result<ValidatedIngestRequest, ApiError> {
+pub(super) fn validate_ingest_request(
+    request: &IngestRequest,
+) -> Result<ValidatedIngestRequest, ApiError> {
     crate::ingest::admission::validate_ingest_request_bytes(&request.content)
         .map_err(ApiError::payload_too_large)?;
     validate_temporal_param("valid_from", request.valid_from.as_deref())?;
@@ -1971,7 +1974,7 @@ fn current_embedding_status(snapshot: &crate::embed::EmbedHealthSnapshot) -> &'s
 }
 
 #[derive(Debug)]
-struct ApiError {
+pub(super) struct ApiError {
     status: StatusCode,
     message: String,
     kind: &'static str,
@@ -1982,7 +1985,7 @@ struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+    pub(super) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
@@ -2020,7 +2023,7 @@ impl ApiError {
         }
     }
 
-    fn database_busy() -> Self {
+    pub(super) fn database_busy() -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: "SQLite database is temporarily busy; retry the mempal write after the active writer completes".to_string(),
@@ -2044,7 +2047,7 @@ impl ApiError {
         }
     }
 
-    fn rest_body_too_large(request_bytes: u64) -> Self {
+    pub(super) fn rest_body_too_large(request_bytes: u64) -> Self {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             message: format!(
@@ -2059,7 +2062,11 @@ impl ApiError {
         }
     }
 
-    fn queue_byte_budget(request_bytes: u64, pending_bytes: u64, limit_bytes: u64) -> Self {
+    pub(super) fn queue_byte_budget(
+        request_bytes: u64,
+        pending_bytes: u64,
+        limit_bytes: u64,
+    ) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: format!(
@@ -2346,7 +2353,7 @@ async fn write_worker(
     }
 }
 
-fn validate_rest_write_runtime(db_path: &std::path::Path) -> Result<(), ApiError> {
+pub(super) fn validate_rest_write_runtime(db_path: &std::path::Path) -> Result<(), ApiError> {
     open_rest_write_database(db_path).map(|_| ())
 }
 
@@ -2434,7 +2441,7 @@ fn db_error_to_api_error(error: DbError) -> ApiError {
     }
 }
 
-fn internal_error(error: impl std::fmt::Display) -> ApiError {
+pub(super) fn internal_error(error: impl std::fmt::Display) -> ApiError {
     ApiError::new(
         StatusCode::INTERNAL_SERVER_ERROR,
         crate::core::config::scrub_sensitive_text(&error.to_string()),

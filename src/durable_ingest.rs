@@ -1,0 +1,142 @@
+//! Durable REST admission backed by the canonical pending-message queue.
+//!
+//! This module owns the transport-neutral contract shared by the REST adapter
+//! and the existing ingest worker. Admission commits an opaque, validated REST
+//! request to `PendingMessageStore`; it does not create another worker or
+//! completion ledger.
+
+use std::path::Path;
+use std::time::{Duration, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use thiserror::Error;
+
+use crate::core::queue::{PendingMessageStore, PendingOperationRecord, QueueError};
+
+pub(crate) const INGEST_ASYNC_KIND: &str = "ingest_async";
+const CONTRACT_VERSION: &str = "mempal.rest.ingest.v1";
+const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
+
+/// Queue payload used by durable REST ingest admissions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DurableIngestEnvelope {
+    contract: String,
+    pub(crate) request: Value,
+}
+
+impl DurableIngestEnvelope {
+    pub(crate) fn new(request: Value) -> Self {
+        Self {
+            contract: CONTRACT_VERSION.to_string(),
+            request,
+        }
+    }
+
+    pub(crate) fn decode(payload: &str) -> Option<Self> {
+        let envelope = serde_json::from_str::<Self>(payload).ok()?;
+        (envelope.contract == CONTRACT_VERSION).then_some(envelope)
+    }
+}
+
+/// Public receipt returned after authoritative SQLite queue admission.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DurableOperationReceipt {
+    pub operation_id: String,
+    pub accepted_at: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drawer_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum DurableAdmissionError {
+    #[error("idempotency_key must be 1..={MAX_IDEMPOTENCY_KEY_BYTES} printable ASCII bytes")]
+    InvalidIdempotencyKey,
+    #[error("failed to encode durable ingest envelope")]
+    Encode(#[source] serde_json::Error),
+    #[error("durable ingest queue operation failed")]
+    Queue(#[from] QueueError),
+    #[error("durable operation not found")]
+    OperationNotFound,
+}
+
+/// Commit a durable ingest request using the producer-owned stable key.
+pub fn admit(
+    db_path: &Path,
+    idempotency_key: &str,
+    request: Value,
+) -> Result<DurableOperationReceipt, DurableAdmissionError> {
+    validate_idempotency_key(idempotency_key)?;
+    let payload = serde_json::to_string(&DurableIngestEnvelope::new(request))
+        .map_err(DurableAdmissionError::Encode)?;
+    let store = PendingMessageStore::new_without_reclaim(db_path);
+    let operation_id =
+        store.enqueue_idempotent_with_key(INGEST_ASYNC_KIND, &payload, idempotency_key)?;
+    status_with_store(&store, &operation_id)
+}
+
+/// Read the authoritative queue/completion-ledger state for an operation.
+pub fn status(
+    db_path: &Path,
+    operation_id: &str,
+) -> Result<DurableOperationReceipt, DurableAdmissionError> {
+    let store = PendingMessageStore::new_without_reclaim(db_path);
+    status_with_store(&store, operation_id)
+}
+
+fn status_with_store(
+    store: &PendingMessageStore,
+    operation_id: &str,
+) -> Result<DurableOperationReceipt, DurableAdmissionError> {
+    let record = store
+        .operation_status(operation_id)?
+        .ok_or(DurableAdmissionError::OperationNotFound)?;
+    Ok(receipt_from_record(record))
+}
+
+fn validate_idempotency_key(key: &str) -> Result<(), DurableAdmissionError> {
+    let valid = !key.is_empty()
+        && key.len() <= MAX_IDEMPOTENCY_KEY_BYTES
+        && key.bytes().all(|byte| byte.is_ascii_graphic());
+    if valid {
+        Ok(())
+    } else {
+        Err(DurableAdmissionError::InvalidIdempotencyKey)
+    }
+}
+
+fn receipt_from_record(record: PendingOperationRecord) -> DurableOperationReceipt {
+    let accepted_at_secs = if record.completed_at.is_some() {
+        record.created_at.div_euclid(1_000)
+    } else {
+        record.created_at
+    };
+    DurableOperationReceipt {
+        operation_id: record.id,
+        accepted_at: crate::cowork::peek::format_rfc3339(
+            UNIX_EPOCH + Duration::from_secs(accepted_at_secs.max(0) as u64),
+        ),
+        state: record.op_state,
+        drawer_id: record.result_drawer_id,
+        rejected_reason: record.rejected_reason,
+        failure_detail: record.failure_detail,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idempotency_key_validation_is_bounded_and_content_free() {
+        assert!(validate_idempotency_key("provider-event_01").is_ok());
+        assert!(validate_idempotency_key("").is_err());
+        assert!(validate_idempotency_key("contains whitespace").is_err());
+        assert!(validate_idempotency_key(&"x".repeat(129)).is_err());
+    }
+}

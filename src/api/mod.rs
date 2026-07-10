@@ -1,6 +1,8 @@
 #![warn(clippy::all)]
 
 #[cfg(feature = "rest")]
+mod durable;
+#[cfg(feature = "rest")]
 mod handlers;
 #[cfg(feature = "rest")]
 mod hermes_compat;

@@ -1,5 +1,6 @@
 #![warn(clippy::all)]
 
+mod ingest_payload;
 mod logging;
 mod server;
 mod stale_daemon;
