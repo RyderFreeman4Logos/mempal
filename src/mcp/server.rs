@@ -3287,6 +3287,25 @@ fn anyhow_chain_contains_sqlite_lock(error: &anyhow::Error) -> bool {
     })
 }
 
+fn ingest_queue_byte_budget_error(error: &anyhow::Error) -> Option<ErrorData> {
+    error.chain().find_map(|cause| {
+        let QueueError::IngestByteBudgetExceeded {
+            payload_bytes,
+            active_bytes,
+            limit_bytes,
+        } = cause.downcast_ref::<QueueError>()?
+        else {
+            return None;
+        };
+        Some(ErrorData::invalid_params(
+            format!(
+                "ingest queue byte budget exceeded: payload_bytes={payload_bytes} active_bytes={active_bytes} limit_bytes={limit_bytes}"
+            ),
+            None,
+        ))
+    })
+}
+
 fn renew_mcp_writer_lease_with_retry(
     db_path: &Path,
     lease: &RuntimeWriterLease,
@@ -3775,6 +3794,10 @@ fn default_queue_stats() -> crate::core::queue::QueueStats {
     crate::core::queue::QueueStats {
         pending: 0,
         claimed: 0,
+        active_payload_bytes: 0,
+        active_ingest_payload_bytes: 0,
+        ingest_payload_limit_bytes: crate::core::queue::DEFAULT_MAX_INGEST_ACTIVE_BYTES,
+        rejected_oversize: 0,
         failed: 0,
         failed_retryable: 0,
         failed_terminal: 0,
@@ -5105,6 +5128,10 @@ impl MempalMcpServer {
             queue_stats: QueueStatsDto {
                 pending: queue_stats.pending,
                 claimed: queue_stats.claimed,
+                active_payload_bytes: queue_stats.active_payload_bytes,
+                active_ingest_payload_bytes: queue_stats.active_ingest_payload_bytes,
+                ingest_payload_limit_bytes: queue_stats.ingest_payload_limit_bytes,
+                rejected_oversize: queue_stats.rejected_oversize,
                 failed: queue_stats.failed,
                 failed_retryable: queue_stats.failed_retryable,
                 failed_terminal: queue_stats.failed_terminal,
@@ -6379,6 +6406,25 @@ impl MempalMcpServer {
         worker_mode: IngestWaitWorkerMode,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         let request_started_at = Instant::now();
+        if let Err(error) =
+            crate::ingest::admission::validate_ingest_request_bytes(&request.content)
+        {
+            tracing::warn!(
+                surface = "mcp_request",
+                request_bytes = error.actual_bytes,
+                limit_bytes = error.limit_bytes,
+                "rejecting oversized ingest admission"
+            );
+            if let Err(counter_error) = self.async_queue.record_oversize_rejection_fail_fast().await
+            {
+                tracing::warn!(
+                    ?counter_error,
+                    surface = "mcp_request",
+                    "failed to persist oversize rejection counter"
+                );
+            }
+            return Err(ErrorData::invalid_params(error.to_string(), None));
+        }
         let dry_run = request.dry_run.unwrap_or(false);
         let controls = resolve_mcp_ingest_controls(&request, controls)?;
         if !dry_run && global_embed_status().should_block_writes() {
@@ -6477,6 +6523,9 @@ impl MempalMcpServer {
         let queue_admission = match self.enqueue_ingest_operation(payload).await {
             Ok(admission) => admission,
             Err(error) => {
+                if let Some(error) = ingest_queue_byte_budget_error(&error) {
+                    return Err(error);
+                }
                 let diagnostic = status_database_diagnostic(
                     &self.db_path,
                     "enqueue_ingest_operation",
@@ -7985,13 +8034,11 @@ impl MempalMcpServer {
                 .llm_judge
                 .as_ref()
                 .and_then(|j| j.system_prompt.clone());
-            let payload = crate::llm::LlmTaskPayload {
-                task_type: "gating".to_string(),
-                drawer_id: newly_created_drawer_ids[0].clone(),
-                drawer_ids: newly_created_drawer_ids.clone(),
-                content: scrubbed_content.clone(),
+            let payload = crate::llm::LlmTaskPayload::for_gating(
+                newly_created_drawer_ids.clone(),
+                &scrubbed_content,
                 system_prompt,
-            };
+            );
             match serde_json::to_string(&payload) {
                 Ok(payload_json) => match crate::core::queue::PendingMessageStore::new(db.path()) {
                     Ok(queue) => {
@@ -12608,6 +12655,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mcp_ingest_rejects_oversized_content_as_invalid_params() {
+        let (_tempdir, db_path, server) = setup_server();
+        let secret = "MCP_OVERSIZE_SECRET_DO_NOT_LEAK";
+        let mut content = "x".repeat(crate::ingest::admission::MAX_INGEST_REQUEST_BYTES);
+        content.push_str(secret);
+        let content_bytes = content.len();
+
+        let error = match server
+            .mempal_ingest(Parameters(IngestRequest {
+                content,
+                wing: "mcp".to_string(),
+                room: Some("oversize".to_string()),
+                ..IngestRequest::default()
+            }))
+            .await
+        {
+            Ok(_) => panic!("oversized MCP ingest must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains(&content_bytes.to_string()));
+        assert!(
+            error
+                .message
+                .contains(&crate::ingest::admission::MAX_INGEST_REQUEST_BYTES.to_string())
+        );
+        assert!(!error.message.contains(secret));
+        let stats = PendingMessageStore::new_without_reclaim(&db_path)
+            .stats()
+            .expect("queue stats");
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.rejected_oversize, 1);
+    }
+
+    #[tokio::test]
     async fn test_daemon_writer_lease_check_failure_does_not_prove_daemon_ownership() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let missing_db_path = tempdir.path().join("missing-parent/palace.db");
@@ -16298,6 +16381,7 @@ prototypes = ["keep"]
                 base_delay_ms: 0,
                 max_delay_ms: 0,
                 max_retries: 0,
+                ..crate::core::queue::QueueConfig::default()
             },
         )
         .expect("create queue store");

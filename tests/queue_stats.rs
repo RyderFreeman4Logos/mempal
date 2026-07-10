@@ -425,6 +425,7 @@ fn test_queue_stats_reflects_current_state() {
         base_delay_ms: 0,
         max_delay_ms: 0,
         max_retries: 0,
+        ..QueueConfig::default()
     });
 
     let pending_id = store.enqueue("hook_event", r#"{"n":1}"#).expect("enqueue");
@@ -508,6 +509,7 @@ fn test_status_command_shows_queue_stats() {
             base_delay_ms: 0,
             max_delay_ms: 0,
             max_retries: 0,
+            ..QueueConfig::default()
         },
     )
     .expect("create store");
@@ -557,6 +559,13 @@ fn test_status_command_shows_queue_stats() {
     assert!(stdout.contains("embed_fail_count: 1"), "{stdout}");
     assert!(stdout.contains("pending: 1"), "{stdout}");
     assert!(stdout.contains("claimed: 1"), "{stdout}");
+    assert!(stdout.contains("active_payload_bytes:"), "{stdout}");
+    assert!(
+        stdout.contains("active_ingest_payload_bytes: 0"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("ingest_payload_limit_bytes:"), "{stdout}");
+    assert!(stdout.contains("rejected_oversize: 0"), "{stdout}");
     assert!(stdout.contains("failed: 1"), "{stdout}");
     assert!(stdout.contains("rate_per_min: 0.1"), "{stdout}");
     assert!(stdout.contains("avg_processing_ms:"), "{stdout}");

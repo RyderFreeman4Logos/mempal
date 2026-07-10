@@ -2927,17 +2927,15 @@ async fn judge_automatic_content_llm_gate(
             "LLM gating is required for automatic hook writes but no LLM gate runtime is available"
         )
     })?;
-    let task = crate::llm::LlmTaskPayload {
-        task_type: "gating".to_string(),
-        drawer_id: candidate_hash.to_string(),
-        drawer_ids: vec![candidate_hash.to_string()],
-        content: content.to_string(),
-        system_prompt: config
+    let task = crate::llm::LlmTaskPayload::for_gating(
+        vec![candidate_hash.to_string()],
+        content,
+        config
             .ingest_gating
             .llm_judge
             .as_ref()
             .and_then(|judge| judge.system_prompt.clone()),
-    };
+    );
     let deadline = automatic_hook_llm_gate_deadline(config);
     let outcome = match tokio::time::timeout(deadline, gate.judge(config, &task, heartbeat)).await {
         Ok(outcome) => outcome,
@@ -3048,13 +3046,11 @@ async fn enqueue_llm_gating_after_durable_insert(
         .llm_judge
         .as_ref()
         .and_then(|j| j.system_prompt.clone());
-    let payload = serde_json::to_string(&crate::llm::LlmTaskPayload {
-        task_type: "gating".to_string(),
-        drawer_id: drawer_id.to_string(),
-        drawer_ids: vec![drawer_id.to_string()],
-        content: content.to_string(),
+    let payload = serde_json::to_string(&crate::llm::LlmTaskPayload::for_gating(
+        vec![drawer_id.to_string()],
+        content,
         system_prompt,
-    })
+    ))
     .context("failed to serialize LLM gating payload")?;
     let drawer_id = drawer_id.to_string();
     if let Err(error) = store.enqueue("llm_task".to_string(), payload).await {
