@@ -33,6 +33,13 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **Security/Dependencies**: upgraded `crossbeam-epoch`, `quick-xml`,
+  `quinn-proto`, and `rmcp` past the five affected RustSec versions, and
+  upgraded `anyhow` and `rand` to their patched releases. The remaining
+  informational audit warnings are temporarily accepted because `daemonize`
+  has no patched release and `core2`, `number_prefix`, `paste`, and
+  `proc-macro-error2` arrive through upstream dependency chains that require
+  broader replacements than this security-only update (#694).
 - **Ingest/Admission**: MCP and REST ingest now reject content above a 10 MiB
   product limit before scrubbing or queue admission, active ingest queues enforce
   aggregate byte budgets, REST extractor-level body rejection returns the same
