@@ -1428,14 +1428,16 @@ impl PendingMessageStore {
     pub fn auto_requeue_failed_model_tasks(&self, model_kind: &str) -> Result<u64> {
         let now = now_secs();
         self.with_connection(|conn| {
-            let updated = match model_kind {
-                "embedding" => requeue_failed_model_tasks(conn, now, "embedding")?,
-                "llm" => requeue_failed_model_tasks(conn, now, "llm")?,
-                other => return Err(QueueError::UnsupportedModelTaskKind(other.to_string())),
-            };
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let updated = requeue_failed_model_tasks(
+                &tx,
+                now,
+                model_kind,
+                self.config.max_ingest_active_bytes,
+            )?;
             if updated > 0 {
                 let now_ms = now_millis().to_string();
-                conn.execute(
+                tx.execute(
                     r#"
                     INSERT INTO fork_ext_meta (key, value)
                     VALUES ('queue.auto_requeue.last_at_unix_ms', ?1)
@@ -1444,6 +1446,7 @@ impl PendingMessageStore {
                     [now_ms],
                 )?;
             }
+            tx.commit()?;
             Ok(updated)
         })
     }
@@ -1500,41 +1503,15 @@ impl PendingMessageStore {
     pub fn retry_failed_embed_messages(&self) -> Result<u64> {
         let now = now_secs();
         self.with_connection(|conn| {
-            let updated = conn.execute(
-                r#"
-                UPDATE pending_messages
-                SET status = 'pending',
-                    retry_count = 0,
-                    retry_backoff_ms = 0,
-                    next_attempt_at = MIN(created_at, ?1),
-                    claim_token = NULL,
-                    claimed_at = NULL,
-                    heartbeat_at = NULL,
-                    last_error = NULL,
-                    op_state = 'queued',
-                    result_drawer_id = CASE
-                        WHEN kind = 'ingest_async' THEN NULL
-                        ELSE result_drawer_id
-                    END,
-                    rejected_reason = CASE
-                        WHEN kind = 'ingest_async' THEN NULL
-                        ELSE rejected_reason
-                    END,
-                    failure_detail = CASE
-                        WHEN kind = 'ingest_async' THEN NULL
-                        ELSE failure_detail
-                    END,
-                    result_json = CASE
-                        WHEN kind = 'ingest_async' THEN NULL
-                        ELSE result_json
-                    END
-                WHERE status = 'failed'
-                  AND failure_class = 'retryable_model'
-                  AND kind != 'llm_task'
-                "#,
-                [now],
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let updated = requeue_failed_model_tasks(
+                &tx,
+                now,
+                "embedding",
+                self.config.max_ingest_active_bytes,
             )?;
-            Ok(updated as u64)
+            tx.commit()?;
+            Ok(updated)
         })
     }
 
@@ -1649,45 +1626,26 @@ impl PendingMessageStore {
         self.with_connection(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let rows = matching_failed_rows(&tx, &filter)?;
-            let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
 
             let now = now_secs();
+            let mut active_ingest_bytes = active_payload_bytes_for_kind(&tx, INGEST_ASYNC_KIND)?;
             let mut changed = 0u64;
-            for id in &ids {
-                let updated = tx.execute(
-                    r#"
-                    UPDATE pending_messages
-                    SET status = 'pending',
-                        retry_count = 0,
-                        retry_backoff_ms = 0,
-                        next_attempt_at = MIN(created_at, ?2),
-                        claim_token = NULL,
-                        claimed_at = NULL,
-                        heartbeat_at = NULL,
-                        last_error = NULL,
-                        op_state = 'queued',
-                        failure_class = NULL,
-                        result_drawer_id = CASE
-                            WHEN kind = 'ingest_async' THEN NULL
-                            ELSE result_drawer_id
-                        END,
-                        rejected_reason = CASE
-                            WHEN kind = 'ingest_async' THEN NULL
-                            ELSE rejected_reason
-                        END,
-                        failure_detail = CASE
-                            WHEN kind = 'ingest_async' THEN NULL
-                            ELSE failure_detail
-                        END,
-                        result_json = CASE
-                            WHEN kind = 'ingest_async' THEN NULL
-                            ELSE result_json
-                        END
-                    WHERE id = ?1 AND status = 'failed'
-                    "#,
-                    params![id, now],
-                )?;
-                changed = changed.saturating_add(updated as u64);
+            for row in &rows {
+                let Some(payload_bytes) = admitted_requeue_payload_bytes(
+                    &tx,
+                    &row.id,
+                    &row.kind,
+                    active_ingest_bytes,
+                    self.config.max_ingest_active_bytes,
+                )?
+                else {
+                    continue;
+                };
+                let updated = requeue_failed_message(&tx, &row.id, now)?;
+                if updated > 0 {
+                    active_ingest_bytes = active_ingest_bytes.saturating_add(payload_bytes);
+                    changed = changed.saturating_add(updated);
+                }
             }
             tx.commit()?;
             Ok(QueueFailureActionOutcome {
@@ -1891,7 +1849,12 @@ impl PendingMessageStore {
     }
 }
 
-fn requeue_failed_model_tasks(conn: &Connection, now: i64, model_kind: &str) -> Result<u64> {
+fn requeue_failed_model_tasks(
+    conn: &Connection,
+    now: i64,
+    model_kind: &str,
+    max_ingest_active_bytes: u64,
+) -> Result<u64> {
     let kind_predicate = match model_kind {
         "embedding" => "kind != 'llm_task'",
         "llm" => "kind = 'llm_task'",
@@ -1899,11 +1862,74 @@ fn requeue_failed_model_tasks(conn: &Connection, now: i64, model_kind: &str) -> 
     };
     let sql = format!(
         r#"
+        SELECT id, kind
+        FROM pending_messages
+        WHERE status = 'failed'
+          AND failure_class = 'retryable_model'
+          AND {kind_predicate}
+        ORDER BY created_at ASC, id ASC
+        "#
+    );
+    let candidates = {
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut active_ingest_bytes = active_payload_bytes_for_kind(conn, INGEST_ASYNC_KIND)?;
+    let mut updated = 0u64;
+    for (id, kind) in candidates {
+        let Some(payload_bytes) = admitted_requeue_payload_bytes(
+            conn,
+            &id,
+            &kind,
+            active_ingest_bytes,
+            max_ingest_active_bytes,
+        )?
+        else {
+            continue;
+        };
+        let changed = requeue_failed_message(conn, &id, now)?;
+        if changed > 0 {
+            active_ingest_bytes = active_ingest_bytes.saturating_add(payload_bytes);
+            updated = updated.saturating_add(changed);
+        }
+    }
+    Ok(updated)
+}
+
+fn admitted_requeue_payload_bytes(
+    conn: &Connection,
+    id: &str,
+    kind: &str,
+    active_ingest_bytes: u64,
+    max_ingest_active_bytes: u64,
+) -> Result<Option<u64>> {
+    if kind != INGEST_ASYNC_KIND {
+        return Ok(Some(0));
+    }
+    let payload_bytes = conn
+        .query_row(
+            "SELECT length(CAST(payload AS BLOB)) FROM pending_messages WHERE id = ?1",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(i64_to_u64)?;
+    if payload_bytes > max_ingest_active_bytes.saturating_sub(active_ingest_bytes) {
+        return Ok(None);
+    }
+    Ok(Some(payload_bytes))
+}
+
+fn requeue_failed_message(conn: &Connection, id: &str, now: i64) -> Result<u64> {
+    let updated = conn.execute(
+        r#"
         UPDATE pending_messages
         SET status = 'pending',
             retry_count = 0,
             retry_backoff_ms = 0,
-            next_attempt_at = MIN(created_at, ?1),
+            next_attempt_at = MIN(created_at, ?2),
             claim_token = NULL,
             claimed_at = NULL,
             heartbeat_at = NULL,
@@ -1926,12 +1952,10 @@ fn requeue_failed_model_tasks(conn: &Connection, now: i64, model_kind: &str) -> 
                 WHEN kind = 'ingest_async' THEN NULL
                 ELSE result_json
             END
-        WHERE status = 'failed'
-          AND failure_class = 'retryable_model'
-          AND {kind_predicate}
-        "#
-    );
-    let updated = conn.execute(&sql, [now])?;
+        WHERE id = ?1 AND status = 'failed'
+        "#,
+        params![id, now],
+    )?;
     Ok(updated as u64)
 }
 
