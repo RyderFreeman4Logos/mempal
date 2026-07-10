@@ -1091,12 +1091,13 @@ async fn requeue_failed_model_tasks_after_recovery(
             .auto_requeue_failed_model_tasks("embedding".to_string())
             .await
         {
-            Ok(requeued) => {
-                completed.embedding = true;
-                if requeued > 0 {
+            Ok(outcome) => {
+                completed.embedding = outcome.skipped == 0;
+                if outcome.requeued > 0 || outcome.skipped > 0 {
                     tracing::info!(
-                        requeued,
-                        "auto-requeued failed embedding tasks after endpoint recovery"
+                        requeued = outcome.requeued,
+                        skipped = outcome.skipped,
+                        "attempted failed embedding task requeue after endpoint recovery"
                     );
                 }
             }
@@ -1110,12 +1111,13 @@ async fn requeue_failed_model_tasks_after_recovery(
             .auto_requeue_failed_model_tasks("llm".to_string())
             .await
         {
-            Ok(requeued) => {
-                completed.llm = true;
-                if requeued > 0 {
+            Ok(outcome) => {
+                completed.llm = outcome.skipped == 0;
+                if outcome.requeued > 0 || outcome.skipped > 0 {
                     tracing::info!(
-                        requeued,
-                        "auto-requeued failed LLM tasks after endpoint recovery"
+                        requeued = outcome.requeued,
+                        skipped = outcome.skipped,
+                        "attempted failed LLM task requeue after endpoint recovery"
                     );
                 }
             }
@@ -4384,6 +4386,84 @@ mod tests {
             .expect("terminal status")
             .expect("terminal record");
         assert_eq!(terminal_status.op_state, "failed");
+    }
+
+    #[tokio::test]
+    async fn test_endpoint_recovery_retries_budget_skipped_ingest_while_healthy() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let sync_store = PendingMessageStore::with_config(
+            &db_path,
+            crate::core::queue::QueueConfig {
+                max_ingest_active_bytes: 1_000,
+                ..crate::core::queue::QueueConfig::default()
+            },
+        )
+        .expect("create byte-bounded queue store");
+        let async_store = AsyncPendingMessageStore::from_store(sync_store.clone());
+
+        for _ in 0..2 {
+            let id = sync_store
+                .enqueue("ingest_async", &"m".repeat(600))
+                .expect("enqueue failed ingest candidate");
+            sync_store
+                .mark_model_task_failed_retryable(&id, "temporary embedding outage")
+                .expect("mark ingest candidate failed");
+        }
+
+        let health = endpoint_health_snapshot(true, false);
+        let mut state = EndpointRecoveryRequeueState::default();
+        let first_plan =
+            super::requeue_failed_model_tasks_after_recovery(&async_store, &mut state, &health)
+                .await
+                .expect("first recovery check");
+        assert_eq!(
+            first_plan,
+            EndpointRecoveryRequeuePlan {
+                embedding: true,
+                llm: false,
+            }
+        );
+        let first_stats = sync_store
+            .stats()
+            .expect("stats after first recovery check");
+        assert_eq!(first_stats.pending, 1);
+        assert_eq!(first_stats.failed_retryable_embed, 1);
+        assert_eq!(
+            state.plan(&health),
+            EndpointRecoveryRequeuePlan {
+                embedding: true,
+                llm: false,
+            },
+            "a budget-skipped ingest must keep automatic recovery open"
+        );
+
+        let admitted = sync_store
+            .claim_next_by_kind("test-ingest-worker", 60, "ingest_async")
+            .expect("claim admitted ingest")
+            .expect("admitted ingest row");
+        sync_store
+            .confirm(&admitted)
+            .expect("free active ingest byte capacity");
+
+        let second_plan =
+            super::requeue_failed_model_tasks_after_recovery(&async_store, &mut state, &health)
+                .await
+                .expect("second recovery check while endpoint remains healthy");
+        assert_eq!(
+            second_plan,
+            EndpointRecoveryRequeuePlan {
+                embedding: true,
+                llm: false,
+            }
+        );
+        let second_stats = sync_store
+            .stats()
+            .expect("stats after capacity-backed recovery check");
+        assert_eq!(second_stats.pending, 1);
+        assert_eq!(second_stats.failed_retryable_embed, 0);
+        assert!(state.plan(&health).is_empty());
     }
 
     #[test]

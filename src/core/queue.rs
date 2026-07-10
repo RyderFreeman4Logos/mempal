@@ -207,6 +207,15 @@ pub struct QueueFailureActionOutcome {
     pub buckets: Vec<QueueFailureBucket>,
 }
 
+/// Result of requeueing retryable tasks for one recovered model family.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelTaskRequeueOutcome {
+    /// Failed tasks returned to the active queue.
+    pub requeued: u64,
+    /// Failed ingest tasks left for a later retry because the byte budget was full.
+    pub skipped: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueConfig {
     pub base_delay_ms: i64,
@@ -623,7 +632,10 @@ impl AsyncPendingMessageStore {
             .await
     }
 
-    pub async fn auto_requeue_failed_model_tasks(&self, model_kind: String) -> Result<u64> {
+    pub async fn auto_requeue_failed_model_tasks(
+        &self,
+        model_kind: String,
+    ) -> Result<ModelTaskRequeueOutcome> {
         self.run(move |store| store.auto_requeue_failed_model_tasks(&model_kind))
             .await
     }
@@ -1425,17 +1437,20 @@ impl PendingMessageStore {
     }
 
     /// Requeue retryable failed model tasks for the recovered model family.
-    pub fn auto_requeue_failed_model_tasks(&self, model_kind: &str) -> Result<u64> {
+    pub fn auto_requeue_failed_model_tasks(
+        &self,
+        model_kind: &str,
+    ) -> Result<ModelTaskRequeueOutcome> {
         let now = now_secs();
         self.with_connection(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let updated = requeue_failed_model_tasks(
+            let outcome = requeue_failed_model_tasks(
                 &tx,
                 now,
                 model_kind,
                 self.config.max_ingest_active_bytes,
             )?;
-            if updated > 0 {
+            if outcome.requeued > 0 {
                 let now_ms = now_millis().to_string();
                 tx.execute(
                     r#"
@@ -1447,7 +1462,7 @@ impl PendingMessageStore {
                 )?;
             }
             tx.commit()?;
-            Ok(updated)
+            Ok(outcome)
         })
     }
 
@@ -1504,14 +1519,14 @@ impl PendingMessageStore {
         let now = now_secs();
         self.with_connection(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let updated = requeue_failed_model_tasks(
+            let outcome = requeue_failed_model_tasks(
                 &tx,
                 now,
                 "embedding",
                 self.config.max_ingest_active_bytes,
             )?;
             tx.commit()?;
-            Ok(updated)
+            Ok(outcome.requeued)
         })
     }
 
@@ -1854,7 +1869,7 @@ fn requeue_failed_model_tasks(
     now: i64,
     model_kind: &str,
     max_ingest_active_bytes: u64,
-) -> Result<u64> {
+) -> Result<ModelTaskRequeueOutcome> {
     let kind_predicate = match model_kind {
         "embedding" => "kind != 'llm_task'",
         "llm" => "kind = 'llm_task'",
@@ -1878,7 +1893,7 @@ fn requeue_failed_model_tasks(
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut active_ingest_bytes = active_payload_bytes_for_kind(conn, INGEST_ASYNC_KIND)?;
-    let mut updated = 0u64;
+    let mut outcome = ModelTaskRequeueOutcome::default();
     for (id, kind) in candidates {
         let Some(payload_bytes) = admitted_requeue_payload_bytes(
             conn,
@@ -1888,15 +1903,16 @@ fn requeue_failed_model_tasks(
             max_ingest_active_bytes,
         )?
         else {
+            outcome.skipped = outcome.skipped.saturating_add(1);
             continue;
         };
         let changed = requeue_failed_message(conn, &id, now)?;
         if changed > 0 {
             active_ingest_bytes = active_ingest_bytes.saturating_add(payload_bytes);
-            updated = updated.saturating_add(changed);
+            outcome.requeued = outcome.requeued.saturating_add(changed);
         }
     }
-    Ok(updated)
+    Ok(outcome)
 }
 
 fn admitted_requeue_payload_bytes(

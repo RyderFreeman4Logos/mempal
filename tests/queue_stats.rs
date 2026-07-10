@@ -1383,11 +1383,12 @@ fn test_auto_requeue_model_tasks_only_requeues_retryable_failed_kind() {
         )
         .expect("mark terminal failed");
 
-    let requeued = store
+    let outcome = store
         .auto_requeue_failed_model_tasks("embedding")
         .expect("auto requeue embedding");
 
-    assert_eq!(requeued, 1);
+    assert_eq!(outcome.requeued, 1);
+    assert_eq!(outcome.skipped, 0);
     let conn = Connection::open(&db_path).expect("open sqlite");
     let status_for = |id: &str| -> (String, i64, Option<String>) {
         conn.query_row(
@@ -1448,11 +1449,12 @@ fn test_auto_failed_ingest_requeue_respects_active_byte_budget() {
             .expect("mark ingest candidate failed");
     }
 
-    let requeued = store
+    let outcome = store
         .auto_requeue_failed_model_tasks("embedding")
         .expect("auto requeue failed ingest rows");
 
-    assert_eq!(requeued, 1);
+    assert_eq!(outcome.requeued, 1);
+    assert_eq!(outcome.skipped, 1);
     let stats = store.stats().expect("queue stats after automatic retry");
     assert_eq!(stats.pending, 1);
     assert_eq!(stats.failed, 1);

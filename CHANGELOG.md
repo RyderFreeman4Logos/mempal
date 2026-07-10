@@ -37,8 +37,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   product limit before scrubbing or queue admission, active ingest queues enforce
   aggregate byte budgets, REST extractor-level body rejection returns the same
   structured `payload_too_large` error and metrics, failed-row retries preserve
-  the active ingest byte budget, LLM gate copies are bounded, and status surfaces
-  only content-free byte/rejection counters (#678).
+  the active ingest byte budget, automatic endpoint recovery keeps retrying rows
+  skipped by that budget after capacity frees, LLM gate copies are bounded, and
+  status surfaces only content-free byte/rejection counters (#678).
 - **CLI**: stdout writes now treat a closed downstream pipe as a successful
   early-consumer exit, preventing `mempal daemon status | head` and sibling
   CLI output paths from panicking on `BrokenPipe` (#690).
