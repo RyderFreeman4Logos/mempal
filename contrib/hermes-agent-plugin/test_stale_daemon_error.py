@@ -44,6 +44,9 @@ class IncompleteReader:
     def read(self, _amount: int) -> bytes:
         raise http.client.IncompleteRead(b"partial stale-daemon response")
 
+    def close(self) -> None:
+        pass
+
 
 class StaleDaemonErrorTests(unittest.TestCase):
     def _conclude_error_details(self, response: Any) -> Dict[str, Any]:
@@ -55,6 +58,7 @@ class StaleDaemonErrorTests(unittest.TestCase):
             response,
         ))
         provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
         result = json.loads(provider.handle_tool_call(
             "mempal_conclude",
             {"conclusion": "synthetic harmless durable fact"},
@@ -82,6 +86,7 @@ class StaleDaemonErrorTests(unittest.TestCase):
             io.BytesIO(response_body),
         ))
         provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
 
         result = json.loads(provider.handle_tool_call(
             "mempal_conclude",
@@ -89,15 +94,21 @@ class StaleDaemonErrorTests(unittest.TestCase):
         ))
 
         details = result["error_details"]
-        self.assertEqual(details["kind"], "stale_daemon")
-        self.assertEqual(details["boundary"], "daemon_executable")
-        self.assertEqual(details["action"], "restart_daemon_then_retry")
-        self.assertTrue(details["stale_daemon"])
-        self.assertEqual(details["daemon_pid"], 706141)
-        self.assertTrue(details["exe_deleted"])
-        self.assertFalse(details["retryable"])
-        self.assertTrue(details["retry_safe_after_restart"])
-        self.assertIn("mempal daemon restart", details["recovery_hint"])
+        self.assertEqual(details["kind"], "durable_admission_deferred")
+        self.assertEqual(details["error_class"], "http_503")
+        self.assertTrue(details["operation_key"])
+        self.assertEqual(details["retry_operation_id"], details["operation_key"])
+        self.assertEqual(provider._write_spool.count(), 1)
+        transport = details["transport"]
+        self.assertEqual(transport["kind"], "stale_daemon")
+        self.assertEqual(transport["boundary"], "daemon_executable")
+        self.assertEqual(transport["action"], "restart_daemon_then_retry")
+        self.assertTrue(transport["stale_daemon"])
+        self.assertEqual(transport["daemon_pid"], 706141)
+        self.assertTrue(transport["exe_deleted"])
+        self.assertFalse(transport["retryable"])
+        self.assertTrue(transport["retry_safe_after_restart"])
+        self.assertIn("mempal daemon restart", transport["recovery_hint"])
         serialized = json.dumps(result)
         self.assertNotIn("synthetic harmless durable fact", serialized)
         self.assertNotIn("SECRET_RESPONSE_TEXT", serialized)
@@ -108,9 +119,11 @@ class StaleDaemonErrorTests(unittest.TestCase):
     def test_truncated_stale_daemon_body_falls_back_to_generic_503(self) -> None:
         details = self._conclude_error_details(IncompleteReader())
 
-        self.assertEqual(details["kind"], "rest_http_error")
-        self.assertTrue(details["retryable"])
-        self.assertNotIn("stale_daemon", details)
+        self.assertEqual(details["kind"], "durable_admission_deferred")
+        self.assertTrue(details["operation_key"])
+        self.assertEqual(details["transport"]["kind"], "rest_http_error")
+        self.assertTrue(details["transport"]["retryable"])
+        self.assertNotIn("stale_daemon", details["transport"])
 
     def test_extreme_json_integer_falls_back_to_generic_503(self) -> None:
         body = (
@@ -120,16 +133,20 @@ class StaleDaemonErrorTests(unittest.TestCase):
         )
         details = self._conclude_error_details(io.BytesIO(body))
 
-        self.assertEqual(details["kind"], "rest_http_error")
-        self.assertTrue(details["retryable"])
-        self.assertNotIn("stale_daemon", details)
+        self.assertEqual(details["kind"], "durable_admission_deferred")
+        self.assertTrue(details["operation_key"])
+        self.assertEqual(details["transport"]["kind"], "rest_http_error")
+        self.assertTrue(details["transport"]["retryable"])
+        self.assertNotIn("stale_daemon", details["transport"])
 
     def test_oversized_error_body_falls_back_to_generic_503(self) -> None:
         details = self._conclude_error_details(io.BytesIO(b"x" * (64 * 1024 + 1)))
 
-        self.assertEqual(details["kind"], "rest_http_error")
-        self.assertTrue(details["retryable"])
-        self.assertNotIn("stale_daemon", details)
+        self.assertEqual(details["kind"], "durable_admission_deferred")
+        self.assertTrue(details["operation_key"])
+        self.assertEqual(details["transport"]["kind"], "rest_http_error")
+        self.assertTrue(details["transport"]["retryable"])
+        self.assertNotIn("stale_daemon", details["transport"])
 
 
 if __name__ == "__main__":

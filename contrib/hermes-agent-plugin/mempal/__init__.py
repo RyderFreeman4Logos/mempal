@@ -39,7 +39,6 @@ _WRITE_QUEUE_MAX = 1000
 _WRITE_DRAIN_TIMEOUT = 10.0
 _WRITE_RETRY_MAX = 3
 _WRITE_RETRY_DELAY = 2.0
-_HEALTH_CHECK_INTERVAL = 60.0
 _PINNED_FACTS_TTL = 300.0
 _DEFAULT_SAFE_MIN_IMPORTANCE = 3
 _DEFAULT_SAFE_CONTEXT_BUDGET_CHARS = 4000
@@ -391,11 +390,7 @@ class MempalMemoryProvider:
 
     def is_available(self) -> bool:
         cfg = _load_config(self._hermes_home)
-        if not cfg.get("base_url"):
-            return False
-        if time.monotonic() - self._last_health_at < _HEALTH_CHECK_INTERVAL:
-            return self._is_healthy
-        return True
+        return bool(cfg.get("base_url"))
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._configure_scope(session_id, kwargs, preserve_existing=False)
@@ -856,12 +851,21 @@ class MempalMemoryProvider:
                     transport_allowed=not self._is_breaker_open(),
                 )
                 if result.stored:
-                    self._record_success()
+                    try:
+                        self._record_success()
+                    except Exception:
+                        logger.warning("mempal conclude success bookkeeping failed")
                 else:
-                    self._record_failure()
+                    try:
+                        self._record_failure()
+                    except Exception:
+                        logger.warning("mempal conclude failure bookkeeping failed")
                     details = result.payload.get("error_details", {})
                     if details.get("kind") != "local_durable_admission_failed":
-                        self._wake_spool_worker()
+                        try:
+                            self._wake_spool_worker()
+                        except Exception:
+                            logger.warning("mempal conclude replay wake failed")
                 return json.dumps(result.payload)
             except Exception as exc:
                 self._record_failure()

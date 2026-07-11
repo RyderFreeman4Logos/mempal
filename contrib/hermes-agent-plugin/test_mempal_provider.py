@@ -898,11 +898,11 @@ class ReadinessActivationTests(unittest.TestCase):
         result = json.loads(provider.handle_tool_call("mempal_search", {"query": "test"}))
         self.assertIn("results", result)
 
-    def test_health_cache_prevents_probe(self) -> None:
+    def test_recent_unhealthy_transport_does_not_disable_local_durable_provider(self) -> None:
         provider = RecordingProvider()
         provider._is_healthy = False
         provider._last_health_at = time.monotonic()
-        self.assertFalse(provider.is_available())
+        self.assertTrue(provider.is_available())
 
 
 class ReadinessDurableMemoryTests(unittest.TestCase):
