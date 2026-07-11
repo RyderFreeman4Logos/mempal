@@ -188,20 +188,37 @@ async fn handle_hook_ipc_connection(
 
     let request_result = tokio::time::timeout(
         crate::hook_ipc::HOOK_IPC_READ_TIMEOUT,
-        crate::hook_ipc::read_enqueue_request(&mut stream),
+        crate::hook_ipc::read_request(&mut stream),
     )
     .await;
     let response = match request_result {
-        Ok(Ok(request)) => persist_hook_ipc_request(&store, &write_observer, request).await,
-        Ok(Err(error)) => crate::hook_ipc::HookIpcEnqueueResponse::Error {
-            message: format!("invalid hook IPC request: {error}"),
-        },
-        Err(_) => crate::hook_ipc::HookIpcEnqueueResponse::Error {
-            message: "invalid hook IPC request: timed out reading frame".to_string(),
-        },
+        Ok(Ok(crate::hook_ipc::HookIpcRequest::Enqueue(request))) => {
+            crate::hook_ipc::HookIpcResponse::Enqueue(
+                persist_hook_ipc_request(&store, &write_observer, request).await,
+            )
+        }
+        Ok(Ok(crate::hook_ipc::HookIpcRequest::Readiness(_))) => {
+            crate::hook_ipc::HookIpcResponse::Readiness(
+                crate::hook_ipc::HookIpcReadinessResponse::Ready {
+                    pid: std::process::id(),
+                    process_identity: crate::core::process_identity::current_process_identity()
+                        .to_string(),
+                },
+            )
+        }
+        Ok(Err(error)) => crate::hook_ipc::HookIpcResponse::Enqueue(
+            crate::hook_ipc::HookIpcEnqueueResponse::Error {
+                message: format!("invalid hook IPC request: {error}"),
+            },
+        ),
+        Err(_) => crate::hook_ipc::HookIpcResponse::Enqueue(
+            crate::hook_ipc::HookIpcEnqueueResponse::Error {
+                message: "invalid hook IPC request: timed out reading frame".to_string(),
+            },
+        ),
     };
 
-    if let Err(error) = crate::hook_ipc::write_enqueue_response(&mut stream, &response).await {
+    if let Err(error) = crate::hook_ipc::write_response(&mut stream, &response).await {
         if is_hook_ipc_peer_disconnect(&error) {
             tracing::debug!(?error, "hook IPC client disconnected before response");
         } else {

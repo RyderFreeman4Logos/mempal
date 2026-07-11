@@ -25,14 +25,11 @@
 //! which is precisely how an orphaned daemon's lock frees up for its successor.
 
 use std::env;
-use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(target_os = "linux")]
-use crate::db_path_identity::DbPathIdentity;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -42,7 +39,11 @@ pub const MEMPAL_RUNTIME_DIR_ENV: &str = "MEMPAL_RUNTIME_DIR";
 pub const DAEMON_LOCK_SUFFIX: &str = ".daemon.lock";
 pub const DAEMON_METADATA_SUFFIX: &str = ".daemon.json";
 const XDG_RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
-const MEMPAL_DB_PATH_ENV: &[u8] = b"MEMPAL_DB_PATH=";
+pub(crate) const MEMPAL_DB_PATH_ENV: &[u8] = b"MEMPAL_DB_PATH=";
+
+#[cfg(all(test, target_os = "linux"))]
+use crate::daemon_process::enumerate_daemon_pids_in_proc;
+pub use crate::daemon_process::{DaemonProcess, enumerate_daemon_pids, enumerate_daemon_processes};
 
 /// Sentinel error meaning a healthy daemon already holds the singleton lock.
 ///
@@ -502,106 +503,6 @@ fn global_flag_takes_value(arg: &str) -> bool {
     const CLI_GLOBAL_VALUE_FLAGS: &[&str] = &["--config", "--config-path"];
 
     !arg.contains('=') && CLI_GLOBAL_VALUE_FLAGS.contains(&arg)
-}
-
-/// Enumerate the PIDs of every live daemon process, excluding this process.
-///
-/// Linux: scans `/proc/<pid>/cmdline`, `/proc/<pid>/fd`, and
-/// `/proc/<pid>/environ`. Non-Linux: returns empty (the pidfile path still
-/// applies; robust sibling reaping is a Linux-only refinement).
-#[cfg(target_os = "linux")]
-pub fn enumerate_daemon_pids(binary_name: &str, db_path: &Path) -> Vec<i32> {
-    let self_pid = std::process::id() as i32;
-    enumerate_daemon_pids_in_proc(binary_name, db_path, Path::new("/proc"), self_pid)
-}
-
-#[cfg(target_os = "linux")]
-fn enumerate_daemon_pids_in_proc(
-    binary_name: &str,
-    db_path: &Path,
-    proc_root: &Path,
-    self_pid: i32,
-) -> Vec<i32> {
-    let mut pids = Vec::new();
-    let Some(db_identity) = DbPathIdentity::from_existing_db_path(db_path) else {
-        return pids;
-    };
-    let Ok(entries) = std::fs::read_dir(proc_root) else {
-        return pids;
-    };
-
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        let Ok(pid) = name.parse::<i32>() else {
-            continue; // skip non-numeric /proc entries
-        };
-        if pid == self_pid {
-            continue;
-        }
-        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
-            continue; // process exited or unreadable; skip
-        };
-        if raw.is_empty() {
-            continue; // kernel threads expose an empty cmdline
-        }
-        let argv = parse_proc_cmdline(&raw);
-        if is_daemon_argv(&argv, binary_name)
-            && process_matches_db_path(&entry.path(), &db_identity)
-        {
-            pids.push(pid);
-        }
-    }
-    pids.sort_unstable();
-    pids
-}
-
-#[cfg(target_os = "linux")]
-fn process_matches_db_path(proc_pid_dir: &Path, db_identity: &DbPathIdentity) -> bool {
-    process_has_db_fd(proc_pid_dir, db_identity)
-        || process_env_matches_db_path(proc_pid_dir, db_identity.db_path())
-}
-
-#[cfg(target_os = "linux")]
-fn process_has_db_fd(proc_pid_dir: &Path, db_identity: &DbPathIdentity) -> bool {
-    let Ok(entries) = std::fs::read_dir(proc_pid_dir.join("fd")) else {
-        return false;
-    };
-
-    entries.flatten().any(|entry| {
-        let Ok(target) = std::fs::read_link(entry.path()) else {
-            return false;
-        };
-        db_identity.matches_fd(&entry.path(), &target)
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn process_env_matches_db_path(proc_pid_dir: &Path, expected_db_path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-
-    let Ok(raw) = std::fs::read(proc_pid_dir.join("environ")) else {
-        return false;
-    };
-
-    raw.split(|byte| *byte == 0)
-        .filter_map(|part| part.strip_prefix(MEMPAL_DB_PATH_ENV))
-        .map(OsStr::from_bytes)
-        .any(|path| env_db_path_matches(path, expected_db_path))
-}
-
-#[cfg(target_os = "linux")]
-fn env_db_path_matches(path: &OsStr, expected_db_path: &Path) -> bool {
-    let path = Path::new(path);
-    path == expected_db_path
-        || std::fs::canonicalize(path).is_ok_and(|canonical| canonical == expected_db_path)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn enumerate_daemon_pids(_binary_name: &str, _db_path: &Path) -> Vec<i32> {
-    Vec::new()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1082,6 +983,11 @@ mod tests {
         let pid_dir = proc_root.join(pid.to_string());
         std::fs::create_dir_all(pid_dir.join("fd")).expect("pid fd dir");
         std::fs::write(pid_dir.join("cmdline"), cmdline).expect("cmdline");
+        std::fs::write(
+            pid_dir.join("stat"),
+            format!("{pid} (mempal) S{} {}", " 0".repeat(18), pid * 100),
+        )
+        .expect("stat");
 
         let mut environ = Vec::new();
         if let Some(path) = env_db_path {

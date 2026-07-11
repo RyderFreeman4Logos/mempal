@@ -182,6 +182,7 @@ Daemon low-memory mode:
 - `"remote"` forces daemon workers and daemon REST embedding to use the configured OpenAI-compatible/API endpoint and disables daemon fallback to local model2vec.
 - `"small_local"` forces the daemon to use `minishlab/potion-base-8M` instead of a larger explicitly configured in-process model; it requires installing with `--features model2vec`.
 - After changing backend/model/dimensions, run `mempal reindex`, then `mempal daemon restart`.
+- On Linux, after starting or restarting a service, use `mempal daemon wait --timeout-secs 10` before sending writes; it verifies the singleton, current executable, and write IPC transport.
 - `mempal daemon status` and `mempal doctor` report daemon RSS/PSS, whether the daemon executable is deleted/replaced, and whether the daemon embedder cache is loaded.
 
 ## Commands
