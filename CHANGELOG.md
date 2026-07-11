@@ -35,6 +35,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **Daemon/Hooks**: hook IPC queue admission now fails fast under SQLite write
+  contention so clients can use durable fallback within their deadline, daemon
+  claim polling backs off bounded SQLite lock streaks, and closed hook IPC
+  clients are treated as expected disconnects instead of WARN noise (#703).
 - **MCP/daemon writes**: detect a live daemon whose executable was deleted or
   replaced before write routing, and return redacted structured restart and
   retry-safety diagnostics through REST, MCP, and Hermes `mempal_conclude`
