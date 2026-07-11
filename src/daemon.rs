@@ -50,6 +50,10 @@ use crate::session_review::{
     split_session_metadata, validate_linked_drawer_ids,
 };
 
+#[path = "daemon/self_heal.rs"]
+mod self_heal;
+use self_heal::ClaimBackoffState;
+
 const SESSION_REVIEW_REJECTED_TOTAL_KEY: &str = "session_review.rejected.total";
 
 /// Budget given to LLM workers to finish in-flight tasks during graceful shutdown.
@@ -693,14 +697,19 @@ fn spawn_hook_worker(
 
 async fn run_hook_worker(state: HookWorkerState, claim_ttl_secs: i64, poll_interval: Duration) {
     let mut idle_count = 0_u32;
+    let mut claim_backoff = ClaimBackoffState::default();
     loop {
         if shutdown_requested() {
             break;
         }
 
-        match poll_claim_next(&state.store, &state.worker_id, claim_ttl_secs, |duration| {
-            Box::pin(wait_for_shutdown_or_sleep(duration))
-        })
+        match poll_claim_next(
+            &state.store,
+            &state.worker_id,
+            claim_ttl_secs,
+            &mut claim_backoff,
+            |duration| Box::pin(wait_for_shutdown_or_sleep(duration)),
+        )
         .await
         {
             ClaimPollResult::Claimed(message) => {
@@ -1143,8 +1152,17 @@ struct HookIpcServiceHandle {
 impl HookIpcServiceHandle {
     async fn shutdown(mut self) {
         if let Some(listener_task) = self.listener_task.take() {
-            listener_task.abort();
-            let _ = listener_task.await;
+            let mut listener_task = listener_task;
+            if tokio::time::timeout(
+                self_heal::HOOK_IPC_HANDLER_DRAIN_BUDGET + Duration::from_secs(1),
+                &mut listener_task,
+            )
+            .await
+            .is_err()
+            {
+                listener_task.abort();
+                let _ = listener_task.await;
+            }
         }
 
         self.socket_guard.take();
@@ -1169,98 +1187,16 @@ async fn spawn_hook_ipc_service(
 ) -> Result<HookIpcServiceHandle> {
     let (listener, socket_guard) = crate::hook_ipc::bind_listener(mempal_home)?;
     let socket_path = socket_guard.path().to_path_buf();
-    let listener_task = tokio::spawn(run_hook_ipc_listener(listener, store, write_observer));
+    let listener_task = tokio::spawn(self_heal::run_hook_ipc_listener(
+        listener,
+        store,
+        write_observer,
+    ));
     tracing::info!("daemon hook IPC listening on {}", socket_path.display());
     Ok(HookIpcServiceHandle {
         listener_task: Some(listener_task),
         socket_guard: Some(socket_guard),
     })
-}
-
-#[cfg(unix)]
-async fn run_hook_ipc_listener(
-    listener: tokio::net::UnixListener,
-    store: AsyncPendingMessageStore,
-    write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
-) {
-    loop {
-        if shutdown_requested() {
-            break;
-        }
-
-        tokio::select! {
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok((stream, _addr)) => {
-                        let store = store.clone();
-                        let write_observer = write_observer.clone();
-                        tokio::spawn(async move {
-                            handle_hook_ipc_connection(stream, store, write_observer).await;
-                        });
-                    }
-                    Err(error) => {
-                        tracing::warn!(?error, "hook IPC accept failed");
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                }
-            }
-            () = tokio::time::sleep(Duration::from_millis(200)) => {}
-        }
-    }
-}
-
-#[cfg(unix)]
-async fn handle_hook_ipc_connection(
-    mut stream: tokio::net::UnixStream,
-    store: AsyncPendingMessageStore,
-    write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
-) {
-    let request_result = tokio::time::timeout(
-        crate::hook_ipc::HOOK_IPC_READ_TIMEOUT,
-        crate::hook_ipc::read_enqueue_request(&mut stream),
-    )
-    .await;
-    let response = match request_result {
-        Ok(Ok(request)) => persist_hook_ipc_request(&store, &write_observer, request).await,
-        Ok(Err(error)) => crate::hook_ipc::HookIpcEnqueueResponse::Error {
-            message: format!("invalid hook IPC request: {error}"),
-        },
-        Err(_) => crate::hook_ipc::HookIpcEnqueueResponse::Error {
-            message: "invalid hook IPC request: timed out reading frame".to_string(),
-        },
-    };
-
-    if let Err(error) = crate::hook_ipc::write_enqueue_response(&mut stream, &response).await {
-        tracing::warn!(?error, "failed to write hook IPC response");
-    }
-}
-
-#[cfg(unix)]
-async fn persist_hook_ipc_request(
-    store: &AsyncPendingMessageStore,
-    write_observer: &crate::daemon_bootstrap::DaemonWriteObserver,
-    request: crate::hook_ipc::HookIpcEnqueueRequest,
-) -> crate::hook_ipc::HookIpcEnqueueResponse {
-    match store
-        .enqueue_idempotent_with_key(
-            request.kind.clone(),
-            request.payload.clone(),
-            request.idempotency_key.clone(),
-        )
-        .await
-    {
-        Ok(message_id) => {
-            tracing::debug!(message_id, kind = %request.kind, "persisted hook IPC capture");
-            write_observer.record_successful_write();
-            crate::hook_ipc::HookIpcEnqueueResponse::Accepted
-        }
-        Err(error) => {
-            let message = format!("failed to persist hook IPC capture: {error}");
-            write_observer.record_error(message.clone());
-            tracing::warn!(?error, kind = %request.kind, "failed to persist hook IPC capture");
-            crate::hook_ipc::HookIpcEnqueueResponse::Error { message }
-        }
-    }
 }
 
 trait ClaimNextSource {
@@ -1319,17 +1255,33 @@ async fn poll_claim_next<'a, S>(
     store: &impl ClaimNextSource,
     worker_id: &str,
     claim_ttl_secs: i64,
+    backoff: &mut ClaimBackoffState,
     sleep_on_error: S,
 ) -> ClaimPollResult
 where
     S: Fn(Duration) -> SleepFuture<'a>,
 {
     match store.claim_next(worker_id, claim_ttl_secs).await {
-        Ok(Some(message)) => ClaimPollResult::Claimed(message),
-        Ok(None) => ClaimPollResult::Idle,
+        Ok(Some(message)) => {
+            backoff.reset();
+            ClaimPollResult::Claimed(message)
+        }
+        Ok(None) => {
+            backoff.reset();
+            ClaimPollResult::Idle
+        }
         Err(error) => {
-            tracing::warn!(?error, "claim_next failed");
-            sleep_on_error(Duration::from_secs(1)).await;
+            let is_sqlite_lock = error.is_sqlite_lock();
+            let next_delay = backoff.delay_after_error(&error);
+            tracing::warn!(
+                ?error,
+                worker_id,
+                is_sqlite_lock,
+                retry_count = backoff.consecutive_sqlite_lock_errors,
+                next_delay_ms = next_delay.as_millis() as u64,
+                "claim_next failed"
+            );
+            sleep_on_error(next_delay).await;
             ClaimPollResult::RetryAfterError
         }
     }
@@ -3844,13 +3796,13 @@ mod tests {
     use crate::core::config::DaemonEmbedderMode;
 
     use super::{
-        AutomaticHookLlmGateTerminalFailure, ClaimNextSource, ClaimPollResult, DaemonEmbedder,
-        DaemonIngestContext, EndpointRecoveryConfigProvider, EndpointRecoveryRequeuePlan,
-        EndpointRecoveryRequeueState, HookPayloadBody, HookWorkerState,
-        automatic_hook_llm_gate_deadline, build_drawer_records, compile_classifier_from_embedder,
-        llm_worker_claim_enabled, poll_claim_next, process_claimed_message_with_embedder,
-        queue_failure_disposition, request_shutdown, reset_shutdown_request, run_hook_worker,
-        wait_for_hook_worker_or_tick, wing_from_cwd,
+        AutomaticHookLlmGateTerminalFailure, ClaimBackoffState, ClaimNextSource, ClaimPollResult,
+        DaemonEmbedder, DaemonIngestContext, EndpointRecoveryConfigProvider,
+        EndpointRecoveryRequeuePlan, EndpointRecoveryRequeueState, HookPayloadBody,
+        HookWorkerState, automatic_hook_llm_gate_deadline, build_drawer_records,
+        compile_classifier_from_embedder, llm_worker_claim_enabled, poll_claim_next,
+        process_claimed_message_with_embedder, queue_failure_disposition, request_shutdown,
+        reset_shutdown_request, run_hook_worker, wait_for_hook_worker_or_tick, wing_from_cwd,
     };
 
     #[test]
@@ -4547,27 +4499,129 @@ mod tests {
             .as_secs() as i64
     }
 
+    fn sqlite_busy_queue_error_for_test() -> QueueError {
+        QueueError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy,
+                extended_code: rusqlite::ffi::SQLITE_BUSY,
+            },
+            Some("database is locked".to_string()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_daemon_claim_sqlite_lock_backoff_sequence_is_bounded() {
+        let store = StubClaimSource::new(
+            (0..6)
+                .map(|_| Err(sqlite_busy_queue_error_for_test()))
+                .collect(),
+        );
+        let mut backoff = ClaimBackoffState::default();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+
+        for _ in 0..6 {
+            let observed = Arc::clone(&observed);
+            let result = poll_claim_next(&store, "worker-a", 60, &mut backoff, move |duration| {
+                observed.lock().expect("observed durations").push(duration);
+                Box::pin(std::future::ready(()))
+            })
+            .await;
+            assert!(matches!(result, ClaimPollResult::RetryAfterError));
+        }
+
+        assert_eq!(
+            *observed.lock().expect("observed durations"),
+            vec![
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_daemon_claim_sqlite_lock_backoff_resets_after_idle_and_claim() {
+        let store = StubClaimSource::new(vec![
+            Err(sqlite_busy_queue_error_for_test()),
+            Ok(None),
+            Err(sqlite_busy_queue_error_for_test()),
+            Ok(Some(claimed_message("msg-1"))),
+            Err(sqlite_busy_queue_error_for_test()),
+        ]);
+        let mut backoff = ClaimBackoffState::default();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+
+        for _ in 0..5 {
+            let observed = Arc::clone(&observed);
+            let _ = poll_claim_next(&store, "worker-a", 60, &mut backoff, move |duration| {
+                observed.lock().expect("observed durations").push(duration);
+                Box::pin(std::future::ready(()))
+            })
+            .await;
+        }
+
+        assert_eq!(
+            *observed.lock().expect("observed durations"),
+            vec![
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_daemon_claim_non_lock_errors_do_not_count_as_sqlite_contention() {
+        let store = StubClaimSource::new(vec![
+            Err(sqlite_busy_queue_error_for_test()),
+            Err(QueueError::MessageNotFound(
+                "missing-test-message".to_string(),
+            )),
+            Err(sqlite_busy_queue_error_for_test()),
+        ]);
+        let mut backoff = ClaimBackoffState::default();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+
+        for _ in 0..3 {
+            let observed = Arc::clone(&observed);
+            let _ = poll_claim_next(&store, "worker-a", 60, &mut backoff, move |duration| {
+                observed.lock().expect("observed durations").push(duration);
+                Box::pin(std::future::ready(()))
+            })
+            .await;
+        }
+
+        assert_eq!(
+            *observed.lock().expect("observed durations"),
+            vec![
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn test_daemon_survives_transient_claim_error() {
         let store = StubClaimSource::new(vec![
-            Err(QueueError::Sqlite(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ErrorCode::DatabaseBusy,
-                    extended_code: rusqlite::ffi::SQLITE_BUSY,
-                },
-                Some("database is locked".to_string()),
-            ))),
+            Err(sqlite_busy_queue_error_for_test()),
             Ok(Some(claimed_message("msg-1"))),
         ]);
         let slept = AtomicUsize::new(0);
+        let mut backoff = ClaimBackoffState::default();
 
-        let first = poll_claim_next(&store, "worker-a", 60, |_| {
+        let first = poll_claim_next(&store, "worker-a", 60, &mut backoff, |_| {
             slept.fetch_add(1, Ordering::SeqCst);
             Box::pin(std::future::ready(()))
         })
         .await;
-        let second =
-            poll_claim_next(&store, "worker-a", 60, |_| Box::pin(std::future::ready(()))).await;
+        let second = poll_claim_next(&store, "worker-a", 60, &mut backoff, |_| {
+            Box::pin(std::future::ready(()))
+        })
+        .await;
 
         assert!(matches!(first, ClaimPollResult::RetryAfterError));
         assert_eq!(slept.load(Ordering::SeqCst), 1);
@@ -4592,8 +4646,9 @@ mod tests {
             .enqueue("hook_user_prompt", r#"{"event":"UserPromptSubmit"}"#)
             .expect("enqueue hook");
         let async_store = AsyncPendingMessageStore::from_store(sync_store.clone());
+        let mut backoff = ClaimBackoffState::default();
 
-        let claimed = poll_claim_next(&async_store, "daemon-hook-worker", 60, |_| {
+        let claimed = poll_claim_next(&async_store, "daemon-hook-worker", 60, &mut backoff, |_| {
             Box::pin(std::future::ready(()))
         })
         .await;
@@ -4614,225 +4669,6 @@ mod tests {
             .expect("async ingest row remains pending for its dedicated worker");
         assert_eq!(ingest_status.op_state, "queued");
         assert!(ingest_status.claimed_at.is_none());
-    }
-
-    #[cfg(unix)]
-    async fn send_hook_ipc_request(
-        store: AsyncPendingMessageStore,
-        observer: crate::daemon_bootstrap::DaemonWriteObserver,
-        request: crate::hook_ipc::HookIpcEnqueueRequest,
-    ) -> crate::hook_ipc::HookIpcEnqueueResponse {
-        let (mut client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-        let handler = tokio::spawn(super::handle_hook_ipc_connection(server, store, observer));
-        let mut frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
-        frame.push(b'\n');
-        tokio::io::AsyncWriteExt::write_all(&mut client, &frame)
-            .await
-            .expect("write request");
-        tokio::io::AsyncWriteExt::flush(&mut client)
-            .await
-            .expect("flush request");
-
-        let mut reader = tokio::io::BufReader::new(client);
-        let mut line = String::new();
-        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
-            .await
-            .expect("read response");
-        handler.await.expect("handler task");
-        serde_json::from_str(line.trim()).expect("hook IPC response")
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_hook_ipc_ack_requires_sqlite_persistence() {
-        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = tmp.path().join("palace.db");
-        Database::open(&db_path).expect("open db");
-
-        let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
-        let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
-        let request = crate::hook_ipc::HookIpcEnqueueRequest::new(
-            HookEvent::UserPromptSubmit.queue_kind(),
-            r#"{"event":"UserPromptSubmit","payload":"durable before ack"}"#,
-        );
-
-        let response = send_hook_ipc_request(store, observer, request).await;
-        assert_eq!(response, crate::hook_ipc::HookIpcEnqueueResponse::Accepted);
-        let (kind, payload): (String, String) = rusqlite::Connection::open(&db_path)
-            .expect("open sqlite")
-            .query_row(
-                "SELECT kind, payload FROM pending_messages ORDER BY created_at DESC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("query persisted IPC message");
-        assert_eq!(kind, HookEvent::UserPromptSubmit.queue_kind());
-        assert!(payload.contains("durable before ack"), "{payload}");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_hook_ipc_waits_for_sqlite_persistence_after_client_timeout() {
-        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = tmp.path().join("palace.db");
-        Database::open(&db_path).expect("open db");
-        let lock_conn = rusqlite::Connection::open(&db_path).expect("open lock connection");
-        lock_conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .expect("hold SQLite write lock");
-
-        let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
-        let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
-        let request = crate::hook_ipc::HookIpcEnqueueRequest::new(
-            HookEvent::UserPromptSubmit.queue_kind(),
-            r#"{"event":"UserPromptSubmit","payload":"durable after lock"}"#,
-        );
-
-        let mut response_task =
-            tokio::spawn(async move { send_hook_ipc_request(store, observer, request).await });
-        assert!(
-            tokio::time::timeout(crate::hook_ipc::HOOK_IPC_TIMEOUT, &mut response_task)
-                .await
-                .is_err(),
-            "locked SQLite persistence must not ACK before durability"
-        );
-        let count_while_locked: i64 = rusqlite::Connection::open(&db_path)
-            .expect("open read connection")
-            .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
-                row.get(0)
-            })
-            .expect("count pending while locked");
-        assert_eq!(count_while_locked, 0);
-
-        lock_conn.execute_batch("ROLLBACK;").expect("release lock");
-        let response = response_task.await.expect("IPC response task");
-        assert_eq!(response, crate::hook_ipc::HookIpcEnqueueResponse::Accepted);
-        let (count_after_unlock, payload): (i64, String) = rusqlite::Connection::open(&db_path)
-            .expect("open read connection")
-            .query_row(
-                "SELECT COUNT(*), COALESCE(MAX(payload), '') FROM pending_messages",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("query pending after unlock");
-        assert_eq!(count_after_unlock, 1);
-        assert!(payload.contains("durable after lock"), "{payload}");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_hook_ipc_stalled_request_times_out_without_persisting() {
-        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = tmp.path().join("palace.db");
-        Database::open(&db_path).expect("open db");
-
-        let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
-        let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
-        let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-        let handler = tokio::spawn(super::handle_hook_ipc_connection(server, store, observer));
-
-        let mut reader = tokio::io::BufReader::new(client);
-        let mut line = String::new();
-        let bytes_read = tokio::time::timeout(
-            crate::hook_ipc::HOOK_IPC_READ_TIMEOUT + Duration::from_secs(1),
-            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line),
-        )
-        .await
-        .expect("stalled request must receive timeout response")
-        .expect("read response");
-        assert!(bytes_read > 0, "daemon should write an error response");
-
-        handler.await.expect("handler task");
-        match serde_json::from_str::<crate::hook_ipc::HookIpcEnqueueResponse>(line.trim())
-            .expect("hook IPC response")
-        {
-            crate::hook_ipc::HookIpcEnqueueResponse::Accepted => {
-                panic!("stalled IPC request must not be accepted")
-            }
-            crate::hook_ipc::HookIpcEnqueueResponse::Error { message } => {
-                assert!(message.contains("timed out reading frame"), "{message}");
-            }
-        }
-
-        let count: i64 = rusqlite::Connection::open(&db_path)
-            .expect("open sqlite")
-            .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
-                row.get(0)
-            })
-            .expect("count pending");
-        assert_eq!(count, 0);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_hook_ipc_timeout_fallback_is_idempotent_with_slow_daemon_persist() {
-        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = tmp.path().join("palace.db");
-        Database::open(&db_path).expect("open db");
-
-        let kind = HookEvent::UserPromptSubmit.queue_kind().to_string();
-        let payload =
-            r#"{"event":"UserPromptSubmit","payload":"timeout fallback same capture"}"#.to_string();
-        let request = crate::hook_ipc::HookIpcEnqueueRequest::new(&kind, &payload);
-        let idempotency_key = request.idempotency_key.clone();
-
-        let store = AsyncPendingMessageStore::new_without_reclaim(&db_path)
-            .with_blocking_delay(crate::hook_ipc::HOOK_IPC_TIMEOUT + Duration::from_millis(200));
-        let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
-        let (mut client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-        let handler = tokio::spawn(super::handle_hook_ipc_connection(server, store, observer));
-
-        let mut frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
-        frame.push(b'\n');
-        tokio::io::AsyncWriteExt::write_all(&mut client, &frame)
-            .await
-            .expect("write request");
-        tokio::io::AsyncWriteExt::flush(&mut client)
-            .await
-            .expect("flush request");
-
-        let timed_out = tokio::time::timeout(crate::hook_ipc::HOOK_IPC_TIMEOUT, async move {
-            let mut reader = tokio::io::BufReader::new(client);
-            let mut line = String::new();
-            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await
-        })
-        .await;
-        assert!(
-            timed_out.is_err(),
-            "client should time out before daemon persist"
-        );
-
-        let fallback_store = PendingMessageStore::new_without_reclaim(&db_path);
-        let fallback_id = fallback_store
-            .enqueue_idempotent_with_key(&kind, &payload, &idempotency_key)
-            .expect("fallback enqueue");
-
-        handler.await.expect("handler task");
-
-        let conn = rusqlite::Connection::open(&db_path).expect("open sqlite");
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
-                row.get(0)
-            })
-            .expect("count pending");
-        assert_eq!(
-            count, 1,
-            "daemon and fallback must collapse the same capture"
-        );
-        let (stored_id, stored_kind, stored_payload): (String, String, String) = conn
-            .query_row(
-                "SELECT id, kind, payload FROM pending_messages LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("read pending row");
-        assert_eq!(stored_id, fallback_id);
-        assert_eq!(stored_kind, kind);
-        assert_eq!(stored_payload, payload);
     }
 
     #[cfg(unix)]
