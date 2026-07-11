@@ -24,6 +24,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from ._backoff import SharedPluginBackoff
+from ._conclude import conclusion_request, submit_conclusion
 from ._rest_errors import rest_error_payload as _rest_error_payload
 from ._write_spool import SpoolOperation, WriteSpool, classify_write_error
 
@@ -95,15 +96,12 @@ SEARCH_SCHEMA = {
 
 CONCLUDE_SCHEMA = {
     "name": "mempal_conclude",
-    "description": (
-        "Store a durable fact about the user in mempal. "
-        "Stored verbatim via local BM25 + vector index. "
-        "Use for explicit preferences, corrections, or decisions."
-    ),
+    "description": "Store a durable fact verbatim in mempal for explicit preferences, corrections, or decisions.",
     "parameters": {
         "type": "object",
         "properties": {
             "conclusion": {"type": "string", "description": "The fact to store."},
+            "operation_key": {"type": "string", "description": "Stable retry key from a pending response."},
         },
         "required": ["conclusion"],
     },
@@ -380,6 +378,7 @@ class MempalMemoryProvider:
         self._write_worker: Optional[threading.Thread] = None
         self._write_stop = threading.Event()
         self._write_drain_timeout = _WRITE_DRAIN_TIMEOUT
+        self._conclude_wait_timeout = 5.0
         self._write_spool: Optional[WriteSpool] = None
         self._pinned_facts_cache: List[Dict[str, Any]] = []
         self._pinned_facts_fetched_at: float = 0.0
@@ -1049,25 +1048,26 @@ class MempalMemoryProvider:
             if not conclusion:
                 return json.dumps({"error": "Missing required parameter: conclusion"})
             try:
-                result = self._post("/api/ingest", self._with_project_id({
-                    "content": conclusion,
-                    "wing": self._wing,
-                    "room": self._facts_room,
-                    "memory_kind": "profile_fact",
-                    "importance": self._safe_min_importance,
-                    "source_type": "user_explicit",
-                }))
-                drawer_id = result.get("drawer_id", "") if isinstance(result, dict) else ""
-                self._record_success()
-                resp = {"result": "Fact stored."}
-                if drawer_id:
-                    resp["drawer_id"] = drawer_id
-                return json.dumps(resp)
+                result = submit_conclusion(
+                    self._post,
+                    self._get,
+                    conclusion_request(
+                        conclusion, self._wing, self._facts_room,
+                        self._safe_min_importance, self._project_id,
+                    ),
+                    operation_key=args.get("operation_key"),
+                    wait_timeout=self._conclude_wait_timeout,
+                )
+                if result.stored:
+                    self._record_success()
+                else:
+                    self._record_failure()
+                return json.dumps(result.payload)
             except Exception as exc:
                 self._record_failure()
                 return json.dumps(_rest_error_payload(
                     "Failed to store memory via mempal REST API.",
-                    "/api/ingest",
+                    "/api/ingest/durable",
                     exc,
                 ))
         return json.dumps({"error": f"Unknown tool: {tool_name}"})

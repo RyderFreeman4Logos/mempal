@@ -79,7 +79,12 @@ Replaces mem0 with a fully local BM25 + vector hybrid backend — no cloud API c
 |------|-------------|
 | `mempal_profile` | Recent memories via `/api/timeline` |
 | `mempal_search` | Hybrid BM25+vector search via `/api/search` |
-| `mempal_conclude` | Store a fact verbatim via `/api/ingest` |
+| `mempal_conclude` | Store a fact verbatim via a durable ingest receipt |
+
+`mempal_conclude` reports success only after the receipt reaches `completed`
+with a non-empty `drawer_id`. A pending response includes `operation_id` and
+`operation_key`; retry with that same `operation_key` to query or resume the
+same durable operation without creating a second drawer.
 
 ### Memory routing
 

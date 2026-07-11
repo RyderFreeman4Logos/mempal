@@ -170,8 +170,8 @@ class MempalProviderScopeTests(unittest.TestCase):
         work.handle_tool_call("mempal_conclude", {"conclusion": "likes vim"})
         personal.handle_tool_call("mempal_conclude", {"conclusion": "likes emacs"})
 
-        self.assertEqual(work.posts[-1][1]["wing"], "hermes-user/alice/work")
-        self.assertEqual(personal.posts[-1][1]["wing"], "hermes-user/alice/personal")
+        self.assertEqual(work.posts[-1][1]["request"]["wing"], "hermes-user/alice/work")
+        self.assertEqual(personal.posts[-1][1]["request"]["wing"], "hermes-user/alice/personal")
 
     def test_same_profile_facts_are_shared_across_chats(self) -> None:
         chat_a = RecordingProvider()
@@ -182,9 +182,12 @@ class MempalProviderScopeTests(unittest.TestCase):
         chat_a.handle_tool_call("mempal_conclude", {"conclusion": "prefers concise answers"})
         chat_b.handle_tool_call("mempal_conclude", {"conclusion": "prefers citations"})
 
-        self.assertEqual(chat_a.posts[-1][1]["wing"], chat_b.posts[-1][1]["wing"])
-        self.assertEqual(chat_a.posts[-1][1]["room"], "facts")
-        self.assertEqual(chat_b.posts[-1][1]["room"], "facts")
+        self.assertEqual(
+            chat_a.posts[-1][1]["request"]["wing"],
+            chat_b.posts[-1][1]["request"]["wing"],
+        )
+        self.assertEqual(chat_a.posts[-1][1]["request"]["room"], "facts")
+        self.assertEqual(chat_b.posts[-1][1]["request"]["room"], "facts")
 
     def test_chat_and_thread_ids_scope_turn_rooms(self) -> None:
         chat_only = RecordingProvider()
@@ -231,7 +234,11 @@ class MempalProviderScopeTests(unittest.TestCase):
 
         timeline_params = provider.gets[0][1]
         search_params = provider.gets[1][1]
-        ingest_bodies = [body for path, body in provider.posts if path == "/api/ingest"]
+        ingest_bodies = [
+            body["request"]
+            for path, body in provider.posts
+            if path == "/api/ingest/durable"
+        ]
 
         self.assertEqual(timeline_params["project_id"], "project-alpha")
         self.assertEqual(search_params["project_id"], "project-alpha")
@@ -255,7 +262,11 @@ class MempalProviderScopeTests(unittest.TestCase):
 
         timeline_params = provider.gets[0][1]
         search_params = provider.gets[1][1]
-        ingest_bodies = [body for path, body in provider.posts if path == "/api/ingest"]
+        ingest_bodies = [
+            body["request"]
+            for path, body in provider.posts
+            if path == "/api/ingest/durable"
+        ]
 
         self.assertEqual(timeline_params["project_id"], "my-project")
         self.assertEqual(search_params["project_id"], "my-project")
@@ -354,7 +365,7 @@ class SearchResultTests(unittest.TestCase):
         details = result["error_details"]
         self.assertEqual(details["kind"], "rest_http_error")
         self.assertEqual(details["http_status"], 500)
-        self.assertEqual(details["route"], "/api/ingest")
+        self.assertEqual(details["route"], "/api/ingest/durable")
         self.assertEqual(details["route_class"], "write")
         self.assertTrue(details["retryable"])
         self.assertIn("recovery_hint", details)
@@ -941,7 +952,7 @@ class ReadinessDurableMemoryTests(unittest.TestCase):
         provider = RecordingProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
         result = json.loads(provider.handle_tool_call("mempal_conclude", {"conclusion": "exact text"}))
-        self.assertEqual(provider.posts[-1][1]["content"], "exact text")
+        self.assertEqual(provider.posts[-1][1]["request"]["content"], "exact text")
         self.assertIn("drawer_id", result)
 
 
