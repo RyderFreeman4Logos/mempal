@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from ._backoff import SharedPluginBackoff
 from ._rest_errors import rest_error_payload as _rest_error_payload
+from ._write_spool import SpoolOperation, WriteSpool
 
 logger = logging.getLogger(__name__)
 
@@ -378,6 +379,7 @@ class MempalMemoryProvider:
         self._write_queue: queue.Queue = queue.Queue(maxsize=_WRITE_QUEUE_MAX)
         self._write_worker: Optional[threading.Thread] = None
         self._write_stop = threading.Event()
+        self._write_spool: Optional[WriteSpool] = None
         self._drawer_map: Dict[str, str] = {}
         self._drawer_map_lock = threading.Lock()
         self._pinned_facts_cache: List[Dict[str, Any]] = []
@@ -470,9 +472,14 @@ class MempalMemoryProvider:
             try:
                 item = self._write_queue.get(timeout=1.0)
             except queue.Empty:
+                self._replay_spooled_write()
                 continue
-            self._process_write(item)
+            if item.get("op") == "spool_wake":
+                self._replay_spooled_write()
+            else:
+                self._process_write(item)
             self._write_queue.task_done()
+            self._replay_spooled_write()
         while True:
             try:
                 item = self._write_queue.get_nowait()
@@ -480,6 +487,43 @@ class MempalMemoryProvider:
                 break
             self._process_write(item)
             self._write_queue.task_done()
+
+    def _spool_ingest(self, body: Dict[str, Any], *, action: str) -> SpoolOperation:
+        if self._write_spool is None:
+            raise RuntimeError("mempal durable write spool is not initialized")
+        operation = self._write_spool.admit("ingest", body, action=action)
+        self._start_write_worker()
+        try:
+            self._write_queue.put_nowait({"op": "spool_wake"})
+        except queue.Full:
+            pass
+        return operation
+
+    def _replay_spooled_write(self) -> None:
+        spool = self._write_spool
+        if spool is None or self._is_breaker_open():
+            return
+        try:
+            outcome = spool.replay_one(self._post, self._get)
+        except Exception:
+            logger.error("mempal durable spool metadata update failed")
+            self._record_failure()
+            self._update_health(False)
+            return
+        if outcome is None:
+            return
+        if outcome.completed:
+            self._record_success()
+            self._update_health(True)
+        elif outcome.error_class:
+            self._record_failure()
+            self._update_health(False)
+            logger.warning(
+                "mempal durable replay deferred operation=%s kind=%s error_class=%s",
+                outcome.operation.operation_key,
+                outcome.operation.kind,
+                outcome.error_class,
+            )
 
     def _process_write(self, item: Dict[str, Any]) -> None:
         op = item.get("op")
@@ -550,6 +594,7 @@ class MempalMemoryProvider:
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._configure_scope(session_id, kwargs, preserve_existing=False)
+        self._write_spool = WriteSpool(self._hermes_home)
         self._start_write_worker()
 
     def _configure_scope(self, session_id, context, *, preserve_existing):
@@ -914,13 +959,11 @@ class MempalMemoryProvider:
         self._prefetch_thread.start()
 
     def sync_turn(self, user_content, assistant_content, *, session_id=""):
-        if self._is_breaker_open():
-            return
         if self._turn_storage_mode() != "raw_evidence":
             return
         content = f"User: {user_content}\nAssistant: {assistant_content}"
         body = self._with_project_id({"content": content, "wing": self._wing, "room": self._turns_room})
-        self._enqueue_write({"op": "ingest", "body": body, "skip_enhance": True})
+        self._spool_ingest(body, action="raw_turn")
         if self._should_enhance() and self._enhancer:
             facts = self._enhancer.extract_facts(content)
             if facts:

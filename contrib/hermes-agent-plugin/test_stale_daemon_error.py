@@ -26,6 +26,10 @@ class FailingPostProvider(MempalMemoryProvider):
         self.exc = exc
         self.posts: List[Tuple[str, Dict[str, Any]]] = []
 
+    def initialize(self, session_id: str, **kwargs) -> None:
+        kwargs.setdefault("hermes_home", self._backoff_dir.name)
+        super().initialize(session_id, **kwargs)
+
     def _post(self, path: str, body: Dict[str, Any]) -> Any:
         self.posts.append((path, dict(body)))
         raise self.exc

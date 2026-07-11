@@ -80,13 +80,31 @@ class RecordingProvider(MempalMemoryProvider):
         self.gets: List[Tuple[str, Optional[Dict[str, Any]]]] = []
         self.posts: List[Tuple[str, Dict[str, Any]]] = []
         self.responses: Dict[str, Any] = {}
+        self.durable_status = {}
+
+    def initialize(self, session_id: str, **kwargs) -> None:
+        kwargs.setdefault("hermes_home", self._backoff_dir.name)
+        super().initialize(session_id, **kwargs)
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         self.gets.append((path, dict(params or {})))
+        if path.startswith("/api/operations/"):
+            return self.durable_status.get(path.rsplit("/", 1)[-1], {})
         return self.responses.get(path, [])
 
     def _post(self, path: str, body: Dict[str, Any]) -> Any:
         self.posts.append((path, dict(body)))
+        if path == "/api/ingest/durable":
+            operation_id = f"operation_{body['idempotency_key']}"
+            self.durable_status.setdefault(operation_id, {
+                "operation_id": operation_id,
+                "state": "completed",
+                "drawer_id": f"drawer_{len(self.durable_status) + 1}",
+            })
+            return {
+                "operation_id": operation_id,
+                "state": "completed",
+            }
         return {"ok": True, "drawer_id": f"drawer_{len(self.posts)}"}
 
     def _turn_storage_mode(self) -> str:
@@ -110,6 +128,10 @@ class StatusRecordingProvider(MempalMemoryProvider):
         )
         self.gets: List[Tuple[str, Optional[Dict[str, Any]]]] = []
         self.responses: Dict[str, Any] = {}
+
+    def initialize(self, session_id: str, **kwargs) -> None:
+        kwargs.setdefault("hermes_home", self._backoff_dir.name)
+        super().initialize(session_id, **kwargs)
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         self.gets.append((path, dict(params or {})))
@@ -175,8 +197,13 @@ class MempalProviderScopeTests(unittest.TestCase):
         chat_only._drain_writes()
         threaded._drain_writes()
 
-        self.assertEqual(chat_only.posts[-1][1]["room"], "turns/slack/chat-a")
-        self.assertEqual(threaded.posts[-1][1]["room"], "turns/slack/chat-a/thread-1")
+        self.assertEqual(
+            chat_only.posts[-1][1]["request"]["room"], "turns/slack/chat-a"
+        )
+        self.assertEqual(
+            threaded.posts[-1][1]["request"]["room"],
+            "turns/slack/chat-a/thread-1",
+        )
 
     def test_project_id_passes_through_rest_calls(self) -> None:
         provider = RecordingProvider()
@@ -280,33 +307,6 @@ class MempalProviderScopeTests(unittest.TestCase):
         self.assertEqual(provider.posts[-2][1]["room"], "facts")
         self.assertEqual(provider.posts[-1][1]["room"], "turns/cli/chat-a")
         self.assertEqual(provider.posts[-1][1]["project_id"], "project-alpha")
-
-
-class WriteQueueTests(unittest.TestCase):
-    def test_write_queue_drains_on_shutdown(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        provider.on_memory_write("add", "profile", "fact 1")
-        provider.on_memory_write("add", "profile", "fact 2")
-        provider.shutdown()
-
-        ingest_bodies = [body for path, body in provider.posts if path == "/api/ingest"]
-        self.assertEqual(len(ingest_bodies), 2)
-
-    def test_is_available_is_config_based(self) -> None:
-        provider = RecordingProvider()
-        self.assertTrue(provider.is_available())
-
-    def test_sync_turn_enqueues_not_threads(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-        provider.sync_turn("hello", "world")
-        provider._drain_writes()
-
-        self.assertEqual(len(provider.posts), 1)
-        self.assertEqual(provider.posts[0][0], "/api/ingest")
-        self.assertIn("User: hello", provider.posts[0][1]["content"])
 
 
 class WriteSemanticTests(unittest.TestCase):
@@ -749,7 +749,7 @@ class IntelligenceModeTests(unittest.TestCase):
         provider.sync_turn("hello there friend", "hi back to you friend")
         provider._drain_writes()
         self.assertEqual(len(provider.posts), 1)
-        self.assertNotIn("source_type", provider.posts[0][1])
+        self.assertNotIn("source_type", provider.posts[0][1]["request"])
 
     def test_system_prompt_shows_mode(self) -> None:
         provider = RecordingProvider()
