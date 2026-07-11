@@ -19,6 +19,7 @@ pub mod daemon_status;
 #[cfg(target_os = "linux")]
 pub(crate) mod db_path_identity;
 pub mod doctor;
+pub mod durable_ingest;
 pub mod embed;
 pub mod endpoint_health;
 pub(crate) mod endpoint_pool;

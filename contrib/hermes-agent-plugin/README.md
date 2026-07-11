@@ -36,11 +36,19 @@ Replaces mem0 with a fully local BM25 + vector hybrid backend — no cloud API c
 
 ### Setup
 
-1. Copy or symlink into hermes-agent's user plugin search path:
+1. Check or explicitly refresh hermes-agent's user plugin copies:
    ```bash
-   mkdir -p "$HERMES_HOME/plugins"
-   cp -r contrib/hermes-agent-plugin/mempal "$HERMES_HOME/plugins/mempal"
+   python3 contrib/hermes-agent-plugin/install_plugins.py \
+     --check --hermes-home "$HERMES_HOME"
+   python3 contrib/hermes-agent-plugin/install_plugins.py \
+     --refresh --hermes-home "$HERMES_HOME"
    ```
+   `--check` is read-only and returns non-zero for missing, changed, or extra
+   plugin files. `--refresh` is an explicit opt-in: it stages and verifies both
+   `mempal` and `mempal-hooks`, then replaces them with rollback protection.
+   Tests must pass a temporary `--hermes-home`; neither command silently uses
+   an alternate path after a filesystem error.
+
    The provider keeps Hermes' `MemoryProvider` / `register_memory_provider`
    discovery markers in the first 8192 bytes of `__init__.py`, so user plugin
    discovery works without copying into Hermes' bundled provider directory.
@@ -79,7 +87,12 @@ Replaces mem0 with a fully local BM25 + vector hybrid backend — no cloud API c
 |------|-------------|
 | `mempal_profile` | Recent memories via `/api/timeline` |
 | `mempal_search` | Hybrid BM25+vector search via `/api/search` |
-| `mempal_conclude` | Store a fact verbatim via `/api/ingest` |
+| `mempal_conclude` | Store a fact verbatim via a durable ingest receipt |
+
+`mempal_conclude` reports success only after the receipt reaches `completed`
+with a non-empty `drawer_id`. A pending response includes `operation_id` and
+`operation_key`; retry with that same `operation_key` to query or resume the
+same durable operation without creating a second drawer.
 
 ### Memory routing
 
@@ -160,10 +173,9 @@ alongside the MemoryProvider — they complement each other:
 
 ### Setup
 
-1. Copy or symlink into hermes-agent's general plugin search path:
-   ```bash
-   cp -r contrib/hermes-agent-plugin/mempal-hooks  /path/to/hermes-agent/plugins/mempal-hooks
-   ```
+1. Use Path 1's `install_plugins.py --check` or explicit `--refresh` command.
+   The verified transaction installs both `mempal` and `mempal-hooks`; do not
+   overlay a stale target with `cp -r`.
 
 2. No extra config needed — shares `$HERMES_HOME/mempal.json` and env vars with the MemoryProvider.
 

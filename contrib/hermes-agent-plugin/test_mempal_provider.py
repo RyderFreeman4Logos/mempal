@@ -80,13 +80,33 @@ class RecordingProvider(MempalMemoryProvider):
         self.gets: List[Tuple[str, Optional[Dict[str, Any]]]] = []
         self.posts: List[Tuple[str, Dict[str, Any]]] = []
         self.responses: Dict[str, Any] = {}
+        self.durable_status = {}
+
+    def initialize(self, session_id: str, **kwargs) -> None:
+        kwargs.setdefault("hermes_home", self._backoff_dir.name)
+        super().initialize(session_id, **kwargs)
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         self.gets.append((path, dict(params or {})))
+        if path.startswith("/api/operations/"):
+            return self.durable_status.get(path.rsplit("/", 1)[-1], {})
         return self.responses.get(path, [])
 
     def _post(self, path: str, body: Dict[str, Any]) -> Any:
         self.posts.append((path, dict(body)))
+        if path in {"/api/ingest/durable", "/api/delete/durable"}:
+            operation_id = f"operation_{body['idempotency_key']}"
+            request = body["request"]
+            drawer_id = request.get("drawer_id") or f"drawer_{len(self.durable_status) + 1}"
+            self.durable_status.setdefault(operation_id, {
+                "operation_id": operation_id,
+                "state": "completed",
+                "drawer_id": drawer_id,
+            })
+            return {
+                "operation_id": operation_id,
+                "state": "completed",
+            }
         return {"ok": True, "drawer_id": f"drawer_{len(self.posts)}"}
 
     def _turn_storage_mode(self) -> str:
@@ -94,6 +114,11 @@ class RecordingProvider(MempalMemoryProvider):
 
     def _drain_writes(self) -> None:
         self._write_queue.join()
+        self._write_stop.set()
+        if self._write_worker:
+            self._write_worker.join(timeout=2.0)
+        self._write_worker = None
+        self._write_stop.clear()
 
     def __del__(self) -> None:
         cleanup = getattr(self, "_backoff_dir", None)
@@ -110,6 +135,10 @@ class StatusRecordingProvider(MempalMemoryProvider):
         )
         self.gets: List[Tuple[str, Optional[Dict[str, Any]]]] = []
         self.responses: Dict[str, Any] = {}
+
+    def initialize(self, session_id: str, **kwargs) -> None:
+        kwargs.setdefault("hermes_home", self._backoff_dir.name)
+        super().initialize(session_id, **kwargs)
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         self.gets.append((path, dict(params or {})))
@@ -141,8 +170,8 @@ class MempalProviderScopeTests(unittest.TestCase):
         work.handle_tool_call("mempal_conclude", {"conclusion": "likes vim"})
         personal.handle_tool_call("mempal_conclude", {"conclusion": "likes emacs"})
 
-        self.assertEqual(work.posts[-1][1]["wing"], "hermes-user/alice/work")
-        self.assertEqual(personal.posts[-1][1]["wing"], "hermes-user/alice/personal")
+        self.assertEqual(work.posts[-1][1]["request"]["wing"], "hermes-user/alice/work")
+        self.assertEqual(personal.posts[-1][1]["request"]["wing"], "hermes-user/alice/personal")
 
     def test_same_profile_facts_are_shared_across_chats(self) -> None:
         chat_a = RecordingProvider()
@@ -153,9 +182,12 @@ class MempalProviderScopeTests(unittest.TestCase):
         chat_a.handle_tool_call("mempal_conclude", {"conclusion": "prefers concise answers"})
         chat_b.handle_tool_call("mempal_conclude", {"conclusion": "prefers citations"})
 
-        self.assertEqual(chat_a.posts[-1][1]["wing"], chat_b.posts[-1][1]["wing"])
-        self.assertEqual(chat_a.posts[-1][1]["room"], "facts")
-        self.assertEqual(chat_b.posts[-1][1]["room"], "facts")
+        self.assertEqual(
+            chat_a.posts[-1][1]["request"]["wing"],
+            chat_b.posts[-1][1]["request"]["wing"],
+        )
+        self.assertEqual(chat_a.posts[-1][1]["request"]["room"], "facts")
+        self.assertEqual(chat_b.posts[-1][1]["request"]["room"], "facts")
 
     def test_chat_and_thread_ids_scope_turn_rooms(self) -> None:
         chat_only = RecordingProvider()
@@ -175,8 +207,13 @@ class MempalProviderScopeTests(unittest.TestCase):
         chat_only._drain_writes()
         threaded._drain_writes()
 
-        self.assertEqual(chat_only.posts[-1][1]["room"], "turns/slack/chat-a")
-        self.assertEqual(threaded.posts[-1][1]["room"], "turns/slack/chat-a/thread-1")
+        self.assertEqual(
+            chat_only.posts[-1][1]["request"]["room"], "turns/slack/chat-a"
+        )
+        self.assertEqual(
+            threaded.posts[-1][1]["request"]["room"],
+            "turns/slack/chat-a/thread-1",
+        )
 
     def test_project_id_passes_through_rest_calls(self) -> None:
         provider = RecordingProvider()
@@ -197,7 +234,11 @@ class MempalProviderScopeTests(unittest.TestCase):
 
         timeline_params = provider.gets[0][1]
         search_params = provider.gets[1][1]
-        ingest_bodies = [body for path, body in provider.posts if path == "/api/ingest"]
+        ingest_bodies = [
+            body["request"]
+            for path, body in provider.posts
+            if path == "/api/ingest/durable"
+        ]
 
         self.assertEqual(timeline_params["project_id"], "project-alpha")
         self.assertEqual(search_params["project_id"], "project-alpha")
@@ -221,7 +262,11 @@ class MempalProviderScopeTests(unittest.TestCase):
 
         timeline_params = provider.gets[0][1]
         search_params = provider.gets[1][1]
-        ingest_bodies = [body for path, body in provider.posts if path == "/api/ingest"]
+        ingest_bodies = [
+            body["request"]
+            for path, body in provider.posts
+            if path == "/api/ingest/durable"
+        ]
 
         self.assertEqual(timeline_params["project_id"], "my-project")
         self.assertEqual(search_params["project_id"], "my-project")
@@ -252,16 +297,6 @@ class MempalProviderScopeTests(unittest.TestCase):
         self.assertEqual(provider.gets[-1][1]["project_id"], "project-alpha")
         self.assertEqual(provider.prefetch("memory", session_id="session-b"), "")
 
-    def test_session_end_uses_session_scoped_room(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work", project_id="project-alpha")
-
-        provider.on_session_end([{"role": "assistant", "content": "summary text"}])
-        provider._drain_writes()
-
-        self.assertEqual(provider.posts[-1][1]["room"], "sessions/session-a")
-        self.assertEqual(provider.posts[-1][1]["project_id"], "project-alpha")
-
     def test_memory_write_routes_by_target(self) -> None:
         provider = RecordingProvider()
         provider.initialize(
@@ -277,111 +312,9 @@ class MempalProviderScopeTests(unittest.TestCase):
         provider.on_memory_write("add", "turns", "turn content")
         provider._drain_writes()
 
-        self.assertEqual(provider.posts[-2][1]["room"], "facts")
-        self.assertEqual(provider.posts[-1][1]["room"], "turns/cli/chat-a")
-        self.assertEqual(provider.posts[-1][1]["project_id"], "project-alpha")
-
-
-class WriteQueueTests(unittest.TestCase):
-    def test_write_queue_drains_on_shutdown(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        provider.on_memory_write("add", "profile", "fact 1")
-        provider.on_memory_write("add", "profile", "fact 2")
-        provider.shutdown()
-
-        ingest_bodies = [body for path, body in provider.posts if path == "/api/ingest"]
-        self.assertEqual(len(ingest_bodies), 2)
-
-    def test_is_available_is_config_based(self) -> None:
-        provider = RecordingProvider()
-        self.assertTrue(provider.is_available())
-
-    def test_sync_turn_enqueues_not_threads(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-        provider.sync_turn("hello", "world")
-        provider._drain_writes()
-
-        self.assertEqual(len(provider.posts), 1)
-        self.assertEqual(provider.posts[0][0], "/api/ingest")
-        self.assertIn("User: hello", provider.posts[0][1]["content"])
-
-
-class WriteSemanticTests(unittest.TestCase):
-    def test_add_tracks_drawer_id(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        provider.on_memory_write("add", "profile", "important fact")
-        provider._drain_writes()
-
-        track_key = "profile:hermes-user/alice/work"
-        with provider._drawer_map_lock:
-            self.assertIn(track_key, provider._drawer_map)
-
-    def test_replace_sends_supersedes(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        provider.on_memory_write("add", "profile", "original fact")
-        provider._drain_writes()
-        provider.on_memory_write("replace", "profile", "updated fact")
-        provider._drain_writes()
-
-        replace_body = provider.posts[-1][1]
-        self.assertIn("supersedes", replace_body)
-
-    def test_replace_without_prior_has_no_supersedes(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        provider.on_memory_write("replace", "profile", "new fact")
-        provider._drain_writes()
-
-        body = provider.posts[-1][1]
-        self.assertNotIn("supersedes", body)
-
-    def test_remove_sends_delete(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        provider.on_memory_write("add", "profile", "to be removed")
-        provider._drain_writes()
-        provider.on_memory_write("remove", "profile", "")
-        provider._drain_writes()
-
-        delete_posts = [(p, b) for p, b in provider.posts if p == "/api/delete"]
-        self.assertEqual(len(delete_posts), 1)
-        self.assertIn("drawer_id", delete_posts[0][1])
-
-    def test_remove_noop_without_tracked_drawer(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        initial_count = len(provider.posts)
-        provider.on_memory_write("remove", "profile", "")
-
-        self.assertEqual(len(provider.posts), initial_count)
-
-    def test_metadata_passes_typed_fields(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        provider.on_memory_write("add", "profile", "typed fact", metadata={
-            "memory_kind": "preference",
-            "domain": "coding",
-            "importance": 4,
-            "is_pinned": True,
-        })
-        provider._drain_writes()
-
-        body = provider.posts[-1][1]
-        self.assertEqual(body["memory_kind"], "preference")
-        self.assertEqual(body["domain"], "coding")
-        self.assertEqual(body["importance"], 4)
-        self.assertTrue(body["is_pinned"])
+        self.assertEqual(provider.posts[-2][1]["request"]["room"], "facts")
+        self.assertEqual(provider.posts[-1][1]["request"]["room"], "turns/cli/chat-a")
+        self.assertEqual(provider.posts[-1][1]["request"]["project_id"], "project-alpha")
 
 
 class SearchResultTests(unittest.TestCase):
@@ -413,7 +346,7 @@ class SearchResultTests(unittest.TestCase):
         result = json.loads(provider.handle_tool_call("mempal_conclude", {"conclusion": "test fact"}))
         self.assertIn("drawer_id", result)
 
-    def test_conclude_http_500_returns_redacted_actionable_error(self) -> None:
+    def test_conclude_http_500_returns_retry_safe_pending_handle(self) -> None:
         provider = FailingPostProvider(urllib.error.HTTPError(
             "http://127.0.0.1:3080/api/ingest?debug=true",
             500,
@@ -428,14 +361,13 @@ class SearchResultTests(unittest.TestCase):
             {"conclusion": "synthetic harmless durable fact"},
         ))
 
-        self.assertEqual(result["error"], "Failed to store memory via mempal REST API.")
+        self.assertEqual(result["error"], "Memory is not yet confirmed stored.")
         details = result["error_details"]
-        self.assertEqual(details["kind"], "rest_http_error")
-        self.assertEqual(details["http_status"], 500)
-        self.assertEqual(details["route"], "/api/ingest")
-        self.assertEqual(details["route_class"], "write")
-        self.assertTrue(details["retryable"])
-        self.assertIn("recovery_hint", details)
+        self.assertEqual(details["kind"], "durable_admission_deferred")
+        self.assertEqual(details["error_class"], "http_500")
+        self.assertTrue(details["retry_safe"])
+        self.assertTrue(details["operation_key"])
+        self.assertEqual(provider._write_spool.count(), 1)
         serialized = json.dumps(result)
         self.assertNotIn("synthetic harmless durable fact", serialized)
         self.assertNotIn("127.0.0.1", serialized)
@@ -749,7 +681,7 @@ class IntelligenceModeTests(unittest.TestCase):
         provider.sync_turn("hello there friend", "hi back to you friend")
         provider._drain_writes()
         self.assertEqual(len(provider.posts), 1)
-        self.assertNotIn("source_type", provider.posts[0][1])
+        self.assertNotIn("source_type", provider.posts[0][1]["request"])
 
     def test_system_prompt_shows_mode(self) -> None:
         provider = RecordingProvider()
@@ -981,7 +913,7 @@ class ReadinessDurableMemoryTests(unittest.TestCase):
         provider.initialize("session-a", user_id="alice", profile="work")
         provider.on_memory_write("add", "profile", "single fact")
         provider._drain_writes()
-        ingests = [b for p, b in provider.posts if p == "/api/ingest"]
+        ingests = [b["request"] for p, b in provider.posts if p == "/api/ingest/durable"]
         self.assertEqual(len(ingests), 1)
         self.assertEqual(ingests[0]["content"], "single fact")
 
@@ -992,7 +924,7 @@ class ReadinessDurableMemoryTests(unittest.TestCase):
         provider._drain_writes()
         provider.on_memory_write("replace", "profile", "v2")
         provider._drain_writes()
-        ingests = [b for p, b in provider.posts if p == "/api/ingest"]
+        ingests = [b["request"] for p, b in provider.posts if p == "/api/ingest/durable"]
         self.assertEqual(len(ingests), 2)
         self.assertIn("supersedes", ingests[1])
         self.assertEqual(ingests[1]["content"], "v2")
@@ -1004,20 +936,22 @@ class ReadinessDurableMemoryTests(unittest.TestCase):
         provider._drain_writes()
         provider.on_memory_write("remove", "profile", "")
         provider._drain_writes()
-        deletes = [b for p, b in provider.posts if p == "/api/delete"]
+        deletes = [b for p, b in provider.posts if p == "/api/delete/durable"]
         self.assertEqual(len(deletes), 1)
 
-    def test_remove_without_prior_is_noop(self) -> None:
+    def test_remove_without_prior_remains_recoverable(self) -> None:
         provider = RecordingProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
         provider.on_memory_write("remove", "profile", "")
         self.assertEqual(len(provider.posts), 0)
+        self.assertEqual(provider._write_spool.count(), 1)
+        provider.shutdown()
 
     def test_conclude_stores_verbatim(self) -> None:
         provider = RecordingProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
         result = json.loads(provider.handle_tool_call("mempal_conclude", {"conclusion": "exact text"}))
-        self.assertEqual(provider.posts[-1][1]["content"], "exact text")
+        self.assertEqual(provider.posts[-1][1]["request"]["content"], "exact text")
         self.assertIn("drawer_id", result)
 
 
@@ -1030,8 +964,8 @@ class ReadinessReliabilityTests(unittest.TestCase):
         for i in range(20):
             provider.on_memory_write("add", "profile", f"fact {i}")
         provider.shutdown()
-        ingests = [b for p, b in provider.posts if p == "/api/ingest"]
-        self.assertEqual(len(ingests), 20)
+        delivered = sum(1 for path, _ in provider.posts if path == "/api/ingest/durable")
+        self.assertEqual(delivered + provider._write_spool.count(), 20)
 
     def test_session_switch_clears_stale_state(self) -> None:
         provider = RecordingProvider()

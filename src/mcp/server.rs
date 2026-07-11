@@ -111,6 +111,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
+use super::ingest_payload::{
+    PreparedIngestOperation, QueuedWriteOperation, decode_queued_ingest_operation,
+    run_durable_delete,
+};
 use super::timeline::{TimelineRequest, TimelineResponse};
 use super::tools::{
     BriefMcpRequest, BriefMcpResponse, ChunkerStatsDto, ContextRequest, ContextResponse,
@@ -1070,10 +1074,10 @@ impl MempalMcpServer {
     ) -> anyhow::Result<()> {
         let span = self.ingest_claim_telemetry_span("mcp.ingest_worker", &claim);
         let queue_wait_ms = queue_wait_ms(claim.created_at, claim.claimed_at);
-        let prepared: PreparedIngestOperation = match serde_json::from_str(&claim.payload) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let detail = format!("failed to decode ingest operation {}: {error}", claim.id);
+        let queued = match decode_queued_ingest_operation(&claim.payload) {
+            Some(queued) => queued,
+            None => {
+                let detail = format!("failed to decode ingest operation {}", claim.id);
                 span.finish_error(&detail);
                 complete_failed_ingest_claim(queue, &claim, queue_wait_ms, detail).await?;
                 return Ok(());
@@ -1122,14 +1126,8 @@ impl MempalMcpServer {
         };
         let runtime_writer_lease = external_writer_lease
             .or_else(|| writer_lease.as_ref().map(|lease| lease.lease().clone()));
-        let pre_resolved_superseded_drawer_id = prepared.superseded_drawer_id.clone();
         let outcome = match self
-            .run_prepared_ingest_off_runtime(
-                prepared.request.clone(),
-                prepared.controls,
-                runtime_writer_lease,
-                pre_resolved_superseded_drawer_id,
-            )
+            .run_queued_write_off_runtime(queued, runtime_writer_lease)
             .await
         {
             Ok(Ok(response)) => Ok(response),
@@ -1221,10 +1219,10 @@ impl MempalMcpServer {
         claim: ClaimedMessage,
     ) -> anyhow::Result<()> {
         let queue_wait_ms = queue_wait_ms(claim.created_at, claim.claimed_at);
-        let prepared: PreparedIngestOperation = match serde_json::from_str(&claim.payload) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let detail = format!("failed to decode ingest operation {}: {error}", claim.id);
+        let queued = match decode_queued_ingest_operation(&claim.payload) {
+            Some(queued) => queued,
+            None => {
+                let detail = format!("failed to decode ingest operation {}", claim.id);
                 complete_failed_ingest_claim(queue, &claim, queue_wait_ms, detail).await?;
                 return Ok(());
             }
@@ -1261,7 +1259,6 @@ impl MempalMcpServer {
                 }
             }
         };
-        let pre_resolved_superseded_drawer_id = prepared.superseded_drawer_id.clone();
         #[cfg(any(test, feature = "db-test-seam"))]
         if let Some(delay) = self.ingest_processing_delay {
             tokio::time::sleep(delay).await;
@@ -1269,12 +1266,7 @@ impl MempalMcpServer {
         let runtime_writer_lease = external_writer_lease
             .or_else(|| writer_lease.as_ref().map(|lease| lease.lease().clone()));
         let outcome = match self
-            .run_prepared_ingest_off_runtime(
-                prepared.request.clone(),
-                prepared.controls,
-                runtime_writer_lease,
-                pre_resolved_superseded_drawer_id,
-            )
+            .run_queued_write_off_runtime(queued, runtime_writer_lease)
             .await
         {
             Ok(Ok(response)) => Ok(response),
@@ -1354,10 +1346,10 @@ impl MempalMcpServer {
     ) -> anyhow::Result<ScopedIngestProcessResult> {
         let started = Instant::now();
         let queue_wait_ms = queue_wait_ms(claim.created_at, claim.claimed_at);
-        let prepared: PreparedIngestOperation = match serde_json::from_str(&claim.payload) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let detail = format!("failed to decode ingest operation {}: {error}", claim.id);
+        let queued = match decode_queued_ingest_operation(&claim.payload) {
+            Some(queued) => queued,
+            None => {
+                let detail = format!("failed to decode ingest operation {}", claim.id);
                 let completion_deadline =
                     scoped_process_remaining(started, budget).unwrap_or_default();
                 if let Err(error) = complete_failed_ingest_claim_with_lock_retry_deadline(
@@ -1457,7 +1449,6 @@ impl MempalMcpServer {
             }
         }
 
-        let pre_resolved_superseded_drawer_id = prepared.superseded_drawer_id.clone();
         let runtime_writer_lease = external_writer_lease
             .or_else(|| writer_lease.as_ref().map(|lease| lease.lease().clone()));
         let Some(remaining) = scoped_process_remaining(started, budget) else {
@@ -1470,16 +1461,11 @@ impl MempalMcpServer {
         };
         let outcome = match tokio::time::timeout(
             remaining,
-            self.mempal_ingest_sync_with_superseded_override(
-                prepared.request.clone(),
-                prepared.controls,
-                runtime_writer_lease.as_ref(),
-                pre_resolved_superseded_drawer_id,
-            ),
+            self.run_queued_write_inline(queued, runtime_writer_lease.as_ref()),
         )
         .await
         {
-            Ok(Ok(response)) => Ok(response.0),
+            Ok(Ok(response)) => Ok(response),
             Ok(Err(error)) => Err(error.to_string()),
             Err(_) => {
                 Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
@@ -1847,13 +1833,17 @@ impl MempalMcpServer {
         })
     }
 
-    async fn run_prepared_ingest_off_runtime(
+    async fn run_queued_write_off_runtime(
         &self,
-        request: IngestRequest,
-        controls: IngestControls,
+        operation: QueuedWriteOperation,
         runtime_writer_lease: Option<RuntimeWriterLease>,
-        pre_resolved_superseded_drawer_id: Option<String>,
     ) -> anyhow::Result<std::result::Result<IngestResponse, ErrorData>> {
+        let queued = match operation {
+            QueuedWriteOperation::Ingest(queued) => queued,
+            QueuedWriteOperation::Delete { drawer_id } => {
+                return Ok(run_durable_delete(self.db_path.clone(), drawer_id).await);
+            }
+        };
         let worker = self.clone();
         #[cfg(any(test, feature = "db-test-seam"))]
         let ingest_processing_delay = self.ingest_processing_delay;
@@ -1870,16 +1860,37 @@ impl MempalMcpServer {
                     .context("failed to build blocking ingest runtime")?;
                 Ok(runtime
                     .block_on(worker.mempal_ingest_sync_with_superseded_override(
-                        request,
-                        controls,
+                        queued.request,
+                        queued.controls,
                         runtime_writer_lease.as_ref(),
-                        pre_resolved_superseded_drawer_id,
+                        queued.superseded_drawer_id,
                     ))
                     .map(|response| response.0))
             })
         })
         .await
         .context("blocking ingest worker task failed")?
+    }
+
+    async fn run_queued_write_inline(
+        &self,
+        operation: QueuedWriteOperation,
+        runtime_writer_lease: Option<&RuntimeWriterLease>,
+    ) -> std::result::Result<IngestResponse, ErrorData> {
+        match operation {
+            QueuedWriteOperation::Ingest(queued) => self
+                .mempal_ingest_sync_with_superseded_override(
+                    queued.request,
+                    queued.controls,
+                    runtime_writer_lease,
+                    queued.superseded_drawer_id,
+                )
+                .await
+                .map(|response| response.0),
+            QueuedWriteOperation::Delete { drawer_id } => {
+                run_durable_delete(self.db_path.clone(), drawer_id).await
+            }
+        }
     }
 
     async fn soft_delete_drawer_for_mcp(
@@ -3199,7 +3210,7 @@ impl MempalMcpServer {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ValidatedIngestMetadata {
+pub(super) struct ValidatedIngestMetadata {
     memory_kind: MemoryKind,
     domain: MemoryDomain,
     field: String,
@@ -3568,21 +3579,6 @@ fn validate_ingest_request(
             })
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PreparedIngestOperation {
-    request: IngestRequest,
-    #[serde(default)]
-    controls: IngestControls,
-    project_id: Option<String>,
-    scrubbed_content: String,
-    source_type: SourceType,
-    confidence: f64,
-    metadata: ValidatedIngestMetadata,
-    superseded_drawer_id: Option<String>,
-    raw_turn: bool,
-    drawer_importance: i32,
 }
 
 const INGEST_ASYNC_KIND: &str = "ingest_async";
@@ -6471,7 +6467,10 @@ impl MempalMcpServer {
         if dry_run {
             let response = match tokio::time::timeout(
                 self.ingest_admission_deadline,
-                self.run_prepared_ingest_off_runtime(request, controls, None, None),
+                self.run_queued_write_off_runtime(
+                    QueuedWriteOperation::ingest(request, controls, None),
+                    None,
+                ),
             )
             .await
             {
@@ -6706,11 +6705,13 @@ impl MempalMcpServer {
         let started = Instant::now();
         loop {
             let outcome = self
-                .run_prepared_ingest_off_runtime(
-                    prepared.request.clone(),
-                    prepared.controls,
+                .run_queued_write_off_runtime(
+                    QueuedWriteOperation::ingest(
+                        prepared.request.clone(),
+                        prepared.controls,
+                        prepared.superseded_drawer_id.clone(),
+                    ),
                     None,
-                    prepared.superseded_drawer_id.clone(),
                 )
                 .await;
             match outcome {

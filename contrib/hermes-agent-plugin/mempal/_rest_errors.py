@@ -14,7 +14,12 @@ _REST_ERROR_BODY_MAX_BYTES = 64 * 1024
 
 
 def _route_class(path: str) -> str:
-    if path in {"/api/ingest", "/api/delete"}:
+    if path in {
+        "/api/ingest",
+        "/api/ingest/durable",
+        "/api/delete",
+        "/api/delete/durable",
+    }:
         return "write"
     if path in {"/api/search", "/api/timeline", "/api/pinned_facts"}:
         return "read"

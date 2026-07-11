@@ -18,13 +18,15 @@ import json
 import logging
 import os
 import queue
-import re
 import threading
 import time
 from typing import Any, Dict, List, Optional
 
 from ._backoff import SharedPluginBackoff
+from ._conclude import conclusion_request, submit_conclusion
+from ._intelligence import _IntelligenceEnhancer, _LLMClient
 from ._rest_errors import rest_error_payload as _rest_error_payload
+from ._write_spool import SpoolOperation, WriteSpool, classify_write_error
 
 logger = logging.getLogger(__name__)
 
@@ -39,23 +41,12 @@ _WRITE_RETRY_MAX = 3
 _WRITE_RETRY_DELAY = 2.0
 _HEALTH_CHECK_INTERVAL = 60.0
 _PINNED_FACTS_TTL = 300.0
-_LLM_DEFAULT_TIMEOUT = 30
-_LLM_BREAKER_THRESHOLD = 3
-_LLM_BREAKER_COOLDOWN = 300.0
 _DEFAULT_SAFE_MIN_IMPORTANCE = 3
 _DEFAULT_SAFE_CONTEXT_BUDGET_CHARS = 4000
 _SAFE_MEMORY_KINDS = {"knowledge", "profile_fact"}
 _AUTHORITATIVE_STATUSES = {"canonical"}
 
 _VALID_MODES = {"deterministic", "local_llm", "cloud_llm", "auto"}
-_VALID_MEMORY_KINDS = {
-    "fact", "preference", "decision", "correction", "rule",
-    "observation", "summary", "context", "goal", "constraint",
-}
-_VALID_DOMAINS = {
-    "coding", "communication", "workflow", "architecture",
-    "debugging", "testing", "deployment", "personal", "project",
-}
 
 PROFILE_SCHEMA = {
     "name": "mempal_profile",
@@ -94,15 +85,12 @@ SEARCH_SCHEMA = {
 
 CONCLUDE_SCHEMA = {
     "name": "mempal_conclude",
-    "description": (
-        "Store a durable fact about the user in mempal. "
-        "Stored verbatim via local BM25 + vector index. "
-        "Use for explicit preferences, corrections, or decisions."
-    ),
+    "description": "Store a durable fact verbatim in mempal for explicit preferences, corrections, or decisions.",
     "parameters": {
         "type": "object",
         "properties": {
             "conclusion": {"type": "string", "description": "The fact to store."},
+            "operation_key": {"type": "string", "description": "Stable retry key from a pending response."},
         },
         "required": ["conclusion"],
     },
@@ -156,200 +144,6 @@ def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, parsed))
 
 
-class _LLMClient:
-    """OpenAI-compatible chat completion client using stdlib only."""
-
-    def __init__(self, cfg: Dict[str, Any]) -> None:
-        self._base_url = (cfg.get("base_url") or "").rstrip("/")
-        self._model = cfg.get("model") or ""
-        self._api_key = cfg.get("api_key") or ""
-        self._timeout = int(cfg.get("timeout_secs") or _LLM_DEFAULT_TIMEOUT)
-        self._extra_body = cfg.get("extra_body") or {}
-        self._consecutive_failures = 0
-        self._breaker_open_until = 0.0
-
-    @property
-    def is_configured(self) -> bool:
-        return bool(self._base_url and self._model)
-
-    def _is_breaker_open(self) -> bool:
-        if self._consecutive_failures < _LLM_BREAKER_THRESHOLD:
-            return False
-        if time.monotonic() >= self._breaker_open_until:
-            self._consecutive_failures = 0
-            return False
-        return True
-
-    def chat(self, system: str, user: str, *, temperature: float = 0.1) -> Optional[str]:
-        if not self.is_configured or self._is_breaker_open():
-            return None
-        import urllib.request
-        body: Dict[str, Any] = {
-            "model": self._model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": temperature,
-            "max_tokens": 1024,
-        }
-        body.update(self._extra_body)
-        headers = {"Content-Type": "application/json"}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
-        url = self._base_url + "/chat/completions"
-        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                result = json.loads(resp.read().decode())
-            content = result.get("choices", [{}])[0].get("message", {}).get("content")
-            if content:
-                self._consecutive_failures = 0
-            return content or None
-        except Exception as exc:
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= _LLM_BREAKER_THRESHOLD:
-                self._breaker_open_until = time.monotonic() + _LLM_BREAKER_COOLDOWN
-                logger.warning("mempal LLM breaker tripped after %d failures, pausing %ds", self._consecutive_failures, _LLM_BREAKER_COOLDOWN)
-            else:
-                logger.debug("mempal LLM call failed: %s", exc)
-            return None
-
-    @property
-    def status(self) -> str:
-        if not self.is_configured:
-            return "not_configured"
-        if self._is_breaker_open():
-            return "breaker_open"
-        return "available"
-
-
-class _IntelligenceEnhancer:
-    """Enhancement pipeline: LLM-powered metadata extraction with deterministic gates."""
-
-    _METADATA_SYSTEM = (
-        "You classify memory entries. Return ONLY a JSON object with these fields:\n"
-        '  "memory_kind": one of: fact, preference, decision, correction, rule, '
-        "observation, summary, context, goal, constraint\n"
-        '  "domain": one of: coding, communication, workflow, architecture, '
-        "debugging, testing, deployment, personal, project\n"
-        '  "importance": integer 1-5 (1=trivial, 5=critical)\n'
-        '  "tags": list of 1-3 short keyword tags\n'
-        "Return ONLY valid JSON, no explanation."
-    )
-
-    _FACTS_SYSTEM = (
-        "Extract durable facts from this conversation turn. Return a JSON array of objects, "
-        "each with:\n"
-        '  "fact": the extracted fact as a concise statement\n'
-        '  "memory_kind": one of: fact, preference, decision, correction, rule, '
-        "observation, context, goal, constraint\n"
-        '  "importance": integer 1-5\n'
-        "Only extract facts worth remembering long-term. If nothing is worth extracting, "
-        "return an empty array []. Return ONLY valid JSON."
-    )
-
-    _SUMMARY_SYSTEM = (
-        "Summarize this conversation for long-term memory. Focus on:\n"
-        "- Key decisions made\n"
-        "- User preferences discovered\n"
-        "- Important context established\n"
-        "Keep it concise (under 500 characters). Return ONLY the summary text, no JSON."
-    )
-
-    def __init__(self, llm: _LLMClient) -> None:
-        self._llm = llm
-
-    def extract_metadata(self, content: str) -> Optional[Dict[str, Any]]:
-        raw = self._llm.chat(self._METADATA_SYSTEM, content)
-        if not raw:
-            return None
-        return self._validate_metadata(raw)
-
-    def extract_facts(self, turn_content: str) -> Optional[List[Dict[str, Any]]]:
-        if len(turn_content) < 50:
-            return None
-        raw = self._llm.chat(self._FACTS_SYSTEM, turn_content)
-        if not raw:
-            return None
-        return self._validate_facts(raw, turn_content)
-
-    def enhance_summary(self, messages_text: str) -> Optional[str]:
-        raw = self._llm.chat(self._SUMMARY_SYSTEM, messages_text)
-        if not raw or len(raw) < 10:
-            return None
-        if len(raw) > 2000:
-            return raw[:2000]
-        return raw
-
-    @staticmethod
-    def _validate_metadata(raw: str) -> Optional[Dict[str, Any]]:
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            return None
-        if not isinstance(parsed, dict):
-            return None
-        result: Dict[str, Any] = {}
-        kind = str(parsed.get("memory_kind", "")).strip().lower()
-        if kind in _VALID_MEMORY_KINDS:
-            result["memory_kind"] = kind
-        domain = str(parsed.get("domain", "")).strip().lower()
-        if domain in _VALID_DOMAINS:
-            result["domain"] = domain
-        try:
-            importance = int(parsed.get("importance", 0))
-            if 1 <= importance <= 5:
-                result["importance"] = importance
-        except (ValueError, TypeError):
-            pass
-        tags = parsed.get("tags")
-        if isinstance(tags, list):
-            clean = [str(t).strip()[:30] for t in tags[:5] if isinstance(t, str) and t.strip()]
-            if clean:
-                result["tags"] = clean
-        return result if result else None
-
-    @staticmethod
-    def _validate_facts(raw: str, source_content: str) -> Optional[List[Dict[str, Any]]]:
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            return None
-        if not isinstance(parsed, list):
-            return None
-        source_lower = source_content.lower()
-        validated: List[Dict[str, Any]] = []
-        for item in parsed[:10]:
-            if not isinstance(item, dict):
-                continue
-            fact = str(item.get("fact", "")).strip()
-            if not fact or len(fact) < 5:
-                continue
-            words = fact.lower().split()
-            grounded = sum(1 for w in words if len(w) > 3 and w in source_lower)
-            if grounded < min(2, len(words) // 3):
-                continue
-            entry: Dict[str, Any] = {"fact": fact}
-            kind = str(item.get("memory_kind", "fact")).strip().lower()
-            entry["memory_kind"] = kind if kind in _VALID_MEMORY_KINDS else "fact"
-            try:
-                imp = int(item.get("importance", 2))
-                entry["importance"] = max(1, min(5, imp))
-            except (ValueError, TypeError):
-                entry["importance"] = 2
-            validated.append(entry)
-        return validated if validated else None
-
-
 class MempalMemoryProvider:
     def __init__(self):
         self._base_url = "http://127.0.0.1:3080"
@@ -378,8 +172,9 @@ class MempalMemoryProvider:
         self._write_queue: queue.Queue = queue.Queue(maxsize=_WRITE_QUEUE_MAX)
         self._write_worker: Optional[threading.Thread] = None
         self._write_stop = threading.Event()
-        self._drawer_map: Dict[str, str] = {}
-        self._drawer_map_lock = threading.Lock()
+        self._write_drain_timeout = _WRITE_DRAIN_TIMEOUT
+        self._conclude_wait_timeout = 5.0
+        self._write_spool: Optional[WriteSpool] = None
         self._pinned_facts_cache: List[Dict[str, Any]] = []
         self._pinned_facts_fetched_at: float = 0.0
         self._pinned_facts_lock = threading.Lock()
@@ -470,9 +265,14 @@ class MempalMemoryProvider:
             try:
                 item = self._write_queue.get(timeout=1.0)
             except queue.Empty:
+                self._replay_spooled_write()
                 continue
-            self._process_write(item)
+            if item.get("op") == "spool_wake":
+                self._replay_spooled_write()
+            else:
+                self._process_write(item)
             self._write_queue.task_done()
+            self._replay_spooled_write()
         while True:
             try:
                 item = self._write_queue.get_nowait()
@@ -480,6 +280,57 @@ class MempalMemoryProvider:
                 break
             self._process_write(item)
             self._write_queue.task_done()
+
+    def _spool_write(
+        self,
+        kind: str,
+        body: Dict[str, Any],
+        *,
+        action: str,
+        track_key: Optional[str] = None,
+        wake: bool = True,
+    ) -> SpoolOperation:
+        if self._write_spool is None:
+            raise RuntimeError("mempal durable write spool is not initialized")
+        operation = self._write_spool.admit(
+            kind, body, track_key=track_key, action=action
+        )
+        if wake:
+            self._wake_spool_worker()
+        return operation
+
+    def _wake_spool_worker(self) -> None:
+        self._start_write_worker()
+        try:
+            self._write_queue.put_nowait({"op": "spool_wake"})
+        except queue.Full:
+            pass
+
+    def _replay_spooled_write(self) -> None:
+        spool = self._write_spool
+        if spool is None or self._is_breaker_open():
+            return
+        try:
+            outcome = spool.replay_one(self._post, self._get)
+        except Exception:
+            logger.error("mempal durable spool metadata update failed")
+            self._record_failure()
+            self._update_health(False)
+            return
+        if outcome is None:
+            return
+        if outcome.completed:
+            self._record_success()
+            self._update_health(True)
+        elif outcome.error_class:
+            self._record_failure()
+            self._update_health(False)
+            logger.warning(
+                "mempal durable replay deferred operation=%s kind=%s error_class=%s",
+                outcome.operation.operation_key,
+                outcome.operation.kind,
+                outcome.error_class,
+            )
 
     def _process_write(self, item: Dict[str, Any]) -> None:
         op = item.get("op")
@@ -498,28 +349,26 @@ class MempalMemoryProvider:
         for attempt in range(_WRITE_RETRY_MAX):
             try:
                 if op == "ingest":
-                    result = self._post("/api/ingest", item["body"])
-                    drawer_id = result.get("drawer_id", "") if isinstance(result, dict) else ""
-                    if drawer_id and item.get("track_key"):
-                        with self._drawer_map_lock:
-                            self._drawer_map[item["track_key"]] = drawer_id
+                    self._post("/api/ingest", item["body"])
                 elif op == "delete":
                     self._post("/api/delete", item["body"])
-                    if item.get("track_key"):
-                        with self._drawer_map_lock:
-                            self._drawer_map.pop(item["track_key"], None)
                 self._record_success()
                 self._update_health(True)
                 return
             except Exception as exc:
-                if "HTTP Error 4" in str(exc):
-                    logger.warning("mempal write rejected (4xx): %s", exc)
+                error_class = classify_write_error(exc)
+                if error_class.startswith("http_4"):
+                    logger.warning("mempal write rejected error_class=%s", error_class)
                     self._record_failure()
                     return
                 if attempt < _WRITE_RETRY_MAX - 1:
                     time.sleep(_WRITE_RETRY_DELAY)
                 else:
-                    logger.warning("mempal write failed after %d retries: %s", _WRITE_RETRY_MAX, exc)
+                    logger.warning(
+                        "mempal write deferred retries=%d error_class=%s",
+                        _WRITE_RETRY_MAX,
+                        error_class,
+                    )
                     self._record_failure()
                     self._update_health(False)
 
@@ -529,7 +378,7 @@ class MempalMemoryProvider:
             self._write_queue.put_nowait(item)
             return True
         except queue.Full:
-            logger.warning("mempal write queue full (%d), dropping write", _WRITE_QUEUE_MAX)
+            logger.warning("mempal write wake queue full capacity=%d", _WRITE_QUEUE_MAX)
             return False
 
     def _update_health(self, healthy: bool) -> None:
@@ -550,7 +399,9 @@ class MempalMemoryProvider:
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._configure_scope(session_id, kwargs, preserve_existing=False)
-        self._start_write_worker()
+        self._write_spool = WriteSpool(self._hermes_home)
+        if self._write_spool.count():
+            self._start_write_worker()
 
     def _configure_scope(self, session_id, context, *, preserve_existing):
         self._session_id = session_id
@@ -914,13 +765,11 @@ class MempalMemoryProvider:
         self._prefetch_thread.start()
 
     def sync_turn(self, user_content, assistant_content, *, session_id=""):
-        if self._is_breaker_open():
-            return
         if self._turn_storage_mode() != "raw_evidence":
             return
         content = f"User: {user_content}\nAssistant: {assistant_content}"
         body = self._with_project_id({"content": content, "wing": self._wing, "room": self._turns_room})
-        self._enqueue_write({"op": "ingest", "body": body, "skip_enhance": True})
+        self._spool_write("ingest", body, action="raw_turn")
         if self._should_enhance() and self._enhancer:
             facts = self._enhancer.extract_facts(content)
             if facts:
@@ -939,7 +788,7 @@ class MempalMemoryProvider:
         return [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]
 
     def handle_tool_call(self, tool_name, args, **kwargs):
-        if self._is_breaker_open():
+        if self._is_breaker_open() and tool_name != "mempal_conclude":
             return json.dumps({"error": "mempal temporarily unavailable. Will retry automatically."})
         if tool_name == "mempal_profile":
             try:
@@ -994,56 +843,67 @@ class MempalMemoryProvider:
             if not conclusion:
                 return json.dumps({"error": "Missing required parameter: conclusion"})
             try:
-                result = self._post("/api/ingest", self._with_project_id({
-                    "content": conclusion,
-                    "wing": self._wing,
-                    "room": self._facts_room,
-                    "memory_kind": "profile_fact",
-                    "importance": self._safe_min_importance,
-                    "source_type": "user_explicit",
-                }))
-                drawer_id = result.get("drawer_id", "") if isinstance(result, dict) else ""
-                self._record_success()
-                resp = {"result": "Fact stored."}
-                if drawer_id:
-                    resp["drawer_id"] = drawer_id
-                return json.dumps(resp)
+                result = submit_conclusion(
+                    self._write_spool,
+                    self._post,
+                    self._get,
+                    conclusion_request(
+                        conclusion, self._wing, self._facts_room,
+                        self._safe_min_importance, self._project_id,
+                    ),
+                    operation_key=args.get("operation_key"),
+                    wait_timeout=self._conclude_wait_timeout,
+                    transport_allowed=not self._is_breaker_open(),
+                )
+                if result.stored:
+                    self._record_success()
+                else:
+                    self._record_failure()
+                    details = result.payload.get("error_details", {})
+                    if details.get("kind") != "local_durable_admission_failed":
+                        self._wake_spool_worker()
+                return json.dumps(result.payload)
             except Exception as exc:
                 self._record_failure()
                 return json.dumps(_rest_error_payload(
                     "Failed to store memory via mempal REST API.",
-                    "/api/ingest",
+                    "/api/ingest/durable",
                     exc,
                 ))
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
     def on_session_end(self, messages):
-        if self._is_breaker_open():
-            return
         assistant_msgs = [m.get("content", "") for m in messages if m.get("role") == "assistant" and m.get("content")]
         if not assistant_msgs:
             return
         summary = assistant_msgs[-1][:2000]
-        if self._should_enhance() and self._enhancer:
-            all_text = "\n".join(f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in messages[-10:] if m.get("content"))
-            enhanced = self._enhancer.enhance_summary(all_text)
-            if enhanced:
-                summary = enhanced
         body = self._with_project_id({"content": f"[Session summary] {summary}", "wing": self._wing, "room": self._session_room()})
-        self._enqueue_write({"op": "ingest", "body": body, "skip_enhance": True})
+        operation = self._spool_write(
+            "ingest", body, action="session_summary", wake=False
+        )
+        try:
+            if self._should_enhance() and self._enhancer:
+                all_text = "\n".join(f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in messages[-10:] if m.get("content"))
+                enhanced = self._enhancer.enhance_summary(all_text)
+                if enhanced:
+                    enhanced_body = dict(body)
+                    enhanced_body["content"] = f"[Session summary] {enhanced}"
+                    self._write_spool.replace_body(operation.operation_key, enhanced_body)
+        except Exception:
+            logger.warning("mempal summary enhancement failed; deterministic evidence retained")
+        finally:
+            self._wake_spool_worker()
 
     def on_memory_write(self, action, target, content, metadata=None):
-        if self._is_breaker_open():
-            return
         track_key = f"{target}:{self._wing}"
         room = self._memory_room_for_target(target)
         if action == "remove":
-            with self._drawer_map_lock:
-                drawer_id = self._drawer_map.get(track_key)
-            if drawer_id:
-                self._enqueue_write({"op": "delete", "body": self._with_project_id({"drawer_id": drawer_id}), "track_key": track_key})
-            else:
-                logger.debug("mempal remove: no tracked drawer_id for %s", target)
+            self._spool_write(
+                "delete",
+                self._with_project_id({}),
+                track_key=track_key,
+                action="delete",
+            )
             return
         body = self._with_project_id({"content": content, "wing": self._wing, "room": room})
         if room == self._facts_room:
@@ -1054,12 +914,12 @@ class MempalMemoryProvider:
             for field in ("memory_kind", "domain", "field", "importance", "status", "is_pinned", "source_type"):
                 if field in metadata and metadata[field] is not None:
                     body[field] = metadata[field]
-        if action == "replace":
-            with self._drawer_map_lock:
-                old_drawer_id = self._drawer_map.get(track_key)
-            if old_drawer_id:
-                body["supersedes"] = old_drawer_id
-        self._enqueue_write({"op": "ingest", "body": body, "track_key": track_key})
+        self._spool_write(
+            "ingest",
+            body,
+            track_key=track_key,
+            action="replace" if action == "replace" else "add",
+        )
 
     def on_session_switch(self, new_session_id, reason="", **kwargs):
         del reason
@@ -1072,18 +932,19 @@ class MempalMemoryProvider:
         self._configure_scope(new_session_id, kwargs, preserve_existing=True)
 
     def shutdown(self):
+        deadline = time.monotonic() + self._write_drain_timeout
         self._write_stop.set()
         if self._prefetch_thread and self._prefetch_thread.is_alive():
-            self._prefetch_thread.join(timeout=3.0)
+            self._prefetch_thread.join(
+                timeout=min(3.0, max(0.0, deadline - time.monotonic()))
+            )
         if self._write_worker and self._write_worker.is_alive():
-            try:
-                self._write_queue.join()
-            except Exception:
-                pass
-            self._write_worker.join(timeout=_WRITE_DRAIN_TIMEOUT)
+            self._write_worker.join(timeout=max(0.0, deadline - time.monotonic()))
             if self._write_worker.is_alive():
-                logger.warning("mempal write worker did not drain in time")
-
+                pending = self._write_spool.count() if self._write_spool else 0
+                logger.warning(
+                    "mempal write worker shutdown timed out pending=%d", pending
+                )
     def get_config_schema(self):
         return [
             {"key": "base_url", "description": "mempal REST endpoint", "default": "http://127.0.0.1:3080", "env_var": "MEMPAL_BASE_URL"},
