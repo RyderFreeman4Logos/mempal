@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from ._backoff import SharedPluginBackoff
 from ._rest_errors import rest_error_payload as _rest_error_payload
-from ._write_spool import SpoolOperation, WriteSpool
+from ._write_spool import SpoolOperation, WriteSpool, classify_write_error
 
 logger = logging.getLogger(__name__)
 
@@ -379,6 +379,7 @@ class MempalMemoryProvider:
         self._write_queue: queue.Queue = queue.Queue(maxsize=_WRITE_QUEUE_MAX)
         self._write_worker: Optional[threading.Thread] = None
         self._write_stop = threading.Event()
+        self._write_drain_timeout = _WRITE_DRAIN_TIMEOUT
         self._write_spool: Optional[WriteSpool] = None
         self._pinned_facts_cache: List[Dict[str, Any]] = []
         self._pinned_facts_fetched_at: float = 0.0
@@ -561,14 +562,19 @@ class MempalMemoryProvider:
                 self._update_health(True)
                 return
             except Exception as exc:
-                if "HTTP Error 4" in str(exc):
-                    logger.warning("mempal write rejected (4xx): %s", exc)
+                error_class = classify_write_error(exc)
+                if error_class.startswith("http_4"):
+                    logger.warning("mempal write rejected error_class=%s", error_class)
                     self._record_failure()
                     return
                 if attempt < _WRITE_RETRY_MAX - 1:
                     time.sleep(_WRITE_RETRY_DELAY)
                 else:
-                    logger.warning("mempal write failed after %d retries: %s", _WRITE_RETRY_MAX, exc)
+                    logger.warning(
+                        "mempal write deferred retries=%d error_class=%s",
+                        _WRITE_RETRY_MAX,
+                        error_class,
+                    )
                     self._record_failure()
                     self._update_health(False)
 
@@ -578,7 +584,7 @@ class MempalMemoryProvider:
             self._write_queue.put_nowait(item)
             return True
         except queue.Full:
-            logger.warning("mempal write queue full (%d), dropping write", _WRITE_QUEUE_MAX)
+            logger.warning("mempal write wake queue full capacity=%d", _WRITE_QUEUE_MAX)
             return False
 
     def _update_health(self, healthy: bool) -> None:
@@ -1126,18 +1132,19 @@ class MempalMemoryProvider:
         self._configure_scope(new_session_id, kwargs, preserve_existing=True)
 
     def shutdown(self):
+        deadline = time.monotonic() + self._write_drain_timeout
         self._write_stop.set()
         if self._prefetch_thread and self._prefetch_thread.is_alive():
-            self._prefetch_thread.join(timeout=3.0)
+            self._prefetch_thread.join(
+                timeout=min(3.0, max(0.0, deadline - time.monotonic()))
+            )
         if self._write_worker and self._write_worker.is_alive():
-            try:
-                self._write_queue.join()
-            except Exception:
-                pass
-            self._write_worker.join(timeout=_WRITE_DRAIN_TIMEOUT)
+            self._write_worker.join(timeout=max(0.0, deadline - time.monotonic()))
             if self._write_worker.is_alive():
-                logger.warning("mempal write worker did not drain in time")
-
+                pending = self._write_spool.count() if self._write_spool else 0
+                logger.warning(
+                    "mempal write worker shutdown timed out pending=%d", pending
+                )
     def get_config_schema(self):
         return [
             {"key": "base_url", "description": "mempal REST endpoint", "default": "http://127.0.0.1:3080", "env_var": "MEMPAL_BASE_URL"},

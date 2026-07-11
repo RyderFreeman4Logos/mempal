@@ -43,6 +43,17 @@ class ReplayOutcome:
     drawer_id: Optional[str] = None
 
 
+def classify_write_error(exc: Exception) -> str:
+    """Return a content-free transport/storage failure class."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"http_{exc.code}"
+    if isinstance(exc, (TimeoutError, urllib.error.URLError)):
+        return "network_timeout"
+    if isinstance(exc, OSError):
+        return f"os_error_{exc.errno or 'unknown'}"
+    return "network_or_protocol_error"
+
+
 class WriteSpool:
     """Durable FIFO of provider writes with persistent target lineage."""
 
@@ -296,19 +307,9 @@ class WriteSpool:
                 self.record_attempt(operation.operation_key, error_class)
             return ReplayOutcome(operation, completed=False, error_class=error_class)
         except Exception as exc:
-            error_class = self._error_class(exc)
+            error_class = classify_write_error(exc)
             self.record_attempt(operation.operation_key, error_class)
             return ReplayOutcome(operation, completed=False, error_class=error_class)
-
-    @staticmethod
-    def _error_class(exc: Exception) -> str:
-        if isinstance(exc, urllib.error.HTTPError):
-            return f"http_{exc.code}"
-        if isinstance(exc, (TimeoutError, urllib.error.URLError)):
-            return "network_timeout"
-        if isinstance(exc, OSError):
-            return f"os_error_{exc.errno or 'unknown'}"
-        return "network_or_protocol_error"
 
     def _update_operation(
         self, operation_key: str, assignment: str, values: tuple[Any, ...]

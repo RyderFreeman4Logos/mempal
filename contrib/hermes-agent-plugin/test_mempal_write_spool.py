@@ -1,11 +1,15 @@
 import os
+import logging
+import queue
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
 from typing import Any, Dict, List, Optional
 
+from mempal import MempalMemoryProvider
 from test_mempal_provider import RecordingProvider
 
 
@@ -300,6 +304,94 @@ class WriteQueueCompatibilityTests(unittest.TestCase):
         self.assertEqual(len(provider.posts), 1)
         self.assertEqual(provider.posts[0][0], "/api/ingest/durable")
         self.assertIn("User: hello", provider.posts[0][1]["request"]["content"])
+        provider.shutdown()
+
+
+class _BlockingProvider(_RestartProvider):
+    def __init__(self, backend: _RestartBackend) -> None:
+        super().__init__(backend)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def _post(self, path: str, body: Dict[str, Any]) -> Any:
+        self.entered.set()
+        self.release.wait(timeout=5.0)
+        raise RuntimeError("synthetic response body must stay private")
+
+
+class DurableSchedulingTests(unittest.TestCase):
+    def test_queue_full_retains_recoverable_work(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a")
+        provider._write_queue = queue.Queue(maxsize=1)
+        provider._write_queue.put_nowait({"op": "noop"})
+        provider._start_write_worker = lambda: None
+
+        provider.sync_turn("queue full user", "queue full assistant")
+
+        self.assertEqual(provider._write_spool.count(), 1)
+        provider._write_queue.get_nowait()
+        provider._write_queue.task_done()
+        MempalMemoryProvider._start_write_worker(provider)
+        deadline = time.monotonic() + 3.0
+        while provider._write_spool.count() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(provider._write_spool.count(), 0)
+        provider.shutdown()
+
+    def test_breaker_pauses_replay_not_admission(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a")
+        for _ in range(5):
+            provider._backoff.record_failure()
+        provider.sync_turn("breaker user", "breaker assistant")
+        time.sleep(0.1)
+        self.assertEqual(provider._write_spool.count(), 1)
+
+        provider._backoff.record_success()
+        provider._wake_spool_worker()
+        deadline = time.monotonic() + 3.0
+        while provider._write_spool.count() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(provider._write_spool.count(), 0)
+        provider.shutdown()
+
+    def test_shutdown_timeout_retains_spool_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as hermes_home:
+            backend = _RestartBackend(failures=0)
+            blocked = _BlockingProvider(backend)
+            blocked._write_drain_timeout = 0.1
+            blocked.initialize("session-a", hermes_home=hermes_home)
+            blocked.sync_turn("shutdown user", "shutdown assistant")
+            self.assertTrue(blocked.entered.wait(timeout=1.0))
+
+            started = time.monotonic()
+            blocked.shutdown()
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(blocked._write_spool.count(), 1)
+            blocked.release.set()
+            blocked._write_worker.join(timeout=1.0)
+
+            restarted = _RestartProvider(backend)
+            restarted.initialize("session-a", hermes_home=hermes_home)
+            deadline = time.monotonic() + 3.0
+            while restarted._write_spool.count() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            restarted.shutdown()
+            self.assertEqual(restarted._write_spool.count(), 0)
+            self.assertEqual(backend.drawer_count, 1)
+
+    def test_replay_logs_do_not_include_payload_or_response(self) -> None:
+        provider = _BlockingProvider(_RestartBackend(failures=0))
+        provider.initialize("session-a")
+        provider.release.set()
+        with self.assertLogs("mempal", level=logging.WARNING) as captured:
+            provider.sync_turn("PRIVATE_RAW_MEMORY", "PRIVATE_ASSISTANT")
+            provider._drain_writes()
+        rendered = "\n".join(captured.output)
+        self.assertNotIn("PRIVATE_RAW_MEMORY", rendered)
+        self.assertNotIn("PRIVATE_ASSISTANT", rendered)
+        self.assertNotIn("synthetic response body", rendered)
         provider.shutdown()
 
 
