@@ -94,12 +94,14 @@ class RecordingProvider(MempalMemoryProvider):
 
     def _post(self, path: str, body: Dict[str, Any]) -> Any:
         self.posts.append((path, dict(body)))
-        if path == "/api/ingest/durable":
+        if path in {"/api/ingest/durable", "/api/delete/durable"}:
             operation_id = f"operation_{body['idempotency_key']}"
+            request = body["request"]
+            drawer_id = request.get("drawer_id") or f"drawer_{len(self.durable_status) + 1}"
             self.durable_status.setdefault(operation_id, {
                 "operation_id": operation_id,
                 "state": "completed",
-                "drawer_id": f"drawer_{len(self.durable_status) + 1}",
+                "drawer_id": drawer_id,
             })
             return {
                 "operation_id": operation_id,
@@ -299,84 +301,9 @@ class MempalProviderScopeTests(unittest.TestCase):
         provider.on_memory_write("add", "turns", "turn content")
         provider._drain_writes()
 
-        self.assertEqual(provider.posts[-2][1]["room"], "facts")
-        self.assertEqual(provider.posts[-1][1]["room"], "turns/cli/chat-a")
-        self.assertEqual(provider.posts[-1][1]["project_id"], "project-alpha")
-
-
-class WriteSemanticTests(unittest.TestCase):
-    def test_add_tracks_drawer_id(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        provider.on_memory_write("add", "profile", "important fact")
-        provider._drain_writes()
-
-        track_key = "profile:hermes-user/alice/work"
-        with provider._drawer_map_lock:
-            self.assertIn(track_key, provider._drawer_map)
-
-    def test_replace_sends_supersedes(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        provider.on_memory_write("add", "profile", "original fact")
-        provider._drain_writes()
-        provider.on_memory_write("replace", "profile", "updated fact")
-        provider._drain_writes()
-
-        replace_body = provider.posts[-1][1]
-        self.assertIn("supersedes", replace_body)
-
-    def test_replace_without_prior_has_no_supersedes(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        provider.on_memory_write("replace", "profile", "new fact")
-        provider._drain_writes()
-
-        body = provider.posts[-1][1]
-        self.assertNotIn("supersedes", body)
-
-    def test_remove_sends_delete(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        provider.on_memory_write("add", "profile", "to be removed")
-        provider._drain_writes()
-        provider.on_memory_write("remove", "profile", "")
-        provider._drain_writes()
-
-        delete_posts = [(p, b) for p, b in provider.posts if p == "/api/delete"]
-        self.assertEqual(len(delete_posts), 1)
-        self.assertIn("drawer_id", delete_posts[0][1])
-
-    def test_remove_noop_without_tracked_drawer(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        initial_count = len(provider.posts)
-        provider.on_memory_write("remove", "profile", "")
-
-        self.assertEqual(len(provider.posts), initial_count)
-
-    def test_metadata_passes_typed_fields(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        provider.on_memory_write("add", "profile", "typed fact", metadata={
-            "memory_kind": "preference",
-            "domain": "coding",
-            "importance": 4,
-            "is_pinned": True,
-        })
-        provider._drain_writes()
-
-        body = provider.posts[-1][1]
-        self.assertEqual(body["memory_kind"], "preference")
-        self.assertEqual(body["domain"], "coding")
-        self.assertEqual(body["importance"], 4)
-        self.assertTrue(body["is_pinned"])
+        self.assertEqual(provider.posts[-2][1]["request"]["room"], "facts")
+        self.assertEqual(provider.posts[-1][1]["request"]["room"], "turns/cli/chat-a")
+        self.assertEqual(provider.posts[-1][1]["request"]["project_id"], "project-alpha")
 
 
 class SearchResultTests(unittest.TestCase):
@@ -976,7 +903,7 @@ class ReadinessDurableMemoryTests(unittest.TestCase):
         provider.initialize("session-a", user_id="alice", profile="work")
         provider.on_memory_write("add", "profile", "single fact")
         provider._drain_writes()
-        ingests = [b for p, b in provider.posts if p == "/api/ingest"]
+        ingests = [b["request"] for p, b in provider.posts if p == "/api/ingest/durable"]
         self.assertEqual(len(ingests), 1)
         self.assertEqual(ingests[0]["content"], "single fact")
 
@@ -987,7 +914,7 @@ class ReadinessDurableMemoryTests(unittest.TestCase):
         provider._drain_writes()
         provider.on_memory_write("replace", "profile", "v2")
         provider._drain_writes()
-        ingests = [b for p, b in provider.posts if p == "/api/ingest"]
+        ingests = [b["request"] for p, b in provider.posts if p == "/api/ingest/durable"]
         self.assertEqual(len(ingests), 2)
         self.assertIn("supersedes", ingests[1])
         self.assertEqual(ingests[1]["content"], "v2")
@@ -999,14 +926,16 @@ class ReadinessDurableMemoryTests(unittest.TestCase):
         provider._drain_writes()
         provider.on_memory_write("remove", "profile", "")
         provider._drain_writes()
-        deletes = [b for p, b in provider.posts if p == "/api/delete"]
+        deletes = [b for p, b in provider.posts if p == "/api/delete/durable"]
         self.assertEqual(len(deletes), 1)
 
-    def test_remove_without_prior_is_noop(self) -> None:
+    def test_remove_without_prior_remains_recoverable(self) -> None:
         provider = RecordingProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
         provider.on_memory_write("remove", "profile", "")
         self.assertEqual(len(provider.posts), 0)
+        self.assertEqual(provider._write_spool.count(), 1)
+        provider.shutdown()
 
     def test_conclude_stores_verbatim(self) -> None:
         provider = RecordingProvider()
@@ -1025,8 +954,8 @@ class ReadinessReliabilityTests(unittest.TestCase):
         for i in range(20):
             provider.on_memory_write("add", "profile", f"fact {i}")
         provider.shutdown()
-        ingests = [b for p, b in provider.posts if p == "/api/ingest"]
-        self.assertEqual(len(ingests), 20)
+        delivered = sum(1 for path, _ in provider.posts if path == "/api/ingest/durable")
+        self.assertEqual(delivered + provider._write_spool.count(), 20)
 
     def test_session_switch_clears_stale_state(self) -> None:
         provider = RecordingProvider()

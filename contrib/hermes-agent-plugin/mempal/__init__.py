@@ -380,8 +380,6 @@ class MempalMemoryProvider:
         self._write_worker: Optional[threading.Thread] = None
         self._write_stop = threading.Event()
         self._write_spool: Optional[WriteSpool] = None
-        self._drawer_map: Dict[str, str] = {}
-        self._drawer_map_lock = threading.Lock()
         self._pinned_facts_cache: List[Dict[str, Any]] = []
         self._pinned_facts_fetched_at: float = 0.0
         self._pinned_facts_lock = threading.Lock()
@@ -488,12 +486,20 @@ class MempalMemoryProvider:
             self._process_write(item)
             self._write_queue.task_done()
 
-    def _spool_ingest(
-        self, body: Dict[str, Any], *, action: str, wake: bool = True
+    def _spool_write(
+        self,
+        kind: str,
+        body: Dict[str, Any],
+        *,
+        action: str,
+        track_key: Optional[str] = None,
+        wake: bool = True,
     ) -> SpoolOperation:
         if self._write_spool is None:
             raise RuntimeError("mempal durable write spool is not initialized")
-        operation = self._write_spool.admit("ingest", body, action=action)
+        operation = self._write_spool.admit(
+            kind, body, track_key=track_key, action=action
+        )
         if wake:
             self._wake_spool_worker()
         return operation
@@ -548,16 +554,9 @@ class MempalMemoryProvider:
         for attempt in range(_WRITE_RETRY_MAX):
             try:
                 if op == "ingest":
-                    result = self._post("/api/ingest", item["body"])
-                    drawer_id = result.get("drawer_id", "") if isinstance(result, dict) else ""
-                    if drawer_id and item.get("track_key"):
-                        with self._drawer_map_lock:
-                            self._drawer_map[item["track_key"]] = drawer_id
+                    self._post("/api/ingest", item["body"])
                 elif op == "delete":
                     self._post("/api/delete", item["body"])
-                    if item.get("track_key"):
-                        with self._drawer_map_lock:
-                            self._drawer_map.pop(item["track_key"], None)
                 self._record_success()
                 self._update_health(True)
                 return
@@ -970,7 +969,7 @@ class MempalMemoryProvider:
             return
         content = f"User: {user_content}\nAssistant: {assistant_content}"
         body = self._with_project_id({"content": content, "wing": self._wing, "room": self._turns_room})
-        self._spool_ingest(body, action="raw_turn")
+        self._spool_write("ingest", body, action="raw_turn")
         if self._should_enhance() and self._enhancer:
             facts = self._enhancer.extract_facts(content)
             if facts:
@@ -1073,7 +1072,9 @@ class MempalMemoryProvider:
             return
         summary = assistant_msgs[-1][:2000]
         body = self._with_project_id({"content": f"[Session summary] {summary}", "wing": self._wing, "room": self._session_room()})
-        operation = self._spool_ingest(body, action="session_summary", wake=False)
+        operation = self._spool_write(
+            "ingest", body, action="session_summary", wake=False
+        )
         try:
             if self._should_enhance() and self._enhancer:
                 all_text = "\n".join(f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in messages[-10:] if m.get("content"))
@@ -1088,17 +1089,15 @@ class MempalMemoryProvider:
             self._wake_spool_worker()
 
     def on_memory_write(self, action, target, content, metadata=None):
-        if self._is_breaker_open():
-            return
         track_key = f"{target}:{self._wing}"
         room = self._memory_room_for_target(target)
         if action == "remove":
-            with self._drawer_map_lock:
-                drawer_id = self._drawer_map.get(track_key)
-            if drawer_id:
-                self._enqueue_write({"op": "delete", "body": self._with_project_id({"drawer_id": drawer_id}), "track_key": track_key})
-            else:
-                logger.debug("mempal remove: no tracked drawer_id for %s", target)
+            self._spool_write(
+                "delete",
+                self._with_project_id({}),
+                track_key=track_key,
+                action="delete",
+            )
             return
         body = self._with_project_id({"content": content, "wing": self._wing, "room": room})
         if room == self._facts_room:
@@ -1109,12 +1108,12 @@ class MempalMemoryProvider:
             for field in ("memory_kind", "domain", "field", "importance", "status", "is_pinned", "source_type"):
                 if field in metadata and metadata[field] is not None:
                     body[field] = metadata[field]
-        if action == "replace":
-            with self._drawer_map_lock:
-                old_drawer_id = self._drawer_map.get(track_key)
-            if old_drawer_id:
-                body["supersedes"] = old_drawer_id
-        self._enqueue_write({"op": "ingest", "body": body, "track_key": track_key})
+        self._spool_write(
+            "ingest",
+            body,
+            track_key=track_key,
+            action="replace" if action == "replace" else "add",
+        )
 
     def on_session_switch(self, new_session_id, reason="", **kwargs):
         del reason

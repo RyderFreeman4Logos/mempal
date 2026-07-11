@@ -14,11 +14,26 @@ use super::handlers::{
     validate_rest_write_runtime,
 };
 use super::state::ApiState;
+use crate::core::config::ConfigHandle;
+use crate::core::db::Database;
+use crate::core::project::{ProjectFilterMode, ProjectSearchScope, resolve_project_id};
 
 #[derive(Debug, Deserialize)]
 struct DurableIngestAdmissionRequest {
     idempotency_key: String,
     request: IngestRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct DurableDeleteRequest {
+    drawer_id: String,
+    project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DurableDeleteAdmissionRequest {
+    idempotency_key: String,
+    request: DurableDeleteRequest,
 }
 
 pub(super) fn routes() -> Router<ApiState> {
@@ -27,6 +42,7 @@ pub(super) fn routes() -> Router<ApiState> {
             "/api/ingest/durable",
             post(ingest_handler).layer(DefaultBodyLimit::max(MAX_REST_INGEST_BODY_BYTES)),
         )
+        .route("/api/delete/durable", post(delete_handler))
         .route("/api/operations/{operation_id}", get(status_handler))
 }
 
@@ -75,6 +91,65 @@ async fn status_handler(
             .map_err(internal_error)?
             .map_err(admission_error)?;
     Ok(Json(receipt))
+}
+
+async fn delete_handler(
+    State(state): State<ApiState>,
+    Json(admission): Json<DurableDeleteAdmissionRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    validate_rest_write_runtime(&state.db_path)?;
+    authorize_delete(&state, &admission.request)?;
+    let db_path = state.db_path.clone();
+    let idempotency_key = admission.idempotency_key;
+    let drawer_id = admission.request.drawer_id;
+    let receipt = tokio::task::spawn_blocking(move || {
+        crate::durable_ingest::admit_delete(&db_path, &idempotency_key, drawer_id)
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(admission_error)?;
+    Ok((StatusCode::ACCEPTED, Json(receipt)))
+}
+
+fn authorize_delete(state: &ApiState, request: &DurableDeleteRequest) -> Result<(), ApiError> {
+    let db = Database::open(&state.db_path).map_err(internal_error)?;
+    if db
+        .get_drawer(&request.drawer_id)
+        .map_err(internal_error)?
+        .is_none()
+    {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "durable delete target was not found",
+        ));
+    }
+    let config = ConfigHandle::current();
+    let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
+        .map_err(internal_error)?;
+    let scope = ProjectSearchScope::from_request(
+        project_id,
+        false,
+        false,
+        config.search.strict_project_isolation,
+    );
+    let drawer_project = db
+        .drawer_project_id(&request.drawer_id)
+        .map_err(internal_error)?;
+    let authorized = match scope.mode {
+        ProjectFilterMode::ProjectScoped | ProjectFilterMode::ProjectPlusGlobal => {
+            drawer_project.as_deref() == scope.project_id.as_deref()
+        }
+        ProjectFilterMode::NullOnly => drawer_project.is_none(),
+        ProjectFilterMode::AllProjects => true,
+    };
+    if authorized {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "drawer belongs to another project",
+        ))
+    }
 }
 
 fn admission_error(error: crate::durable_ingest::DurableAdmissionError) -> ApiError {

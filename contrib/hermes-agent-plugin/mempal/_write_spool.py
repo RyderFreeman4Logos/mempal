@@ -40,6 +40,7 @@ class ReplayOutcome:
     operation: SpoolOperation
     completed: bool
     error_class: Optional[str] = None
+    drawer_id: Optional[str] = None
 
 
 class WriteSpool:
@@ -245,16 +246,30 @@ class WriteSpool:
         operation = self.next_operation()
         if operation is None:
             return None
+        request = dict(operation.body)
+        if operation.track_key and operation.action in {"replace", "delete"}:
+            target = self.drawer_for_track(operation.track_key)
+            if not target:
+                self.record_attempt(operation.operation_key, "target_unresolved")
+                return ReplayOutcome(
+                    operation, completed=False, error_class="target_unresolved"
+                )
+            request["supersedes" if operation.action == "replace" else "drawer_id"] = target
         try:
             operation_id = operation.receipt_operation_id
             if operation_id:
                 status = get(f"/api/operations/{operation_id}")
             else:
+                route = (
+                    "/api/delete/durable"
+                    if operation.kind == "delete"
+                    else "/api/ingest/durable"
+                )
                 receipt = post(
-                    "/api/ingest/durable",
+                    route,
                     {
                         "idempotency_key": operation.operation_key,
-                        "request": operation.body,
+                        "request": request,
                     },
                 )
                 if not isinstance(receipt, dict):
@@ -269,8 +284,13 @@ class WriteSpool:
             state = str(status.get("state") or "")
             drawer_id = str(status.get("drawer_id") or "")
             if state == "completed" and drawer_id:
-                self.complete(operation.operation_key)
-                return ReplayOutcome(operation, completed=True)
+                self.complete(
+                    operation.operation_key,
+                    track_key=operation.track_key,
+                    drawer_id=None if operation.action == "delete" else drawer_id,
+                    delete_track=operation.action == "delete",
+                )
+                return ReplayOutcome(operation, completed=True, drawer_id=drawer_id)
             error_class = f"terminal_{state}" if state in {"failed", "rejected"} else None
             if error_class:
                 self.record_attempt(operation.operation_key, error_class)

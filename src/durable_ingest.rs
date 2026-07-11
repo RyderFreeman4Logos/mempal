@@ -16,6 +16,7 @@ use crate::core::queue::{PendingMessageStore, PendingOperationRecord, QueueError
 
 pub(crate) const INGEST_ASYNC_KIND: &str = "ingest_async";
 const CONTRACT_VERSION: &str = "mempal.rest.ingest.v1";
+const DELETE_CONTRACT_VERSION: &str = "mempal.rest.delete.v1";
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 
 /// Queue payload used by durable REST ingest admissions.
@@ -36,6 +37,27 @@ impl DurableIngestEnvelope {
     pub(crate) fn decode(payload: &str) -> Option<Self> {
         let envelope = serde_json::from_str::<Self>(payload).ok()?;
         (envelope.contract == CONTRACT_VERSION).then_some(envelope)
+    }
+}
+
+/// Queue payload used by durable REST delete admissions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DurableDeleteEnvelope {
+    contract: String,
+    pub(crate) drawer_id: String,
+}
+
+impl DurableDeleteEnvelope {
+    fn new(drawer_id: String) -> Self {
+        Self {
+            contract: DELETE_CONTRACT_VERSION.to_string(),
+            drawer_id,
+        }
+    }
+
+    pub(crate) fn decode(payload: &str) -> Option<Self> {
+        let envelope = serde_json::from_str::<Self>(payload).ok()?;
+        (envelope.contract == DELETE_CONTRACT_VERSION).then_some(envelope)
     }
 }
 
@@ -73,6 +95,21 @@ pub fn admit(
 ) -> Result<DurableOperationReceipt, DurableAdmissionError> {
     validate_idempotency_key(idempotency_key)?;
     let payload = serde_json::to_string(&DurableIngestEnvelope::new(request))
+        .map_err(DurableAdmissionError::Encode)?;
+    let store = PendingMessageStore::new_without_reclaim(db_path);
+    let operation_id =
+        store.enqueue_idempotent_with_key(INGEST_ASYNC_KIND, &payload, idempotency_key)?;
+    status_with_store(&store, &operation_id)
+}
+
+/// Commit a durable delete request to the canonical ingest worker queue.
+pub fn admit_delete(
+    db_path: &Path,
+    idempotency_key: &str,
+    drawer_id: String,
+) -> Result<DurableOperationReceipt, DurableAdmissionError> {
+    validate_idempotency_key(idempotency_key)?;
+    let payload = serde_json::to_string(&DurableDeleteEnvelope::new(drawer_id))
         .map_err(DurableAdmissionError::Encode)?;
     let store = PendingMessageStore::new_without_reclaim(db_path);
     let operation_id =

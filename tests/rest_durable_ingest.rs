@@ -127,3 +127,51 @@ async fn durable_ingest_survives_restart() {
     assert_eq!(completed.state, Some(IngestOperationState::Completed));
     assert!(!completed.drawer_id.is_empty());
 }
+
+#[tokio::test]
+async fn durable_delete_reuses_queue_and_survives_restart() {
+    let (_tempdir, db_path, server) = setup();
+    let ingest = durable_ingest::admit(
+        &db_path,
+        "delete-seed-event",
+        serde_json::json!({
+            "content": "synthetic delete seed",
+            "wing": "receipt-test",
+            "room": "delete"
+        }),
+    )
+    .expect("admit seed ingest");
+    let worker = server.spawn_scoped_ingest_drain_worker();
+    let inserted = server
+        .wait_for_operation_completion(&ingest.operation_id)
+        .await
+        .expect("complete seed ingest");
+    worker.shutdown_and_drain().await;
+    let drawer_id = inserted.drawer_id;
+
+    let first = durable_ingest::admit_delete(&db_path, "delete-event-1", drawer_id.clone())
+        .expect("admit durable delete");
+    let replay = durable_ingest::admit_delete(&db_path, "delete-event-1", drawer_id.clone())
+        .expect("replay durable delete");
+    assert_eq!(first.operation_id, replay.operation_id);
+    drop(server);
+
+    let restarted =
+        MempalMcpServer::new_with_factory(db_path.clone(), Arc::new(StubEmbedderFactory))
+            .expect("restart delete worker");
+    let worker = restarted.spawn_scoped_ingest_drain_worker();
+    let deleted = restarted
+        .wait_for_operation_completion(&first.operation_id)
+        .await
+        .expect("complete durable delete after restart");
+    worker.shutdown_and_drain().await;
+
+    assert_eq!(deleted.state, Some(IngestOperationState::Completed));
+    assert_eq!(deleted.drawer_id, drawer_id);
+    let db = Database::open(&db_path).expect("open deleted database");
+    assert!(
+        db.get_drawer(&deleted.drawer_id)
+            .expect("query deleted drawer")
+            .is_none()
+    );
+}
