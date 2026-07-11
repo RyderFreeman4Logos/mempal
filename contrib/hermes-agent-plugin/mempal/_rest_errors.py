@@ -51,7 +51,7 @@ def _stale_daemon_http_error_details(exc: Any) -> Dict[str, Any]:
     """Read only the bounded, allowlisted stale-daemon REST error contract."""
     try:
         raw = exc.read(_REST_ERROR_BODY_MAX_BYTES + 1)
-    except (AttributeError, OSError, http.client.HTTPException):
+    except (AttributeError, OSError, ValueError, http.client.HTTPException):
         return {}
     if not isinstance(raw, bytes) or len(raw) > _REST_ERROR_BODY_MAX_BYTES:
         return {}

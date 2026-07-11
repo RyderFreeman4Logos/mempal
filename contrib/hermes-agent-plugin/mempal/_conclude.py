@@ -122,6 +122,7 @@ def submit_conclusion(
                 key,
                 state,
                 error_class,
+                outcome.error_details,
             ))
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
@@ -132,10 +133,12 @@ def _retry_payload(
     operation_key: str,
     state: str,
     error_class: Optional[str] = None,
+    transport_details: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     details = {
         "kind": kind,
         "operation_key": operation_key,
+        "retry_operation_id": operation_key,
         "state": state,
         "retry_safe": True,
     }
@@ -143,6 +146,8 @@ def _retry_payload(
         details["operation_id"] = operation_id
     if error_class:
         details["error_class"] = error_class
+    if transport_details:
+        details["transport"] = dict(transport_details)
     return {
         "error": "Memory is not yet confirmed stored.",
         "error_details": details,

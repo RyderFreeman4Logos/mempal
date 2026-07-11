@@ -17,6 +17,8 @@ from contextlib import closing
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
+from ._rest_errors import rest_error_payload
+
 
 _DB_RELATIVE_PATH = os.path.join("state", "mempal", "write-spool.sqlite3")
 _CONNECT_TIMEOUT_SECS = 0.5
@@ -54,6 +56,7 @@ class ReplayOutcome:
     drawer_id: Optional[str] = None
     operation_id: Optional[str] = None
     quarantined: bool = False
+    error_details: Optional[Dict[str, Any]] = None
 
 
 def classify_write_error(exc: Exception) -> str:
@@ -458,9 +461,11 @@ class WriteSpool:
                 )
             request["supersedes" if operation.action == "replace" else "drawer_id"] = target
         operation_id = operation.receipt_operation_id
+        route = "/api/ingest/durable"
         try:
             if operation_id:
-                status = get(f"/api/operations/{operation_id}")
+                route = f"/api/operations/{operation_id}"
+                status = get(route)
             else:
                 route = (
                     "/api/delete/durable"
@@ -480,7 +485,8 @@ class WriteSpool:
                 if not operation_id:
                     raise RuntimeError("durable admission omitted operation_id")
                 self.record_receipt(operation.operation_key, operation_id)
-                status = get(f"/api/operations/{operation_id}")
+                route = f"/api/operations/{operation_id}"
+                status = get(route)
             if not isinstance(status, dict):
                 raise RuntimeError("durable status returned an invalid response")
             state = str(status.get("state") or "")
@@ -527,6 +533,11 @@ class WriteSpool:
             )
         except Exception as exc:
             error_class = classify_write_error(exc)
+            error_details = rest_error_payload(
+                "Durable write replay failed.",
+                route,
+                exc,
+            )["error_details"]
             quarantined = self.record_attempt(
                 operation.operation_key,
                 error_class,
@@ -538,6 +549,7 @@ class WriteSpool:
                 error_class=error_class,
                 operation_id=operation_id,
                 quarantined=quarantined,
+                error_details=error_details,
             )
 
     def _update_operation(

@@ -151,6 +151,7 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertEqual(details["state"], "local_admitted")
         self.assertTrue(details["retry_safe"])
         self.assertTrue(details["operation_key"])
+        self.assertEqual(details["retry_operation_id"], details["operation_key"])
         self.assertEqual(provider._write_spool.count(), 1)
         self.assertEqual(provider.posts[0][1]["idempotency_key"], details["operation_key"])
         self.assertEqual(
@@ -162,6 +163,33 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertNotIn("SECRET_CONCLUSION", serialized)
         self.assertNotIn("SECRET_ENDPOINT", serialized)
         self.assertNotIn("SECRET_RESPONSE_BODY", serialized)
+
+    def test_unhealthy_provider_gate_still_returns_durable_conclude_receipt(self) -> None:
+        provider = AdmissionFailureProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
+        provider._update_health(False)
+
+        result = self._hermes_style_tool_dispatch(
+            provider,
+            "mempal_conclude",
+            {"conclusion": "SECRET_GATE_CONCLUSION"},
+        )
+
+        self.assertEqual(result["error"], "Memory is not yet confirmed stored.")
+        details = result["error_details"]
+        self.assertEqual(details["kind"], "durable_admission_deferred")
+        self.assertEqual(details["error_class"], "http_503")
+        self.assertTrue(details["operation_key"])
+        self.assertEqual(details["retry_operation_id"], details["operation_key"])
+        self.assertEqual(provider._write_spool.count(), 1)
+        self.assertEqual(
+            provider._write_spool.next_operation().operation_key,
+            details["operation_key"],
+        )
+        serialized = json.dumps(result)
+        self.assertNotIn("mempal temporarily unavailable", serialized)
+        self.assertNotIn("SECRET_GATE_CONCLUSION", serialized)
 
     def test_status_lookup_failure_is_retry_safe_and_content_free(self) -> None:
         provider = ControlledConcludeProvider(
@@ -321,6 +349,16 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertEqual(provider.posts, [])
         self.assertEqual(provider._write_spool.count(), 1)
         self.assertNotIn("SECRET_BREAKER_CONCLUSION", json.dumps(result))
+
+    @staticmethod
+    def _hermes_style_tool_dispatch(
+        provider: RecordingProvider,
+        tool_name: str,
+        args: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not provider.is_available():
+            return {"error": "mempal temporarily unavailable. Will retry automatically."}
+        return json.loads(provider.handle_tool_call(tool_name, args))
 
     @staticmethod
     def _conclude(
