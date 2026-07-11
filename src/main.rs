@@ -173,6 +173,7 @@ fn write_cli_stdout_line(args: std::fmt::Arguments<'_>) {
 }
 
 mod case_skill;
+mod daemon_cli;
 mod foresight_cli;
 mod insights;
 mod longmemeval;
@@ -184,6 +185,7 @@ mod skills;
 
 use crate::longmemeval::{BenchMode, LongMemEvalArgs, LongMemEvalGranularity, default_top_k};
 use crate::prime_cli::{PrimeArgs, PrimeFormat};
+use daemon_cli::DaemonSubcommand;
 
 #[derive(Parser)]
 #[command(name = "mempal", about = "Project memory for coding agents", version)]
@@ -1391,24 +1393,6 @@ enum CheckpointCommands {
     /// Disable automatic checkpoint on Stop hook.
     Disable,
     /// Show whether automatic checkpoint is enabled or disabled.
-    Status,
-}
-
-#[derive(Subcommand, Clone, Debug)]
-enum DaemonSubcommand {
-    /// Start the daemon. Fails if already running.
-    Start {
-        /// Run in foreground without daemonizing.
-        #[arg(long, default_value_t = false)]
-        foreground: bool,
-    },
-    /// Gracefully stop the running daemon (waits up to 30s).
-    Stop,
-    /// Stop and restart the daemon.
-    Restart,
-    /// Reap duplicate daemon processes while keeping one singleton alive.
-    Reap,
-    /// Show daemon status, PID, and queue stats.
     Status,
 }
 
@@ -3552,6 +3536,10 @@ fn run() -> Result<()> {
                     run_daemon_stop(&db_path)
                 }
                 Some(DaemonSubcommand::Restart) => run_daemon_restart(cfg_path),
+                Some(DaemonSubcommand::Wait { timeout_secs }) => {
+                    let db_path = daemon_config_db_path(&cfg_path)?;
+                    run_daemon_wait(&db_path, *timeout_secs)
+                }
                 Some(DaemonSubcommand::Reap) => {
                     let db_path = daemon_config_db_path(&cfg_path)?;
                     run_daemon_reap(&db_path)
@@ -15611,6 +15599,13 @@ fn run_daemon_restart(config_path: PathBuf) -> Result<()> {
         return Err(error);
     }
     mempal::daemon::run_command(config_path, false)
+}
+
+fn run_daemon_wait(db_path: &Path, timeout_secs: u64) -> Result<()> {
+    let pid =
+        mempal::daemon_readiness::wait(db_path, std::time::Duration::from_secs(timeout_secs))?;
+    println!("daemon ready (pid {pid})");
+    Ok(())
 }
 
 #[cfg(unix)]

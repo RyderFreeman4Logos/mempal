@@ -28,10 +28,49 @@ pub(crate) struct HookIpcEnqueueRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct HookIpcReadinessRequest {
+    probe: HookIpcProbe,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HookIpcProbe {
+    Readiness,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum HookIpcRequest {
+    Enqueue(HookIpcEnqueueRequest),
+    Readiness(HookIpcReadinessRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum HookIpcEnqueueResponse {
     Accepted,
     Error { message: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum HookIpcReadinessResponse {
+    Ready { pid: u32, process_identity: String },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HookIpcReadiness {
+    pub pid: u32,
+    pub peer_pid: u32,
+    pub process_identity: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum HookIpcResponse {
+    Enqueue(HookIpcEnqueueResponse),
+    Readiness(HookIpcReadinessResponse),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +200,33 @@ pub(crate) fn enqueue_with_timeout(
     })
 }
 
+/// Probe the daemon's write transport without mutating its queue.
+///
+/// A successful response proves that the daemon has acquired its singleton
+/// runtime resources and is actively serving the same IPC boundary used by
+/// hook writes. The caller must match the kernel-authenticated peer PID, not
+/// merely the response fields, against the singleton registration.
+#[cfg(target_os = "linux")]
+pub(crate) fn probe_readiness(mempal_home: &Path, timeout: Duration) -> Option<HookIpcReadiness> {
+    let path = socket_path(mempal_home);
+    if !path.exists() {
+        return None;
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .ok()?;
+
+    runtime.block_on(async move {
+        tokio::time::timeout(timeout, probe_readiness_once(&path))
+            .await
+            .ok()
+            .flatten()
+    })
+}
+
 async fn enqueue_once(path: &Path, request: HookIpcEnqueueRequest) -> HookIpcClientOutcome {
     let mut stream = match UnixStream::connect(path).await {
         Ok(stream) => stream,
@@ -201,10 +267,51 @@ async fn enqueue_once(path: &Path, request: HookIpcEnqueueRequest) -> HookIpcCli
     }
 }
 
+#[cfg(target_os = "linux")]
+async fn probe_readiness_once(path: &Path) -> Option<HookIpcReadiness> {
+    let mut stream = UnixStream::connect(path).await.ok()?;
+    let peer_pid = u32::try_from(stream.peer_cred().ok()?.pid()?).ok()?;
+    let request = HookIpcReadinessRequest {
+        probe: HookIpcProbe::Readiness,
+    };
+    let mut frame = serde_json::to_vec(&request).ok()?;
+    frame.push(b'\n');
+    stream.write_all(&frame).await.ok()?;
+    stream.flush().await.ok()?;
+
+    let frame = read_frame(&mut stream).await.ok()?;
+    match serde_json::from_slice::<HookIpcReadinessResponse>(trim_line_ending(&frame)).ok()? {
+        HookIpcReadinessResponse::Ready {
+            pid,
+            process_identity,
+        } => Some(HookIpcReadiness {
+            pid,
+            peer_pid,
+            process_identity,
+        }),
+    }
+}
+
+pub(crate) async fn read_request(stream: &mut UnixStream) -> Result<HookIpcRequest> {
+    let frame = read_frame(stream).await?;
+    let request: HookIpcRequest = serde_json::from_slice(trim_line_ending(&frame))
+        .context("invalid hook IPC request JSON")?;
+    if let HookIpcRequest::Enqueue(request) = &request {
+        validate_enqueue_request(request)?;
+    }
+    Ok(request)
+}
+
+#[cfg(test)]
 pub(crate) async fn read_enqueue_request(stream: &mut UnixStream) -> Result<HookIpcEnqueueRequest> {
     let frame = read_frame(stream).await?;
     let request: HookIpcEnqueueRequest = serde_json::from_slice(trim_line_ending(&frame))
         .context("invalid hook IPC request JSON")?;
+    validate_enqueue_request(&request)?;
+    Ok(request)
+}
+
+fn validate_enqueue_request(request: &HookIpcEnqueueRequest) -> Result<()> {
     if request.kind.trim().is_empty() {
         bail!("hook IPC request kind must not be empty");
     }
@@ -220,12 +327,31 @@ pub(crate) async fn read_enqueue_request(stream: &mut UnixStream) -> Result<Hook
             MAX_IDEMPOTENCY_KEY_BYTES
         );
     }
-    Ok(request)
+    Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn write_enqueue_response(
     stream: &mut UnixStream,
     response: &HookIpcEnqueueResponse,
+) -> Result<()> {
+    let mut frame =
+        serde_json::to_vec(response).context("failed to serialize hook IPC response")?;
+    frame.push(b'\n');
+    stream
+        .write_all(&frame)
+        .await
+        .context("failed to write hook IPC response")?;
+    stream
+        .flush()
+        .await
+        .context("failed to flush hook IPC response")?;
+    Ok(())
+}
+
+pub(crate) async fn write_response(
+    stream: &mut UnixStream,
+    response: &HookIpcResponse,
 ) -> Result<()> {
     let mut frame =
         serde_json::to_vec(response).context("failed to serialize hook IPC response")?;
