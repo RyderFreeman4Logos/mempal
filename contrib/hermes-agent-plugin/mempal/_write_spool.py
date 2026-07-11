@@ -52,6 +52,7 @@ class ReplayOutcome:
     completed: bool
     error_class: Optional[str] = None
     drawer_id: Optional[str] = None
+    operation_id: Optional[str] = None
     quarantined: bool = False
 
 
@@ -191,22 +192,30 @@ class WriteSpool:
         *,
         track_key: Optional[str] = None,
         action: Optional[str] = None,
+        operation_key: Optional[str] = None,
     ) -> SpoolOperation:
-        operation_key = secrets.token_urlsafe(32)
+        operation_key = operation_key or secrets.token_urlsafe(32)
         encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
         now = time.time()
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            cursor = connection.execute(
-                """
-                INSERT INTO write_operations (
-                    operation_key, kind, body_json, track_key, action,
-                    created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-                """,
-                (operation_key, kind, encoded, track_key, action, now),
-            )
-            sequence = int(cursor.lastrowid)
+            try:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO write_operations (
+                        operation_key, kind, body_json, track_key, action,
+                        created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                    """,
+                    (operation_key, kind, encoded, track_key, action, now),
+                )
+                sequence = int(cursor.lastrowid)
+            except sqlite3.IntegrityError:
+                connection.execute("ROLLBACK")
+                existing = self.get(operation_key)
+                if existing is None:
+                    raise
+                return existing
             connection.execute("COMMIT")
         self._chmod_sqlite_files()
         return SpoolOperation(
@@ -395,6 +404,43 @@ class WriteSpool:
         operation = self.next_replayable_operation()
         if operation is None:
             return None
+        return self._replay_operation(operation, post, get)
+
+    def replay_operation_key(
+        self,
+        operation_key: str,
+        post: Callable[[str, Dict[str, Any]], Any],
+        get: Callable[[str], Any],
+        *,
+        ignore_retry_delay: bool = False,
+    ) -> Optional[ReplayOutcome]:
+        """Attempt one specific operation, preserving its producer-owned key."""
+        operation = self.get(operation_key)
+        if operation is None:
+            return None
+        if operation.quarantined_at is not None:
+            return ReplayOutcome(
+                operation,
+                completed=False,
+                error_class=operation.quarantine_reason or operation.last_error_class,
+                operation_id=operation.receipt_operation_id,
+                quarantined=True,
+            )
+        if not ignore_retry_delay and operation.next_attempt_at > time.time():
+            return ReplayOutcome(
+                operation,
+                completed=False,
+                error_class=operation.last_error_class or "retry_not_due",
+                operation_id=operation.receipt_operation_id,
+            )
+        return self._replay_operation(operation, post, get)
+
+    def _replay_operation(
+        self,
+        operation: SpoolOperation,
+        post: Callable[[str, Dict[str, Any]], Any],
+        get: Callable[[str], Any],
+    ) -> ReplayOutcome:
         request = dict(operation.body)
         if operation.track_key and operation.action in {"replace", "delete"}:
             target = self.drawer_for_track(operation.track_key)
@@ -411,8 +457,8 @@ class WriteSpool:
                     quarantined=quarantined,
                 )
             request["supersedes" if operation.action == "replace" else "drawer_id"] = target
+        operation_id = operation.receipt_operation_id
         try:
-            operation_id = operation.receipt_operation_id
             if operation_id:
                 status = get(f"/api/operations/{operation_id}")
             else:
@@ -446,7 +492,12 @@ class WriteSpool:
                     drawer_id=None if operation.action == "delete" else drawer_id,
                     delete_track=operation.action == "delete",
                 )
-                return ReplayOutcome(operation, completed=True, drawer_id=drawer_id)
+                return ReplayOutcome(
+                    operation,
+                    completed=True,
+                    drawer_id=drawer_id,
+                    operation_id=operation_id,
+                )
             error_class = f"terminal_{state}" if state in {"failed", "rejected"} else None
             if error_class:
                 quarantined = self.record_attempt(
@@ -458,6 +509,7 @@ class WriteSpool:
                     operation,
                     completed=False,
                     error_class=error_class,
+                    operation_id=operation_id,
                     quarantined=quarantined,
                 )
             status_class = f"status_{state or 'unknown'}"
@@ -470,6 +522,7 @@ class WriteSpool:
                 operation,
                 completed=False,
                 error_class=status_class,
+                operation_id=operation_id,
                 quarantined=quarantined,
             )
         except Exception as exc:
@@ -483,6 +536,7 @@ class WriteSpool:
                 operation,
                 completed=False,
                 error_class=error_class,
+                operation_id=operation_id,
                 quarantined=quarantined,
             )
 

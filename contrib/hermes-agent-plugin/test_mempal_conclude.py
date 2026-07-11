@@ -2,6 +2,8 @@ import io
 import json
 import os
 import sys
+import tempfile
+import time
 import unittest
 import urllib.error
 from typing import Any, Dict, Optional
@@ -11,6 +13,7 @@ PLUGIN_DIR = os.path.dirname(__file__)
 if PLUGIN_DIR not in sys.path:
     sys.path.insert(0, PLUGIN_DIR)
 
+import mempal._conclude as conclude_module  # noqa: E402
 from test_mempal_provider import RecordingProvider  # noqa: E402
 
 
@@ -59,6 +62,57 @@ class AdmissionFailureProvider(RecordingProvider):
         )
 
 
+class SharedConcludeBackend:
+    def __init__(self, *, lose_receipt_once: bool = False) -> None:
+        self.lose_receipt_once = lose_receipt_once
+        self.keys = []
+        self.operations: Dict[str, Dict[str, Any]] = {}
+        self.drawer_count = 0
+
+    def admit(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        key = str(body["idempotency_key"])
+        self.keys.append(key)
+        operation_id = f"operation_{key}"
+        if operation_id not in self.operations:
+            self.drawer_count += 1
+            self.operations[operation_id] = {
+                "operation_id": operation_id,
+                "state": "completed",
+                "drawer_id": f"drawer_{self.drawer_count}",
+            }
+        if self.lose_receipt_once:
+            self.lose_receipt_once = False
+            raise urllib.error.URLError("SECRET_LOST_RECEIPT_BODY")
+        return {
+            "operation_id": operation_id,
+            "accepted_at": "2026-07-10T00:00:00Z",
+            "state": "completed",
+        }
+
+
+class SharedConcludeProvider(RecordingProvider):
+    def __init__(self, backend: SharedConcludeBackend) -> None:
+        super().__init__()
+        self.backend = backend
+
+    def _post(self, path: str, body: Dict[str, Any]) -> Any:
+        self.posts.append((path, dict(body)))
+        if path == "/api/ingest/durable":
+            return self.backend.admit(body)
+        return {"ok": True}
+
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        self.gets.append((path, dict(params or {})))
+        if path.startswith("/api/operations/"):
+            return self.backend.operations.get(path.rsplit("/", 1)[-1], {})
+        return self.responses.get(path, [])
+
+
+class BrokenSpool:
+    def admit(self, *_args: Any, **_kwargs: Any) -> None:
+        raise OSError("SECRET_LOCAL_SPOOL_BODY")
+
+
 class DurableConcludeTests(unittest.TestCase):
     def test_completed_receipt_with_drawer_reports_success(self) -> None:
         provider = ControlledConcludeProvider("completed", drawer_id="drawer-terminal")
@@ -87,10 +141,22 @@ class DurableConcludeTests(unittest.TestCase):
     def test_admission_503_never_claims_storage_and_redacts_payload(self) -> None:
         provider = AdmissionFailureProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
 
-        result = self._conclude(provider, "SECRET_CONCLUSION", operation_key="event-503")
+        result = self._conclude(provider, "SECRET_CONCLUSION")
 
-        self.assertEqual(result["error_details"]["http_status"], 503)
+        details = result["error_details"]
+        self.assertEqual(details["kind"], "durable_admission_deferred")
+        self.assertEqual(details["error_class"], "http_503")
+        self.assertEqual(details["state"], "local_admitted")
+        self.assertTrue(details["retry_safe"])
+        self.assertTrue(details["operation_key"])
+        self.assertEqual(provider._write_spool.count(), 1)
+        self.assertEqual(provider.posts[0][1]["idempotency_key"], details["operation_key"])
+        self.assertEqual(
+            provider._write_spool.next_operation().operation_key,
+            details["operation_key"],
+        )
         self.assertNotIn("result", result)
         serialized = json.dumps(result)
         self.assertNotIn("SECRET_CONCLUSION", serialized)
@@ -157,16 +223,118 @@ class DurableConcludeTests(unittest.TestCase):
             2,
         )
 
+    def test_lost_receipt_retry_reuses_generated_key_and_single_effect(self) -> None:
+        backend = SharedConcludeBackend(lose_receipt_once=True)
+        provider = SharedConcludeProvider(backend)
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
+
+        first = self._conclude(provider, "SECRET_LOST_RECEIPT_CONCLUSION")
+        key = first["error_details"]["operation_key"]
+        second = self._conclude(
+            provider,
+            "SECRET_LOST_RECEIPT_CONCLUSION",
+            operation_key=key,
+        )
+
+        self.assertEqual(first["error_details"]["kind"], "durable_admission_deferred")
+        self.assertEqual(second["result"], "Fact stored.")
+        self.assertEqual(second["operation_key"], key)
+        self.assertEqual(second["operation_id"], f"operation_{key}")
+        self.assertEqual(backend.drawer_count, 1)
+        self.assertEqual(set(backend.keys), {key})
+        self.assertEqual(provider._write_spool.count(), 0)
+        serialized = json.dumps(first)
+        self.assertNotIn("SECRET_LOST_RECEIPT_CONCLUSION", serialized)
+        self.assertNotIn("SECRET_LOST_RECEIPT_BODY", serialized)
+
+    def test_lost_receipt_replays_after_provider_restart_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory() as hermes_home:
+            backend = SharedConcludeBackend(lose_receipt_once=True)
+            first = SharedConcludeProvider(backend)
+            first.initialize("session-a", hermes_home=hermes_home)
+            first._start_write_worker = lambda: None
+
+            result = self._conclude(first, "restart conclusion")
+            key = result["error_details"]["operation_key"]
+            self.assertEqual(first._write_spool.count(), 1)
+            first.shutdown()
+
+            restarted = SharedConcludeProvider(backend)
+            restarted.initialize("session-a", hermes_home=hermes_home)
+            deadline = time.monotonic() + 3.0
+            while restarted._write_spool.count() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            restarted.shutdown()
+
+            self.assertEqual(restarted._write_spool.count(), 0)
+            self.assertEqual(backend.drawer_count, 1)
+            self.assertEqual(set(backend.keys), {key})
+
+    def test_distinct_identical_conclusions_get_distinct_operation_identity(self) -> None:
+        backend = SharedConcludeBackend()
+        provider = SharedConcludeProvider(backend)
+        provider.initialize("session-a", user_id="alice", profile="work")
+        generated = iter(("explicit-a", "explicit-b"))
+        original = conclude_module.secrets.token_urlsafe
+        conclude_module.secrets.token_urlsafe = lambda _size: next(generated)
+        try:
+            first = self._conclude(provider, "identical explicit conclusion")
+            second = self._conclude(provider, "identical explicit conclusion")
+        finally:
+            conclude_module.secrets.token_urlsafe = original
+
+        self.assertEqual(first["operation_key"], "explicit-a")
+        self.assertEqual(second["operation_key"], "explicit-b")
+        self.assertNotEqual(first["operation_id"], second["operation_id"])
+        self.assertNotEqual(first["drawer_id"], second["drawer_id"])
+        self.assertEqual(backend.drawer_count, 2)
+
+    def test_local_admission_failure_returns_stable_content_free_retry_handle(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._write_spool = BrokenSpool()
+
+        result = self._conclude(provider, "SECRET_LOCAL_CONCLUSION")
+
+        details = result["error_details"]
+        self.assertEqual(details["kind"], "local_durable_admission_failed")
+        self.assertEqual(details["state"], "local_admission_failed")
+        self.assertTrue(details["operation_key"])
+        self.assertEqual(provider.posts, [])
+        serialized = json.dumps(result)
+        self.assertNotIn("SECRET_LOCAL_CONCLUSION", serialized)
+        self.assertNotIn("SECRET_LOCAL_SPOOL_BODY", serialized)
+
+    def test_open_breaker_admits_conclude_locally_without_transport(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        for _ in range(5):
+            provider._backoff.record_failure()
+
+        result = self._conclude(provider, "SECRET_BREAKER_CONCLUSION")
+
+        details = result["error_details"]
+        self.assertEqual(details["kind"], "durable_replay_deferred")
+        self.assertEqual(details["error_class"], "breaker_open")
+        self.assertTrue(details["operation_key"])
+        self.assertEqual(provider.posts, [])
+        self.assertEqual(provider._write_spool.count(), 1)
+        self.assertNotIn("SECRET_BREAKER_CONCLUSION", json.dumps(result))
+
     @staticmethod
     def _conclude(
         provider: RecordingProvider,
         conclusion: str,
         *,
-        operation_key: str,
+        operation_key: Optional[str] = None,
     ) -> Dict[str, Any]:
+        args = {"conclusion": conclusion}
+        if operation_key is not None:
+            args["operation_key"] = operation_key
         return json.loads(provider.handle_tool_call(
             "mempal_conclude",
-            {"conclusion": conclusion, "operation_key": operation_key},
+            args,
         ))
 
 

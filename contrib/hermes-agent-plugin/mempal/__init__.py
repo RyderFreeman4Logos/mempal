@@ -993,7 +993,7 @@ class MempalMemoryProvider:
         return [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]
 
     def handle_tool_call(self, tool_name, args, **kwargs):
-        if self._is_breaker_open():
+        if self._is_breaker_open() and tool_name != "mempal_conclude":
             return json.dumps({"error": "mempal temporarily unavailable. Will retry automatically."})
         if tool_name == "mempal_profile":
             try:
@@ -1049,6 +1049,7 @@ class MempalMemoryProvider:
                 return json.dumps({"error": "Missing required parameter: conclusion"})
             try:
                 result = submit_conclusion(
+                    self._write_spool,
                     self._post,
                     self._get,
                     conclusion_request(
@@ -1057,11 +1058,15 @@ class MempalMemoryProvider:
                     ),
                     operation_key=args.get("operation_key"),
                     wait_timeout=self._conclude_wait_timeout,
+                    transport_allowed=not self._is_breaker_open(),
                 )
                 if result.stored:
                     self._record_success()
                 else:
                     self._record_failure()
+                    details = result.payload.get("error_details", {})
+                    if details.get("kind") != "local_durable_admission_failed":
+                        self._wake_spool_worker()
                 return json.dumps(result.payload)
             except Exception as exc:
                 self._record_failure()
