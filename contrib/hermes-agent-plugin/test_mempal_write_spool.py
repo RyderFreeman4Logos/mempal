@@ -106,6 +106,62 @@ class DurableRawTurnTests(unittest.TestCase):
             self.assertEqual(len(set(backend.keys)), 1)
 
 
+class _FailingEnhancer:
+    def enhance_summary(self, _text: str) -> str:
+        raise RuntimeError("synthetic enhancement failure")
+
+
+class DurableSessionSummaryTests(unittest.TestCase):
+    def test_session_summary_spools_while_breaker_open(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", project_id="project-alpha")
+        for _ in range(5):
+            provider._backoff.record_failure()
+
+        provider.on_session_end([{"role": "assistant", "content": "summary text"}])
+
+        operation = provider._write_spool.next_operation()
+        self.assertEqual(operation.action, "session_summary")
+        self.assertEqual(operation.body["room"], "sessions/session-a")
+        self.assertEqual(operation.body["project_id"], "project-alpha")
+        provider.shutdown()
+
+    def test_enhancement_failure_retains_deterministic_summary(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a")
+        provider._should_enhance = lambda: True
+        provider._enhancer = _FailingEnhancer()
+        for _ in range(5):
+            provider._backoff.record_failure()
+
+        provider.on_session_end([{"role": "assistant", "content": "deterministic"}])
+
+        operation = provider._write_spool.next_operation()
+        self.assertIn("deterministic", operation.body["content"])
+        provider.shutdown()
+
+    def test_session_summary_survives_503_and_provider_restart_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory() as hermes_home:
+            backend = _RestartBackend(failures=2)
+            first = _RestartProvider(backend)
+            first.initialize("session-a", hermes_home=hermes_home)
+            first.on_session_end([{"role": "assistant", "content": "summary restart"}])
+            first._drain_writes()
+            self.assertEqual(first._write_spool.count(), 1)
+            first.shutdown()
+
+            restarted = _RestartProvider(backend)
+            restarted.initialize("session-a", hermes_home=hermes_home)
+            deadline = time.monotonic() + 4.0
+            while restarted._write_spool.count() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            restarted.shutdown()
+
+            self.assertEqual(restarted._write_spool.count(), 0)
+            self.assertEqual(backend.drawer_count, 1)
+            self.assertEqual(len(set(backend.keys)), 1)
+
+
 class WriteQueueCompatibilityTests(unittest.TestCase):
     def test_legacy_write_queue_drains_on_shutdown(self) -> None:
         provider = RecordingProvider()

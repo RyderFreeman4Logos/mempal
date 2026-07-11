@@ -488,16 +488,22 @@ class MempalMemoryProvider:
             self._process_write(item)
             self._write_queue.task_done()
 
-    def _spool_ingest(self, body: Dict[str, Any], *, action: str) -> SpoolOperation:
+    def _spool_ingest(
+        self, body: Dict[str, Any], *, action: str, wake: bool = True
+    ) -> SpoolOperation:
         if self._write_spool is None:
             raise RuntimeError("mempal durable write spool is not initialized")
         operation = self._write_spool.admit("ingest", body, action=action)
+        if wake:
+            self._wake_spool_worker()
+        return operation
+
+    def _wake_spool_worker(self) -> None:
         self._start_write_worker()
         try:
             self._write_queue.put_nowait({"op": "spool_wake"})
         except queue.Full:
             pass
-        return operation
 
     def _replay_spooled_write(self) -> None:
         spool = self._write_spool
@@ -595,7 +601,8 @@ class MempalMemoryProvider:
     def initialize(self, session_id: str, **kwargs) -> None:
         self._configure_scope(session_id, kwargs, preserve_existing=False)
         self._write_spool = WriteSpool(self._hermes_home)
-        self._start_write_worker()
+        if self._write_spool.count():
+            self._start_write_worker()
 
     def _configure_scope(self, session_id, context, *, preserve_existing):
         self._session_id = session_id
@@ -1061,19 +1068,24 @@ class MempalMemoryProvider:
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
     def on_session_end(self, messages):
-        if self._is_breaker_open():
-            return
         assistant_msgs = [m.get("content", "") for m in messages if m.get("role") == "assistant" and m.get("content")]
         if not assistant_msgs:
             return
         summary = assistant_msgs[-1][:2000]
-        if self._should_enhance() and self._enhancer:
-            all_text = "\n".join(f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in messages[-10:] if m.get("content"))
-            enhanced = self._enhancer.enhance_summary(all_text)
-            if enhanced:
-                summary = enhanced
         body = self._with_project_id({"content": f"[Session summary] {summary}", "wing": self._wing, "room": self._session_room()})
-        self._enqueue_write({"op": "ingest", "body": body, "skip_enhance": True})
+        operation = self._spool_ingest(body, action="session_summary", wake=False)
+        try:
+            if self._should_enhance() and self._enhancer:
+                all_text = "\n".join(f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in messages[-10:] if m.get("content"))
+                enhanced = self._enhancer.enhance_summary(all_text)
+                if enhanced:
+                    enhanced_body = dict(body)
+                    enhanced_body["content"] = f"[Session summary] {enhanced}"
+                    self._write_spool.replace_body(operation.operation_key, enhanced_body)
+        except Exception:
+            logger.warning("mempal summary enhancement failed; deterministic evidence retained")
+        finally:
+            self._wake_spool_worker()
 
     def on_memory_write(self, action, target, content, metadata=None):
         if self._is_breaker_open():

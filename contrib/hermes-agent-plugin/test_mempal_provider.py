@@ -112,6 +112,11 @@ class RecordingProvider(MempalMemoryProvider):
 
     def _drain_writes(self) -> None:
         self._write_queue.join()
+        self._write_stop.set()
+        if self._write_worker:
+            self._write_worker.join(timeout=2.0)
+        self._write_worker = None
+        self._write_stop.clear()
 
     def __del__(self) -> None:
         cleanup = getattr(self, "_backoff_dir", None)
@@ -278,16 +283,6 @@ class MempalProviderScopeTests(unittest.TestCase):
         self.assertIn("session scoped memory", result)
         self.assertEqual(provider.gets[-1][1]["project_id"], "project-alpha")
         self.assertEqual(provider.prefetch("memory", session_id="session-b"), "")
-
-    def test_session_end_uses_session_scoped_room(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work", project_id="project-alpha")
-
-        provider.on_session_end([{"role": "assistant", "content": "summary text"}])
-        provider._drain_writes()
-
-        self.assertEqual(provider.posts[-1][1]["room"], "sessions/session-a")
-        self.assertEqual(provider.posts[-1][1]["project_id"], "project-alpha")
 
     def test_memory_write_routes_by_target(self) -> None:
         provider = RecordingProvider()

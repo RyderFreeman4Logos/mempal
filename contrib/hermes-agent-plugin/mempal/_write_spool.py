@@ -184,6 +184,15 @@ class WriteSpool:
             (error_class, time.time()),
         )
 
+    def replace_body(self, operation_key: str, body: Dict[str, Any]) -> None:
+        """Atomically refine an admitted operation before delivery begins."""
+        encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        self._update_operation(
+            operation_key,
+            "body_json = ?2, updated_at = ?3",
+            (encoded, time.time()),
+        )
+
     def complete(
         self,
         operation_key: str,
