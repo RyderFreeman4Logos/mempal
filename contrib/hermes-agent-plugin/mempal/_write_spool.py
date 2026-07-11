@@ -20,6 +20,8 @@ from typing import Any, Callable, Dict, Optional
 
 _DB_RELATIVE_PATH = os.path.join("state", "mempal", "write-spool.sqlite3")
 _CONNECT_TIMEOUT_SECS = 0.5
+_MAX_REPLAY_ATTEMPTS = 5
+_RETRY_BACKOFF_SECS = (0.25, 0.5, 1.0, 2.0, 5.0)
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,9 @@ class SpoolOperation:
     receipt_operation_id: Optional[str]
     attempt_count: int
     last_error_class: Optional[str]
+    next_attempt_at: float
+    quarantined_at: Optional[float]
+    quarantine_reason: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,7 @@ class ReplayOutcome:
     completed: bool
     error_class: Optional[str] = None
     drawer_id: Optional[str] = None
+    quarantined: bool = False
 
 
 def classify_write_error(exc: Exception) -> str:
@@ -55,7 +61,7 @@ def classify_write_error(exc: Exception) -> str:
 
 
 class WriteSpool:
-    """Durable FIFO of provider writes with persistent target lineage."""
+    """Durable provider writes with per-track ordering and persistent lineage."""
 
     def __init__(self, hermes_home: str) -> None:
         if not hermes_home:
@@ -105,11 +111,18 @@ class WriteSpool:
                     receipt_operation_id TEXT,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
                     last_error_class TEXT,
+                    next_attempt_at REAL NOT NULL DEFAULT 0,
+                    quarantined_at REAL,
+                    quarantine_reason TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_write_operations_fifo
                     ON write_operations(sequence);
+                CREATE INDEX IF NOT EXISTS idx_write_operations_replay
+                    ON write_operations(quarantined_at, next_attempt_at, sequence);
+                CREATE INDEX IF NOT EXISTS idx_write_operations_track
+                    ON write_operations(track_key, sequence);
                 CREATE TABLE IF NOT EXISTS track_drawers (
                     track_key TEXT PRIMARY KEY,
                     drawer_id TEXT NOT NULL,
@@ -118,7 +131,37 @@ class WriteSpool:
                 COMMIT;
                 """
             )
+            self._migrate_schema(connection)
         self._chmod_sqlite_files()
+
+    def _migrate_schema(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(write_operations)")
+        }
+        if "next_attempt_at" not in columns:
+            connection.execute(
+                "ALTER TABLE write_operations "
+                "ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0"
+            )
+        if "quarantined_at" not in columns:
+            connection.execute("ALTER TABLE write_operations ADD COLUMN quarantined_at REAL")
+        if "quarantine_reason" not in columns:
+            connection.execute(
+                "ALTER TABLE write_operations ADD COLUMN quarantine_reason TEXT"
+            )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_write_operations_replay
+                ON write_operations(quarantined_at, next_attempt_at, sequence)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_write_operations_track
+                ON write_operations(track_key, sequence)
+            """
+        )
 
     def _chmod_sqlite_files(self) -> None:
         for path in (self.path, f"{self.path}-wal", f"{self.path}-shm"):
@@ -160,12 +203,40 @@ class WriteSpool:
             receipt_operation_id=None,
             attempt_count=0,
             last_error_class=None,
+            next_attempt_at=0.0,
+            quarantined_at=None,
+            quarantine_reason=None,
         )
 
     def next_operation(self) -> Optional[SpoolOperation]:
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT * FROM write_operations ORDER BY sequence LIMIT 1"
+            ).fetchone()
+        return self._row_to_operation(row) if row is not None else None
+
+    def next_replayable_operation(self) -> Optional[SpoolOperation]:
+        now = time.time()
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM write_operations AS candidate
+                WHERE candidate.quarantined_at IS NULL
+                  AND candidate.next_attempt_at <= ?1
+                  AND (
+                    candidate.track_key IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM write_operations AS earlier
+                        WHERE earlier.track_key = candidate.track_key
+                          AND earlier.sequence < candidate.sequence
+                    )
+                  )
+                ORDER BY candidate.sequence
+                LIMIT 1
+                """,
+                (now,),
             ).fetchone()
         return self._row_to_operation(row) if row is not None else None
 
@@ -189,12 +260,57 @@ class WriteSpool:
             (operation_id, time.time()),
         )
 
-    def record_attempt(self, operation_key: str, error_class: Optional[str]) -> None:
-        self._update_operation(
-            operation_key,
-            "attempt_count = attempt_count + 1, last_error_class = ?2, updated_at = ?3",
-            (error_class, time.time()),
-        )
+    def record_attempt(self, operation_key: str, error_class: Optional[str]) -> bool:
+        now = time.time()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT attempt_count
+                FROM write_operations
+                WHERE operation_key = ?1
+                """,
+                (operation_key,),
+            ).fetchone()
+            if row is None:
+                connection.execute("ROLLBACK")
+                raise KeyError("spool operation is no longer present")
+            next_count = int(row["attempt_count"]) + 1
+            delay = _RETRY_BACKOFF_SECS[
+                min(next_count - 1, len(_RETRY_BACKOFF_SECS) - 1)
+            ]
+            quarantined = next_count >= _MAX_REPLAY_ATTEMPTS
+            updated = connection.execute(
+                """
+                UPDATE write_operations
+                SET attempt_count = ?2,
+                    last_error_class = ?3,
+                    next_attempt_at = ?4,
+                    quarantined_at = CASE
+                        WHEN ?5 THEN ?6
+                        ELSE quarantined_at
+                    END,
+                    quarantine_reason = CASE
+                        WHEN ?5 THEN ?3
+                        ELSE quarantine_reason
+                    END,
+                    updated_at = ?6
+                WHERE operation_key = ?1
+                """,
+                (
+                    operation_key,
+                    next_count,
+                    error_class,
+                    now + delay,
+                    quarantined,
+                    now,
+                ),
+            ).rowcount
+            if updated != 1:
+                connection.execute("ROLLBACK")
+                raise KeyError("spool operation is no longer present")
+            connection.execute("COMMIT")
+        return quarantined
 
     def replace_body(self, operation_key: str, body: Dict[str, Any]) -> None:
         """Atomically refine an admitted operation before delivery begins."""
@@ -253,17 +369,22 @@ class WriteSpool:
         post: Callable[[str, Dict[str, Any]], Any],
         get: Callable[[str], Any],
     ) -> Optional[ReplayOutcome]:
-        """Attempt the oldest operation without surrendering it on ambiguity."""
-        operation = self.next_operation()
+        """Attempt the earliest eligible operation without surrendering ambiguity."""
+        operation = self.next_replayable_operation()
         if operation is None:
             return None
         request = dict(operation.body)
         if operation.track_key and operation.action in {"replace", "delete"}:
             target = self.drawer_for_track(operation.track_key)
             if not target:
-                self.record_attempt(operation.operation_key, "target_unresolved")
+                quarantined = self.record_attempt(
+                    operation.operation_key, "target_unresolved"
+                )
                 return ReplayOutcome(
-                    operation, completed=False, error_class="target_unresolved"
+                    operation,
+                    completed=False,
+                    error_class="target_unresolved",
+                    quarantined=quarantined,
                 )
             request["supersedes" if operation.action == "replace" else "drawer_id"] = target
         try:
@@ -304,12 +425,30 @@ class WriteSpool:
                 return ReplayOutcome(operation, completed=True, drawer_id=drawer_id)
             error_class = f"terminal_{state}" if state in {"failed", "rejected"} else None
             if error_class:
-                self.record_attempt(operation.operation_key, error_class)
-            return ReplayOutcome(operation, completed=False, error_class=error_class)
+                quarantined = self.record_attempt(operation.operation_key, error_class)
+                return ReplayOutcome(
+                    operation,
+                    completed=False,
+                    error_class=error_class,
+                    quarantined=quarantined,
+                )
+            status_class = f"status_{state or 'unknown'}"
+            quarantined = self.record_attempt(operation.operation_key, status_class)
+            return ReplayOutcome(
+                operation,
+                completed=False,
+                error_class=status_class,
+                quarantined=quarantined,
+            )
         except Exception as exc:
             error_class = classify_write_error(exc)
-            self.record_attempt(operation.operation_key, error_class)
-            return ReplayOutcome(operation, completed=False, error_class=error_class)
+            quarantined = self.record_attempt(operation.operation_key, error_class)
+            return ReplayOutcome(
+                operation,
+                completed=False,
+                error_class=error_class,
+                quarantined=quarantined,
+            )
 
     def _update_operation(
         self, operation_key: str, assignment: str, values: tuple[Any, ...]
@@ -340,4 +479,9 @@ class WriteSpool:
             receipt_operation_id=row["receipt_operation_id"],
             attempt_count=int(row["attempt_count"]),
             last_error_class=row["last_error_class"],
+            next_attempt_at=float(row["next_attempt_at"]),
+            quarantined_at=(
+                None if row["quarantined_at"] is None else float(row["quarantined_at"])
+            ),
+            quarantine_reason=row["quarantine_reason"],
         )

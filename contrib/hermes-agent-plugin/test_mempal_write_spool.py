@@ -10,6 +10,7 @@ import urllib.error
 from typing import Any, Dict, List, Optional
 
 from mempal import MempalMemoryProvider
+from mempal._write_spool import WriteSpool
 from test_mempal_provider import RecordingProvider
 
 
@@ -320,6 +321,27 @@ class _BlockingProvider(_RestartProvider):
 
 
 class DurableSchedulingTests(unittest.TestCase):
+    def _seed_unresolved_profile_replace(
+        self, hermes_home: str, backend: _RestartBackend
+    ) -> None:
+        provider = _RestartProvider(backend)
+        provider.initialize("session-a", hermes_home=hermes_home)
+        provider.on_memory_write("replace", "profile", "orphan replacement")
+        provider._drain_writes()
+
+        operation = provider._write_spool.next_operation()
+        self.assertEqual(operation.last_error_class, "target_unresolved")
+        self.assertEqual(provider._write_spool.count(), 1)
+        provider.shutdown()
+
+    def _force_all_spool_rows_due(self, spool: WriteSpool) -> None:
+        connection = sqlite3.connect(spool.path)
+        try:
+            connection.execute("UPDATE write_operations SET next_attempt_at = 0")
+            connection.commit()
+        finally:
+            connection.close()
+
     def test_queue_full_retains_recoverable_work(self) -> None:
         provider = RecordingProvider()
         provider.initialize("session-a")
@@ -393,6 +415,98 @@ class DurableSchedulingTests(unittest.TestCase):
         self.assertNotIn("PRIVATE_ASSISTANT", rendered)
         self.assertNotIn("synthetic response body", rendered)
         provider.shutdown()
+
+    def test_blocked_oldest_does_not_starve_raw_turn_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as hermes_home:
+            backend = _RestartBackend(failures=0)
+            self._seed_unresolved_profile_replace(hermes_home, backend)
+
+            restarted = _RestartProvider(backend)
+            restarted.initialize("session-a", hermes_home=hermes_home)
+            restarted.sync_turn("later raw user", "later raw assistant")
+            restarted._drain_writes()
+
+            raw_requests = [
+                body["request"]
+                for path, body in restarted.posts
+                if path == "/api/ingest/durable"
+                and "later raw user" in body["request"].get("content", "")
+            ]
+            self.assertEqual(len(raw_requests), 1)
+            self.assertEqual(restarted._write_spool.count(), 1)
+            restarted.shutdown()
+
+    def test_blocked_oldest_does_not_starve_session_summary_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as hermes_home:
+            backend = _RestartBackend(failures=0)
+            self._seed_unresolved_profile_replace(hermes_home, backend)
+
+            restarted = _RestartProvider(backend)
+            restarted.initialize("session-a", hermes_home=hermes_home)
+            restarted.on_session_end([
+                {"role": "assistant", "content": "later summary evidence"}
+            ])
+            restarted._drain_writes()
+
+            summary_requests = [
+                body["request"]
+                for path, body in restarted.posts
+                if path == "/api/ingest/durable"
+                and "later summary evidence" in body["request"].get("content", "")
+            ]
+            self.assertEqual(len(summary_requests), 1)
+            self.assertEqual(restarted._write_spool.count(), 1)
+            restarted.shutdown()
+
+    def test_blocked_oldest_does_not_starve_independent_mirrored_write_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as hermes_home:
+            backend = _RestartBackend(failures=0)
+            self._seed_unresolved_profile_replace(hermes_home, backend)
+
+            restarted = _RestartProvider(backend)
+            restarted.initialize("session-a", hermes_home=hermes_home)
+            restarted.on_memory_write("add", "turns", "independent mirrored evidence")
+            restarted._drain_writes()
+
+            mirrored_requests = [
+                body["request"]
+                for path, body in restarted.posts
+                if path == "/api/ingest/durable"
+                and body["request"].get("content") == "independent mirrored evidence"
+            ]
+            self.assertEqual(len(mirrored_requests), 1)
+            self.assertEqual(restarted._write_spool.count(), 1)
+            restarted.shutdown()
+
+    def test_exhausted_unresolved_target_is_quarantined_without_deleting_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as hermes_home:
+            spool = WriteSpool(hermes_home)
+            spool.admit(
+                "ingest",
+                {"content": "orphan replacement", "wing": "wing", "room": "facts"},
+                track_key="profile:wing",
+                action="replace",
+            )
+            posts: List[Dict[str, Any]] = []
+
+            for _ in range(5):
+                outcome = spool.replay_one(
+                    lambda _path, body: posts.append(body),
+                    lambda _path: {},
+                )
+                self.assertIsNotNone(outcome)
+                if outcome.quarantined:
+                    break
+                self._force_all_spool_rows_due(spool)
+
+            operation = spool.next_operation()
+            self.assertIsNotNone(operation)
+            self.assertEqual(operation.last_error_class, "target_unresolved")
+            self.assertEqual(operation.quarantine_reason, "target_unresolved")
+            self.assertIsNotNone(operation.quarantined_at)
+            self.assertEqual(spool.count(), 1)
+            self.assertIsNone(spool.next_replayable_operation())
+            self.assertEqual(posts, [])
 
 
 if __name__ == "__main__":
