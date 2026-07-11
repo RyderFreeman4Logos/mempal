@@ -22,6 +22,12 @@ _DB_RELATIVE_PATH = os.path.join("state", "mempal", "write-spool.sqlite3")
 _CONNECT_TIMEOUT_SECS = 0.5
 _MAX_REPLAY_ATTEMPTS = 5
 _RETRY_BACKOFF_SECS = (0.25, 0.5, 1.0, 2.0, 5.0)
+_RETRYABLE_HTTP_4XX = {"http_408", "http_429"}
+_NON_RETRYABLE_REPLAY_ERRORS = {
+    "target_unresolved",
+    "terminal_failed",
+    "terminal_rejected",
+}
 
 
 @dataclass(frozen=True)
@@ -58,6 +64,16 @@ def classify_write_error(exc: Exception) -> str:
     if isinstance(exc, OSError):
         return f"os_error_{exc.errno or 'unknown'}"
     return "network_or_protocol_error"
+
+
+def _is_retryable_replay_error(error_class: Optional[str]) -> bool:
+    if not error_class:
+        return True
+    if error_class in _NON_RETRYABLE_REPLAY_ERRORS:
+        return False
+    if error_class.startswith("http_4") and error_class not in _RETRYABLE_HTTP_4XX:
+        return False
+    return True
 
 
 class WriteSpool:
@@ -260,7 +276,13 @@ class WriteSpool:
             (operation_id, time.time()),
         )
 
-    def record_attempt(self, operation_key: str, error_class: Optional[str]) -> bool:
+    def record_attempt(
+        self,
+        operation_key: str,
+        error_class: Optional[str],
+        *,
+        retryable: bool = True,
+    ) -> bool:
         now = time.time()
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -279,7 +301,7 @@ class WriteSpool:
             delay = _RETRY_BACKOFF_SECS[
                 min(next_count - 1, len(_RETRY_BACKOFF_SECS) - 1)
             ]
-            quarantined = next_count >= _MAX_REPLAY_ATTEMPTS
+            quarantined = (not retryable) and next_count >= _MAX_REPLAY_ATTEMPTS
             updated = connection.execute(
                 """
                 UPDATE write_operations
@@ -378,7 +400,9 @@ class WriteSpool:
             target = self.drawer_for_track(operation.track_key)
             if not target:
                 quarantined = self.record_attempt(
-                    operation.operation_key, "target_unresolved"
+                    operation.operation_key,
+                    "target_unresolved",
+                    retryable=False,
                 )
                 return ReplayOutcome(
                     operation,
@@ -425,7 +449,11 @@ class WriteSpool:
                 return ReplayOutcome(operation, completed=True, drawer_id=drawer_id)
             error_class = f"terminal_{state}" if state in {"failed", "rejected"} else None
             if error_class:
-                quarantined = self.record_attempt(operation.operation_key, error_class)
+                quarantined = self.record_attempt(
+                    operation.operation_key,
+                    error_class,
+                    retryable=False,
+                )
                 return ReplayOutcome(
                     operation,
                     completed=False,
@@ -433,7 +461,11 @@ class WriteSpool:
                     quarantined=quarantined,
                 )
             status_class = f"status_{state or 'unknown'}"
-            quarantined = self.record_attempt(operation.operation_key, status_class)
+            quarantined = self.record_attempt(
+                operation.operation_key,
+                status_class,
+                retryable=True,
+            )
             return ReplayOutcome(
                 operation,
                 completed=False,
@@ -442,7 +474,11 @@ class WriteSpool:
             )
         except Exception as exc:
             error_class = classify_write_error(exc)
-            quarantined = self.record_attempt(operation.operation_key, error_class)
+            quarantined = self.record_attempt(
+                operation.operation_key,
+                error_class,
+                retryable=_is_retryable_replay_error(error_class),
+            )
             return ReplayOutcome(
                 operation,
                 completed=False,

@@ -342,6 +342,19 @@ class DurableSchedulingTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def _pin_operation_retry_deadline(
+        self, spool: WriteSpool, operation_key: str, next_attempt_at: float
+    ) -> None:
+        connection = sqlite3.connect(spool.path)
+        try:
+            connection.execute(
+                "UPDATE write_operations SET next_attempt_at = ? WHERE operation_key = ?",
+                (next_attempt_at, operation_key),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
     def test_queue_full_retains_recoverable_work(self) -> None:
         provider = RecordingProvider()
         provider.initialize("session-a")
@@ -507,6 +520,172 @@ class DurableSchedulingTests(unittest.TestCase):
             self.assertEqual(spool.count(), 1)
             self.assertIsNone(spool.next_replayable_operation())
             self.assertEqual(posts, [])
+
+    def test_retryable_http_503_never_quarantines_and_survives_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as hermes_home:
+            spool = WriteSpool(hermes_home)
+            spool.admit(
+                "ingest",
+                {
+                    "content": "recoverable 503 evidence",
+                    "wing": "wing",
+                    "room": "turns",
+                },
+                action="raw_turn",
+            )
+            failures_remaining = 6
+
+            def post(_path: str, _body: Dict[str, Any]) -> Dict[str, Any]:
+                nonlocal failures_remaining
+                if failures_remaining > 0:
+                    failures_remaining -= 1
+                    error = urllib.error.HTTPError(
+                        "/api/ingest/durable",
+                        503,
+                        "synthetic unavailable",
+                        None,
+                        None,
+                    )
+                    error.close()
+                    raise error
+                return {
+                    "operation_id": "operation-recovered-503",
+                    "state": "queued",
+                }
+
+            def get(_path: str) -> Dict[str, Any]:
+                return {
+                    "operation_id": "operation-recovered-503",
+                    "state": "completed",
+                    "drawer_id": "drawer-recovered-503",
+                }
+
+            for _ in range(6):
+                outcome = spool.replay_one(post, get)
+                self.assertIsNotNone(outcome)
+                self.assertEqual(outcome.error_class, "http_503")
+                self.assertFalse(outcome.quarantined)
+                self._force_all_spool_rows_due(spool)
+
+            pending = spool.next_operation()
+            self.assertIsNotNone(pending)
+            self.assertEqual(pending.attempt_count, 6)
+            self.assertEqual(pending.last_error_class, "http_503")
+            self.assertIsNone(pending.quarantined_at)
+            self.assertIsNone(pending.quarantine_reason)
+
+            restarted = WriteSpool(hermes_home)
+            self._force_all_spool_rows_due(restarted)
+            completed = restarted.replay_one(post, get)
+
+            self.assertIsNotNone(completed)
+            self.assertTrue(completed.completed)
+            self.assertEqual(completed.drawer_id, "drawer-recovered-503")
+            self.assertEqual(restarted.count(), 0)
+
+    def test_long_queued_receipt_never_quarantines_and_completes_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as hermes_home:
+            spool = WriteSpool(hermes_home)
+            spool.admit(
+                "ingest",
+                {"content": "slow queued evidence", "wing": "wing", "room": "turns"},
+                action="raw_turn",
+            )
+            post_calls = 0
+            status_polls = 0
+
+            def post(_path: str, _body: Dict[str, Any]) -> Dict[str, Any]:
+                nonlocal post_calls
+                post_calls += 1
+                return {"operation_id": "operation-slow-queued", "state": "queued"}
+
+            def get(_path: str) -> Dict[str, Any]:
+                nonlocal status_polls
+                status_polls += 1
+                if status_polls <= 6:
+                    return {"operation_id": "operation-slow-queued", "state": "queued"}
+                return {
+                    "operation_id": "operation-slow-queued",
+                    "state": "completed",
+                    "drawer_id": "drawer-slow-queued",
+                }
+
+            for _ in range(6):
+                outcome = spool.replay_one(post, get)
+                self.assertIsNotNone(outcome)
+                self.assertEqual(outcome.error_class, "status_queued")
+                self.assertFalse(outcome.quarantined)
+                self._force_all_spool_rows_due(spool)
+
+            pending = spool.next_operation()
+            self.assertIsNotNone(pending)
+            self.assertEqual(pending.receipt_operation_id, "operation-slow-queued")
+            self.assertEqual(pending.attempt_count, 6)
+            self.assertIsNone(pending.quarantined_at)
+            self.assertEqual(post_calls, 1)
+
+            restarted = WriteSpool(hermes_home)
+            self._force_all_spool_rows_due(restarted)
+            completed = restarted.replay_one(post, get)
+
+            self.assertIsNotNone(completed)
+            self.assertTrue(completed.completed)
+            self.assertEqual(completed.drawer_id, "drawer-slow-queued")
+            self.assertEqual(restarted.count(), 0)
+
+    def test_not_due_retryable_row_does_not_block_independent_due_row(self) -> None:
+        with tempfile.TemporaryDirectory() as hermes_home:
+            spool = WriteSpool(hermes_home)
+            stuck = spool.admit(
+                "ingest",
+                {"content": "temporarily stuck", "wing": "wing", "room": "turns"},
+                action="raw_turn",
+            )
+
+            def fail_once(_path: str, _body: Dict[str, Any]) -> Dict[str, Any]:
+                error = urllib.error.HTTPError(
+                    "/api/ingest/durable",
+                    503,
+                    "synthetic unavailable",
+                    None,
+                    None,
+                )
+                error.close()
+                raise error
+
+            stuck_outcome = spool.replay_one(fail_once, lambda _path: {})
+            self.assertIsNotNone(stuck_outcome)
+            self.assertFalse(stuck_outcome.quarantined)
+            self._pin_operation_retry_deadline(
+                spool, stuck.operation_key, time.time() + 60.0
+            )
+
+            spool.admit(
+                "ingest",
+                {"content": "independent due", "wing": "wing", "room": "turns"},
+                action="raw_turn",
+            )
+            delivered_contents: List[str] = []
+
+            def post_success(_path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+                delivered_contents.append(str(body["request"]["content"]))
+                return {"operation_id": "operation-independent", "state": "queued"}
+
+            def get_success(_path: str) -> Dict[str, Any]:
+                return {
+                    "operation_id": "operation-independent",
+                    "state": "completed",
+                    "drawer_id": "drawer-independent",
+                }
+
+            independent = spool.replay_one(post_success, get_success)
+
+            self.assertIsNotNone(independent)
+            self.assertTrue(independent.completed)
+            self.assertEqual(delivered_contents, ["independent due"])
+            remaining = spool.next_operation()
+            self.assertIsNotNone(remaining)
+            self.assertEqual(remaining.operation_key, stuck.operation_key)
 
 
 if __name__ == "__main__":
