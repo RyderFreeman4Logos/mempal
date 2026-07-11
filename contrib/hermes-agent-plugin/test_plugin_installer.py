@@ -38,6 +38,7 @@ class PluginInstallerTests(unittest.TestCase):
         (provider / "__init__.py").write_text("short", encoding="utf-8")
         (provider / "_write_spool.py").unlink()
         (provider / "_backoff.py").unlink()
+        (provider / "_intelligence.py").unlink()
         (provider / "stale-provider-copy.py").write_text("stale", encoding="utf-8")
 
         result = self._result("mempal")
@@ -45,6 +46,7 @@ class PluginInstallerTests(unittest.TestCase):
         self.assertIn("__init__.py", result.changed)
         self.assertIn("_write_spool.py", result.missing)
         self.assertIn("_backoff.py", result.missing)
+        self.assertIn("_intelligence.py", result.missing)
         self.assertIn("stale-provider-copy.py", result.extra)
 
     def test_check_detects_and_refreshes_stale_hooks_copy(self) -> None:

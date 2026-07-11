@@ -22,6 +22,7 @@ _REQUIRED_FILES = {
         "__init__.py",
         "_backoff.py",
         "_conclude.py",
+        "_intelligence.py",
         "_rest_errors.py",
         "_write_spool.py",
         "plugin.yaml",
