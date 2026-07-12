@@ -40,6 +40,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   original-ranking fallbacks, return redacted stage/boundary metadata, and
   expose aggregate timeout/fallback telemetry instead of allowing serial
   hybrid and reranker deadlines to outlive the tool call (#711).
+- **REST search**: when `bm25_fallback` is disabled, embedding timeout/exhausted
+  primary budget and hybrid DB timeout again return `504 Gateway Timeout`
+  instead of `200 []`, restoring the historical REST contract so backend
+  failure is not indistinguishable from zero hits (#711).
 - **Daemon/Hooks**: hook IPC queue admission now fails fast under SQLite write
   contention so clients can use durable fallback within their deadline, daemon
   claim polling backs off bounded SQLite lock streaks, and closed hook IPC

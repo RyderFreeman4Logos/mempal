@@ -10,7 +10,7 @@ use std::time::Duration;
 use axum::{
     Json,
     extract::{Query, State},
-    http::{HeaderMap, header::USER_AGENT},
+    http::{HeaderMap, StatusCode, header::USER_AGENT},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -99,7 +99,6 @@ struct SearchExecution {
     embed_elapsed: Duration,
     db_elapsed: Duration,
     query_vector: Option<Vec<f32>>,
-    stop_search: bool,
     bm25_fallback_enabled: bool,
 }
 
@@ -151,7 +150,6 @@ pub(super) async fn search_handler(
     let embed_snapshot = crate::embed::global_embed_status().snapshot();
     let vector_search_circuit =
         VectorSearchCircuit::from_config_and_snapshot(config.as_ref(), &embed_snapshot);
-    let mut stop_search = false;
     let query_vector = if vector_search_circuit.bm25_fallback_enabled && vector_search_circuit.open
     {
         search_mode = SearchMode::Bm25Only;
@@ -198,16 +196,20 @@ pub(super) async fn search_handler(
                 None
             }
             Some(Ok(Err(error))) => return Err(internal_error(error)),
-            Some(Err(_)) | None => {
+            Some(Err(_)) | None if vector_search_circuit.bm25_fallback_enabled => {
                 metadata.timeout(SearchTelemetryStage::Embedding, "daemon.embedding");
                 warnings.push(embedding_timeout_warning(embed_limit));
-                if vector_search_circuit.bm25_fallback_enabled {
-                    search_mode = SearchMode::Bm25Only;
-                    metadata.fallback("bm25");
-                } else {
-                    stop_search = true;
-                }
+                search_mode = SearchMode::Bm25Only;
+                metadata.fallback("bm25");
                 None
+            }
+            // Fallback disabled: keep the historical REST contract (504) so a
+            // primary embedding timeout is never indistinguishable from "no hits".
+            Some(Err(_)) | None => {
+                return Err(ApiError::new(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "embedding deadline exceeded",
+                ));
             }
         }
     };
@@ -229,7 +231,6 @@ pub(super) async fn search_handler(
         embed_elapsed,
         db_elapsed,
         query_vector,
-        stop_search,
         bm25_fallback_enabled: vector_search_circuit.bm25_fallback_enabled,
     })
     .await
@@ -253,119 +254,120 @@ async fn finish_search(execution: SearchExecution) -> Result<Response, ApiError>
         embed_elapsed,
         mut db_elapsed,
         query_vector,
-        stop_search,
         bm25_fallback_enabled,
     } = execution;
     let config = ConfigHandle::current();
     let db_deadline = Duration::from_secs(config.api.search_db_deadline_secs);
     let mut results = Vec::new();
-    if !stop_search {
-        if let Some(query_vector) = query_vector {
-            telemetry.set_stage(SearchTelemetryStage::HybridDb.as_str());
-            let search_started = Instant::now();
-            let hybrid_limit = budget.primary_limit(db_deadline);
-            let hybrid = run_hybrid_search_bounded(
-                &state,
-                RestHybridSearchRequest {
-                    query: query.q.clone(),
-                    route: route.clone(),
-                    scope: scope.clone(),
-                    search_options: search_options.clone(),
-                    top_k,
-                    query_vector,
-                    deadline: hybrid_limit,
-                    search_mode,
-                },
-            )
-            .await?;
-            db_elapsed += Instant::now().saturating_duration_since(search_started);
-            match hybrid {
-                Some(Ok(found)) => results = found,
-                Some(Err(crate::search::SearchError::VectorDimensionMismatch {
-                    current_dim,
+    if let Some(query_vector) = query_vector {
+        telemetry.set_stage(SearchTelemetryStage::HybridDb.as_str());
+        let search_started = Instant::now();
+        let hybrid_limit = budget.primary_limit(db_deadline);
+        let hybrid = run_hybrid_search_bounded(
+            &state,
+            RestHybridSearchRequest {
+                query: query.q.clone(),
+                route: route.clone(),
+                scope: scope.clone(),
+                search_options: search_options.clone(),
+                top_k,
+                query_vector,
+                deadline: hybrid_limit,
+                search_mode,
+            },
+        )
+        .await?;
+        db_elapsed += Instant::now().saturating_duration_since(search_started);
+        match hybrid {
+            Some(Ok(found)) => results = found,
+            Some(Err(crate::search::SearchError::VectorDimensionMismatch {
+                current_dim,
+                new_dim,
+            })) if bm25_fallback_enabled => {
+                search_mode = SearchMode::Bm25Only;
+                metadata.fallback("bm25");
+                warnings.push(bm25_fallback_warning_dimension_mismatch(
                     new_dim,
-                })) if bm25_fallback_enabled => {
-                    search_mode = SearchMode::Bm25Only;
-                    metadata.fallback("bm25");
-                    warnings.push(bm25_fallback_warning_dimension_mismatch(
-                        new_dim,
-                        current_dim,
-                    ));
-                    telemetry.set_stage(SearchTelemetryStage::Bm25FallbackDb.as_str());
-                    results = run_bm25_fallback(
-                        &state,
-                        RestBm25SearchRequest {
-                            query: query.q.clone(),
-                            route,
-                            scope,
-                            search_options,
-                            top_k,
-                            deadline: budget.fallback_limit(db_deadline),
-                            stage: SearchTelemetryStage::Bm25FallbackDb,
-                            search_mode: SearchMode::Bm25Only,
-                        },
-                        &mut warnings,
-                        &mut metadata,
-                        &mut db_elapsed,
-                    )
-                    .await?;
-                }
-                Some(Err(error)) => return Err(internal_error(error)),
-                None if bm25_fallback_enabled => {
-                    metadata.timeout(SearchTelemetryStage::HybridDb, "daemon.search_db");
-                    metadata.fallback("bm25");
-                    search_mode = SearchMode::Bm25Only;
-                    warnings.push(rest_search_timeout_warning("hybrid search", hybrid_limit));
-                    telemetry.set_stage(SearchTelemetryStage::Bm25FallbackDb.as_str());
-                    results = run_bm25_fallback(
-                        &state,
-                        RestBm25SearchRequest {
-                            query: query.q.clone(),
-                            route,
-                            scope,
-                            search_options,
-                            top_k,
-                            deadline: budget.fallback_limit(db_deadline),
-                            stage: SearchTelemetryStage::Bm25FallbackDb,
-                            search_mode: SearchMode::Bm25Only,
-                        },
-                        &mut warnings,
-                        &mut metadata,
-                        &mut db_elapsed,
-                    )
-                    .await?;
-                }
-                None => {
-                    metadata.timeout(SearchTelemetryStage::HybridDb, "daemon.search_db");
-                    warnings.push(rest_search_timeout_warning("hybrid search", hybrid_limit));
-                }
+                    current_dim,
+                ));
+                telemetry.set_stage(SearchTelemetryStage::Bm25FallbackDb.as_str());
+                results = run_bm25_fallback(
+                    &state,
+                    RestBm25SearchRequest {
+                        query: query.q.clone(),
+                        route,
+                        scope,
+                        search_options,
+                        top_k,
+                        deadline: budget.fallback_limit(db_deadline),
+                        stage: SearchTelemetryStage::Bm25FallbackDb,
+                        search_mode: SearchMode::Bm25Only,
+                    },
+                    &mut warnings,
+                    &mut metadata,
+                    &mut db_elapsed,
+                )
+                .await?;
             }
-        } else {
-            telemetry.set_stage(SearchTelemetryStage::Bm25Db.as_str());
-            let bm25_started = Instant::now();
-            let bm25_limit = budget.fallback_limit(db_deadline);
-            let outcome = run_rest_bm25_search_bounded(
-                &state,
-                RestBm25SearchRequest {
-                    query: query.q.clone(),
-                    route,
-                    scope,
-                    search_options,
-                    top_k,
-                    deadline: bm25_limit,
-                    stage: SearchTelemetryStage::Bm25Db,
-                    search_mode,
-                },
-            )
-            .await?;
-            db_elapsed += Instant::now().saturating_duration_since(bm25_started);
-            match outcome {
-                Some(Ok(found)) => results = found,
-                Some(Err(error)) => return Err(internal_error(error)),
-                None => {
-                    metadata.timeout(SearchTelemetryStage::Bm25Db, "daemon.search_db");
-                    warnings.push(rest_search_timeout_warning("BM25 search", bm25_limit));
-                }
+            Some(Err(error)) => return Err(internal_error(error)),
+            None if bm25_fallback_enabled => {
+                metadata.timeout(SearchTelemetryStage::HybridDb, "daemon.search_db");
+                metadata.fallback("bm25");
+                search_mode = SearchMode::Bm25Only;
+                warnings.push(rest_search_timeout_warning("hybrid search", hybrid_limit));
+                telemetry.set_stage(SearchTelemetryStage::Bm25FallbackDb.as_str());
+                results = run_bm25_fallback(
+                    &state,
+                    RestBm25SearchRequest {
+                        query: query.q.clone(),
+                        route,
+                        scope,
+                        search_options,
+                        top_k,
+                        deadline: budget.fallback_limit(db_deadline),
+                        stage: SearchTelemetryStage::Bm25FallbackDb,
+                        search_mode: SearchMode::Bm25Only,
+                    },
+                    &mut warnings,
+                    &mut metadata,
+                    &mut db_elapsed,
+                )
+                .await?;
+            }
+            // Fallback disabled: restore historical 504 so hybrid timeout is
+            // not reported as an empty successful result set.
+            None => {
+                return Err(ApiError::new(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    rest_search_timeout_warning("hybrid search", hybrid_limit),
+                ));
+            }
+        }
+    } else {
+        telemetry.set_stage(SearchTelemetryStage::Bm25Db.as_str());
+        let bm25_started = Instant::now();
+        let bm25_limit = budget.fallback_limit(db_deadline);
+        let outcome = run_rest_bm25_search_bounded(
+            &state,
+            RestBm25SearchRequest {
+                query: query.q.clone(),
+                route,
+                scope,
+                search_options,
+                top_k,
+                deadline: bm25_limit,
+                stage: SearchTelemetryStage::Bm25Db,
+                search_mode,
+            },
+        )
+        .await?;
+        db_elapsed += Instant::now().saturating_duration_since(bm25_started);
+        match outcome {
+            Some(Ok(found)) => results = found,
+            Some(Err(error)) => return Err(internal_error(error)),
+            None => {
+                metadata.timeout(SearchTelemetryStage::Bm25Db, "daemon.search_db");
+                warnings.push(rest_search_timeout_warning("BM25 search", bm25_limit));
             }
         }
     }

@@ -9,6 +9,8 @@ use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode};
 use mempal::api::ApiState;
+#[cfg(feature = "db-test-seam")]
+use mempal::core::AsyncDb;
 use mempal::core::config::ConfigHandle;
 use mempal::core::db::Database;
 use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
@@ -28,6 +30,14 @@ struct TestEnv {
 
 impl TestEnv {
     fn new(config_suffix: &str) -> Self {
+        Self::with_options(true, 30, config_suffix)
+    }
+
+    fn with_options(
+        bm25_fallback: bool,
+        search_db_deadline_secs: u64,
+        config_suffix: &str,
+    ) -> Self {
         let tmp = TempDir::new().expect("tempdir");
         let mempal_home = tmp.path().join(".mempal");
         fs::create_dir_all(&mempal_home).expect("create mempal home");
@@ -42,13 +52,13 @@ db_path = "{}"
 enabled = false
 
 [search]
-bm25_fallback = true
+bm25_fallback = {bm25_fallback}
 
 [embed.retry]
 search_deadline_secs = 30
 
 [api]
-search_db_deadline_secs = 30
+search_db_deadline_secs = {search_db_deadline_secs}
 {config_suffix}
 "#,
             db_path.display()
@@ -104,6 +114,33 @@ impl Embedder for SlowEmbedder {
 
     fn name(&self) -> &str {
         "slow-search-budget-test"
+    }
+}
+
+#[derive(Clone)]
+struct FastEmbedderFactory;
+
+struct FastEmbedder;
+
+#[async_trait]
+impl EmbedderFactory for FastEmbedderFactory {
+    async fn build(&self) -> Result<Box<dyn Embedder>, EmbedError> {
+        Ok(Box::new(FastEmbedder))
+    }
+}
+
+#[async_trait]
+impl Embedder for FastEmbedder {
+    async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts.iter().map(|_| vec![0.5; 4]).collect())
+    }
+
+    fn dimensions(&self) -> usize {
+        4
+    }
+
+    fn name(&self) -> &str {
+        "fast-search-budget-test"
     }
 }
 
@@ -219,6 +256,72 @@ async fn slow_embedder_uses_bm25_within_single_caller_budget() {
         assert_eq!(telemetry.stage_timeout_counts.get("embedding"), Some(&1));
         assert_eq!(telemetry.fallback_counts.get("bm25"), Some(&1));
     }
+}
+
+#[tokio::test]
+async fn embedding_timeout_without_bm25_fallback_returns_gateway_timeout() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::with_options(false, 30, "");
+    insert_search_drawer(
+        &env.db(),
+        "drawer_embed_timeout_no_fallback",
+        "alpha exact durable preference",
+        4,
+    );
+    let state = env.state(Arc::new(SlowEmbedderFactory));
+    let started = StdInstant::now();
+    let (status, _headers, body) = get_json(
+        state,
+        "/api/search?q=alpha&scope=global&top_k=5&deadline_ms=2000&correlation_id=embed-no-fallback",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(body["error"]["status"], 504);
+    assert_eq!(body["error"]["message"], "embedding deadline exceeded");
+    assert!(
+        body.as_array().is_none(),
+        "fallback-disabled embedding timeout must not return an empty success array: {body:#}"
+    );
+}
+
+#[cfg(feature = "db-test-seam")]
+#[tokio::test]
+async fn hybrid_db_timeout_without_bm25_fallback_returns_gateway_timeout() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::with_options(false, 1, "");
+    insert_search_drawer(
+        &env.db(),
+        "drawer_hybrid_timeout_no_fallback",
+        "alpha exact durable preference",
+        4,
+    );
+    let async_db = AsyncDb::open(&env.db_path, 4)
+        .expect("open async db")
+        .with_read_delay(Duration::from_millis(1_500));
+    let state = env
+        .state(Arc::new(FastEmbedderFactory))
+        .with_async_db_for_test(async_db);
+    let started = StdInstant::now();
+    let (status, _headers, body) = get_json(
+        state,
+        "/api/search?q=alpha&scope=global&top_k=5&deadline_ms=2000&correlation_id=hybrid-no-fallback",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(body["error"]["status"], 504);
+    let message = body["error"]["message"].as_str().expect("error message");
+    assert!(
+        message.contains("hybrid search deadline exceeded"),
+        "message={message}"
+    );
+    assert!(
+        body.as_array().is_none(),
+        "fallback-disabled hybrid timeout must not return an empty success array: {body:#}"
+    );
 }
 
 #[tokio::test]
