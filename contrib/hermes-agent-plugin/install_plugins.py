@@ -17,6 +17,8 @@ from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
 
 
 PLUGIN_NAMES = ("mempal", "mempal-hooks")
+_SHARED_TRANSPORT_INSTALL_NAME = "_search_transport.py"
+_SHARED_TRANSPORT_SOURCE_NAME = "mempal_search_transport.py"
 _REQUIRED_FILES = {
     "mempal": {
         "__init__.py",
@@ -25,9 +27,14 @@ _REQUIRED_FILES = {
         "_intelligence.py",
         "_rest_errors.py",
         "_write_spool.py",
+        _SHARED_TRANSPORT_INSTALL_NAME,
         "plugin.yaml",
     },
-    "mempal-hooks": {"__init__.py", "plugin.yaml"},
+    "mempal-hooks": {
+        "__init__.py",
+        _SHARED_TRANSPORT_INSTALL_NAME,
+        "plugin.yaml",
+    },
 }
 _IGNORED_DIRS = {"__pycache__"}
 _IGNORED_SUFFIXES = {".pyc", ".pyo"}
@@ -203,6 +210,9 @@ def _manifest(root: Path) -> Dict[str, str]:
 
 def _source_manifest(plugin: str, root: Path) -> Dict[str, str]:
     manifest = _manifest(root)
+    manifest[_SHARED_TRANSPORT_INSTALL_NAME] = _digest_file(
+        root.parent / _SHARED_TRANSPORT_SOURCE_NAME
+    )
     if not _REQUIRED_FILES[plugin].issubset(manifest):
         raise InstallerError("source_incomplete")
     return manifest
@@ -247,7 +257,10 @@ def _copy_tree(source: Path, target: Path, manifest: Dict[str, str]) -> None:
         for relative in manifest:
             destination = target / relative
             destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            source_fd = _open_read_only(source / relative)
+            source_path = source / relative
+            if relative == _SHARED_TRANSPORT_INSTALL_NAME:
+                source_path = source.parent / _SHARED_TRANSPORT_SOURCE_NAME
+            source_fd = _open_read_only(source_path)
             with os.fdopen(source_fd, "rb") as source_handle:
                 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
                 destination_fd = os.open(destination, flags, 0o600)

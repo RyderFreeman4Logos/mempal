@@ -142,7 +142,9 @@ impl ApiState {
             counter.fetch_add(1, Ordering::SeqCst);
         }
         let async_db = self.async_db().await?;
-        let sqlite_deadline = Instant::now() + deadline;
+        // Keep the caller's wall-clock budget exact while still reserving the
+        // final grace interval for SQLite's progress-handler interruption.
+        let sqlite_deadline = Instant::now() + deadline.saturating_sub(SQLITE_INTERRUPT_GRACE);
         let db_path = self.db_path.clone();
         let started_at = Instant::now();
         let completed = Arc::new(AtomicBool::new(false));
@@ -152,7 +154,7 @@ impl ApiState {
             completed_for_task.store(true, Ordering::SeqCst);
             result
         });
-        match tokio::time::timeout(deadline + SQLITE_INTERRUPT_GRACE, &mut read).await {
+        match tokio::time::timeout(deadline, &mut read).await {
             Ok(Ok(Ok(result))) => {
                 record_bounded_read_telemetry(
                     &db_path,
@@ -275,6 +277,8 @@ pub struct SearchTelemetrySnapshot {
     pub active_count: usize,
     pub active_searches: Vec<ActiveSearchSnapshot>,
     pub slow_queries: Vec<SlowSearchSnapshot>,
+    pub stage_timeout_counts: BTreeMap<String, u64>,
+    pub fallback_counts: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -326,6 +330,8 @@ pub(crate) struct SearchTelemetry {
     next_id: AtomicU64,
     active: Mutex<BTreeMap<u64, ActiveSearch>>,
     slow_queries: Mutex<VecDeque<SlowSearchSnapshot>>,
+    stage_timeout_counts: Mutex<BTreeMap<String, u64>>,
+    fallback_counts: Mutex<BTreeMap<String, u64>>,
 }
 
 impl SearchTelemetry {
@@ -378,6 +384,8 @@ impl SearchTelemetry {
         else {
             return;
         };
+        increment_counts(&self.stage_timeout_counts, &outcome.timed_out_stages);
+        increment_counts(&self.fallback_counts, &outcome.fallbacks);
         let elapsed_ms = duration_ms(active.started_at.elapsed());
         if active.started_at.elapsed() < SLOW_SEARCH_THRESHOLD && !outcome.partial {
             return;
@@ -443,6 +451,16 @@ impl SearchTelemetry {
             active_count: active_searches.len(),
             active_searches,
             slow_queries,
+            stage_timeout_counts: self
+                .stage_timeout_counts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            fallback_counts: self
+                .fallback_counts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
         }
     }
 }
@@ -458,6 +476,8 @@ pub(crate) struct SearchTelemetryOutcome {
     pub result_count: usize,
     pub warning_count: usize,
     pub partial: bool,
+    pub timed_out_stages: Vec<String>,
+    pub fallbacks: Vec<String>,
 }
 
 pub(crate) struct SearchTelemetryGuard {
@@ -487,6 +507,15 @@ impl Drop for SearchTelemetryGuard {
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn increment_counts(counts: &Mutex<BTreeMap<String, u64>>, values: &[String]) {
+    let mut counts = counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for value in values {
+        *counts.entry(value.clone()).or_default() += 1;
+    }
 }
 
 fn unix_ms_now() -> u64 {

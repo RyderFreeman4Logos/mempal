@@ -500,6 +500,7 @@ async fn harness_integration_smoke() -> Result<()> {
     fs::create_dir_all(&mempal_home)?;
     let db_path = mempal_home.join("palace.db");
     let config_path = mempal_home.join("config.toml");
+    let runtime_root = tmp.path().join("runtime");
 
     Database::open(&db_path)?;
     let store = PendingMessageStore::new(&db_path)?;
@@ -554,8 +555,14 @@ log_path = "{}"
 
     let (tx, mut observer): (_, BootstrapObserver) = common::harness::channel();
     let bootstrap_config = config_path.clone();
+    let bootstrap_runtime_root = runtime_root.clone();
     let bootstrap_task = tokio::task::spawn_blocking(move || {
-        DaemonContext::bootstrap_with_events(bootstrap_config, true, Some(tx))
+        DaemonContext::bootstrap_with_events_for_test(
+            bootstrap_config,
+            true,
+            Some(tx),
+            &bootstrap_runtime_root,
+        )
     });
     let bootstrap_context = tokio::time::timeout(Duration::from_secs(10), bootstrap_task)
         .await?
@@ -579,7 +586,13 @@ log_path = "{}"
         .expect("join context drop task");
 
     let mut supervisor = DaemonSupervisor::spawn(
-        HashMap::from([("HOME".to_string(), tmp.path().display().to_string())]),
+        HashMap::from([
+            ("HOME".to_string(), tmp.path().display().to_string()),
+            (
+                mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV.to_string(),
+                runtime_root.display().to_string(),
+            ),
+        ]),
         vec!["--foreground".to_string()],
     )
     .await?;

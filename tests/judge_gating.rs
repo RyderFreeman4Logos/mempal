@@ -1373,30 +1373,23 @@ fn test_llm_judge_section_no_longer_warns() {
         r#"
 [llm]
 enabled = true
-base_url = "http://localhost:8317/v1"
-
+base_url = "http://127.0.0.1:9/v1"
+model = "t"
 [ingest_gating.llm_judge]
 enabled = true
 backend = "api"
 "#,
     );
-
     let config = env.config();
     assert!(config.llm.enabled);
     assert!(!config.ingest_gating.enabled);
-
     let output = run_mempal(&env.home, &["status"]);
     assert!(output.status.success(), "{output:?}");
-    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
-    let obsolete_warning = [
-        "llm_judge tier",
-        " ignored",
-        ": ",
-        "external LLM",
-        " API disabled by design",
-    ]
-    .concat();
-    assert!(!stderr.contains(&obsolete_warning), "{stderr}");
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(
+        !stderr.contains("llm_judge tier ignored: external LLM API disabled by design"),
+        "{stderr}"
+    );
 }
 
 #[test]

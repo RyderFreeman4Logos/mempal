@@ -19,6 +19,7 @@ from mempal import (  # noqa: E402
     _LLMClient,
     _IntelligenceEnhancer,
     _encode_query_params,
+    SearchTransportResponse,
     SharedPluginBackoff,
 )
 
@@ -69,7 +70,6 @@ class DiscoveryTests(unittest.TestCase):
             if original_mempal is not None:
                 sys.modules["mempal"] = original_mempal
 
-
 class RecordingProvider(MempalMemoryProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -91,6 +91,10 @@ class RecordingProvider(MempalMemoryProvider):
         if path.startswith("/api/operations/"):
             return self.durable_status.get(path.rsplit("/", 1)[-1], {})
         return self.responses.get(path, [])
+
+    def _search_request(self, params: Dict[str, Any]) -> SearchTransportResponse:
+        self.gets.append(("/api/search", dict(params)))
+        return SearchTransportResponse(self.responses.get("/api/search", []), {})
 
     def _post(self, path: str, body: Dict[str, Any]) -> Any:
         self.posts.append((path, dict(body)))
@@ -501,15 +505,18 @@ class PluginBackoffTests(unittest.TestCase):
         provider = RecordingProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
 
-        def get_with_warning_header(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-            provider.gets.append((path, dict(params or {})))
-            provider._last_response_headers = {
+        def search_with_warning_header(params: Dict[str, Any]) -> SearchTransportResponse:
+            provider.gets.append(("/api/search", dict(params)))
+            headers = {
                 "degraded": "true",
                 "mempal-warnings": "embedding deadline exceeded after 5s",
             }
-            return [{"content": "partial memory", "importance": 4}]
+            return SearchTransportResponse(
+                [{"content": "partial memory", "importance": 4}],
+                headers,
+            )
 
-        provider._get = get_with_warning_header
+        provider._search_request = search_with_warning_header
 
         provider.queue_prefetch("memory", session_id="session-a")
         block = provider.prefetch("memory", session_id="session-a")
@@ -577,13 +584,16 @@ class PluginBackoffTests(unittest.TestCase):
             hooks._initialized = True
             hooks._wing = "hermes-user/alice/work"
             hooks._backoff = SharedPluginBackoff(path=os.path.join(tmpdir, ".plugin_backoff"))
-            hooks._get = lambda path, params=None: [
-                {
-                    "content": "partial hooks memory",
-                    "importance": 4,
-                    "warnings": ["deadline_hit"],
-                },
-            ]
+            class DegradedTransport:
+                def get_json(self, path: str, params: Dict[str, Any]) -> Any:
+                    del path, params
+                    return module.SearchTransportResponse([{
+                        "content": "partial hooks memory",
+                        "importance": 4,
+                        "warnings": ["deadline_hit"],
+                    }], {})
+
+            hooks._search_transport = DegradedTransport()
 
             result = hooks.pre_llm_call("session-a", "memory")
 

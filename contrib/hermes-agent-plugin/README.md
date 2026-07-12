@@ -86,7 +86,7 @@ Replaces mem0 with a fully local BM25 + vector hybrid backend — no cloud API c
 | Tool | Description |
 |------|-------------|
 | `mempal_profile` | Recent memories via `/api/timeline` |
-| `mempal_search` | Hybrid BM25+vector search via `/api/search` |
+| `mempal_search` | Bounded hybrid/BM25 search via `/api/search`; partial/timeouts include redacted correlation and stage metadata |
 | `mempal_conclude` | Store a fact verbatim via a durable ingest receipt |
 
 `mempal_conclude` reports success only after the receipt reaches `completed`

@@ -409,7 +409,7 @@ async fn test_read_drawer_returns_full_verbatim() {
     assert!(response.has_vector);
     assert_eq!(response.vector_dimension, Some(3));
     assert_eq!(response.vector_distance_metric.as_deref(), Some("cosine"));
-    assert_eq!(response.vector_embedder.as_deref(), Some("api"));
+    assert_eq!(response.vector_embedder.as_deref(), Some("openai_compat"));
     assert_eq!(response.vector_model.as_deref(), Some("test-model"));
     assert_eq!(response.vector_index_version.as_deref(), Some("v2"));
     assert!(!response.vector_stale);

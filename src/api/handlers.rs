@@ -5,14 +5,14 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crate::core::{
     anchor,
     config::{ConfigHandle, scrub_runtime_diagnostic_text},
     db::{Database, DbError, db_error_is_sqlite_lock},
-    project::{ProjectSearchScope, resolve_project_id},
+    project::resolve_project_id,
     queue::{QueueStats, failure_headline_count, queue_stats_readonly},
     remote_calls::{
         RemoteCallService, endpoint_policy_display_label, endpoint_policy_global_runtime_error,
@@ -21,7 +21,7 @@ use crate::core::{
     strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
         BootstrapEvidenceArgs, Drawer, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
-        RouteDecision, SearchResult, SourceType, TaxonomyEntry, default_confidence,
+        SourceType, TaxonomyEntry, default_confidence,
     },
     utils::{
         build_bootstrap_evidence_drawer_id, iso_timestamp, link_superseded_drawer,
@@ -34,20 +34,14 @@ use crate::ingest::normalize::CURRENT_NORMALIZE_VERSION;
 use crate::observability::{
     OperationTelemetryRecord, OperationTelemetrySource, OperationTelemetrySpan,
 };
-use crate::search::{
-    SearchMode, SearchOptions, SearchTelemetryStage, VectorSearchCircuit,
-    bm25_fallback_warning_degraded, bm25_fallback_warning_dimension_mismatch,
-    bm25_fallback_warning_embed_error, bm25_fallback_warning_missing_query_vector,
-    bm25_fallback_warning_timeout, maybe_rerank_search_results, resolve_route,
-    search_bm25_only_with_options, search_with_vector_and_scope_options,
-};
+use crate::search::VectorSearchCircuit;
 use axum::{
     Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Query, State, rejection::JsonRejection},
     http::{
         HeaderMap, HeaderValue, Method, Request, StatusCode, header::CONTENT_LENGTH,
-        header::CONTENT_TYPE, header::USER_AGENT,
+        header::CONTENT_TYPE,
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -58,11 +52,10 @@ use serde_json::json;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use super::state::{ApiState, SearchTelemetryOutcome, SearchTelemetrySnapshot};
+use super::state::{ApiState, SearchTelemetrySnapshot};
 
 pub const DEFAULT_REST_ADDR: &str = "127.0.0.1:3080";
 const HERMES_COMPAT_VERSION: &str = "mempal-hermes-compat/1";
-const REST_SEARCH_WARNING_HEADER: &str = "mempal-warnings";
 const STATUS_DB_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(1);
 const REST_WRITE_RESTART_HINT: &str = "Restart the mempal daemon after upgrading so REST writes use a binary that supports this palace.db schema.";
 const REST_STALE_DAEMON_RESTART_HINT: &str =
@@ -121,7 +114,7 @@ async fn shutdown_signal() {
 pub fn router(state: ApiState) -> Router {
     let telemetry_state = state.clone();
     Router::new()
-        .route("/api/search", get(search_handler))
+        .route("/api/search", get(super::search::search_handler))
         .route(
             "/api/ingest",
             post(ingest_handler).layer(DefaultBodyLimit::max(MAX_REST_INGEST_BODY_BYTES)),
@@ -180,20 +173,6 @@ fn is_local_origin(origin: &HeaderValue) -> bool {
                 || value.starts_with("https://127.0.0.1")
         })
         .unwrap_or(false)
-}
-
-#[derive(Debug, Deserialize)]
-struct SearchQuery {
-    q: String,
-    wing: Option<String>,
-    room: Option<String>,
-    top_k: Option<usize>,
-    scope: Option<String>,
-    project_id: Option<String>,
-    include_global: Option<bool>,
-    all_projects: Option<bool>,
-    include_raw_turns: Option<bool>,
-    include_expired: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -343,11 +322,11 @@ fn parse_tier_opt(value: &str) -> Result<KnowledgeTier, ApiError> {
     }
 }
 
-fn memory_kind_slug(kind: MemoryKind) -> &'static str {
+pub(super) fn memory_kind_slug(kind: MemoryKind) -> &'static str {
     kind.as_str()
 }
 
-fn domain_slug(domain: MemoryDomain) -> &'static str {
+pub(super) fn domain_slug(domain: MemoryDomain) -> &'static str {
     match domain {
         MemoryDomain::Project => "project",
         MemoryDomain::User => "user",
@@ -357,7 +336,7 @@ fn domain_slug(domain: MemoryDomain) -> &'static str {
     }
 }
 
-fn knowledge_status_slug(status: &KnowledgeStatus) -> &'static str {
+pub(super) fn knowledge_status_slug(status: &KnowledgeStatus) -> &'static str {
     match status {
         KnowledgeStatus::Active => "active",
         KnowledgeStatus::Superseded => "superseded",
@@ -370,7 +349,7 @@ fn knowledge_status_slug(status: &KnowledgeStatus) -> &'static str {
     }
 }
 
-fn knowledge_tier_slug(tier: &KnowledgeTier) -> &'static str {
+pub(super) fn knowledge_tier_slug(tier: &KnowledgeTier) -> &'static str {
     match tier {
         KnowledgeTier::Qi => "qi",
         KnowledgeTier::Shu => "shu",
@@ -542,6 +521,8 @@ struct StatusResponse {
     embed_status: ApiEmbedStatus,
     embedder_cache: crate::embed::SharedEmbedderRuntimeSnapshot,
     search_mode: String,
+    /// Hot-reloaded end-to-end and stage search deadline policy (seconds).
+    search_policy: SearchPolicyStatus,
     embedder_circuit: EmbedderCircuitStatus,
     queue_stats: ApiQueueStats,
     hook_admission: crate::hook_diagnostics::HookAdmissionStats,
@@ -561,6 +542,19 @@ struct StatusResponse {
     search_telemetry: SearchTelemetrySnapshot,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     status_warnings: Vec<String>,
+}
+
+/// Operator-visible search deadline policy from the active hot-reloaded config.
+#[derive(Debug, Serialize)]
+struct SearchPolicyStatus {
+    /// End-to-end monotonic query deadline shared across all search stages.
+    query_deadline_secs: u64,
+    /// Stage cap for DB work (still limited by remaining E2E budget).
+    db_deadline_secs: u64,
+    /// Stage cap for query embedding (still limited by remaining E2E budget).
+    embed_deadline_secs: u64,
+    /// Stage cap for reranker HTTP (still limited by remaining E2E budget).
+    reranker_timeout_secs: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -783,43 +777,6 @@ struct ScopeCount {
     drawer_count: i64,
 }
 
-#[derive(Debug, Serialize)]
-struct SearchResultDto {
-    drawer_id: String,
-    content: String,
-    wing: String,
-    room: Option<String>,
-    source_file: String,
-    source: String,
-    source_type: String,
-    confidence: f64,
-    similarity: f32,
-    route: RouteDecisionDto,
-    search_mode: String,
-    // Typed metadata fields
-    memory_kind: String,
-    domain: String,
-    field: String,
-    importance: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tier: Option<String>,
-    is_pinned: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    statement: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    warnings: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct RouteDecisionDto {
-    wing: Option<String>,
-    room: Option<String>,
-    confidence: f32,
-    reason: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct PinnedFactsQuery {
     wing: Option<String>,
@@ -855,465 +812,11 @@ struct TaxonomyEntryDto {
     keywords: Vec<String>,
 }
 
-fn resolve_api_search_scope(
-    query: &SearchQuery,
-    config: &crate::core::config::Config,
-) -> Result<(ProjectSearchScope, String), ApiError> {
-    let mut include_global = query.include_global.unwrap_or(false);
-    let mut all_projects = query.all_projects.unwrap_or(false);
-    let explicit_scope = query
-        .scope
-        .as_deref()
-        .map(str::trim)
-        .filter(|scope| !scope.is_empty());
-    match explicit_scope {
-        Some("global" | "all_projects") => {
-            all_projects = true;
-        }
-        Some("all_wings" | "project") => {
-            include_global = false;
-            all_projects = false;
-        }
-        Some("project_plus_global" | "project_global") => {
-            include_global = true;
-            all_projects = false;
-        }
-        Some(other) => {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "invalid scope: {other}; expected project, all_wings, project_plus_global, global, or all_projects"
-                ),
-            ));
-        }
-        None => {}
-    }
-    let resolved_project =
-        resolve_project_id(query.project_id.as_deref(), config, None).map_err(internal_error)?;
-    let scope = ProjectSearchScope::from_request(
-        resolved_project,
-        include_global,
-        all_projects,
-        config.search.strict_project_isolation,
-    );
-    let wing = query.wing.as_deref().unwrap_or("*");
-    let room = query.room.as_deref().unwrap_or("*");
-    let label = format!(
-        "scope={} project={} wing={} room={}",
-        explicit_scope.unwrap_or("legacy"),
-        scope.mode.as_sql_mode(),
-        wing,
-        room
-    );
-    Ok((scope, label))
-}
-
 fn rest_search_timeout_warning(stage: &str, deadline: Duration) -> String {
     format!(
         "{stage} deadline exceeded after {}s; returning partial/fallback search results",
         deadline.as_secs()
     )
-}
-
-fn search_client_from_headers(headers: &HeaderMap) -> String {
-    headers
-        .get(USER_AGENT)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| format!("rest:{value}"))
-        .unwrap_or_else(|| "rest:unknown".to_string())
-}
-
-fn attach_search_headers(response: &mut Response, search_mode: SearchMode, warnings: &[String]) {
-    response.headers_mut().insert(
-        "search-mode",
-        HeaderValue::from_static(search_mode.as_str()),
-    );
-    if search_mode == SearchMode::Bm25Only {
-        response
-            .headers_mut()
-            .insert("degraded", HeaderValue::from_static("true"));
-    }
-    if !warnings.is_empty()
-        && let Ok(value) = HeaderValue::from_str(&warnings.join(" | "))
-    {
-        response
-            .headers_mut()
-            .insert(REST_SEARCH_WARNING_HEADER, value);
-    }
-}
-
-async fn run_rest_bm25_search_bounded(
-    state: &ApiState,
-    request: RestBm25SearchRequest,
-) -> anyhow::Result<Option<crate::search::Result<Vec<SearchResult>>>> {
-    state
-        .run_read_anyhow_bounded_with_telemetry(
-            move |db| {
-                Ok(search_bm25_only_with_options(
-                    db,
-                    &request.query,
-                    request.route,
-                    &request.scope,
-                    request.search_options,
-                    request.top_k,
-                ))
-            },
-            request.deadline,
-            rest_search_read_telemetry(request.stage, request.search_mode),
-        )
-        .await
-}
-
-struct RestBm25SearchRequest {
-    query: String,
-    route: RouteDecision,
-    scope: ProjectSearchScope,
-    search_options: SearchOptions,
-    top_k: usize,
-    deadline: Duration,
-    stage: SearchTelemetryStage,
-    search_mode: SearchMode,
-}
-
-fn rest_search_read_telemetry(
-    stage: SearchTelemetryStage,
-    search_mode: SearchMode,
-) -> OperationTelemetryRecord {
-    OperationTelemetryRecord::new(
-        OperationTelemetrySource::Rest,
-        "GET /api/search",
-        "rest.search.read",
-    )
-    .with_stage(stage.as_str())
-    .with_search_mode(search_mode.as_str())
-}
-
-async fn search_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Query(query): Query<SearchQuery>,
-) -> Result<Response, ApiError> {
-    let config = ConfigHandle::current();
-    let (scope, scope_label) = resolve_api_search_scope(&query, config.as_ref())?;
-    let search_options = SearchOptions {
-        include_raw_turns: query.include_raw_turns.unwrap_or(false),
-        include_expired: query.include_expired.unwrap_or(false),
-        ..SearchOptions::default()
-    };
-    let top_k = query.top_k.unwrap_or(10);
-    let db_deadline = Duration::from_secs(config.api.search_db_deadline_secs);
-    let telemetry = state.search_telemetry().start(
-        search_client_from_headers(&headers),
-        scope_label,
-        top_k,
-        db_deadline,
-    );
-    let embed_snapshot = crate::embed::global_embed_status().snapshot();
-    let vector_search_circuit =
-        VectorSearchCircuit::from_config_and_snapshot(config.as_ref(), &embed_snapshot);
-    let mut search_mode = SearchMode::Hybrid;
-    let mut warnings = Vec::new();
-    let mut partial = false;
-    let route_elapsed;
-    let mut embed_elapsed = Duration::ZERO;
-    let mut db_elapsed = Duration::ZERO;
-    let query_vector = if vector_search_circuit.bm25_fallback_enabled && vector_search_circuit.open
-    {
-        search_mode = SearchMode::Bm25Only;
-        warnings.push(bm25_fallback_warning_degraded(
-            vector_search_circuit.failure_count,
-        ));
-        None
-    } else {
-        telemetry.set_stage(SearchTelemetryStage::Embedding.as_str());
-        let embed_started = Instant::now();
-        match state.embedder_factory.build().await {
-            Ok(embedder) => match tokio::time::timeout(
-                Duration::from_secs(vector_search_circuit.search_deadline_secs),
-                embedder.embed(&[query.q.as_str()]),
-            )
-            .await
-            {
-                Ok(Ok(vectors)) => {
-                    embed_elapsed = embed_started.elapsed();
-                    match vectors.into_iter().next() {
-                        Some(vector) => Some(vector),
-                        None if vector_search_circuit.bm25_fallback_enabled => {
-                            search_mode = SearchMode::Bm25Only;
-                            warnings.push(bm25_fallback_warning_missing_query_vector());
-                            None
-                        }
-                        None => {
-                            return Err(ApiError::new(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "embedder returned no vector",
-                            ));
-                        }
-                    }
-                }
-                Ok(Err(error)) if vector_search_circuit.bm25_fallback_enabled => {
-                    embed_elapsed = embed_started.elapsed();
-                    search_mode = SearchMode::Bm25Only;
-                    warnings.push(bm25_fallback_warning_embed_error(
-                        &crate::core::config::scrub_sensitive_text(&error.to_string()),
-                    ));
-                    None
-                }
-                Ok(Err(error)) => {
-                    return Err(internal_error(error));
-                }
-                Err(_) if vector_search_circuit.bm25_fallback_enabled => {
-                    embed_elapsed = embed_started.elapsed();
-                    search_mode = SearchMode::Bm25Only;
-                    partial = true;
-                    warnings.push(bm25_fallback_warning_timeout(
-                        vector_search_circuit.search_deadline_secs,
-                    ));
-                    None
-                }
-                Err(_) => {
-                    return Err(ApiError::new(
-                        StatusCode::GATEWAY_TIMEOUT,
-                        "embedding deadline exceeded",
-                    ));
-                }
-            },
-            Err(error) if vector_search_circuit.bm25_fallback_enabled => {
-                embed_elapsed = embed_started.elapsed();
-                search_mode = SearchMode::Bm25Only;
-                warnings.push(bm25_fallback_warning_embed_error(
-                    &crate::core::config::scrub_sensitive_text(&error.to_string()),
-                ));
-                None
-            }
-            Err(error) => {
-                return Err(internal_error(error));
-            }
-        }
-    };
-
-    telemetry.set_stage(SearchTelemetryStage::Routing.as_str());
-    let route_started = Instant::now();
-    let fallback_route = RouteDecision {
-        wing: query.wing.clone(),
-        room: query.room.clone(),
-        confidence: if query.wing.is_some() || query.room.is_some() {
-            1.0
-        } else {
-            0.0
-        },
-        reason: "bounded REST fallback: route resolution timed out".to_string(),
-    };
-    let route_query = query.q.clone();
-    let route_wing = query.wing.clone();
-    let route_room = query.room.clone();
-    let route = match state
-        .run_read_anyhow_bounded_with_telemetry(
-            move |db| {
-                Ok(resolve_route(
-                    db,
-                    &route_query,
-                    route_wing.as_deref(),
-                    route_room.as_deref(),
-                ))
-            },
-            db_deadline,
-            rest_search_read_telemetry(SearchTelemetryStage::Routing, search_mode),
-        )
-        .await
-    {
-        Ok(Some(Ok(route))) => {
-            route_elapsed = route_started.elapsed();
-            route
-        }
-        Ok(Some(Err(error))) => return Err(internal_error(error)),
-        Ok(None) => {
-            route_elapsed = route_started.elapsed();
-            partial = true;
-            warnings.push(rest_search_timeout_warning("route resolution", db_deadline));
-            fallback_route
-        }
-        Err(error) => return Err(internal_error(error)),
-    };
-
-    let results = if let Some(query_vector) = query_vector {
-        telemetry.set_stage(SearchTelemetryStage::HybridDb.as_str());
-        let search_started = Instant::now();
-        let hybrid_query = query.q.clone();
-        let hybrid_route = route.clone();
-        let hybrid_scope = scope.clone();
-        let hybrid_options = search_options.clone();
-        match state
-            .run_read_anyhow_bounded_with_telemetry(
-                move |db| {
-                    Ok(search_with_vector_and_scope_options(
-                        db,
-                        &hybrid_query,
-                        &query_vector,
-                        hybrid_route,
-                        &hybrid_scope,
-                        hybrid_options,
-                        top_k,
-                    ))
-                },
-                db_deadline,
-                rest_search_read_telemetry(SearchTelemetryStage::HybridDb, search_mode),
-            )
-            .await
-        {
-            Ok(Some(Ok(results))) => {
-                db_elapsed += search_started.elapsed();
-                results
-            }
-            Ok(Some(Err(crate::search::SearchError::VectorDimensionMismatch {
-                current_dim,
-                new_dim,
-            }))) if vector_search_circuit.bm25_fallback_enabled => {
-                db_elapsed += search_started.elapsed();
-                search_mode = SearchMode::Bm25Only;
-                warnings.push(bm25_fallback_warning_dimension_mismatch(
-                    new_dim,
-                    current_dim,
-                ));
-                telemetry.set_stage(SearchTelemetryStage::Bm25FallbackDb.as_str());
-                let bm25_started = Instant::now();
-                match run_rest_bm25_search_bounded(
-                    &state,
-                    RestBm25SearchRequest {
-                        query: query.q.clone(),
-                        route,
-                        scope,
-                        search_options,
-                        top_k,
-                        deadline: db_deadline,
-                        stage: SearchTelemetryStage::Bm25FallbackDb,
-                        search_mode: SearchMode::Bm25Only,
-                    },
-                )
-                .await
-                {
-                    Ok(Some(Ok(results))) => {
-                        db_elapsed += bm25_started.elapsed();
-                        results
-                    }
-                    Ok(Some(Err(error))) => return Err(internal_error(error)),
-                    Ok(None) => {
-                        db_elapsed += bm25_started.elapsed();
-                        partial = true;
-                        warnings.push(rest_search_timeout_warning("BM25 fallback", db_deadline));
-                        Vec::new()
-                    }
-                    Err(error) => return Err(internal_error(error)),
-                }
-            }
-            Ok(Some(Err(error))) => return Err(internal_error(error)),
-            Ok(None) if vector_search_circuit.bm25_fallback_enabled => {
-                db_elapsed += search_started.elapsed();
-                search_mode = SearchMode::Bm25Only;
-                partial = true;
-                warnings.push(rest_search_timeout_warning("hybrid search", db_deadline));
-                telemetry.set_stage(SearchTelemetryStage::Bm25FallbackDb.as_str());
-                let bm25_started = Instant::now();
-                match run_rest_bm25_search_bounded(
-                    &state,
-                    RestBm25SearchRequest {
-                        query: query.q.clone(),
-                        route,
-                        scope,
-                        search_options,
-                        top_k,
-                        deadline: db_deadline,
-                        stage: SearchTelemetryStage::Bm25FallbackDb,
-                        search_mode: SearchMode::Bm25Only,
-                    },
-                )
-                .await
-                {
-                    Ok(Some(Ok(results))) => {
-                        db_elapsed += bm25_started.elapsed();
-                        results
-                    }
-                    Ok(Some(Err(error))) => return Err(internal_error(error)),
-                    Ok(None) => {
-                        db_elapsed += bm25_started.elapsed();
-                        warnings.push(rest_search_timeout_warning("BM25 fallback", db_deadline));
-                        Vec::new()
-                    }
-                    Err(error) => return Err(internal_error(error)),
-                }
-            }
-            Ok(None) => {
-                db_elapsed += search_started.elapsed();
-                return Err(ApiError::new(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    rest_search_timeout_warning("hybrid search", db_deadline),
-                ));
-            }
-            Err(error) => return Err(internal_error(error)),
-        }
-    } else {
-        telemetry.set_stage(SearchTelemetryStage::Bm25Db.as_str());
-        let bm25_started = Instant::now();
-        match run_rest_bm25_search_bounded(
-            &state,
-            RestBm25SearchRequest {
-                query: query.q.clone(),
-                route,
-                scope,
-                search_options,
-                top_k,
-                deadline: db_deadline,
-                stage: SearchTelemetryStage::Bm25Db,
-                search_mode,
-            },
-        )
-        .await
-        {
-            Ok(Some(Ok(results))) => {
-                db_elapsed += bm25_started.elapsed();
-                results
-            }
-            Ok(Some(Err(error))) => return Err(internal_error(error)),
-            Ok(None) => {
-                db_elapsed += bm25_started.elapsed();
-                partial = true;
-                warnings.push(rest_search_timeout_warning("BM25 search", db_deadline));
-                Vec::new()
-            }
-            Err(error) => return Err(internal_error(error)),
-        }
-    };
-    telemetry.set_stage(SearchTelemetryStage::Rerank.as_str());
-    let rerank_started = Instant::now();
-    let rerank_outcome = maybe_rerank_search_results(&query.q, results).await;
-    let rerank_elapsed = rerank_started.elapsed();
-    warnings.extend(rerank_outcome.warnings);
-    let results = rerank_outcome.results;
-
-    let result_count = results.len();
-    telemetry.finish(SearchTelemetryOutcome {
-        search_mode: search_mode.as_str().to_string(),
-        route: route_elapsed,
-        embed: embed_elapsed,
-        db: db_elapsed,
-        rerank: rerank_elapsed,
-        lock_wait: Duration::ZERO,
-        result_count,
-        warning_count: warnings.len(),
-        partial,
-    });
-
-    let mut response = Json(
-        results
-            .into_iter()
-            .map(|result| SearchResultDto::from_result(result, search_mode, &warnings))
-            .collect::<Vec<_>>(),
-    )
-    .into_response();
-    attach_search_headers(&mut response, search_mode, &warnings);
-    Ok(response)
 }
 
 async fn ingest_handler(
@@ -1916,6 +1419,12 @@ async fn status_handler(
             .vector_search_mode
             .as_str()
             .to_string(),
+        search_policy: SearchPolicyStatus {
+            query_deadline_secs: config.api.search_query_deadline_secs,
+            db_deadline_secs: config.api.search_db_deadline_secs,
+            embed_deadline_secs: config.embed.retry.search_deadline_secs,
+            reranker_timeout_secs: config.search.reranker.timeout_secs,
+        },
         embedder_circuit: vector_search_circuit.into(),
         queue_stats: queue_stats_report,
         hook_admission: crate::hook_diagnostics::hook_admission_stats(
@@ -1993,6 +1502,18 @@ impl ApiError {
             schema_skew: None,
             recovery_hint: None,
             retryable: None,
+            stale_daemon: None,
+        }
+    }
+
+    pub(super) fn search_admission(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            kind: "search_admission_error",
+            schema_skew: None,
+            recovery_hint: None,
+            retryable: Some(false),
             stale_daemon: None,
         }
     }
@@ -2481,52 +2002,6 @@ fn supersede_drawer_for_ingest(db: &Database, old_id: &str, new_id: &str) -> Res
     db.supersede_drawer(old_id, &format!("replaced by {new_id}"))
         .map_err(db_error_to_api_error)?;
     Ok(())
-}
-
-impl SearchResultDto {
-    fn from_result(value: SearchResult, search_mode: SearchMode, warnings: &[String]) -> Self {
-        Self {
-            drawer_id: value.drawer_id,
-            content: value.content,
-            wing: value.wing,
-            room: value.room,
-            source_file: value.source_file,
-            source: value.source.as_str().to_string(),
-            source_type: value.source_type.as_str().to_string(),
-            confidence: value.confidence,
-            similarity: value.similarity,
-            route: value.route.into(),
-            search_mode: search_mode.as_str().to_string(),
-            memory_kind: memory_kind_slug(value.memory_kind).to_string(),
-            domain: domain_slug(value.domain).to_string(),
-            field: value.field,
-            importance: value.importance,
-            status: value
-                .status
-                .as_ref()
-                .map(knowledge_status_slug)
-                .map(str::to_string),
-            tier: value
-                .tier
-                .as_ref()
-                .map(knowledge_tier_slug)
-                .map(str::to_string),
-            is_pinned: value.is_pinned,
-            statement: value.statement,
-            warnings: warnings.to_vec(),
-        }
-    }
-}
-
-impl From<RouteDecision> for RouteDecisionDto {
-    fn from(value: RouteDecision) -> Self {
-        Self {
-            wing: value.wing,
-            room: value.room,
-            confidence: value.confidence,
-            reason: value.reason,
-        }
-    }
 }
 
 impl From<TaxonomyEntry> for TaxonomyEntryDto {

@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import queue
+import secrets
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -25,8 +26,17 @@ from typing import Any, Dict, List, Optional
 from ._backoff import SharedPluginBackoff
 from ._conclude import conclusion_request, submit_conclusion
 from ._intelligence import _IntelligenceEnhancer, _LLMClient
-from ._rest_errors import rest_error_payload as _rest_error_payload
+from ._rest_errors import (
+    rest_error_payload as _rest_error_payload,
+    search_metadata_from_headers,
+    search_timeout_metadata_from_http_error,
+)
 from ._write_spool import SpoolOperation, WriteSpool, classify_write_error
+
+try:
+    from mempal_search_transport import SearchTransport, SearchTransportResponse
+except ImportError:  # Installed plugin copy materialized by install_plugins.py.
+    from ._search_transport import SearchTransport, SearchTransportResponse
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +172,8 @@ class MempalMemoryProvider:
         self._prefetch_generation = 0
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: Optional[threading.Thread] = None
+        self._prefetch_pending = None
+        self._prefetch_stop = threading.Event()
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
         self._backoff = SharedPluginBackoff(
@@ -180,6 +192,7 @@ class MempalMemoryProvider:
         self._is_healthy = True
         self._last_health_at: float = 0.0
         self._last_response_headers: Dict[str, str] = {}
+        self._search_transport = SearchTransport(self._base_url)
         self._intelligence_mode = "deterministic"
         self._llm = _LLMClient({})
         self._enhancer: Optional[_IntelligenceEnhancer] = None
@@ -404,6 +417,8 @@ class MempalMemoryProvider:
             self._hermes_home = str(context.get("hermes_home", ""))
         cfg = _load_config(self._hermes_home)
         self._base_url = cfg["base_url"].rstrip("/")
+        self._search_transport = SearchTransport(self._base_url)
+        self._prefetch_stop.clear()
         user_id = context.get("user_id") or (self._user_id if preserve_existing else cfg.get("user_id", "hermes-user"))
         profile = context.get("agent_identity") or context.get("profile") or (self._profile if preserve_existing else "default")
         platform = context.get("platform") or (self._platform if preserve_existing else "cli")
@@ -611,23 +626,49 @@ class MempalMemoryProvider:
             return warning
         return ""
 
-    def _get_search(self, params):
+    def _search_metadata_from_headers(self, headers, correlation_id):
+        return search_metadata_from_headers(
+            headers,
+            correlation_id,
+        )
+
+    @staticmethod
+    def _is_search_timeout(exc):
+        if isinstance(exc, TimeoutError):
+            return True
+        reason = getattr(exc, "reason", None)
+        return isinstance(reason, TimeoutError)
+
+    def _search_request(self, params) -> SearchTransportResponse:
+        return self._search_transport.get_json("/api/search", params)
+
+    def _get_search(self, params, correlation_id=None):
+        correlation_id = correlation_id or f"search-{secrets.token_hex(8)}"
+        bounded_params = dict(params)
+        # Omit deadline_ms so the daemon hot-reloaded E2E policy is authoritative.
+        bounded_params.pop("deadline_ms", None)
+        bounded_params["correlation_id"] = correlation_id
         started = time.monotonic()
         self._last_response_headers = {}
-        response = self._get("/api/search", params)
+        transport_response = self._search_request(bounded_params)
+        response = transport_response.payload
+        self._last_response_headers = dict(transport_response.headers)
         elapsed = time.monotonic() - started
         reason = (
             self._search_degraded_reason(response, elapsed)
             or self._search_header_degraded_reason(self._last_response_headers)
         )
-        return self._search_results_payload(response), reason
+        metadata = self._search_metadata_from_headers(
+            self._last_response_headers, correlation_id,
+        )
+        return self._search_results_payload(response), reason, metadata
 
-    def _get(self, path, params=None):
+    def _get(self, path, params=None, timeout=10.0):
         import urllib.request
         url = self._base_url + path
         if params:
             url += "?" + _encode_query_params(params)
-        with urllib.request.urlopen(url, timeout=10) as resp:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
             self._last_response_headers = dict(resp.headers.items())
             return json.loads(resp.read().decode())
 
@@ -696,8 +737,11 @@ class MempalMemoryProvider:
         return base
 
     def prefetch(self, query, *, session_id=""):
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            self._prefetch_thread.join(timeout=3.0)
+        del query
+        with self._prefetch_lock:
+            thread = self._prefetch_thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=3.0)
         key = self._session_key(session_id)
         with self._prefetch_lock:
             result = self._prefetch_results.pop(key, "")
@@ -713,7 +757,6 @@ class MempalMemoryProvider:
             return
         key = self._session_key(session_id)
         wing = self._wing
-        generation = self._prefetch_generation
         params = self._retrieval_params({
             "q": query,
             "wing": wing,
@@ -721,43 +764,74 @@ class MempalMemoryProvider:
         })
         # REST currently supports cheaper prefetch only through top_k reduction.
         # Rerank bypass needs REST-side query support before the plugin can send it.
-        def _run():
-            try:
-                results, degraded_reason = self._get_search(params)
-                if results:
-                    lines = []
-                    used = 0
-                    for r in self._safe_filter_items(results):
-                        content = r.get("content", "").replace("\n", " ")
-                        if not content:
-                            continue
-                        drawer_id = r.get("drawer_id") or "unknown"
-                        source = r.get("source") or r.get("source_file") or "unknown"
-                        label = self._memory_authority_label(r)
-                        line = (
-                            f"- [{label}] {content} "
-                            f"(drawer_id: {drawer_id}, source: {source}, "
-                            f"importance: {r.get('importance', 0)})"
-                        )
-                        used, accepted = self._append_with_budget(lines, line, used)
-                        if not accepted:
-                            break
-                    with self._prefetch_lock:
-                        if generation == self._prefetch_generation:
-                            result = "\n".join(lines)
-                            self._prefetch_results[key] = result
-                            if key == self._session_id:
-                                self._prefetch_result = result
-                if degraded_reason:
-                    self._record_failure()
-                    logger.debug("mempal prefetch degraded: %s", degraded_reason)
-                else:
-                    self._record_success()
-            except Exception as exc:
+        with self._prefetch_lock:
+            if self._prefetch_stop.is_set():
+                return
+            self._prefetch_pending = (
+                params, key, self._prefetch_generation,
+            )
+            if self._prefetch_thread is not None:
+                return
+            worker = threading.Thread(
+                target=self._prefetch_loop,
+                daemon=True,
+                name="mempal-prefetch",
+            )
+            self._prefetch_thread = worker
+            worker.start()
+
+    def _prefetch_loop(self):
+        while not self._prefetch_stop.is_set():
+            with self._prefetch_lock:
+                job = self._prefetch_pending
+                self._prefetch_pending = None
+                if job is None:
+                    self._prefetch_thread = None
+                    return
+            self._process_prefetch_job(*job)
+        with self._prefetch_lock:
+            self._prefetch_pending = None
+            self._prefetch_thread = None
+
+    def _process_prefetch_job(self, params, key, generation):
+        try:
+            results, degraded_reason, _metadata = self._get_search(params)
+            if results:
+                lines = []
+                used = 0
+                for result_item in self._safe_filter_items(results):
+                    content = result_item.get("content", "").replace("\n", " ")
+                    if not content:
+                        continue
+                    drawer_id = result_item.get("drawer_id") or "unknown"
+                    source = (
+                        result_item.get("source")
+                        or result_item.get("source_file")
+                        or "unknown"
+                    )
+                    label = self._memory_authority_label(result_item)
+                    line = (
+                        f"- [{label}] {content} "
+                        f"(drawer_id: {drawer_id}, source: {source}, "
+                        f"importance: {result_item.get('importance', 0)})"
+                    )
+                    used, accepted = self._append_with_budget(lines, line, used)
+                    if not accepted:
+                        break
+                with self._prefetch_lock:
+                    if generation == self._prefetch_generation:
+                        rendered = "\n".join(lines)
+                        self._prefetch_results[key] = rendered
+                        if key == self._session_id:
+                            self._prefetch_result = rendered
+            if degraded_reason:
                 self._record_failure()
-                logger.debug("mempal prefetch failed: %s", exc)
-        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="mempal-prefetch")
-        self._prefetch_thread.start()
+                logger.debug("mempal prefetch degraded: %s", degraded_reason)
+            else:
+                self._record_success()
+        except Exception as exc:
+            self._record_failure()
+            logger.debug("mempal prefetch failed: %s", exc)
 
     def sync_turn(self, user_content, assistant_content, *, session_id=""):
         if self._turn_storage_mode() != "raw_evidence":
@@ -819,20 +893,80 @@ class MempalMemoryProvider:
                 top_k = min(int(args.get("top_k", 10)), 50)
             except (ValueError, TypeError):
                 top_k = 10
+            correlation_id = f"search-{secrets.token_hex(8)}"
+            started = time.monotonic()
             try:
-                results, degraded_reason = self._get_search(self._retrieval_params({"q": q, "wing": self._wing, "top_k": top_k}))
+                results, degraded_reason, metadata = self._get_search(
+                    self._retrieval_params({"q": q, "wing": self._wing, "top_k": top_k}),
+                    correlation_id,
+                )
                 if degraded_reason:
                     self._record_failure()
                     logger.debug("mempal search degraded: %s", degraded_reason)
                 else:
                     self._record_success()
                 if not results:
-                    return json.dumps({"result": "No relevant memories found."})
+                    payload = {"result": "No relevant memories found."}
+                    if metadata and (metadata["partial"] or metadata["fallback_used"]):
+                        payload["search_metadata"] = metadata
+                    return json.dumps(payload)
                 items = [_strip_none({"memory": r.get("content", ""), "score": r.get("similarity", 0), "drawer_id": r.get("drawer_id"), "source": r.get("source"), "source_type": r.get("source_type"), "provenance": r.get("provenance"), "status": r.get("status"), "memory_kind": r.get("memory_kind"), "domain": r.get("domain"), "field": r.get("field"), "importance": r.get("importance"), "is_pinned": r.get("is_pinned"), "confidence": r.get("confidence"), "authority": self._memory_authority_label(r)}) for r in self._safe_filter_items(results)]
-                return json.dumps({"results": items, "count": len(items)})
+                payload = {"results": items, "count": len(items)}
+                if metadata and (metadata["partial"] or metadata["fallback_used"]):
+                    payload["search_metadata"] = metadata
+                return json.dumps(payload)
             except Exception as exc:
                 self._record_failure()
-                return json.dumps({"error": f"Search failed: {exc}"})
+                daemon_timeout = search_timeout_metadata_from_http_error(
+                    exc,
+                    correlation_id,
+                )
+                if daemon_timeout:
+                    return json.dumps({
+                        "error": "Mempal search reached the daemon deadline.",
+                        "error_details": {
+                            "kind": "search_timeout",
+                            **daemon_timeout,
+                        },
+                    })
+                if self._is_search_timeout(exc):
+                    elapsed_ms = int((time.monotonic() - started) * 1000)
+                    return json.dumps({
+                        "error": "Mempal search transport timed out before the daemon returned terminal metadata.",
+                        "error_details": {
+                            "kind": "search_timeout",
+                            "correlation_id": correlation_id,
+                            "elapsed_ms": elapsed_ms,
+                            "partial": False,
+                            "retry_safe": True,
+                            "fallback_used": [],
+                            "timeouts": [{
+                                "stage": "transport",
+                                "boundary": "plugin.rest_transport",
+                            }],
+                        },
+                    })
+                status = getattr(exc, "code", None)
+                failure = {
+                    "stage": "transport",
+                    "boundary": "plugin.rest_transport",
+                    "error_class": exc.__class__.__name__,
+                }
+                if isinstance(status, int) and not isinstance(status, bool):
+                    failure["http_status"] = status
+                return json.dumps({
+                    "error": "Mempal search transport failed.",
+                    "error_details": {
+                        "kind": "search_transport_failure",
+                        "correlation_id": correlation_id,
+                        "elapsed_ms": int((time.monotonic() - started) * 1000),
+                        "partial": False,
+                        "retry_safe": True,
+                        "fallback_used": [],
+                        "timeouts": [],
+                        "failures": [failure],
+                    },
+                })
         elif tool_name == "mempal_conclude":
             conclusion = args.get("conclusion", "")
             if not conclusion:
@@ -930,6 +1064,7 @@ class MempalMemoryProvider:
         with self._prefetch_lock:
             self._prefetch_result = ""
             self._prefetch_results.clear()
+            self._prefetch_pending = None
             self._prefetch_generation += 1
         with self._pinned_facts_lock:
             self._pinned_facts_fetched_at = 0.0
@@ -938,8 +1073,12 @@ class MempalMemoryProvider:
     def shutdown(self):
         deadline = time.monotonic() + self._write_drain_timeout
         self._write_stop.set()
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            self._prefetch_thread.join(
+        self._prefetch_stop.set()
+        with self._prefetch_lock:
+            self._prefetch_pending = None
+            prefetch_thread = self._prefetch_thread
+        if prefetch_thread and prefetch_thread.is_alive():
+            prefetch_thread.join(
                 timeout=min(3.0, max(0.0, deadline - time.monotonic()))
             )
         if self._write_worker and self._write_worker.is_alive():

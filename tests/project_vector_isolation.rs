@@ -3,7 +3,6 @@
 mod common;
 
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 #[cfg(feature = "integration")]
@@ -21,9 +20,9 @@ use mempal::core::db::{
     Database, apply_fork_ext_migrations_to, read_fork_ext_version, set_fork_ext_version,
 };
 use mempal::core::project::{
-    MAX_PROJECT_ID_BYTES, ProjectError, ProjectFilterMode, escape_project_id_for_display,
-    infer_project_id_from_path, infer_project_id_from_root_uri, migrate_null_project_ids,
-    validate_project_id,
+    MAX_PROJECT_ID_BYTES, ProjectError, ProjectFilterMode, ProjectMigrationEvent,
+    escape_project_id_for_display, infer_project_id_from_path, infer_project_id_from_root_uri,
+    migrate_null_project_ids, validate_project_id,
 };
 use mempal::core::reindex::ReindexProgressStore;
 use mempal::core::types::{Drawer, SourceType};
@@ -400,6 +399,8 @@ fn drawer_project_ids(conn: &Connection, table: &str) -> Vec<Option<String>> {
 }
 
 fn downgrade_to_v4(conn: &Connection, drop_vector_table: bool) {
+    conn.execute_batch("DROP INDEX IF EXISTS idx_drawers_reindex_source_identity_active;")
+        .expect("drop reindex source identity index");
     conn.execute_batch("DROP INDEX IF EXISTS idx_drawers_project_id;")
         .expect("drop project index");
     conn.execute_batch("DROP INDEX IF EXISTS idx_drawers_project_id_active;")
@@ -974,7 +975,7 @@ fn test_status_reports_null_project_backfill_pending_after_v5_migration() {
     downgrade_to_v4(db.conn(), false);
     apply_fork_ext_migrations_to(db.conn(), 5).expect("apply ext v5");
 
-    let output = run_mempal(&home, &["status"]);
+    let output = run_mempal(&home, &["status", "--full"]);
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("status stdout utf8");
     assert!(
@@ -1031,7 +1032,7 @@ fn test_status_shows_project_breakdown() {
         &[0.1, 0.2, 0.3],
     );
 
-    let output = run_mempal(&home, &["status"]);
+    let output = run_mempal(&home, &["status", "--full"]);
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("status stdout utf8");
     let lines = stdout.lines().collect::<Vec<_>>();
@@ -1089,7 +1090,7 @@ fn test_status_escapes_project_id_with_control_chars() {
     )
     .expect("inject ansi project id");
 
-    let output = run_mempal(&home, &["status"]);
+    let output = run_mempal(&home, &["status", "--full"]);
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("status stdout utf8");
     let lines = stdout.lines().collect::<Vec<_>>();
@@ -1247,14 +1248,8 @@ fn test_project_migrate_batched_does_not_block_ingest() {
 
 #[test]
 fn test_project_migrate_begin_immediate_fails_fast() {
-    let _guard = home_guard();
     let tmp = TempDir::new().expect("tempdir");
-    let home = install_cli_home(&tmp);
-    let db_path = home.join(".mempal").join("palace.db");
-    write_config_atomic(
-        &home.join(".mempal").join("config.toml"),
-        &search_config(&db_path, None, false),
-    );
+    let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
     insert_projected_drawer(
         &db_path,
@@ -1283,55 +1278,20 @@ fn test_project_migrate_begin_immediate_fails_fast() {
     });
     ready_rx.recv().expect("lock holder ready");
 
-    let mut child = Command::new(mempal_bin())
-        .args([
-            "project",
-            "migrate",
-            "--project",
-            "proj-A",
-            "--wing",
-            "code-memory",
-        ])
-        .env("HOME", &home)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn project migrate");
-    let stdout = child.stdout.take().expect("stdout pipe");
-    let mut reader = BufReader::new(stdout);
-
     let started = Instant::now();
-    let mut lines = Vec::new();
-    loop {
-        let mut line = String::new();
-        let read = reader.read_line(&mut line).expect("read line");
-        if read == 0 {
-            break;
+    let mut first_busy_elapsed = None;
+    migrate_null_project_ids(&db_path, "proj-A", Some("code-memory"), |event| {
+        if matches!(event, ProjectMigrationEvent::Busy { .. }) && first_busy_elapsed.is_none() {
+            first_busy_elapsed = Some(started.elapsed());
         }
-        let trimmed = line.trim().to_string();
-        lines.push(trimmed.clone());
-        if trimmed.contains("batch busy") {
-            break;
-        }
-    }
-
-    let busy_elapsed = started.elapsed();
-    let output = child.wait_with_output().expect("wait with output");
+    })
+    .expect("migrate after transient busy lock");
     lock_thread.join().expect("join lock thread");
 
+    let busy_elapsed = first_busy_elapsed.expect("migration should report the busy lock");
     assert!(
         busy_elapsed < Duration::from_millis(100),
         "busy retry was not fail-fast: {busy_elapsed:?}"
-    );
-    assert!(
-        output.status.success(),
-        "project migrate failed:\nstdout={:?}\nstderr={}",
-        lines,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        lines.iter().any(|line| line.contains("batch busy")),
-        "missing busy retry output: {lines:?}"
     );
 }
 

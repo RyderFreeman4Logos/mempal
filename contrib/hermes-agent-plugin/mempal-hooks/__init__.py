@@ -17,12 +17,36 @@ Or via $HERMES_HOME/mempal.json (shared with MemoryProvider plugin).
 from __future__ import annotations
 
 import json
+import importlib.util
 import logging
 import os
+import sys
 import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
+
+try:
+    from mempal_search_transport import SearchTransport, SearchTransportResponse
+except ImportError:
+    _transport_candidates = (
+        os.path.join(os.path.dirname(__file__), "_search_transport.py"),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "mempal_search_transport.py"),
+    )
+    _transport_path = next(
+        (candidate for candidate in _transport_candidates if os.path.isfile(candidate)),
+        "",
+    )
+    _transport_spec = importlib.util.spec_from_file_location(
+        "mempal_hooks_search_transport", _transport_path,
+    )
+    if _transport_spec is None or _transport_spec.loader is None:
+        raise ImportError("mempal search transport is unavailable")
+    _transport_module = importlib.util.module_from_spec(_transport_spec)
+    sys.modules[_transport_spec.name] = _transport_module
+    _transport_spec.loader.exec_module(_transport_module)
+    SearchTransport = _transport_module.SearchTransport
+    SearchTransportResponse = _transport_module.SearchTransportResponse
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +228,7 @@ class _MempalHooks:
             cooldown_secs=_BREAKER_COOLDOWN_SECS,
         )
         self._last_response_headers: Dict[str, str] = {}
+        self._search_transport = SearchTransport(self._base_url)
         self._initialized = False
         self._init_lock = threading.Lock()
 
@@ -218,6 +243,7 @@ class _MempalHooks:
                 self._hermes_home = str(hermes_home)
             cfg = _load_config(self._hermes_home)
             self._base_url = cfg["base_url"].rstrip("/")
+            self._search_transport = SearchTransport(self._base_url)
             self._user_id = cfg.get("user_id", "hermes-user")
             self._wing = f"hermes-user/{self._user_id}/default"
             self._initialized = True
@@ -324,7 +350,9 @@ class _MempalHooks:
     def _get_search(self, params: Dict[str, Any]) -> tuple[List[Dict[str, Any]], str]:
         started = time.monotonic()
         self._last_response_headers = {}
-        response = self._get("/api/search", params)
+        transport_response = self._search_transport.get_json("/api/search", params)
+        response = transport_response.payload
+        self._last_response_headers = dict(transport_response.headers)
         elapsed = time.monotonic() - started
         return (
             self._search_results_payload(response),

@@ -181,6 +181,7 @@ block_writes_when_degraded = true
 [api]
 write_queue_capacity = 10
 write_drain_timeout_secs = 2
+search_query_deadline_secs = {api_search_deadline_secs}
 search_db_deadline_secs = {api_search_deadline_secs}
 "#,
                 db_path.display()

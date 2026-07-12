@@ -14,6 +14,7 @@ use super::types::IntelligenceMode;
 
 const DEFAULT_DB_PATH: &str = "~/.mempal/palace.db";
 const DEFAULT_EMBED_BACKEND: &str = "openai_compat";
+const EMBED_URL_REQUIRED: &str = "embed base_url missing; example http://127.0.0.1:18002/v1";
 pub const DEFAULT_MODEL2VEC_FINGERPRINT_MODEL: &str = "model2vec/potion-multilingual-128M";
 const DEFAULT_CHUNKER_MAX_TOKENS: usize = 1024;
 const DEFAULT_CHUNKER_TARGET_TOKENS: usize = 512;
@@ -32,7 +33,7 @@ const DEFAULT_LLM_RETRY_INTERVAL_SECS: u64 = 2;
 const DEFAULT_LLM_MAX_CONCURRENT: usize = 16;
 const DEFAULT_LLM_ENDPOINT_PRIORITY: i32 = 0;
 const DEFAULT_MEMORY_INTELLIGENCE_TIMEOUT_SECS: u64 = 1800;
-const DEFAULT_SEARCH_DEADLINE_SECS: u64 = 30;
+const DEFAULT_SEARCH_DEADLINE_SECS: u64 = 240;
 const DEFAULT_SEARCH_PREVIEW_CHARS: usize = 120;
 const DEFAULT_SEARCH_TUNNEL_FANOUT_CAP: usize = 5;
 const DEFAULT_SEARCH_TUNNEL_HINTS_DISPLAY_CAP: usize = 8;
@@ -42,7 +43,7 @@ const DEFAULT_SEARCH_DECAY_HALF_LIFE_DAYS: u64 = 90;
 const DEFAULT_SEARCH_DECAY_STEP_FULL_DAYS: u64 = 30;
 const DEFAULT_SEARCH_DECAY_STEP_REDUCED_WEIGHT: f64 = 0.5;
 const DEFAULT_SEARCH_BM25_FALLBACK: bool = true;
-const DEFAULT_SEARCH_RERANKER_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_SEARCH_RERANKER_TIMEOUT_SECS: u64 = 240;
 const DEFAULT_SEARCH_RERANKER_TOP_K: usize = 50;
 const DEFAULT_TURN_STORAGE_MODE: TurnStorageMode = TurnStorageMode::RawEvidence;
 const DEFAULT_TURN_IMPORTANCE: i32 = 0;
@@ -59,7 +60,8 @@ const DEFAULT_SESSION_REVIEW_MIN_LENGTH: usize = 100;
 const DEFAULT_SESSION_REVIEW_TRAILING_MESSAGES: usize = 1;
 const DEFAULT_API_WRITE_QUEUE_CAPACITY: usize = 1_000;
 const DEFAULT_API_WRITE_DRAIN_TIMEOUT_SECS: u64 = 30;
-const DEFAULT_API_SEARCH_DB_DEADLINE_SECS: u64 = 30;
+const DEFAULT_API_SEARCH_QUERY_DEADLINE_SECS: u64 = 240;
+const DEFAULT_API_SEARCH_DB_DEADLINE_SECS: u64 = 240;
 const DEFAULT_HOTPATCH_MIN_IMPORTANCE_STARS: i32 = 4;
 const DEFAULT_HOTPATCH_MAX_SUGGESTION_LENGTH: usize = 80;
 const DEFAULT_IMPORTANCE_DECAY_RATE: f64 = 0.01;
@@ -336,9 +338,9 @@ impl Config {
                 "api.write_drain_timeout_secs must be greater than 0".to_string(),
             ));
         }
-        if self.api.search_db_deadline_secs == 0 {
+        if self.api.search_query_deadline_secs == 0 || self.api.search_db_deadline_secs == 0 {
             return Err(ConfigError::InvalidConfig(
-                "api.search_db_deadline_secs must be greater than 0".to_string(),
+                "api search deadlines must be greater than 0".to_string(),
             ));
         }
         if !(0..=5).contains(&self.turns.default_importance) {
@@ -358,6 +360,7 @@ impl Config {
                 "search.reranker.timeout_secs must be greater than 0".to_string(),
             ));
         }
+        super::deadline::validate_search_deadlines(self)?;
         if self.search.reranker.top_k == 0 {
             return Err(ConfigError::InvalidConfig(
                 "search.reranker.top_k must be greater than 0".to_string(),
@@ -985,7 +988,7 @@ fn normalize_embed_endpoint_base_url(
     let base_url = base_url
         .map(str::trim)
         .filter(|base_url| !base_url.is_empty())
-        .ok_or_else(|| ConfigError::Validation(format!("{field} must not be empty")))?
+        .ok_or_else(|| ConfigError::Validation(EMBED_URL_REQUIRED.to_string()))?
         .trim_end_matches('/')
         .to_string();
     validate_embed_base_url(&base_url, field).map_err(ConfigError::Validation)?;
@@ -1309,17 +1312,11 @@ impl Default for HooksSessionEndConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ApiConfig {
-    /// Start the REST API server automatically when the daemon starts.
-    /// Requires the binary to be built with `--features rest`.
     pub enabled: bool,
-    /// Address to bind the REST API server on.
     pub addr: String,
-    /// Maximum number of pending REST write requests before new writes get 503.
     pub write_queue_capacity: usize,
-    /// Maximum time to wait for queued REST writes during graceful shutdown.
     pub write_drain_timeout_secs: u64,
-    /// Maximum time a REST search may spend in synchronous database work before
-    /// returning a partial/fallback response.
+    pub search_query_deadline_secs: u64,
     pub search_db_deadline_secs: u64,
 }
 
@@ -1330,6 +1327,7 @@ impl Default for ApiConfig {
             addr: "127.0.0.1:3080".to_string(),
             write_queue_capacity: DEFAULT_API_WRITE_QUEUE_CAPACITY,
             write_drain_timeout_secs: DEFAULT_API_WRITE_DRAIN_TIMEOUT_SECS,
+            search_query_deadline_secs: DEFAULT_API_SEARCH_QUERY_DEADLINE_SECS,
             search_db_deadline_secs: DEFAULT_API_SEARCH_DB_DEADLINE_SECS,
         }
     }

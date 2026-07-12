@@ -1,0 +1,253 @@
+use super::*;
+use crate::core::queue::PendingMessageStore;
+
+#[tokio::test]
+async fn write_observer_reports_stall_when_queue_has_work_and_no_recent_writes() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    sync_store
+        .enqueue("hook:user-prompt-submit", "{}")
+        .expect("enqueue pending message");
+    let store = AsyncPendingMessageStore::from_store(sync_store);
+
+    let observer = DaemonWriteObserver::new();
+    let now = unix_secs();
+    observer.force_last_successful_write_for_test(now.saturating_sub(DAEMON_STALL_SECONDS));
+    observer.record_error("failed to merge drawer");
+
+    let diagnostic = observer
+        .stall_diagnostic(&store, now)
+        .await
+        .expect("stall diagnostic");
+    assert_eq!(diagnostic.queued_count, 1);
+    assert!(diagnostic.seconds_since_successful_write >= DAEMON_STALL_SECONDS);
+    assert_eq!(diagnostic.last_error, "failed to merge drawer");
+}
+
+#[tokio::test]
+async fn write_observer_ignores_empty_queue() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    let store = AsyncPendingMessageStore::from_store(sync_store);
+
+    let observer = DaemonWriteObserver::new();
+    let now = unix_secs();
+    observer.force_last_successful_write_for_test(now.saturating_sub(DAEMON_STALL_SECONDS));
+
+    assert_eq!(observer.stall_diagnostic(&store, now).await, None);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn write_observer_stall_checks_record_queue_io_burst() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let store = AsyncPendingMessageStore::from_store(
+        PendingMessageStore::new(&db_path).expect("open queue"),
+    );
+    let queue_sample_count = || {
+        crate::observability::io_burst_snapshot()
+            .paths
+            .into_iter()
+            .find(|path| path.path == crate::observability::IoOperationPath::Queue)
+            .map_or(0, |path| path.sample_count)
+    };
+    let before = queue_sample_count();
+
+    DaemonWriteObserver::new().maybe_log_stall(&store).await;
+
+    assert!(queue_sample_count() > before);
+}
+
+#[test]
+fn test_sqlite_lock_detection_checks_context_chain() {
+    let error = anyhow::anyhow!("database is locked: Error code 5")
+        .context("failed to open daemon database");
+
+    assert!(is_sqlite_lock_error(&error));
+}
+
+#[test]
+fn test_daemon_db_env_path_resolves_missing_relative_path_against_current_dir() -> Result<()> {
+    let cwd = std::env::current_dir().context("read current working directory")?;
+    let relative = PathBuf::from("tmp-mempal-daemon-db-path.db");
+    let resolved = daemon_db_env_path(&relative)?;
+
+    assert!(resolved.is_absolute());
+    assert_eq!(resolved, cwd.join(&relative));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct FakeDbHolderOps {
+    reports: Vec<DbHolderReport>,
+    running: std::collections::BTreeMap<i32, bool>,
+    signals: Vec<(i32, i32)>,
+    term_ignored: std::collections::BTreeSet<i32>,
+}
+
+#[cfg(target_os = "linux")]
+impl DbHolderProcessOps for FakeDbHolderOps {
+    fn inspect_holders(&mut self) -> DbHolderReport {
+        if self.reports.len() > 1 {
+            self.reports.remove(0)
+        } else {
+            self.reports
+                .first()
+                .cloned()
+                .unwrap_or_else(|| db_holder_report(Vec::new()))
+        }
+    }
+
+    fn signal(&mut self, pid: i32, signal: i32) -> Result<()> {
+        self.signals.push((pid, signal));
+        if signal == libc::SIGKILL || (signal == libc::SIGTERM && !self.term_ignored.contains(&pid))
+        {
+            self.running.insert(pid, false);
+        }
+        Ok(())
+    }
+
+    fn is_running(&mut self, pid: i32) -> Result<bool> {
+        Ok(self.running.get(&pid).copied().unwrap_or(false))
+    }
+
+    fn sleep(&mut self, _duration: Duration) {}
+}
+
+#[cfg(target_os = "linux")]
+fn db_holder_report(holders: Vec<crate::process_diagnostics::DbHolderProcess>) -> DbHolderReport {
+    DbHolderReport {
+        db_path: "/tmp/palace.db".to_string(),
+        holder_count: holders.len(),
+        extra_holder_count: holders
+            .iter()
+            .filter(|holder| holder.classification == "extra_holder")
+            .count(),
+        stale_mcp_server_count: holders
+            .iter()
+            .filter(|holder| holder.classification == "stale_mcp_server")
+            .count(),
+        orphan_daemon_count: holders
+            .iter()
+            .filter(|holder| holder.classification == "orphan_daemon")
+            .count(),
+        error: None,
+        holders,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn db_holder(
+    pid: i32,
+    role: &str,
+    classification: &str,
+    started_at_unix_secs: u64,
+) -> crate::process_diagnostics::DbHolderProcess {
+    crate::process_diagnostics::DbHolderProcess {
+        pid,
+        role: role.to_string(),
+        classification: classification.to_string(),
+        command: match role {
+            "mempal_mcp_server" => "mempal serve".to_string(),
+            "mempal_daemon" => "mempal daemon".to_string(),
+            _ => "other process".to_string(),
+        },
+        opened_files: vec!["db".to_string()],
+        started_at_unix_secs: Some(started_at_unix_secs),
+        age_secs: None,
+        current_process: classification == "current_process",
+        current_daemon: classification == "current_daemon",
+        current_mcp_server: classification == "current_mcp_server",
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_db_holder_termination_skips_pid_reuse_before_sigterm() {
+    let original = db_holder(77, "mempal_mcp_server", "stale_mcp_server", 1_000);
+    let target = DbHolderRemediationTarget::from_holder(&original);
+    let reused = db_holder(77, "other", "extra_holder", 2_000);
+    let mut ops = FakeDbHolderOps {
+        reports: vec![db_holder_report(vec![reused])],
+        running: [(77, true)].into_iter().collect(),
+        ..Default::default()
+    };
+
+    let outcome = terminate_db_holder_targets_with_ops(
+        &[target],
+        &mut ops,
+        Duration::ZERO,
+        Duration::from_millis(1),
+    );
+
+    assert!(ops.signals.is_empty());
+    assert!(outcome.signaled.is_empty());
+    assert_eq!(outcome.errors.len(), 1);
+    assert!(outcome.errors[0].contains("SIGTERM pid 77 skipped"));
+    assert!(outcome.errors[0].contains("classification=stale_mcp_server"));
+    assert!(outcome.errors[0].contains("classification=extra_holder"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_db_holder_termination_skips_pid_reuse_before_sigkill() {
+    let original = db_holder(88, "mempal_daemon", "orphan_daemon", 1_000);
+    let target = DbHolderRemediationTarget::from_holder(&original);
+    let reused = db_holder(88, "mempal_mcp_server", "current_mcp_server", 2_000);
+    let mut ops = FakeDbHolderOps {
+        reports: vec![
+            db_holder_report(vec![original]),
+            db_holder_report(vec![reused]),
+        ],
+        running: [(88, true)].into_iter().collect(),
+        term_ignored: [88].into_iter().collect(),
+        ..Default::default()
+    };
+
+    let outcome = terminate_db_holder_targets_with_ops(
+        &[target],
+        &mut ops,
+        Duration::ZERO,
+        Duration::from_millis(1),
+    );
+
+    assert_eq!(ops.signals, vec![(88, libc::SIGTERM)]);
+    assert_eq!(outcome.signaled, vec![88]);
+    assert!(outcome.killed.is_empty());
+    assert_eq!(outcome.errors.len(), 1);
+    assert!(outcome.errors[0].contains("SIGKILL pid 88 skipped"));
+    assert!(outcome.errors[0].contains("classification=orphan_daemon"));
+    assert!(outcome.errors[0].contains("classification=current_mcp_server"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_db_holder_termination_preserves_matching_stale_holder_reap() {
+    let original = db_holder(99, "mempal_mcp_server", "stale_mcp_server", 1_000);
+    let target = DbHolderRemediationTarget::from_holder(&original);
+    let mut ops = FakeDbHolderOps {
+        reports: vec![db_holder_report(vec![original])],
+        running: [(99, true)].into_iter().collect(),
+        term_ignored: [99].into_iter().collect(),
+        ..Default::default()
+    };
+
+    let outcome = terminate_db_holder_targets_with_ops(
+        &[target],
+        &mut ops,
+        Duration::ZERO,
+        Duration::from_millis(1),
+    );
+
+    assert_eq!(ops.signals, vec![(99, libc::SIGTERM), (99, libc::SIGKILL)]);
+    assert_eq!(outcome.signaled, vec![99]);
+    assert_eq!(outcome.killed, vec![99]);
+    assert!(outcome.errors.is_empty());
+}
