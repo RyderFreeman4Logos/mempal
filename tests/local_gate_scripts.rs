@@ -124,11 +124,17 @@ fn cargo_test_wrapper_success_does_not_leave_timeout_sleeper() {
 #[test]
 fn rest_gate_dry_run_wraps_cargo_test_phases() {
     let script = repo_root().join("scripts/gates/rest-tests.sh");
+    let fixture = tempfile::tempdir().expect("create dry-run fixture");
+    let target = fixture.path().join("target");
     let output = run_bash_script(
         &script,
         &[],
         &[
             ("REST_GATE_DRY_RUN", "1"),
+            (
+                "REST_GATE_TARGET_DIR",
+                target.to_str().expect("UTF-8 target path"),
+            ),
             ("REST_TEST_TARGETS_PER_BATCH", "999"),
         ],
         Duration::from_secs(10),
@@ -142,6 +148,123 @@ fn rest_gate_dry_run_wraps_cargo_test_phases() {
     );
     assert!(stdout.contains("--features rest --lib --bins"));
     assert!(stdout.contains("--features rest --doc"));
+}
+
+#[test]
+fn rest_gate_isolates_cleanup_from_the_shared_cargo_target() {
+    let script = repo_root().join("scripts/gates/rest-tests.sh");
+    let isolated_target = repo_root().join("target/test-rest-gate-isolated");
+    let isolated_target_text = isolated_target.to_str().expect("UTF-8 target path");
+    let output = run_bash_script(
+        &script,
+        &[],
+        &[
+            ("REST_GATE_DRY_RUN", "1"),
+            ("REST_GATE_TARGET_DIR", isolated_target_text),
+            ("REST_TEST_TARGETS_PER_BATCH", "999"),
+            ("CARGO_BUILD_JOBS", "2"),
+        ],
+        Duration::from_secs(10),
+    );
+
+    assert!(output.status.success());
+    let isolated_target = fs::canonicalize(&isolated_target).expect("canonical isolated target");
+    let isolated_target_text = isolated_target.to_str().expect("UTF-8 target path");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("rest cargo target dir: {isolated_target_text}")),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("rest cargo build jobs: 2"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn rest_gate_rejects_the_shared_cargo_target() {
+    let script = repo_root().join("scripts/gates/rest-tests.sh");
+    let shared_target = repo_root().join("target");
+    let shared_target_text = shared_target.to_str().expect("UTF-8 target path");
+    let output = run_bash_script(
+        &script,
+        &[],
+        &[
+            ("REST_GATE_DRY_RUN", "1"),
+            ("REST_GATE_TARGET_DIR", shared_target_text),
+        ],
+        Duration::from_secs(10),
+    );
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("must not use the shared Cargo target"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
+    let fixture = tempfile::tempdir().expect("create lock fixture");
+    let target = fixture.path().join("target");
+    fs::create_dir(&target).expect("create isolated target");
+    let target = fs::canonicalize(target).expect("canonical isolated target");
+    let mut lock_file = target.as_os_str().to_os_string();
+    lock_file.push(".lock");
+    let lock_file = PathBuf::from(lock_file);
+    let unsafe_override = fixture.path().join("different.lock");
+    let ready_file = fixture.path().join("lock-ready");
+    let mut lock_holder = Command::new("flock")
+        .arg(&lock_file)
+        .args(["bash", "-c", "touch \"$LOCK_READY\"; sleep 1"])
+        .env("LOCK_READY", &ready_file)
+        .spawn()
+        .expect("spawn lock holder");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !ready_file.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(ready_file.exists(), "lock holder did not become ready");
+
+    let script = repo_root().join("scripts/gates/rest-tests.sh");
+    let output = run_bash_script(
+        &script,
+        &[],
+        &[
+            ("REST_GATE_DRY_RUN", "1"),
+            (
+                "REST_GATE_LOCK_FILE",
+                unsafe_override.to_str().expect("UTF-8 lock path"),
+            ),
+            (
+                "REST_GATE_TARGET_DIR",
+                target.to_str().expect("UTF-8 target path"),
+            ),
+            ("REST_TEST_TARGETS_PER_BATCH", "999"),
+        ],
+        Duration::from_secs(10),
+    );
+    lock_holder.wait().expect("reap lock holder");
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("rest gate waiting for lock:"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("rest gate acquired lock:"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(lock_file.to_str().expect("UTF-8 lock path")),
+        "stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains(unsafe_override.to_str().expect("UTF-8 lock path")),
+        "stderr={stderr}"
+    );
 }
 
 #[test]
