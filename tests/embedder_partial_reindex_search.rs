@@ -4,18 +4,18 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use common::harness::start as start_mock;
+use common::harness::{CapturedChild, start as start_mock};
 use mempal::core::db::Database;
 use mempal::core::types::{Drawer, SourceType};
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory, global_embed_status};
 use mempal::mcp::{IngestRequest, MempalMcpServer, SearchRequest};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
-use tokio::process::Command as TokioCommand;
 
 async fn test_guard() -> tokio::sync::OwnedMutexGuard<()> {
     static GUARD: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
@@ -133,6 +133,30 @@ async fn wait_for_request_count(handle: &common::harness::MockEmbedHandle, expec
     );
 }
 
+async fn wait_for_child_exit(
+    child: &mut CapturedChild,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(None) => {
+                let kill = child.kill();
+                let wait = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("child wait timed out; cleanup kill={kill:?}, wait={wait:?}"),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct StubEmbedderFactory {
     vector: Vec<f32>,
@@ -168,6 +192,25 @@ impl Embedder for StubEmbedder {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_wait_for_child_exit_reaps_on_timeout() {
+    let diagnostics = TempDir::new().expect("diagnostics tempdir");
+    let mut command = Command::new("sleep");
+    command.arg("30");
+    let mut child = CapturedChild::spawn(&mut command, diagnostics.path(), "timeout-cleanup", None)
+        .expect("spawn sleeping child");
+
+    let error = wait_for_child_exit(&mut child, Duration::from_millis(20))
+        .await
+        .expect_err("sleeping child should time out");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(
+        child.try_wait().expect("poll reaped child").is_some(),
+        "timeout cleanup must reap the child"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_search_and_ingest_during_partial_reindex() {
     let _guard = test_guard().await;
     let (addr, handle) = start_mock(0).await.expect("start mock");
@@ -184,15 +227,19 @@ async fn test_search_and_ingest_during_partial_reindex() {
     );
     seed_drawers(&env.db_path, 3, 2);
 
-    let mut child = TokioCommand::new(mempal_bin());
-    child
+    let mut child_command = Command::new(mempal_bin());
+    child_command
         .arg("reindex")
         .arg("--embedder")
         .arg("openai_compat")
-        .env("HOME", &env.home)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let mut child = child.spawn().expect("spawn reindex child");
+        .env("HOME", &env.home);
+    let mut child = CapturedChild::spawn(
+        &mut child_command,
+        &env.home.join(".mempal/test-child"),
+        "partial-reindex",
+        None,
+    )
+    .expect("spawn reindex child");
     wait_for_request_count(&handle, 1).await;
 
     let server = MempalMcpServer::new_with_factory(
@@ -238,10 +285,9 @@ async fn test_search_and_ingest_during_partial_reindex() {
     let operation_id = receipt.operation_id.expect("queued ingest operation id");
 
     handle.resume();
-    let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+    let status = wait_for_child_exit(&mut child, Duration::from_secs(3))
         .await
-        .expect("child wait timeout")
-        .expect("wait reindex child");
+        .unwrap_or_else(|error| panic!("wait reindex child: {error}\n{}", child.diagnostics()));
     assert!(status.success());
 
     let ingest = server
