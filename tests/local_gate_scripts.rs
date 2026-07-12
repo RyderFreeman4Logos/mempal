@@ -153,7 +153,8 @@ fn rest_gate_dry_run_wraps_cargo_test_phases() {
 #[test]
 fn rest_gate_isolates_cleanup_from_the_shared_cargo_target() {
     let script = repo_root().join("scripts/gates/rest-tests.sh");
-    let isolated_target = repo_root().join("target/test-rest-gate-isolated");
+    let fixture = tempfile::tempdir().expect("create isolated fixture");
+    let isolated_target = fixture.path().join("target");
     let isolated_target_text = isolated_target.to_str().expect("UTF-8 target path");
     let output = run_bash_script(
         &script,
@@ -206,6 +207,10 @@ fn rest_gate_rejects_the_shared_cargo_target() {
 
 #[test]
 fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
+    if Command::new("flock").arg("--version").output().is_err() {
+        eprintln!("skipping test: flock command not found in PATH");
+        return;
+    }
     let fixture = tempfile::tempdir().expect("create lock fixture");
     let target = fixture.path().join("target");
     fs::create_dir(&target).expect("create isolated target");
