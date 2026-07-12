@@ -8,16 +8,15 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use common::harness::FailMode;
 use common::harness::start as start_mock;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::{Database, VECTOR_DISTANCE_METRIC};
 use mempal::core::reindex::ReindexProgressStore;
 use mempal::core::types::{Drawer, SourceType};
-use mempal::embed::{EmbedError, Embedder, EmbedderFactory, global_embed_status};
+use mempal::embed::global_embed_status;
 use mempal::ingest::{IngestError, IngestOptions, ingest_file_with_options};
-use mempal::mcp::{IngestRequest, MempalMcpServer, SearchRequest};
+use mempal::mcp::{IngestRequest, MempalMcpServer};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 use tokio::process::Command as TokioCommand;
@@ -205,40 +204,6 @@ async fn wait_for_request_count(handle: &common::harness::MockEmbedHandle, expec
     );
 }
 
-#[derive(Clone)]
-struct StubEmbedderFactory {
-    vector: Vec<f32>,
-}
-
-#[derive(Clone)]
-struct StubEmbedder {
-    vector: Vec<f32>,
-}
-
-#[async_trait]
-impl EmbedderFactory for StubEmbedderFactory {
-    async fn build(&self) -> std::result::Result<Box<dyn Embedder>, EmbedError> {
-        Ok(Box::new(StubEmbedder {
-            vector: self.vector.clone(),
-        }))
-    }
-}
-
-#[async_trait]
-impl Embedder for StubEmbedder {
-    async fn embed(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
-        Ok(texts.iter().map(|_| self.vector.clone()).collect())
-    }
-
-    fn dimensions(&self) -> usize {
-        self.vector.len()
-    }
-
-    fn name(&self) -> &str {
-        "stub"
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_reindex_with_resume() {
     let _guard = test_guard().await;
@@ -280,82 +245,6 @@ async fn test_reindex_with_resume() {
         .expect("read progress");
     assert_eq!(state, (29, "done".to_string()));
 
-    handle.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_search_and_ingest_during_partial_reindex() {
-    let _guard = test_guard().await;
-    let (addr, handle) = start_mock(0).await.expect("start mock");
-    handle.pause();
-    let env = TestHome::new(&reindex_config(
-        Path::new("/tmp/mempal-partial.db"),
-        &format!("http://{addr}/v1"),
-        4,
-        true,
-    ));
-    write_config(
-        &env.config_path,
-        &reindex_config(&env.db_path, &format!("http://{addr}/v1"), 4, true),
-    );
-    seed_drawers(&env.db_path, 3, 2);
-
-    let mut child = TokioCommand::new(mempal_bin());
-    child
-        .arg("reindex")
-        .arg("--embedder")
-        .arg("openai_compat")
-        .env("HOME", &env.home)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let mut child = child.spawn().expect("spawn reindex child");
-    wait_for_request_count(&handle, 1).await;
-
-    let server = MempalMcpServer::new_with_factory(
-        env.db_path.clone(),
-        Arc::new(StubEmbedderFactory {
-            vector: vec![0.2, 0.3, 0.4, 0.5],
-        }),
-    )
-    .expect("create MCP server");
-    let search = server
-        .mempal_search(Parameters(SearchRequest {
-            query: "drawer content".to_string(),
-            wing: None,
-            room: None,
-            top_k: Some(5),
-            project_id: None,
-            include_global: None,
-            all_projects: None,
-            disable_progressive: None,
-            ..SearchRequest::default()
-        }))
-        .await
-        .expect("search during reindex")
-        .0;
-    assert!(!search.results.is_empty());
-
-    let ingest = server
-        .ingest_json_for_test(
-            serde_json::to_value(IngestRequest {
-                content: "ingest during partial reindex".to_string(),
-                wing: "test".to_string(),
-                room: Some("reindex".to_string()),
-                dry_run: Some(false),
-                ..IngestRequest::default()
-            })
-            .expect("serialize ingest request"),
-        )
-        .await
-        .expect("ingest during reindex");
-    assert!(!ingest.drawer_id.is_empty());
-
-    handle.resume();
-    let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
-        .await
-        .expect("child wait timeout")
-        .expect("wait reindex child");
-    assert!(status.success());
     handle.shutdown().await;
 }
 

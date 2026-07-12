@@ -20,7 +20,16 @@ pub struct DaemonSupervisor {
 }
 
 impl DaemonSupervisor {
-    pub async fn spawn(env_vars: HashMap<String, String>, args: Vec<String>) -> Result<Self> {
+    pub async fn spawn(mut env_vars: HashMap<String, String>, args: Vec<String>) -> Result<Self> {
+        if !env_vars.contains_key(mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV)
+            && let Some(home) = env_vars.get("HOME")
+        {
+            let runtime_root = std::path::Path::new(home).join(".mempal").join("runtime");
+            env_vars.insert(
+                mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV.to_string(),
+                runtime_root.display().to_string(),
+            );
+        }
         let mut command = Command::new(env!("CARGO_BIN_EXE_mempal"));
         command.arg("daemon");
         command.args(args);
