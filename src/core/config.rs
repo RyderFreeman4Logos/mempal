@@ -14,6 +14,7 @@ use super::types::IntelligenceMode;
 
 const DEFAULT_DB_PATH: &str = "~/.mempal/palace.db";
 const DEFAULT_EMBED_BACKEND: &str = "openai_compat";
+const EMBED_URL_REQUIRED: &str = "embed base_url missing; example http://127.0.0.1:18002/v1";
 pub const DEFAULT_MODEL2VEC_FINGERPRINT_MODEL: &str = "model2vec/potion-multilingual-128M";
 const DEFAULT_CHUNKER_MAX_TOKENS: usize = 1024;
 const DEFAULT_CHUNKER_TARGET_TOKENS: usize = 512;
@@ -359,6 +360,7 @@ impl Config {
                 "search.reranker.timeout_secs must be greater than 0".to_string(),
             ));
         }
+        super::deadline::validate_search_deadlines(self)?;
         if self.search.reranker.top_k == 0 {
             return Err(ConfigError::InvalidConfig(
                 "search.reranker.top_k must be greater than 0".to_string(),
@@ -986,7 +988,7 @@ fn normalize_embed_endpoint_base_url(
     let base_url = base_url
         .map(str::trim)
         .filter(|base_url| !base_url.is_empty())
-        .ok_or_else(|| ConfigError::Validation(format!("{field} must not be empty")))?
+        .ok_or_else(|| ConfigError::Validation(EMBED_URL_REQUIRED.to_string()))?
         .trim_end_matches('/')
         .to_string();
     validate_embed_base_url(&base_url, field).map_err(ConfigError::Validation)?;

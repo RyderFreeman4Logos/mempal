@@ -10,23 +10,22 @@ use std::time::Duration;
 use axum::{
     Json,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode, header::USER_AGENT},
+    http::{HeaderMap, header::USER_AGENT},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 use tokio::time::Instant;
 
 use crate::core::{
-    config::ConfigHandle,
+    config::{Config, ConfigHandle, RemoteCallPolicyConfig, SearchRerankerConfig},
     project::{ProjectSearchScope, resolve_project_id},
     types::{RouteDecision, SearchResult},
 };
 use crate::search::{
     SearchMode, SearchOptions, SearchTelemetryStage, VectorSearchCircuit,
     bm25_fallback_warning_degraded, bm25_fallback_warning_dimension_mismatch,
-    bm25_fallback_warning_embed_error, bm25_fallback_warning_missing_query_vector,
-    maybe_rerank_search_results, resolve_route, search_bm25_only_with_options,
-    search_with_vector_and_scope_options,
+    bm25_fallback_warning_embed_error, bm25_fallback_warning_missing_query_vector, resolve_route,
+    search_bm25_only_with_options, search_with_vector_and_scope_options,
 };
 
 use super::{
@@ -35,12 +34,14 @@ use super::{
 };
 
 mod contract;
+mod terminal;
 
 use contract::{
     SearchBudget, SearchExecutionMetadata, SearchResponseMetadata, SearchResultDto,
     attach_search_headers, duration_ms, embedding_timeout_warning, reranker_timeout_warning,
     rest_search_timeout_warning, safe_correlation_id,
 };
+use terminal::{TerminalSearchTimeout, finalize_terminal_timeout};
 
 const MIN_CALLER_DEADLINE: Duration = Duration::from_millis(100);
 
@@ -82,14 +83,36 @@ struct RestHybridSearchRequest {
     search_mode: SearchMode,
 }
 
+struct SearchExecutionPlan {
+    budget: SearchBudget,
+    db_stage_deadline: Duration,
+    embed_stage_deadline: Duration,
+    reranker_config: SearchRerankerConfig,
+    remote_call_policy: RemoteCallPolicyConfig,
+}
+
+impl SearchExecutionPlan {
+    fn admit(query: &SearchQuery, config: &Config) -> Result<Self, ApiError> {
+        let total_deadline = caller_deadline(query, config.api.search_query_deadline_secs)?;
+        let budget = SearchBudget::try_new(total_deadline).ok_or_else(|| {
+            ApiError::search_admission(
+                "effective search deadline must be representable by the platform monotonic clock",
+            )
+        })?;
+        Ok(Self {
+            budget,
+            db_stage_deadline: Duration::from_secs(config.api.search_db_deadline_secs),
+            embed_stage_deadline: Duration::from_secs(config.embed.retry.search_deadline_secs),
+            reranker_config: config.search.reranker.clone(),
+            remote_call_policy: config.privacy.remote_calls.clone(),
+        })
+    }
+}
+
 struct SearchExecution {
     state: ApiState,
     telemetry: super::state::SearchTelemetryGuard,
-    budget: SearchBudget,
-    /// Admission-time DB stage cap (remaining E2E budget still wins).
-    db_stage_deadline: Duration,
-    /// Admission-time rerank stage cap (remaining E2E budget still wins).
-    rerank_stage_deadline: Duration,
+    plan: SearchExecutionPlan,
     correlation_id: String,
     query: SearchQuery,
     route: RouteDecision,
@@ -113,12 +136,8 @@ pub(super) async fn search_handler(
 ) -> Result<Response, ApiError> {
     // Snapshot config at admission so hot-reload affects only subsequent queries.
     let config = ConfigHandle::current();
-    let query_deadline_secs = config.api.search_query_deadline_secs;
-    let db_stage_deadline = Duration::from_secs(config.api.search_db_deadline_secs);
-    let embed_stage_deadline = Duration::from_secs(config.embed.retry.search_deadline_secs);
-    let rerank_stage_deadline = Duration::from_secs(config.search.reranker.timeout_secs);
-    let total_deadline = caller_deadline(&query, query_deadline_secs)?;
-    let budget = SearchBudget::new(total_deadline);
+    let plan = SearchExecutionPlan::admit(&query, config.as_ref())?;
+    let total_deadline = plan.budget.total;
     let correlation_id = safe_correlation_id(query.correlation_id.as_deref());
     let (scope, scope_label) = resolve_api_search_scope(&query, config.as_ref())?;
     let search_options = SearchOptions {
@@ -142,7 +161,7 @@ pub(super) async fn search_handler(
 
     telemetry.set_stage(SearchTelemetryStage::Routing.as_str());
     let route_started = Instant::now();
-    let route_limit = budget.route_limit(db_stage_deadline);
+    let route_limit = plan.budget.route_limit(plan.db_stage_deadline);
     let route = resolve_route_bounded(&state, &query, search_mode, route_limit).await?;
     route_elapsed += Instant::now().saturating_duration_since(route_started);
     let route = match route {
@@ -169,7 +188,7 @@ pub(super) async fn search_handler(
     } else {
         telemetry.set_stage(SearchTelemetryStage::Embedding.as_str());
         let embed_started = Instant::now();
-        let embed_limit = budget.primary_limit(embed_stage_deadline);
+        let embed_limit = plan.budget.primary_limit(plan.embed_stage_deadline);
         let embed_result = if embed_limit.is_zero() {
             None
         } else {
@@ -212,10 +231,19 @@ pub(super) async fn search_handler(
             // Fallback disabled: keep the historical REST contract (504) so a
             // primary embedding timeout is never indistinguishable from "no hits".
             Some(Err(_)) | None => {
-                return Err(ApiError::new(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "embedding deadline exceeded",
-                ));
+                return Ok(finalize_terminal_timeout(TerminalSearchTimeout {
+                    telemetry,
+                    budget: plan.budget,
+                    correlation_id,
+                    search_mode,
+                    metadata,
+                    route_elapsed,
+                    embed_elapsed,
+                    db_elapsed,
+                    message: "embedding deadline exceeded".to_string(),
+                    stage: SearchTelemetryStage::Embedding,
+                    boundary: "daemon.embedding",
+                }));
             }
         }
     };
@@ -223,9 +251,7 @@ pub(super) async fn search_handler(
     finish_search(SearchExecution {
         state,
         telemetry,
-        budget,
-        db_stage_deadline,
-        rerank_stage_deadline,
+        plan,
         correlation_id,
         query,
         route,
@@ -248,9 +274,7 @@ async fn finish_search(execution: SearchExecution) -> Result<Response, ApiError>
     let SearchExecution {
         state,
         telemetry,
-        budget,
-        db_stage_deadline,
-        rerank_stage_deadline,
+        plan,
         correlation_id,
         query,
         route,
@@ -267,6 +291,14 @@ async fn finish_search(execution: SearchExecution) -> Result<Response, ApiError>
         bm25_fallback_enabled,
     } = execution;
     // Use admission-time stage caps only — do not re-read hot-reloaded config.
+    let SearchExecutionPlan {
+        budget,
+        db_stage_deadline,
+        embed_stage_deadline: _,
+        reranker_config,
+        remote_call_policy,
+    } = plan;
+    let rerank_stage_deadline = Duration::from_secs(reranker_config.timeout_secs);
     let mut results = Vec::new();
     if let Some(query_vector) = query_vector {
         telemetry.set_stage(SearchTelemetryStage::HybridDb.as_str());
@@ -346,10 +378,19 @@ async fn finish_search(execution: SearchExecution) -> Result<Response, ApiError>
             // Fallback disabled: restore historical 504 so hybrid timeout is
             // not reported as an empty successful result set.
             None => {
-                return Err(ApiError::new(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    rest_search_timeout_warning("hybrid search", hybrid_limit),
-                ));
+                return Ok(finalize_terminal_timeout(TerminalSearchTimeout {
+                    telemetry,
+                    budget,
+                    correlation_id,
+                    search_mode,
+                    metadata,
+                    route_elapsed,
+                    embed_elapsed,
+                    db_elapsed,
+                    message: "hybrid search deadline exceeded".to_string(),
+                    stage: SearchTelemetryStage::HybridDb,
+                    boundary: "daemon.search_db",
+                }));
             }
         }
     } else {
@@ -390,9 +431,17 @@ async fn finish_search(execution: SearchExecution) -> Result<Response, ApiError>
         let rerank = if rerank_limit.is_zero() {
             None
         } else {
-            tokio::time::timeout(rerank_limit, maybe_rerank_search_results(&query.q, results))
-                .await
-                .ok()
+            tokio::time::timeout(
+                rerank_limit,
+                crate::search::rerank::maybe_rerank_with_config_and_policy(
+                    &reranker_config,
+                    &remote_call_policy,
+                    &query.q,
+                    results,
+                ),
+            )
+            .await
+            .ok()
         };
         match rerank {
             Some(outcome) => {
@@ -600,12 +649,14 @@ fn caller_deadline(
     };
     let requested = Duration::from_millis(deadline_ms);
     if requested < MIN_CALLER_DEADLINE {
-        return Err(ApiError::new(
-            axum::http::StatusCode::BAD_REQUEST,
-            format!(
-                "deadline_ms must be at least {}",
-                duration_ms(MIN_CALLER_DEADLINE)
-            ),
+        return Err(ApiError::search_admission(format!(
+            "deadline_ms must be at least {}",
+            duration_ms(MIN_CALLER_DEADLINE)
+        )));
+    }
+    if i64::try_from(deadline_ms).is_err() || Instant::now().checked_add(requested).is_none() {
+        return Err(ApiError::search_admission(
+            "deadline_ms must be representable by the signed deadline contract and platform monotonic clock",
         ));
     }
     // Shorter caller deadline wins; callers cannot bypass the configured ceiling.

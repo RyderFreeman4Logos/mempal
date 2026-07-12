@@ -1506,6 +1506,18 @@ impl ApiError {
         }
     }
 
+    pub(super) fn search_admission(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            kind: "search_admission_error",
+            schema_skew: None,
+            recovery_hint: None,
+            retryable: Some(false),
+            stale_daemon: None,
+        }
+    }
+
     fn schema_skew(current: u32, supported: u32) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,

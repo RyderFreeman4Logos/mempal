@@ -1,7 +1,9 @@
+import io
 import json
 import os
 import sys
 import unittest
+import urllib.error
 from typing import Any, Dict, List, Optional
 
 
@@ -10,53 +12,31 @@ if PLUGIN_DIR not in sys.path:
     sys.path.insert(0, PLUGIN_DIR)
 
 from test_mempal_provider import RecordingProvider  # noqa: E402
+from mempal import SearchTransportResponse  # noqa: E402
 
 
 class TimeoutSearchProvider(RecordingProvider):
     def __init__(self) -> None:
         super().__init__()
-        self.search_timeouts: List[float] = []
+        self.search_timeouts: List[Optional[float]] = []
 
-    def _get(self, path: str, params: Optional[Dict[str, Any]] = None, timeout: float = 10.0) -> Any:
-        self.gets.append((path, dict(params or {})))
-        if path == "/api/search":
-            self.search_timeouts.append(timeout)
-            raise TimeoutError("SECRET_QUERY_OR_ENDPOINT timed out")
-        if path == "/api/status":
-            return {
-                "search_policy": {
-                    "query_deadline_secs": 240,
-                    "db_deadline_secs": 240,
-                    "embed_deadline_secs": 240,
-                    "reranker_timeout_secs": 240,
-                }
-            }
+    def _search_request(self, params: Dict[str, Any]) -> SearchTransportResponse:
+        self.gets.append(("/api/search", dict(params)))
+        self.search_timeouts.append(None)
         raise TimeoutError("SECRET_QUERY_OR_ENDPOINT timed out")
 
 
 class FailedSearchProvider(RecordingProvider):
-    def _get(self, path: str, params: Optional[Dict[str, Any]] = None, timeout: float = 10.0) -> Any:
-        self.gets.append((path, dict(params or {})))
-        if path == "/api/status":
-            return {
-                "search_policy": {
-                    "query_deadline_secs": 240,
-                }
-            }
+    def _search_request(self, params: Dict[str, Any]) -> SearchTransportResponse:
+        self.gets.append(("/api/search", dict(params)))
         raise RuntimeError("SECRET_ENDPOINT_RESPONSE_BODY")
 
 
 class MetadataSearchProvider(RecordingProvider):
-    def _get(self, path: str, params: Optional[Dict[str, Any]] = None, timeout: float = 10.0) -> Any:
-        self.gets.append((path, dict(params or {})))
-        if path == "/api/status":
-            return {
-                "search_policy": {
-                    "query_deadline_secs": 240,
-                }
-            }
-        correlation_id = str((params or {})["correlation_id"])
-        self._last_response_headers = {
+    def _search_request(self, params: Dict[str, Any]) -> SearchTransportResponse:
+        self.gets.append(("/api/search", dict(params)))
+        correlation_id = str(params["correlation_id"])
+        headers = {
             "degraded": "true",
             "mempal-warnings": "bounded fallback",
             "mempal-search-metadata": json.dumps({
@@ -72,33 +52,67 @@ class MetadataSearchProvider(RecordingProvider):
                 ],
             }),
         }
-        return [{
-            "content": "bounded BM25 result",
-            "drawer_id": "drawer-bounded",
-            "importance": 4,
-        }]
+        return SearchTransportResponse([{
+                "content": "bounded BM25 result",
+                "drawer_id": "drawer-bounded",
+                "importance": 4,
+            }], headers)
 
 
 class LongDeadlineSearchProvider(RecordingProvider):
     def __init__(self) -> None:
         super().__init__()
-        self.search_timeouts: List[float] = []
+        self.search_timeouts: List[Optional[float]] = []
 
-    def _get(self, path: str, params: Optional[Dict[str, Any]] = None, timeout: float = 10.0) -> Any:
-        self.gets.append((path, dict(params or {})))
-        if path == "/api/status":
-            return {
-                "search_policy": {
-                    "query_deadline_secs": 600,
-                    "db_deadline_secs": 600,
-                    "embed_deadline_secs": 600,
-                    "reranker_timeout_secs": 600,
-                }
+    def _search_request(self, params: Dict[str, Any]) -> SearchTransportResponse:
+        self.gets.append(("/api/search", dict(params)))
+        self.search_timeouts.append(None)
+        return SearchTransportResponse([], {})
+
+
+class StaleLowPolicySearchProvider(RecordingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.status_deadline = 1
+        self.search_timeouts: List[Optional[float]] = []
+
+    def _search_request(self, params: Dict[str, Any]) -> SearchTransportResponse:
+        self.gets.append(("/api/search", dict(params)))
+        self.search_timeouts.append(None)
+        return SearchTransportResponse([], {})
+
+
+class GatewayTimeoutSearchProvider(RecordingProvider):
+    def _search_request(self, params: Dict[str, Any]) -> SearchTransportResponse:
+        self.gets.append(("/api/search", dict(params)))
+        correlation_id = str(params["correlation_id"])
+        metadata = {
+            "correlation_id": correlation_id,
+            "elapsed_ms": 1999,
+            "deadline_ms": 2000,
+            "partial": True,
+            "retry_safe": True,
+            "fallback_used": [],
+            "timeouts": [{
+                "stage": "embedding",
+                "boundary": "daemon.embedding",
+            }],
+        }
+        body = json.dumps({
+            "error": {
+                "kind": "search_timeout",
+                "status": 504,
+                "message": "SECRET_DAEMON_DETAIL",
+                "search_metadata": metadata,
             }
-        if path == "/api/search":
-            self.search_timeouts.append(timeout)
-            return []
-        return []
+        }).encode("utf-8")
+        raise urllib.error.HTTPError(
+            "http://127.0.0.1:3080/api/search?SECRET_QUERY",
+            504,
+            "Gateway Timeout",
+            {"mempal-search-metadata": json.dumps(metadata)},
+            io.BytesIO(body),
+        )
 
 
 class SearchTimeoutContractTests(unittest.TestCase):
@@ -125,8 +139,7 @@ class SearchTimeoutContractTests(unittest.TestCase):
         self.assertNotIn("deadline_ms", params)
         self.assertEqual(params["correlation_id"], details["correlation_id"])
         self.assertEqual(len(provider.search_timeouts), 1)
-        self.assertGreaterEqual(provider.search_timeouts[0], 240.0)
-        self.assertLessEqual(provider.search_timeouts[0], 250.0)
+        self.assertIsNone(provider.search_timeouts[0])
         serialized = json.dumps(result)
         self.assertNotIn("SECRET_QUERY_TEXT", serialized)
         self.assertNotIn("SECRET_QUERY_OR_ENDPOINT", serialized)
@@ -174,7 +187,7 @@ class SearchTimeoutContractTests(unittest.TestCase):
             ],
         )
 
-    def test_transport_timeout_honors_daemon_deadline_above_default(self) -> None:
+    def test_transport_has_no_finite_read_ceiling_for_deadlines_above_default(self) -> None:
         provider = LongDeadlineSearchProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
 
@@ -189,9 +202,41 @@ class SearchTimeoutContractTests(unittest.TestCase):
         params = search_calls[0][1] or {}
         self.assertNotIn("deadline_ms", params)
         self.assertEqual(len(provider.search_timeouts), 1)
-        self.assertGreaterEqual(provider.search_timeouts[0], 600.0)
-        self.assertLessEqual(provider.search_timeouts[0], 610.0)
-        self.assertEqual(provider._effective_search_deadline_ms(), 600_000)
+        self.assertIsNone(provider.search_timeouts[0])
+        self.assertEqual(provider._effective_search_deadline_ms(), 240_000)
+
+    def test_stale_low_policy_cache_never_sets_a_finite_search_read_deadline(self) -> None:
+        provider = StaleLowPolicySearchProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider.handle_tool_call("mempal_search", {"query": "first"})
+        provider.status_deadline = 600
+
+        result = json.loads(provider.handle_tool_call(
+            "mempal_search", {"query": "after upward reload"},
+        ))
+
+        self.assertEqual(result["result"], "No relevant memories found.")
+        self.assertEqual(provider.search_timeouts, [None, None])
+
+    def test_gateway_timeout_parses_allowlisted_body_and_header_metadata(self) -> None:
+        provider = GatewayTimeoutSearchProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+
+        result = json.loads(provider.handle_tool_call(
+            "mempal_search", {"query": "SECRET_QUERY_TEXT"},
+        ))
+
+        details = result["error_details"]
+        self.assertEqual(details["kind"], "search_timeout")
+        self.assertEqual(details["deadline_ms"], 2000)
+        self.assertEqual(details["timeouts"], [{
+            "stage": "embedding",
+            "boundary": "daemon.embedding",
+        }])
+        serialized = json.dumps(result)
+        self.assertNotIn("SECRET_QUERY_TEXT", serialized)
+        self.assertNotIn("SECRET_QUERY", serialized)
+        self.assertNotIn("SECRET_DAEMON_DETAIL", serialized)
 
 
 if __name__ == "__main__":

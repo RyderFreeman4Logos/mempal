@@ -26,11 +26,9 @@ where
                 if !error.is_retryable() {
                     return Err(error);
                 }
-                let retry_after = error
-                    .retry_after()
-                    .unwrap_or_else(|| Duration::from_secs(status.retry_interval_secs()));
+                let retry_after_hint = error.retry_after();
                 refresh_heartbeat(heartbeat);
-                wait_for_next_retry(status, heartbeat, retry_after).await;
+                wait_for_next_retry(status, heartbeat, retry_after_hint).await;
             }
         }
     }
@@ -39,13 +37,15 @@ where
 async fn wait_for_next_retry(
     status: &EmbedStatus,
     heartbeat: Option<&HeartbeatCallback>,
-    retry_after: Duration,
+    retry_after_hint: Option<Duration>,
 ) {
     let started_at = tokio::time::Instant::now();
     let tick = Duration::from_millis(50);
     loop {
         let configured_retry_after = Duration::from_secs(status.retry_interval_secs());
-        let retry_after = retry_after.max(configured_retry_after);
+        let retry_after = retry_after_hint
+            .map(|hint| hint.max(configured_retry_after))
+            .unwrap_or(configured_retry_after);
         let elapsed = started_at.elapsed();
         if elapsed >= retry_after {
             refresh_heartbeat(heartbeat);

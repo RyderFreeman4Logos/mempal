@@ -9388,7 +9388,7 @@ async fn reindex_command_by_embedder(
         return Ok(());
     }
     let writer_lease = acquire_maintenance_writer_lease(db, "reindex-embedder")?;
-    let embedder = build_specific_embedder(config, embedder_name).await?;
+    let embedder = build_reindex_embedder(config, embedder_name).await?;
     let new_dim = embedder.dimensions();
     let current_dim = current_vector_dim(db).context("failed to read embedding dim")?;
     let current_metric = db
@@ -9590,7 +9590,7 @@ async fn preview_reindex_stale_vector_work(
     embedder_name: &str,
     target: ReindexVectorTarget,
 ) -> Result<usize> {
-    let embedder = build_specific_embedder(config, embedder_name).await?;
+    let embedder = build_reindex_embedder(config, embedder_name).await?;
     let target_fingerprint = config
         .embed
         .vector_embedder_fingerprint(embedder_name, embedder.dimensions());
@@ -14682,27 +14682,18 @@ async fn build_embedder(config: &Config) -> Result<Box<dyn Embedder>> {
         .await
         .context("failed to initialize embedder")
 }
-async fn build_specific_embedder(config: &Config, backend: &str) -> Result<Box<dyn Embedder>> {
-    if same_embed_backend(config.embed.backend.as_str(), backend) {
-        return build_embedder(config).await;
-    }
+/// Build one raw backend so the reindex batch policy owns all retry decisions.
+///
+/// `ManagedEmbedder` deliberately retries retryable failures forever for ingest,
+/// where raw data has not been stored yet. Reindex operates on durable drawers
+/// and must return after its bounded `--max-batch-retries` policy is exhausted.
+async fn build_reindex_embedder(config: &Config, backend: &str) -> Result<Box<dyn Embedder>> {
     let mut selected = config.clone();
     selected.embed.backend = backend.to_string();
     selected.embed.fallback = None;
     build_backend_from_name(&selected, backend)
         .await
         .context("failed to initialize requested embedder")
-}
-
-fn same_embed_backend(left: &str, right: &str) -> bool {
-    normalize_embed_backend_alias(left) == normalize_embed_backend_alias(right)
-}
-
-fn normalize_embed_backend_alias(backend: &str) -> &str {
-    match backend {
-        "api" => "openai_compat",
-        other => other,
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -25448,13 +25439,6 @@ api_model = "text-embedding-3-large"
         );
     }
 
-    #[test]
-    fn embed_backend_aliases_match_for_shared_pool() {
-        assert!(same_embed_backend("api", "openai_compat"));
-        assert!(same_embed_backend("openai_compat", "api"));
-        assert!(!same_embed_backend("model2vec", "openai_compat"));
-    }
-
     #[cfg(feature = "model2vec")]
     #[tokio::test]
     async fn reindex_embedder_dry_run_snapshots_stale_rows_without_writes() {
@@ -25464,7 +25448,7 @@ api_model = "text-embedding-3-large"
         write_model2vec_fixture(&model_dir, 1024);
         let mut config = model2vec_dry_run_config();
         config.embed.model = Some(model_dir.display().to_string());
-        let embedder = build_specific_embedder(&config, "model2vec")
+        let embedder = build_reindex_embedder(&config, "model2vec")
             .await
             .expect("build local model2vec embedder");
         let dim = embedder.dimensions();

@@ -20,6 +20,9 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+#[path = "search_budget/admission.rs"]
+mod search_budget_admission;
+
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct TestEnv {
@@ -124,11 +127,14 @@ impl Embedder for SlowEmbedder {
     }
 }
 
+#[cfg(feature = "db-test-seam")]
 #[derive(Clone)]
 struct FastEmbedderFactory;
 
+#[cfg(feature = "db-test-seam")]
 struct FastEmbedder;
 
+#[cfg(feature = "db-test-seam")]
 #[async_trait]
 impl EmbedderFactory for FastEmbedderFactory {
     async fn build(&self) -> Result<Box<dyn Embedder>, EmbedError> {
@@ -136,6 +142,7 @@ impl EmbedderFactory for FastEmbedderFactory {
     }
 }
 
+#[cfg(feature = "db-test-seam")]
 #[async_trait]
 impl Embedder for FastEmbedder {
     async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
@@ -277,8 +284,8 @@ async fn embedding_timeout_without_bm25_fallback_returns_gateway_timeout() {
     );
     let state = env.state(Arc::new(SlowEmbedderFactory));
     let started = StdInstant::now();
-    let (status, _headers, body) = get_json(
-        state,
+    let (status, headers, body) = get_json(
+        state.clone(),
         "/api/search?q=alpha&scope=global&top_k=5&deadline_ms=2000&correlation_id=embed-no-fallback",
     )
     .await;
@@ -287,6 +294,21 @@ async fn embedding_timeout_without_bm25_fallback_returns_gateway_timeout() {
     assert!(started.elapsed() < Duration::from_secs(3));
     assert_eq!(body["error"]["status"], 504);
     assert_eq!(body["error"]["message"], "embedding deadline exceeded");
+    let metadata = search_metadata(&headers);
+    assert_eq!(metadata["correlation_id"], "embed-no-fallback");
+    assert_eq!(metadata["deadline_ms"], 2_000);
+    assert_eq!(metadata["retry_safe"], true);
+    assert_eq!(
+        metadata["timeouts"],
+        json!([{"stage": "embedding", "boundary": "daemon.embedding"}])
+    );
+    assert_eq!(body["error"]["search_metadata"], metadata);
+    #[cfg(feature = "db-test-seam")]
+    {
+        let telemetry = state.search_telemetry_snapshot_for_test();
+        assert_eq!(telemetry.active_count, 0);
+        assert_eq!(telemetry.stage_timeout_counts.get("embedding"), Some(&1));
+    }
     assert!(
         body.as_array().is_none(),
         "fallback-disabled embedding timeout must not return an empty success array: {body:#}"
@@ -311,8 +333,8 @@ async fn hybrid_db_timeout_without_bm25_fallback_returns_gateway_timeout() {
         .state(Arc::new(FastEmbedderFactory))
         .with_async_db_for_test(async_db);
     let started = StdInstant::now();
-    let (status, _headers, body) = get_json(
-        state,
+    let (status, headers, body) = get_json(
+        state.clone(),
         "/api/search?q=alpha&scope=global&top_k=5&deadline_ms=2000&correlation_id=hybrid-no-fallback",
     )
     .await;
@@ -325,6 +347,22 @@ async fn hybrid_db_timeout_without_bm25_fallback_returns_gateway_timeout() {
         message.contains("hybrid search deadline exceeded"),
         "message={message}"
     );
+    let metadata = search_metadata(&headers);
+    assert_eq!(metadata["correlation_id"], "hybrid-no-fallback");
+    assert_eq!(metadata["deadline_ms"], 2_000);
+    assert_eq!(metadata["retry_safe"], true);
+    assert_eq!(
+        metadata["timeouts"],
+        json!([
+            {"stage": "routing", "boundary": "daemon.search_db"},
+            {"stage": "hybrid_db", "boundary": "daemon.search_db"}
+        ])
+    );
+    assert_eq!(body["error"]["search_metadata"], metadata);
+    let telemetry = state.search_telemetry_snapshot_for_test();
+    assert_eq!(telemetry.active_count, 0);
+    assert_eq!(telemetry.stage_timeout_counts.get("routing"), Some(&1));
+    assert_eq!(telemetry.stage_timeout_counts.get("hybrid_db"), Some(&1));
     assert!(
         body.as_array().is_none(),
         "fallback-disabled hybrid timeout must not return an empty success array: {body:#}"
@@ -429,11 +467,7 @@ async fn default_query_deadline_is_around_four_minutes_not_a_hard_ceiling() {
         get_json(env.state(Arc::new(FailingEmbedderFactory)), "/api/status").await;
     assert_eq!(status_code, StatusCode::OK);
     assert_eq!(status_body["search_policy"]["query_deadline_secs"], 240);
-    // 240s is a default, not a hard ceiling: longer values remain configurable.
-    assert!(
-        ConfigHandle::current().api.search_query_deadline_secs <= 10_000,
-        "query deadline must remain operator-configurable without a hidden hard max"
-    );
+    assert_eq!(ConfigHandle::current().api.search_query_deadline_secs, 240);
 }
 
 #[tokio::test]

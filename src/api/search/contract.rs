@@ -79,14 +79,15 @@ pub(super) struct SearchBudget {
 }
 
 impl SearchBudget {
-    pub fn new(total: Duration) -> Self {
+    pub fn try_new(total: Duration) -> Option<Self> {
         let started = Instant::now();
-        Self {
+        let deadline = started.checked_add(total)?;
+        Some(Self {
             started,
-            deadline: started + total,
+            deadline,
             total,
             fallback_reserve: MAX_BM25_FALLBACK_RESERVE.min(total / 4),
-        }
+        })
     }
 
     pub fn remaining(&self) -> Duration {
