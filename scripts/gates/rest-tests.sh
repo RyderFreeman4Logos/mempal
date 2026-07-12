@@ -3,8 +3,14 @@ set -euo pipefail
 
 REST_TEST_TARGETS_PER_BATCH="${REST_TEST_TARGETS_PER_BATCH:-12}"
 REST_GATE_DRY_RUN="${REST_GATE_DRY_RUN:-0}"
+REST_GATE_LOCK_TIMEOUT_SECS="${REST_GATE_LOCK_TIMEOUT_SECS:-1800}"
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 rest_target_dir="${REST_GATE_TARGET_DIR:-${repo_root}/target/rest-gate}"
+
+if ! [[ "${REST_GATE_LOCK_TIMEOUT_SECS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "REST_GATE_LOCK_TIMEOUT_SECS must be a positive integer" >&2
+    exit 2
+fi
 
 # REST batches clean package artifacts between phases. Keep that cleanup in a
 # dedicated target directory so it cannot delete another Cargo process's files.
@@ -25,7 +31,10 @@ if ! flock -n "${rest_lock_fd}"; then
     if command -v fuser >/dev/null 2>&1; then
         fuser -v "${rest_lock_file}" >&2 || true
     fi
-    flock "${rest_lock_fd}"
+    if ! flock -w "${REST_GATE_LOCK_TIMEOUT_SECS}" "${rest_lock_fd}"; then
+        echo "rest gate lock timed out after ${REST_GATE_LOCK_TIMEOUT_SECS}s: ${rest_lock_file}" >&2
+        exit 75
+    fi
     echo "rest gate acquired lock: ${rest_lock_file} (pid=$$)" >&2
 fi
 

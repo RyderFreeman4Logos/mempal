@@ -207,10 +207,6 @@ fn rest_gate_rejects_the_shared_cargo_target() {
 
 #[test]
 fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
-    if Command::new("flock").arg("--version").output().is_err() {
-        eprintln!("skipping test: flock command not found in PATH");
-        return;
-    }
     let fixture = tempfile::tempdir().expect("create lock fixture");
     let target = fixture.path().join("target");
     fs::create_dir(&target).expect("create isolated target");
@@ -220,7 +216,7 @@ fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
     let lock_file = PathBuf::from(lock_file);
     let unsafe_override = fixture.path().join("different.lock");
     let ready_file = fixture.path().join("lock-ready");
-    let mut lock_holder = Command::new("flock")
+    let lock_holder = Command::new("flock")
         .arg(&lock_file)
         .args(["bash", "-c", "touch \"$LOCK_READY\"; sleep 1"])
         .env("LOCK_READY", &ready_file)
@@ -238,6 +234,7 @@ fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
         &[],
         &[
             ("REST_GATE_DRY_RUN", "1"),
+            ("REST_GATE_LOCK_TIMEOUT_SECS", "3"),
             (
                 "REST_GATE_LOCK_FILE",
                 unsafe_override.to_str().expect("UTF-8 lock path"),
@@ -250,7 +247,7 @@ fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
         ],
         Duration::from_secs(10),
     );
-    lock_holder.wait().expect("reap lock holder");
+    wait_with_timeout(lock_holder, Duration::from_secs(3)).expect("reap lock holder");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -268,6 +265,53 @@ fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
     );
     assert!(
         !stderr.contains(unsafe_override.to_str().expect("UTF-8 lock path")),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn rest_gate_fails_with_a_bounded_lock_timeout() {
+    let fixture = tempfile::tempdir().expect("create timeout fixture");
+    let target = fixture.path().join("target");
+    fs::create_dir(&target).expect("create isolated target");
+    let target = fs::canonicalize(target).expect("canonical isolated target");
+    let mut lock_file = target.as_os_str().to_os_string();
+    lock_file.push(".lock");
+    let lock_file = PathBuf::from(lock_file);
+    let ready_file = fixture.path().join("lock-ready");
+    let lock_holder = Command::new("flock")
+        .arg(&lock_file)
+        .args(["bash", "-c", "touch \"$LOCK_READY\"; sleep 3"])
+        .env("LOCK_READY", &ready_file)
+        .spawn()
+        .expect("spawn lock holder");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !ready_file.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(ready_file.exists(), "lock holder did not become ready");
+
+    let script = repo_root().join("scripts/gates/rest-tests.sh");
+    let output = run_bash_script(
+        &script,
+        &[],
+        &[
+            ("REST_GATE_DRY_RUN", "1"),
+            ("REST_GATE_LOCK_TIMEOUT_SECS", "1"),
+            (
+                "REST_GATE_TARGET_DIR",
+                target.to_str().expect("UTF-8 target path"),
+            ),
+            ("REST_TEST_TARGETS_PER_BATCH", "999"),
+        ],
+        Duration::from_secs(5),
+    );
+    wait_with_timeout(lock_holder, Duration::from_secs(5)).expect("reap lock holder");
+
+    assert_eq!(output.status.code(), Some(75));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("rest gate lock timed out after 1s:"),
         "stderr={stderr}"
     );
 }
