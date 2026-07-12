@@ -11,7 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use common::harness::FailMode;
 use common::harness::start as start_mock;
-use mempal::core::config::{Config, ConfigHandle, DEFAULT_MODEL2VEC_FINGERPRINT_MODEL};
+use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::{Database, VECTOR_DISTANCE_METRIC};
 use mempal::core::reindex::ReindexProgressStore;
 use mempal::core::types::{Drawer, SourceType};
@@ -69,18 +69,6 @@ block_writes_when_degraded = {}
         base_url,
         dim,
         block_writes
-    )
-}
-
-fn model2vec_reindex_config(db_path: &Path) -> String {
-    format!(
-        r#"
-db_path = "{}"
-
-[embed]
-backend = "model2vec"
-"#,
-        db_path.display()
     )
 }
 
@@ -1212,10 +1200,14 @@ async fn test_reindex_dim_change_invalidates_existing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_default_model2vec_reindex_records_non_stale_fingerprint() {
     let _guard = test_guard().await;
-    let env = TestHome::new(&model2vec_reindex_config(Path::new(
-        "/tmp/mempal-model2vec-fingerprint.db",
-    )));
-    write_config(&env.config_path, &model2vec_reindex_config(&env.db_path));
+    let config = |db_path: &Path| {
+        format!(
+            "db_path = \"{}\"\n\n[embed]\nbackend = \"model2vec\"\n",
+            db_path.display()
+        )
+    };
+    let env = TestHome::new(&config(Path::new("/tmp/mempal-model2vec-fingerprint.db")));
+    write_config(&env.config_path, &config(&env.db_path));
     seed_drawers(&env.db_path, 1, 2);
 
     let output = run_reindex(
@@ -1241,7 +1233,7 @@ async fn test_default_model2vec_reindex_records_non_stale_fingerprint() {
     );
     assert_eq!(
         details.model.as_deref(),
-        Some(DEFAULT_MODEL2VEC_FINGERPRINT_MODEL)
+        Some(mempal::core::config::DEFAULT_MODEL2VEC_FINGERPRINT_MODEL)
     );
     assert!(!details.stale, "{details:?}");
 }

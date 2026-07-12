@@ -35,6 +35,11 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **Hermes/REST search**: propagate an 8-second caller budget and correlation
+  ID through one daemon-wide search deadline, reserve time for BM25 and
+  original-ranking fallbacks, return redacted stage/boundary metadata, and
+  expose aggregate timeout/fallback telemetry instead of allowing serial
+  hybrid and reranker deadlines to outlive the tool call (#711).
 - **Daemon/Hooks**: hook IPC queue admission now fails fast under SQLite write
   contention so clients can use durable fallback within their deadline, daemon
   claim polling backs off bounded SQLite lock streaks, and closed hook IPC

@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import queue
+import secrets
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
 _DEGRADED_RESPONSE_SECS = 8.0
+_SEARCH_CALLER_BUDGET_MS = 8_000
 _PREFETCH_TOP_K = 5
 _TURN_STORAGE_MODE_TTL = 60.0
 _WRITE_QUEUE_MAX = 1000
@@ -611,16 +613,84 @@ class MempalMemoryProvider:
             return warning
         return ""
 
-    def _get_search(self, params):
+    @staticmethod
+    def _search_metadata_from_headers(headers, correlation_id):
+        normalized = {
+            str(key).lower(): str(value)
+            for key, value in dict(headers or {}).items()
+            if value is not None
+        }
+        raw = normalized.get("mempal-search-metadata")
+        if not raw:
+            return {}
+        try:
+            source = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(source, dict):
+            return {}
+        if source.get("correlation_id") != correlation_id:
+            return {}
+        allowed_stages = {
+            "embedding", "routing", "hybrid_db", "bm25_fallback_db",
+            "bm25_db", "rerank",
+        }
+        allowed_boundaries = {
+            "daemon.embedding", "daemon.search_db", "daemon.reranker",
+        }
+        allowed_fallbacks = {"bm25", "original_ranking", "route_defaults"}
+        timeouts = []
+        for item in source.get("timeouts", []):
+            if not isinstance(item, dict):
+                continue
+            stage = item.get("stage")
+            boundary = item.get("boundary")
+            if stage in allowed_stages and boundary in allowed_boundaries:
+                timeouts.append({"stage": stage, "boundary": boundary})
+        fallback_used = [
+            value for value in source.get("fallback_used", [])
+            if value in allowed_fallbacks
+        ]
+        elapsed_ms = source.get("elapsed_ms")
+        deadline_ms = source.get("deadline_ms")
+        if not isinstance(elapsed_ms, int) or isinstance(elapsed_ms, bool) or elapsed_ms < 0:
+            elapsed_ms = 0
+        if not isinstance(deadline_ms, int) or isinstance(deadline_ms, bool) or deadline_ms < 0:
+            deadline_ms = _SEARCH_CALLER_BUDGET_MS
+        return {
+            "correlation_id": correlation_id,
+            "elapsed_ms": elapsed_ms,
+            "deadline_ms": min(deadline_ms, _SEARCH_CALLER_BUDGET_MS),
+            "partial": source.get("partial") is True,
+            "retry_safe": source.get("retry_safe") is True,
+            "fallback_used": fallback_used,
+            "timeouts": timeouts,
+        }
+
+    @staticmethod
+    def _is_search_timeout(exc):
+        if isinstance(exc, TimeoutError):
+            return True
+        reason = getattr(exc, "reason", None)
+        return isinstance(reason, TimeoutError)
+
+    def _get_search(self, params, correlation_id=None):
+        correlation_id = correlation_id or f"search-{secrets.token_hex(8)}"
+        bounded_params = dict(params)
+        bounded_params["deadline_ms"] = _SEARCH_CALLER_BUDGET_MS
+        bounded_params["correlation_id"] = correlation_id
         started = time.monotonic()
         self._last_response_headers = {}
-        response = self._get("/api/search", params)
+        response = self._get("/api/search", bounded_params)
         elapsed = time.monotonic() - started
         reason = (
             self._search_degraded_reason(response, elapsed)
             or self._search_header_degraded_reason(self._last_response_headers)
         )
-        return self._search_results_payload(response), reason
+        metadata = self._search_metadata_from_headers(
+            self._last_response_headers, correlation_id,
+        )
+        return self._search_results_payload(response), reason, metadata
 
     def _get(self, path, params=None):
         import urllib.request
@@ -723,7 +793,7 @@ class MempalMemoryProvider:
         # Rerank bypass needs REST-side query support before the plugin can send it.
         def _run():
             try:
-                results, degraded_reason = self._get_search(params)
+                results, degraded_reason, _metadata = self._get_search(params)
                 if results:
                     lines = []
                     used = 0
@@ -819,20 +889,70 @@ class MempalMemoryProvider:
                 top_k = min(int(args.get("top_k", 10)), 50)
             except (ValueError, TypeError):
                 top_k = 10
+            correlation_id = f"search-{secrets.token_hex(8)}"
+            started = time.monotonic()
             try:
-                results, degraded_reason = self._get_search(self._retrieval_params({"q": q, "wing": self._wing, "top_k": top_k}))
+                results, degraded_reason, metadata = self._get_search(
+                    self._retrieval_params({"q": q, "wing": self._wing, "top_k": top_k}),
+                    correlation_id,
+                )
                 if degraded_reason:
                     self._record_failure()
                     logger.debug("mempal search degraded: %s", degraded_reason)
                 else:
                     self._record_success()
                 if not results:
-                    return json.dumps({"result": "No relevant memories found."})
+                    payload = {"result": "No relevant memories found."}
+                    if metadata and (metadata["partial"] or metadata["fallback_used"]):
+                        payload["search_metadata"] = metadata
+                    return json.dumps(payload)
                 items = [_strip_none({"memory": r.get("content", ""), "score": r.get("similarity", 0), "drawer_id": r.get("drawer_id"), "source": r.get("source"), "source_type": r.get("source_type"), "provenance": r.get("provenance"), "status": r.get("status"), "memory_kind": r.get("memory_kind"), "domain": r.get("domain"), "field": r.get("field"), "importance": r.get("importance"), "is_pinned": r.get("is_pinned"), "confidence": r.get("confidence"), "authority": self._memory_authority_label(r)}) for r in self._safe_filter_items(results)]
-                return json.dumps({"results": items, "count": len(items)})
+                payload = {"results": items, "count": len(items)}
+                if metadata and (metadata["partial"] or metadata["fallback_used"]):
+                    payload["search_metadata"] = metadata
+                return json.dumps(payload)
             except Exception as exc:
                 self._record_failure()
-                return json.dumps({"error": f"Search failed: {exc}"})
+                if self._is_search_timeout(exc):
+                    elapsed_ms = int((time.monotonic() - started) * 1000)
+                    return json.dumps({
+                        "error": "Mempal search exceeded its bounded transport deadline.",
+                        "error_details": {
+                            "kind": "search_timeout",
+                            "correlation_id": correlation_id,
+                            "elapsed_ms": elapsed_ms,
+                            "deadline_ms": _SEARCH_CALLER_BUDGET_MS,
+                            "partial": False,
+                            "retry_safe": True,
+                            "fallback_used": [],
+                            "timeouts": [{
+                                "stage": "transport",
+                                "boundary": "plugin.rest_transport",
+                            }],
+                        },
+                    })
+                status = getattr(exc, "code", None)
+                failure = {
+                    "stage": "transport",
+                    "boundary": "plugin.rest_transport",
+                    "error_class": exc.__class__.__name__,
+                }
+                if isinstance(status, int) and not isinstance(status, bool):
+                    failure["http_status"] = status
+                return json.dumps({
+                    "error": "Mempal search transport failed.",
+                    "error_details": {
+                        "kind": "search_transport_failure",
+                        "correlation_id": correlation_id,
+                        "elapsed_ms": int((time.monotonic() - started) * 1000),
+                        "deadline_ms": _SEARCH_CALLER_BUDGET_MS,
+                        "partial": False,
+                        "retry_safe": True,
+                        "fallback_used": [],
+                        "timeouts": [],
+                        "failures": [failure],
+                    },
+                })
         elif tool_name == "mempal_conclude":
             conclusion = args.get("conclusion", "")
             if not conclusion:
