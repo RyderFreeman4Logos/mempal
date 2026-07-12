@@ -8,6 +8,14 @@ Only delete IDs returned by the same smoke run as `created_drawer_ids` (or a doc
 
 If a create/update does not expose cleanup-safe IDs, fail closed: skip update/delete, classify the API gap, and avoid guessing.
 
+Before each write or fallback, the automated runner atomically checkpoints its
+current cleanup-safe IDs in a mode-`0600` file under `/tmp`. The manifest contains
+only IDs returned by the current run; it never contains marker text, requests,
+responses, or memory content. Verified cleanup removes IDs from the manifest and
+deletes the file when no IDs remain. On failure with unresolved IDs, the final JSON
+reports `cleanup_manifest_path` without copying any IDs into diagnostics. Resume
+cleanup only from that exact manifest; never reconstruct authority from search.
+
 ## Reversible CLI CRUD outline
 
 1. Generate a unique marker.
@@ -28,6 +36,11 @@ If a create/update does not expose cleanup-safe IDs, fail closed: skip update/de
 ## Reversible MCP CRUD outline
 
 Use MCP tools already exposed to the active client when available. If not, `scripts/full_smoke.py` may start short-lived `mempal serve --mcp` stdio children because it owns shutdown and kills leftovers. Do not manually leave unmanaged MCP servers running.
+
+An MCP timeout or JSON-RPC error must close and reap the current stdio child before
+the runner attempts CLI observation, REST fallback, or CLI cleanup. If any
+runner-owned MCP child survives the bounded shutdown sweep, the fallback is blocked
+and the smoke fails with aggregate lifecycle counts and roles only.
 
 Required MCP coverage when available:
 
