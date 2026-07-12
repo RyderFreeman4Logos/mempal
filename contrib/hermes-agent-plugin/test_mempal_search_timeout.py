@@ -126,7 +126,7 @@ class SearchTimeoutContractTests(unittest.TestCase):
 
         details = result["error_details"]
         self.assertEqual(details["kind"], "search_timeout")
-        self.assertEqual(details["deadline_ms"], 240_000)
+        self.assertNotIn("deadline_ms", details)
         self.assertTrue(details["retry_safe"])
         self.assertEqual(details["timeouts"][0]["stage"], "transport")
         self.assertEqual(
@@ -155,6 +155,7 @@ class SearchTimeoutContractTests(unittest.TestCase):
 
         details = result["error_details"]
         self.assertEqual(details["kind"], "search_transport_failure")
+        self.assertNotIn("deadline_ms", details)
         self.assertTrue(details["retry_safe"])
         self.assertEqual(details["failures"], [{
             "stage": "transport",
@@ -203,7 +204,6 @@ class SearchTimeoutContractTests(unittest.TestCase):
         self.assertNotIn("deadline_ms", params)
         self.assertEqual(len(provider.search_timeouts), 1)
         self.assertIsNone(provider.search_timeouts[0])
-        self.assertEqual(provider._effective_search_deadline_ms(), 240_000)
 
     def test_stale_low_policy_cache_never_sets_a_finite_search_read_deadline(self) -> None:
         provider = StaleLowPolicySearchProvider()

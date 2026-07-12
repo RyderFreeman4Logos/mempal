@@ -43,7 +43,6 @@ logger = logging.getLogger(__name__)
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
 _DEGRADED_RESPONSE_SECS = 8.0
-_DEFAULT_SEARCH_QUERY_DEADLINE_SECS = 240
 _PREFETCH_TOP_K = 5
 _TURN_STORAGE_MODE_TTL = 60.0
 _WRITE_QUEUE_MAX = 1000
@@ -631,7 +630,6 @@ class MempalMemoryProvider:
         return search_metadata_from_headers(
             headers,
             correlation_id,
-            self._effective_search_deadline_ms(),
         )
 
     @staticmethod
@@ -641,12 +639,6 @@ class MempalMemoryProvider:
         reason = getattr(exc, "reason", None)
         return isinstance(reason, TimeoutError)
 
-    def _effective_search_deadline_secs(self) -> int:
-        return _DEFAULT_SEARCH_QUERY_DEADLINE_SECS
-
-    def _effective_search_deadline_ms(self) -> int:
-        return self._effective_search_deadline_secs() * 1000
-
     def _search_request(self, params) -> SearchTransportResponse:
         return self._search_transport.get_json("/api/search", params)
 
@@ -654,7 +646,6 @@ class MempalMemoryProvider:
         correlation_id = correlation_id or f"search-{secrets.token_hex(8)}"
         bounded_params = dict(params)
         # Omit deadline_ms so the daemon hot-reloaded E2E policy is authoritative.
-        # Callers that must tighten may still set deadline_ms; never raise above daemon.
         bounded_params.pop("deadline_ms", None)
         bounded_params["correlation_id"] = correlation_id
         started = time.monotonic()
@@ -929,7 +920,6 @@ class MempalMemoryProvider:
                 daemon_timeout = search_timeout_metadata_from_http_error(
                     exc,
                     correlation_id,
-                    self._effective_search_deadline_ms(),
                 )
                 if daemon_timeout:
                     return json.dumps({
@@ -941,14 +931,12 @@ class MempalMemoryProvider:
                     })
                 if self._is_search_timeout(exc):
                     elapsed_ms = int((time.monotonic() - started) * 1000)
-                    deadline_ms = self._effective_search_deadline_ms()
                     return json.dumps({
-                        "error": "Mempal search exceeded its bounded transport deadline.",
+                        "error": "Mempal search transport timed out before the daemon returned terminal metadata.",
                         "error_details": {
                             "kind": "search_timeout",
                             "correlation_id": correlation_id,
                             "elapsed_ms": elapsed_ms,
-                            "deadline_ms": deadline_ms,
                             "partial": False,
                             "retry_safe": True,
                             "fallback_used": [],
@@ -972,7 +960,6 @@ class MempalMemoryProvider:
                         "kind": "search_transport_failure",
                         "correlation_id": correlation_id,
                         "elapsed_ms": int((time.monotonic() - started) * 1000),
-                        "deadline_ms": self._effective_search_deadline_ms(),
                         "partial": False,
                         "retry_safe": True,
                         "fallback_used": [],

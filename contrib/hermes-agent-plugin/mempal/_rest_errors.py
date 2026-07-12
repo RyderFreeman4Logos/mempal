@@ -103,7 +103,7 @@ def _stale_daemon_http_error_details(exc: Any) -> Dict[str, Any]:
 def _sanitize_search_metadata(
     source: Any,
     correlation_id: str,
-    default_deadline_ms: int,
+    default_deadline_ms: Optional[int],
 ) -> Dict[str, Any]:
     if not isinstance(source, dict) or source.get("correlation_id") != correlation_id:
         return {}
@@ -134,23 +134,29 @@ def _sanitize_search_metadata(
     deadline_ms = source.get("deadline_ms")
     if not isinstance(elapsed_ms, int) or isinstance(elapsed_ms, bool) or elapsed_ms < 0:
         elapsed_ms = 0
-    if not isinstance(deadline_ms, int) or isinstance(deadline_ms, bool) or deadline_ms <= 0:
+    if (
+        not isinstance(deadline_ms, int)
+        or isinstance(deadline_ms, bool)
+        or deadline_ms <= 0
+    ):
         deadline_ms = default_deadline_ms
-    return {
+    metadata = {
         "correlation_id": correlation_id,
         "elapsed_ms": elapsed_ms,
-        "deadline_ms": deadline_ms,
         "partial": source.get("partial") is True,
         "retry_safe": source.get("retry_safe") is True,
         "fallback_used": fallback_used,
         "timeouts": timeouts,
     }
+    if isinstance(deadline_ms, int) and not isinstance(deadline_ms, bool) and deadline_ms > 0:
+        metadata["deadline_ms"] = deadline_ms
+    return metadata
 
 
 def search_metadata_from_headers(
     headers: Any,
     correlation_id: str,
-    default_deadline_ms: int,
+    default_deadline_ms: Optional[int] = None,
 ) -> Dict[str, Any]:
     normalized = {
         str(key).lower(): str(value)
@@ -170,7 +176,7 @@ def search_metadata_from_headers(
 def search_timeout_metadata_from_http_error(
     exc: Exception,
     correlation_id: str,
-    default_deadline_ms: int,
+    default_deadline_ms: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Parse only the allowlisted terminal-search timeout contract."""
     if not isinstance(exc, urllib.error.HTTPError) or int(exc.code) != 504:

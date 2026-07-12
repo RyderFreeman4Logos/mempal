@@ -1064,7 +1064,10 @@ async fn test_truncated_envelope_preview_is_scrubbed() {
         stderr.contains("truncated hook envelope"),
         "missing scrub log: {stderr}"
     );
-    assert!(!stderr.contains("sk-ABC...WXYZ"), "secret leaked: {stderr}");
+    assert!(
+        !stderr.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890WXYZ"),
+        "secret leaked: {stderr}"
+    );
 
     daemon.sigterm();
     let status = daemon.wait().await.expect("wait daemon");
