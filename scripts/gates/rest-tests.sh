@@ -4,6 +4,12 @@ set -euo pipefail
 REST_TEST_TARGETS_PER_BATCH="${REST_TEST_TARGETS_PER_BATCH:-12}"
 REST_GATE_DRY_RUN="${REST_GATE_DRY_RUN:-0}"
 REST_GATE_LOCK_TIMEOUT_SECS="${REST_GATE_LOCK_TIMEOUT_SECS:-1800}"
+
+if ! command -v flock >/dev/null 2>&1; then
+    echo "REST gate requires 'flock' in PATH" >&2
+    exit 2
+fi
+
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 rest_target_dir="${REST_GATE_TARGET_DIR:-${repo_root}/target/rest-gate}"
 
@@ -26,10 +32,15 @@ fi
 rest_lock_file="${rest_target_dir}.lock"
 mkdir -p -- "$(dirname -- "${rest_lock_file}")"
 exec {rest_lock_fd}>"${rest_lock_file}"
+# The top-level shell owns this descriptor. Every non-lock child closes its
+# copy so a detached test descendant cannot extend the gate's lock lifetime.
 if ! flock -n "${rest_lock_fd}"; then
     echo "rest gate waiting for lock: ${rest_lock_file} (pid=$$)" >&2
     if command -v fuser >/dev/null 2>&1; then
-        fuser -v "${rest_lock_file}" >&2 || true
+        (
+            exec {rest_lock_fd}>&-
+            fuser -v "${rest_lock_file}" >&2
+        ) || true
     fi
     if ! flock -w "${REST_GATE_LOCK_TIMEOUT_SECS}" "${rest_lock_fd}"; then
         echo "rest gate lock timed out after ${REST_GATE_LOCK_TIMEOUT_SECS}s: ${rest_lock_file}" >&2
@@ -65,7 +76,10 @@ run_cmd() {
     printf '\n'
 
     if [[ "${REST_GATE_DRY_RUN}" != "1" ]]; then
-        "$@"
+        (
+            exec {rest_lock_fd}>&-
+            "$@"
+        )
     fi
 }
 
@@ -101,6 +115,7 @@ run_cargo_test --workspace --features rest --doc
 clean_mempal_artifacts
 
 mapfile -t integration_tests < <(
+    exec {rest_lock_fd}>&-
     find tests -maxdepth 1 -type f -name '*.rs' -printf '%f\n' \
         | sed 's/\.rs$//' \
         | sort
