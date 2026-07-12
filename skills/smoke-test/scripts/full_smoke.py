@@ -6,10 +6,10 @@ Exercises CLI and MCP CRUD without printing drawer content or raw command output
 from __future__ import annotations
 
 import json
+import importlib.util
 import ipaddress
 import math
 import os
-import select
 import signal
 import subprocess
 import sys
@@ -21,6 +21,21 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+
+def _load_smoke_runtime() -> Any:
+    """Load the sibling runtime module without mutating global import paths."""
+    path = Path(__file__).with_name('smoke_runtime.py')
+    spec = importlib.util.spec_from_file_location('_mempal_smoke_runtime', path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f'cannot load smoke runtime from {path}')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_SMOKE_RUNTIME = _load_smoke_runtime()
+CleanupManifest = _SMOKE_RUNTIME.CleanupManifest
 
 try:
     import tomllib
@@ -50,7 +65,9 @@ SUMMARY: dict[str, Any] = {
         ],
     },
 }
-OWNED_MCP_CHILDREN: dict[int, subprocess.Popen[Any]] = {}
+OWNED_MCP_REGISTRY = _SMOKE_RUNTIME.OwnedSubprocessRegistry()
+OWNED_MCP_CHILDREN: dict[int, subprocess.Popen[Any]] = OWNED_MCP_REGISTRY.processes
+CLEANUP_MANIFEST: CleanupManifest | None = CleanupManifest()
 
 PROC_IO_KEYS = ('read_bytes', 'write_bytes', 'cancelled_write_bytes', 'rchar', 'wchar')
 CONFORMANCE_MATRIX_PATH = 'docs/conformance-matrix.md'
@@ -1161,6 +1178,7 @@ def delete_exact_ids_cli(drawer_ids: list[str], label: str, room: str | None = N
     stdout_bytes = 0
     stderr_bytes = 0
     for drawer_id in unique_ids:
+        _checkpoint_manifest()
         proc = run_child_process(
             ['mempal', 'delete', drawer_id],
             timeout=60,
@@ -1172,8 +1190,8 @@ def delete_exact_ids_cli(drawer_ids: list[str], label: str, room: str | None = N
             deleted += 1
         else:
             failed += 1
-    active_matches_after_failed_deletes: int | None = None
-    if failed > 0 and deleted == 0 and room is not None:
+    active_matches_after_deletes: int | None = None
+    if unique_ids and room is not None:
         rc, _out, _err, parsed, _shape = run_cli(
             label + '_post_cleanup_search',
             ['mempal', 'search', MARKER, '--top-k', '5', '--json'],
@@ -1181,7 +1199,9 @@ def delete_exact_ids_cli(drawer_ids: list[str], label: str, room: str | None = N
             timeout=180,
         )
         if rc == 0:
-            active_matches_after_failed_deletes = count_marker_matches(parsed, room)
+            active_matches_after_deletes = count_marker_matches(parsed, room)
+            if active_matches_after_deletes == 0:
+                _mark_verified_cleaned(unique_ids)
     result = {
         'attempted_count': len(unique_ids),
         'deleted_count': deleted,
@@ -1189,14 +1209,14 @@ def delete_exact_ids_cli(drawer_ids: list[str], label: str, room: str | None = N
         'stdout_bytes': stdout_bytes,
         'stderr_bytes': stderr_bytes,
     }
-    if active_matches_after_failed_deletes is not None:
-        result['active_matches_after_failed_deletes'] = active_matches_after_failed_deletes
+    if active_matches_after_deletes is not None:
+        result['active_matches_after_deletes'] = active_matches_after_deletes
     note(
         label,
         failed == 0
         or deleted > 0
         or not unique_ids
-        or active_matches_after_failed_deletes == 0,
+        or active_matches_after_deletes == 0,
         **result,
     )
     return result
@@ -1257,6 +1277,7 @@ def _rest_ingest_fallback(content: str, label: str, supersedes: str | None = Non
     }
     if supersedes:
         payload['supersedes'] = supersedes
+    _checkpoint_manifest()
     try:
         req = urllib.request.Request(
             'http://127.0.0.1:3080/api/ingest',
@@ -1268,6 +1289,7 @@ def _rest_ingest_fallback(content: str, label: str, supersedes: str | None = Non
         if resp.status in (200, 201):
             body = json.loads(resp.read().decode())
             ids = created_ids_from(body)
+            _remember_created_ids(ids)
             note(label, bool(ids), created_id_count=len(ids), json=json_shape(body))
             return ids
     except Exception as exc:
@@ -1282,25 +1304,16 @@ def _mcp_tool_with_hard_timeout(
     args: dict[str, Any],
     timeout: int,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    """Call an MCP tool with a hard process-level timeout via SIGALRM.
-
-    The fork's MCP ingest path can hang indefinitely when the daemon holds the
-    sqlite-writer lease. The normal ``client.tool()`` timeout uses
-    ``select.select`` which only works if the child writes data. If the child
-    is spinning on a lock, it may never write, and ``readline`` can block
-    forever even after select reports readiness.
-
-    This wrapper uses SIGALRM to interrupt the blocking call after ``timeout``
-    seconds. The alarm handler kills the MCP child process, which causes the
-    blocked ``readline`` to raise an exception.
-    """
-    import signal
-
+    """Interrupt a blocked MCP readline and synchronously reap its process."""
     result_box: dict[str, Any] = {}
+    hard_timed_out = False
     old_handler = signal.getsignal(signal.SIGALRM)
-    old_timer = signal.setitimer(signal.ITIMER_REAL, 0)  # cancel any existing
+    old_timer = signal.setitimer(signal.ITIMER_REAL, 0)
 
     def _alarm_handler(signum: int, frame: Any) -> None:
+        nonlocal hard_timed_out
+        hard_timed_out = True
+        client._hard_killed = True
         try:
             client.proc.kill()
         except Exception:
@@ -1318,6 +1331,9 @@ def _mcp_tool_with_hard_timeout(
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_handler)
+        signal.setitimer(signal.ITIMER_REAL, *old_timer)
+        if hard_timed_out:
+            client.close()
 
     if 'info' in result_box:
         return result_box.get('structured'), result_box['info']
@@ -1327,6 +1343,7 @@ def _mcp_tool_with_hard_timeout(
 def cli_crud() -> list[str]:
     cleanup_ids: list[str] = []
     content = json.dumps({'content': f'{MARKER} reversible CLI smoke drawer; nonce {NONCE}; lexical tokens quorvax nimbledrift zettaplum; safe to delete', 'wing': 'smoke', 'room': 'cli', 'source_type': 'agent_inference', 'memory_kind': 'evidence', 'domain': 'project', 'field': 'smoke'}) + '\n'
+    _checkpoint_manifest()
     rc, _out, _err, parsed, _shape = run_cli(
         'cli_create',
         ['mempal', 'ingest', '--stdin', '--wing', 'smoke', '--room', 'cli', '--source-type', 'agent_inference', '--memory-kind', 'evidence', '--domain', 'project', '--field', 'smoke', '--no-gate', '--wait', '--wait-timeout-secs', '90', '--json'],
@@ -1335,6 +1352,7 @@ def cli_crud() -> list[str]:
         timeout=130,
     )
     ids, create_recovery = recover_created_ids(parsed, 'cli_create_wait')
+    _remember_created_ids(ids)
 
     # Fallback: if CLI direct-write fails due to daemon writer lease, retry via REST.
     # The fork's daemon holds a long-lived sqlite-writer lease; CLI ingest that
@@ -1364,11 +1382,14 @@ def cli_crud() -> list[str]:
     note('cli_search_created_match', matches > 0, active_matches=matches)
     run_cli('cli_context_created', ['mempal', 'context', MARKER, '--format', 'json', '--max-items', '3', '--no-distill-suggestions'], expect_json=True, timeout=150)
     run_cli('cli_pinned_before', ['mempal', 'pinned', '--json'], expect_json=True, timeout=60)
+    _checkpoint_manifest()
     run_cli('cli_pin', ['mempal', 'pin', created_id], timeout=60)
+    _checkpoint_manifest()
     run_cli('cli_unpin', ['mempal', 'unpin', created_id], timeout=60)
     run_cli('cli_pinned_after', ['mempal', 'pinned', '--json'], expect_json=True, timeout=60)
 
     update_content = json.dumps({'content': f'{MARKER} reversible CLI smoke drawer updated; nonce {NONCE[::-1]}; lexical tokens ploverquartz rivetmint yondercoil; safe to delete', 'wing': 'smoke', 'room': 'cli', 'source_type': 'agent_inference', 'memory_kind': 'evidence', 'domain': 'project', 'field': 'smoke'}) + '\n'
+    _checkpoint_manifest()
     rc, _out, _err, upd_parsed, _shape = run_cli(
         'cli_update',
         ['mempal', 'ingest', '--stdin', '--wing', 'smoke', '--room', 'cli', '--source-type', 'agent_inference', '--memory-kind', 'evidence', '--domain', 'project', '--field', 'smoke', '--no-gate', '--supersedes', created_id, '--wait', '--wait-timeout-secs', '90', '--json'],
@@ -1377,6 +1398,7 @@ def cli_crud() -> list[str]:
         timeout=130,
     )
     upd_ids, update_recovery = recover_created_ids(upd_parsed, 'cli_update_wait')
+    _remember_created_ids(upd_ids)
 
     # Fallback: retry update via REST if direct write failed (writer lease).
     if not upd_ids:
@@ -1399,7 +1421,7 @@ def cli_crud() -> list[str]:
     SUMMARY['created_counts']['cli'] = len(cleanup_ids)
     run_cli('cli_read_updated', ['mempal', 'view', upd_ids[0], '--all-projects'], timeout=60)
 
-    delete_result = delete_exact_ids_cli(cleanup_ids, 'cli_delete_batch')
+    delete_result = delete_exact_ids_cli(cleanup_ids, 'cli_delete_batch', room='cli')
     deleted = int(delete_result['deleted_count'])
     delete_failures = int(delete_result['failed_count'])
     SUMMARY['cleanup']['cli_deleted_count'] = deleted
@@ -1411,160 +1433,91 @@ def cli_crud() -> list[str]:
     return cleanup_ids
 
 
-class McpClient:
-    def __init__(self) -> None:
-        self.stderr_file = tempfile.TemporaryFile()
-        self.proc_io_before: dict[str, int] | None = None
-        self.proc = subprocess.Popen(
-            ['mempal', 'serve', '--mcp'],
-            cwd=str(REPO),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=self.stderr_file,
-            text=True,
-            bufsize=1,
+McpClient = _SMOKE_RUNTIME.McpClient
+
+
+def new_mcp_client(process_factory: Any = subprocess.Popen) -> McpClient:
+    lifecycle = SUMMARY.setdefault(
+        'mcp_stdio_lifecycle',
+        {'process_count': 0, 'exited_count': 0, 'killed_count': 0, 'roles': {}},
+    )
+    return McpClient(
+        command=['mempal', 'serve', '--mcp'],
+        cwd=REPO,
+        registry=OWNED_MCP_REGISTRY,
+        read_proc_io=read_proc_io,
+        record_proc_io_delta=record_proc_io_delta,
+        json_shape=json_shape,
+        lifecycle_receipt=lifecycle,
+        process_factory=process_factory,
+    )
+
+
+def terminate_and_reap_owned_mcp_children(timeout: float = 1.0) -> dict[str, Any]:
+    return OWNED_MCP_REGISTRY.terminate_and_reap(timeout)
+
+
+def run_with_owned_mcp_cleanup(run: Any) -> Any:
+    """Run a smoke entry point and reap owned MCP children on every exit path."""
+    try:
+        return run()
+    finally:
+        terminate_and_reap_owned_mcp_children(timeout=5.0)
+
+
+def _checkpoint_manifest() -> None:
+    if CLEANUP_MANIFEST is not None:
+        CLEANUP_MANIFEST.checkpoint()
+
+
+def _remember_created_ids(drawer_ids: list[str]) -> None:
+    if drawer_ids and CLEANUP_MANIFEST is not None:
+        CLEANUP_MANIFEST.add_created_ids(drawer_ids)
+
+
+def _mark_verified_cleaned(drawer_ids: list[str]) -> None:
+    if drawer_ids and CLEANUP_MANIFEST is not None:
+        CLEANUP_MANIFEST.mark_cleaned(drawer_ids)
+
+
+def finalize_cleanup_manifest(summary: dict[str, Any]) -> None:
+    _SMOKE_RUNTIME.finalize_cleanup_manifest(CLEANUP_MANIFEST, summary)
+
+
+def run_fallback_after_mcp_reaped(
+    client: McpClient | None,
+    label: str,
+    fallback: Any,
+) -> Any:
+    """Permit a write fallback only after every owned MCP holder is reaped."""
+    if client is not None:
+        client.close()
+    sweep = terminate_and_reap_owned_mcp_children(timeout=5.0)
+    if sweep['remaining_count'] != 0 or OWNED_MCP_CHILDREN:
+        note(
+            f'mcp_{label}_fallback_holder_clear',
+            False,
+            reason='owned_mcp_holder_not_reaped',
+            remaining_count=len(OWNED_MCP_CHILDREN),
         )
-        OWNED_MCP_CHILDREN[self.proc.pid] = self.proc
-        self.proc_io_before = read_proc_io(self.proc.pid)
-        self.next_id = 1
-
-    def send(self, msg: dict[str, Any]) -> None:
-        assert self.proc.stdin is not None
-        self.proc.stdin.write(json.dumps(msg, separators=(',', ':')) + '\n')
-        self.proc.stdin.flush()
-
-    def call(self, method: str, params: dict[str, Any] | None = None, timeout: int = 120) -> dict[str, Any]:
-        msg_id = self.next_id
-        self.next_id += 1
-        self.send({'jsonrpc': '2.0', 'id': msg_id, 'method': method, 'params': params or {}})
-        return self.read_response(msg_id, timeout)
-
-    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
-        msg: dict[str, Any] = {'jsonrpc': '2.0', 'method': method}
-        if params is not None:
-            msg['params'] = params
-        self.send(msg)
-
-    def read_response(self, msg_id: int, timeout: int) -> dict[str, Any]:
-        assert self.proc.stdout is not None
-        end = time.monotonic() + timeout
-        while time.monotonic() < end:
-            remaining = max(0.1, end - time.monotonic())
-            ready, _, _ = select.select([self.proc.stdout], [], [], remaining)
-            if not ready:
-                continue
-            line = self.proc.stdout.readline()
-            if not line:
-                raise RuntimeError('mcp eof')
-            msg = json.loads(line)
-            if msg.get('id') == msg_id:
-                return msg
-        raise TimeoutError(f'mcp response timeout for {msg_id}')
-
-    def tool(self, name: str, arguments: dict[str, Any], timeout: int = 120) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-        start = time.monotonic()
-        try:
-            msg = self.call('tools/call', {'name': name, 'arguments': arguments}, timeout=timeout)
-            elapsed = int((time.monotonic() - start) * 1000)
-            if 'error' in msg:
-                return None, {'ok': False, 'latency_ms': elapsed, 'error_code': msg['error'].get('code'), 'error_message_bytes': len(json.dumps(msg['error']).encode())}
-            result = msg.get('result', {})
-            structured = result.get('structuredContent')
-            return structured, {'ok': isinstance(structured, dict), 'latency_ms': elapsed, 'shape': json_shape(structured)}
-        except Exception as exc:
-            return None, {'ok': False, 'error_type': type(exc).__name__}
-
-    def close(self) -> None:
-        if self.proc is None:
-            return
-        killed = False
-        exited = False
-        try:
-            self.notify('notifications/exit')
-        except Exception:
-            pass
-        try:
-            if self.proc.stdin is not None and not self.proc.stdin.closed:
-                self.proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            waited = wait_exited_without_reap(self.proc.pid, 1)
-            exited = waited is True
-        except Exception:
-            exited = False
-        proc_io_after = read_proc_io(self.proc.pid)
-        try:
-            self.proc.wait(timeout=1)
-        except Exception:
-            try:
-                killed = True
-                self.proc.terminate()
-            except Exception:
-                pass
-            try:
-                self.proc.wait(timeout=1)
-                exited = True
-            except Exception:
-                pass
-        if self.proc.returncode is None:
-            try:
-                killed = True
-                self.proc.kill()
-            except Exception:
-                pass
-            try:
-                wait_exited_without_reap(self.proc.pid, 5)
-                proc_io_after = proc_io_after or read_proc_io(self.proc.pid)
-                self.proc.wait(timeout=5)
-                exited = True
-            except Exception:
-                pass
-        record_proc_io_delta('mcp_stdio_child_processes', self.proc_io_before, proc_io_after)
-        lifecycle = SUMMARY.setdefault('mcp_stdio_lifecycle', {'process_count': 0, 'exited_count': 0, 'killed_count': 0})
-        lifecycle['process_count'] += 1
-        if exited or self.proc.returncode is not None:
-            lifecycle['exited_count'] += 1
-        if killed:
-            lifecycle['killed_count'] += 1
-        try:
-            self.stderr_file.close()
-        except Exception:
-            pass
-        if self.proc.returncode is not None:
-            OWNED_MCP_CHILDREN.pop(self.proc.pid, None)
-
-
-def wait_owned_mcp_children_reaped(timeout: float = 5.0) -> dict[str, Any]:
-    initial_pids = sorted(OWNED_MCP_CHILDREN)
-    deadline = time.monotonic() + timeout
-    while OWNED_MCP_CHILDREN and time.monotonic() < deadline:
-        for pid, proc in list(OWNED_MCP_CHILDREN.items()):
-            try:
-                proc.wait(timeout=0)
-            except subprocess.TimeoutExpired:
-                continue
-            except Exception:
-                OWNED_MCP_CHILDREN.pop(pid, None)
-                continue
-            if proc.returncode is not None:
-                OWNED_MCP_CHILDREN.pop(pid, None)
-        if OWNED_MCP_CHILDREN:
-            time.sleep(0.05)
-    remaining_pids = sorted(OWNED_MCP_CHILDREN)
-    return {
-        'initial_count': len(initial_pids),
-        'remaining_count': len(remaining_pids),
-        'reaped_count': len(initial_pids) - len(remaining_pids),
-    }
+        return []
+    _checkpoint_manifest()
+    result = fallback()
+    if isinstance(result, list):
+        _remember_created_ids([value for value in result if isinstance(value, str)])
+    return result
 
 
 def mcp_start_initialized() -> McpClient:
-    client = McpClient()
-    init = client.call('initialize', {'protocolVersion': '2024-11-05', 'capabilities': {}, 'clientInfo': {'name': 'mempal-skill-smoke', 'version': '0'}}, timeout=15)
-    note('mcp_initialize', 'result' in init, result_fields=sorted(init.get('result', {}).keys()) if isinstance(init.get('result'), dict) else [])
-    client.notify('notifications/initialized')
-    return client
+    client = new_mcp_client()
+    try:
+        init = client.call('initialize', {'protocolVersion': '2024-11-05', 'capabilities': {}, 'clientInfo': {'name': 'mempal-skill-smoke', 'version': '0'}}, timeout=15)
+        note('mcp_initialize', 'result' in init, result_fields=sorted(init.get('result', {}).keys()) if isinstance(init.get('result'), dict) else [])
+        client.notify('notifications/initialized')
+        return client
+    except BaseException:
+        client.close()
+        raise
 
 
 def mcp_call_isolated(tool_names: list[str], name: str, args: dict[str, Any], timeout: int) -> tuple[Any | None, dict[str, Any]]:
@@ -1630,14 +1583,12 @@ def mcp_crud() -> list[str]:
     try:
         client = mcp_start_initialized()
 
-        # MCP ingest with wait=True hangs when the daemon holds the sqlite-writer
-        # lease (the MCP child process spins on the lock and never responds).
-        # Call MCP ingest first under a hard SIGALRM timeout; only fall back to
-        # REST if MCP fails/hangs, so MCP write regressions are surfaced rather
-        # than masked.
+        # Keep MCP write regressions visible before trying the guarded fallback.
         create_args = {'content': f'{MARKER} reversible MCP smoke drawer; nonce {NONCE}; lexical tokens azurequill basaltfern cobaltlyric; safe to delete', 'wing': 'smoke', 'room': 'mcp', 'source_type': 'agent_inference', 'memory_kind': 'evidence', 'domain': 'project', 'field': 'smoke', 'smoke': True, 'wait': True, 'wait_timeout_secs': 15}
+        _checkpoint_manifest()
         create, info = _mcp_tool_with_hard_timeout(client, 'mempal_ingest', create_args, timeout=30)
         ids = created_ids_from(create)
+        _remember_created_ids(ids)
         create_operation_id = operation_id_from(create)
         create_recovery: dict[str, Any] = {
             'operation_id_present': bool(create_operation_id),
@@ -1660,21 +1611,30 @@ def mcp_crud() -> list[str]:
             # processing the write. Close this stdio server before following the
             # operation via CLI so the smoke runner never observes a result while
             # its own MCP process is still an extra SQLite holder.
-            client.close()
+            waited = run_fallback_after_mcp_reaped(
+                client,
+                'create_cli_wait',
+                lambda: wait_operation(create_operation_id, 'mcp_create_cli_wait'),
+            )
             client = None
-            waited = wait_operation(create_operation_id, 'mcp_create_cli_wait')
             ids = created_ids_from(waited)
+            _remember_created_ids(ids)
             create_recovery.update({'recovered_via': 'mcp_create_cli_wait', 'recovered_state': operation_state_from(waited)})
             SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
         # Fallback: if MCP ingest fails/hangs (writer lease), retry via REST so
         # follow-on read/delete paths still have a drawer to exercise.
         if not ids:
-            rest_ids = _rest_ingest_fallback(
-                f'{MARKER} reversible MCP smoke drawer; nonce {NONCE}; lexical tokens azurequill basaltfern cobaltlyric; safe to delete',
-                'mcp_create_rest_fallback',
-                room='mcp',
+            rest_ids = run_fallback_after_mcp_reaped(
+                client,
+                'create_rest',
+                lambda: _rest_ingest_fallback(
+                    f'{MARKER} reversible MCP smoke drawer; nonce {NONCE}; lexical tokens azurequill basaltfern cobaltlyric; safe to delete',
+                    'mcp_create_rest_fallback',
+                    room='mcp',
+                ),
             )
+            client = None
             if rest_ids:
                 ids = rest_ids
                 create_recovery = {'recovered_via': 'rest_fallback'}
@@ -1694,7 +1654,7 @@ def mcp_crud() -> list[str]:
                 False,
                 reason='create_missing_created_drawer_ids',
                 **recovery_fields(create_recovery),
-                product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/545',
+                product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/715',
             )
             return cleanup_ids
         cleanup_ids.extend(ids)
@@ -1729,29 +1689,41 @@ def mcp_crud() -> list[str]:
         # if MCP fails/hangs, so MCP write regressions are surfaced rather than
         # masked by a REST bypass.
         update_args = {'content': f'{MARKER} reversible MCP smoke drawer updated; nonce {NONCE[::-1]}; lexical tokens deltaorchid embervault frostcairn; safe to delete', 'wing': 'smoke', 'room': 'mcp', 'source_type': 'agent_inference', 'memory_kind': 'evidence', 'domain': 'project', 'field': 'smoke', 'smoke': True, 'supersedes': created_id, 'wait': True, 'wait_timeout_secs': 15}
+        _checkpoint_manifest()
         update, uinfo = _mcp_tool_with_hard_timeout(client, 'mempal_ingest', update_args, timeout=30)
         upd_ids = created_ids_from(update)
+        _remember_created_ids(upd_ids)
         update_recovery: dict[str, Any] = {
             'operation_id_present': bool(operation_id_from(update)),
             'operation_state': operation_state_from(update),
         }
         if not upd_ids and operation_id_from(update):
-            client.close()
+            operation_id = operation_id_from(update) or ''
+            waited = run_fallback_after_mcp_reaped(
+                client,
+                'update_cli_wait',
+                lambda: wait_operation(operation_id, 'mcp_update_cli_wait'),
+            )
             client = None
-            waited = wait_operation(operation_id_from(update) or '', 'mcp_update_cli_wait')
             upd_ids = created_ids_from(waited)
+            _remember_created_ids(upd_ids)
             update_recovery.update({'recovered_via': 'mcp_update_cli_wait', 'recovered_state': operation_state_from(waited)})
             SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
         # Fallback: if MCP update fails/hangs (writer lease), retry via REST so
         # follow-on read/delete paths still have an updated drawer to exercise.
         if not upd_ids:
-            rest_upd_ids = _rest_ingest_fallback(
-                f'{MARKER} reversible MCP smoke drawer updated; nonce {NONCE[::-1]}; lexical tokens deltaorchid embervault frostcairn; safe to delete',
-                'mcp_update_rest_fallback',
-                supersedes=created_id,
-                room='mcp',
+            rest_upd_ids = run_fallback_after_mcp_reaped(
+                client,
+                'update_rest',
+                lambda: _rest_ingest_fallback(
+                    f'{MARKER} reversible MCP smoke drawer updated; nonce {NONCE[::-1]}; lexical tokens deltaorchid embervault frostcairn; safe to delete',
+                    'mcp_update_rest_fallback',
+                    supersedes=created_id,
+                    room='mcp',
+                ),
             )
+            client = None
             if rest_upd_ids:
                 upd_ids = rest_upd_ids
                 update_recovery = {'recovered_via': 'rest_fallback'}
@@ -1772,7 +1744,7 @@ def mcp_crud() -> list[str]:
                 False,
                 reason='update_missing_created_drawer_ids',
                 **recovery_fields(update_recovery),
-                product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/545',
+                product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/715',
             )
             return cleanup_ids
         cleanup_ids.extend(upd_ids)
@@ -1785,6 +1757,7 @@ def mcp_crud() -> list[str]:
         deleted = 0
         delete_false_count = 0
         for drawer_id in list(dict.fromkeys(cleanup_ids)):
+            _checkpoint_manifest()
             structured, dinfo = client.tool('mempal_delete', {'drawer_id': drawer_id}, timeout=60)
             ok = bool(dinfo.get('ok')) and isinstance(structured, dict) and structured.get('deleted') is True
             if ok:
@@ -1794,10 +1767,13 @@ def mcp_crud() -> list[str]:
         SUMMARY['cleanup']['mcp_deleted_count'] = deleted
         post, pinfo = client.tool('mempal_search', {'query': MARKER, 'top_k': 5, 'all_projects': True}, timeout=180)
         post_matches = count_marker_matches(post, 'mcp')
-        if post_matches > 0:
+        cleanup_verified = bool(pinfo.get('ok')) and post_matches == 0
+        if cleanup_verified:
+            _mark_verified_cleaned(cleanup_ids)
+        else:
             SUMMARY['cleanup']['failures'] += delete_false_count
-        note('mcp_delete_batch', post_matches == 0, attempted_count=len(set(cleanup_ids)), deleted_count=deleted, delete_false_count=delete_false_count)
-        note('mcp_crud', post_matches == 0 and deleted > 0, created_id_count=len(cleanup_ids), deleted_count=deleted, delete_false_count=delete_false_count, post_delete_active_matches=post_matches)
+        note('mcp_delete_batch', cleanup_verified, attempted_count=len(set(cleanup_ids)), deleted_count=deleted, delete_false_count=delete_false_count)
+        note('mcp_crud', cleanup_verified and deleted > 0, created_id_count=len(cleanup_ids), deleted_count=deleted, delete_false_count=delete_false_count, post_delete_active_matches=post_matches)
         if 'mempal_status' in tool_names:
             structured, sinfo = client.tool('mempal_status', {}, timeout=30)
             note('mcp_status_last', bool(sinfo.get('ok')), **without_ok(sinfo))
@@ -1808,18 +1784,25 @@ def mcp_crud() -> list[str]:
     finally:
         if client is not None:
             client.close()
+            client = None
         # If MCP CRUD failed after exposing cleanup-safe IDs, clean them by exact ID.
         if SUMMARY['groups'].get('mcp_crud', {}).get('ok') is not True and cleanup_ids:
-            cleaned = 0
-            for drawer_id in list(dict.fromkeys(cleanup_ids)):
-                proc = run_child_process(
-                    ['mempal', 'delete', drawer_id],
-                    timeout=60,
-                    io_category='cli_child_processes',
+            cleanup_result = run_fallback_after_mcp_reaped(
+                None,
+                'fallback_cli_cleanup',
+                lambda: delete_exact_ids_cli(
+                    cleanup_ids,
+                    'mcp_fallback_cli_cleanup_delete',
+                    room='mcp',
+                ),
+            )
+            if isinstance(cleanup_result, dict):
+                note(
+                    'mcp_fallback_cli_cleanup',
+                    cleanup_result.get('active_matches_after_deletes') == 0,
+                    exact_id_count=len(set(cleanup_ids)),
+                    deleted_count=cleanup_result.get('deleted_count', 0),
                 )
-                if proc['returncode'] == 0:
-                    cleaned += 1
-            note('mcp_fallback_cli_cleanup', True, exact_id_count=len(set(cleanup_ids)), deleted_count=cleaned)
 
 
 def holder_summary() -> dict[str, Any]:
@@ -2096,10 +2079,24 @@ def main() -> int:
     run_cli('repair_json', ['mempal', 'repair', 'list', '--json'], expect_json=True, timeout=60)
     probe_search_reranker_behavior()
 
-    cli_ids = cli_crud()
-    mcp_ids = mcp_crud()
+    cli_crud()
+    mcp_crud()
 
-    SUMMARY['mcp_owned_children_after_wait'] = wait_owned_mcp_children_reaped()
+    SUMMARY['mcp_owned_children_after_wait'] = terminate_and_reap_owned_mcp_children(timeout=5.0)
+    if SUMMARY['mcp_owned_children_after_wait']['remaining_count'] > 0:
+        note(
+            'mcp_owned_children_reaped',
+            False,
+            reason='owned_mcp_children_remaining_before_holder_summary',
+            remaining_count=SUMMARY['mcp_owned_children_after_wait']['remaining_count'],
+        )
+    if CLEANUP_MANIFEST is not None and CLEANUP_MANIFEST.pending_count > 0:
+        note(
+            'cleanup_manifest_pending',
+            False,
+            reason='verified_cleanup_incomplete',
+            remaining_count=CLEANUP_MANIFEST.pending_count,
+        )
     SUMMARY['holders_after'] = holder_summary()
     daemon_pid_after = daemon_main_pid()
     daemon_io_after = read_proc_io(daemon_pid_after)
@@ -2114,6 +2111,7 @@ def main() -> int:
     SUMMARY['duration_ms'] = int((time.monotonic() - start) * 1000)
     SUMMARY['conformance'] = build_conformance_report()
     SUMMARY['overall_ok'] = smoke_overall_ok(SUMMARY)
+    finalize_cleanup_manifest(SUMMARY)
     append_io_history()
     print(json.dumps(SUMMARY, sort_keys=True))
     return 0 if SUMMARY['overall_ok'] else 1
@@ -2126,4 +2124,4 @@ if __name__ == '__main__':
             "Runs the aggregate mempal CLI/MCP smoke suite and prints a JSON summary."
         )
         raise SystemExit(0)
-    raise SystemExit(main())
+    raise SystemExit(run_with_owned_mcp_cleanup(main))
