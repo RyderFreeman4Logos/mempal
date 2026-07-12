@@ -1444,6 +1444,13 @@ def run_with_owned_mcp_cleanup(run: Any) -> Any:
     """Run a smoke entry point and reap owned MCP children on every exit path."""
     try:
         return run()
+    except BaseException as error:
+        SUMMARY['mcp_owned_children_after_failure'] = terminate_and_reap_owned_mcp_children(timeout=5.0)
+        note('runner_exception', False, error_type=type(error).__name__)
+        SUMMARY['overall_ok'] = False
+        finalize_cleanup_manifest(SUMMARY, checkpoint=False)
+        print(json.dumps(SUMMARY, sort_keys=True))
+        return 1
     finally:
         terminate_and_reap_owned_mcp_children(timeout=5.0)
 
@@ -1463,8 +1470,8 @@ def _mark_verified_cleaned(drawer_ids: list[str]) -> None:
         CLEANUP_MANIFEST.mark_cleaned(drawer_ids)
 
 
-def finalize_cleanup_manifest(summary: dict[str, Any]) -> None:
-    _SMOKE_RUNTIME.finalize_cleanup_manifest(CLEANUP_MANIFEST, summary)
+def finalize_cleanup_manifest(summary: dict[str, Any], *, checkpoint: bool = True) -> None:
+    _SMOKE_RUNTIME.finalize_cleanup_manifest(CLEANUP_MANIFEST, summary, checkpoint=checkpoint)
 
 
 def run_fallback_after_mcp_reaped(

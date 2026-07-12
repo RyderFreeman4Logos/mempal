@@ -2,7 +2,9 @@
 """Regression tests for smoke MCP subprocess lifecycle primitives."""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -230,6 +232,39 @@ time.sleep(60)
         process.wait.side_effect = None
         process.wait.return_value = 0
         self.smoke.terminate_and_reap_owned_mcp_children(timeout=0.01)
+
+    def test_checkpoint_exception_emits_safe_manifest_recovery_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / "cleanup.json")
+            manifest.add_created_ids(["drawer-recoverable"])
+            self.smoke.CLEANUP_MANIFEST = manifest
+            output = io.StringIO()
+
+            def fail_after_creation() -> int:
+                manifest.checkpoint()
+                return 0
+
+            with mock.patch.object(
+                manifest,
+                "checkpoint",
+                side_effect=OSError("private raw checkpoint detail"),
+            ):
+                with contextlib.redirect_stdout(output):
+                    return_code = self.smoke.run_with_owned_mcp_cleanup(
+                        fail_after_creation,
+                    )
+
+            receipt = json.loads(output.getvalue())
+            self.assertEqual(return_code, 1)
+            self.assertFalse(receipt["overall_ok"])
+            self.assertEqual(receipt["cleanup_manifest_path"], str(manifest.path))
+            self.assertEqual(receipt["cleanup_pending_count"], 1)
+            self.assertEqual(
+                receipt["groups"]["runner_exception"]["error_type"],
+                "OSError",
+            )
+            self.assertNotIn("private raw checkpoint detail", output.getvalue())
+            self.assertTrue(manifest.path.exists())
 
     def test_initialize_failure_closes_spawned_client(self) -> None:
         fake_client = mock.Mock()
@@ -489,9 +524,10 @@ time.sleep(60)
         def cancelled() -> int:
             raise KeyboardInterrupt
 
-        with self.assertRaises(KeyboardInterrupt):
-            self.smoke.run_with_owned_mcp_cleanup(cancelled)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return_code = self.smoke.run_with_owned_mcp_cleanup(cancelled)
 
+        self.assertEqual(return_code, 1)
         self.assertIsNotNone(proc.poll())
         self.assertEqual(self.smoke.OWNED_MCP_CHILDREN, {})
 

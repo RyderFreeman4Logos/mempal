@@ -139,6 +139,8 @@ class CleanupManifest:
 def finalize_cleanup_manifest(
     manifest: CleanupManifest | None,
     summary: MutableMapping[str, Any],
+    *,
+    checkpoint: bool = True,
 ) -> None:
     """Expose a recovery receipt only while cleanup-authorized IDs remain."""
     summary.pop("cleanup_manifest_path", None)
@@ -146,9 +148,11 @@ def finalize_cleanup_manifest(
     if manifest is None:
         return
     if manifest.pending_count > 0:
-        manifest.checkpoint()
-        summary["cleanup_manifest_path"] = str(manifest.path)
-        summary["cleanup_pending_count"] = manifest.pending_count
+        if checkpoint:
+            manifest.checkpoint()
+        if manifest.path.exists():
+            summary["cleanup_manifest_path"] = str(manifest.path)
+            summary["cleanup_pending_count"] = manifest.pending_count
     else:
         manifest.discard()
 
