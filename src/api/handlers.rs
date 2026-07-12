@@ -521,6 +521,8 @@ struct StatusResponse {
     embed_status: ApiEmbedStatus,
     embedder_cache: crate::embed::SharedEmbedderRuntimeSnapshot,
     search_mode: String,
+    /// Hot-reloaded end-to-end and stage search deadline policy (seconds).
+    search_policy: SearchPolicyStatus,
     embedder_circuit: EmbedderCircuitStatus,
     queue_stats: ApiQueueStats,
     hook_admission: crate::hook_diagnostics::HookAdmissionStats,
@@ -540,6 +542,19 @@ struct StatusResponse {
     search_telemetry: SearchTelemetrySnapshot,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     status_warnings: Vec<String>,
+}
+
+/// Operator-visible search deadline policy from the active hot-reloaded config.
+#[derive(Debug, Serialize)]
+struct SearchPolicyStatus {
+    /// End-to-end monotonic query deadline shared across all search stages.
+    query_deadline_secs: u64,
+    /// Stage cap for DB work (still limited by remaining E2E budget).
+    db_deadline_secs: u64,
+    /// Stage cap for query embedding (still limited by remaining E2E budget).
+    embed_deadline_secs: u64,
+    /// Stage cap for reranker HTTP (still limited by remaining E2E budget).
+    reranker_timeout_secs: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1404,6 +1419,12 @@ async fn status_handler(
             .vector_search_mode
             .as_str()
             .to_string(),
+        search_policy: SearchPolicyStatus {
+            query_deadline_secs: config.api.search_query_deadline_secs,
+            db_deadline_secs: config.api.search_db_deadline_secs,
+            embed_deadline_secs: config.embed.retry.search_deadline_secs,
+            reranker_timeout_secs: config.search.reranker.timeout_secs,
+        },
         embedder_circuit: vector_search_circuit.into(),
         queue_stats: queue_stats_report,
         hook_admission: crate::hook_diagnostics::hook_admission_stats(

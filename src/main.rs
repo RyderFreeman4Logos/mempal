@@ -7592,7 +7592,7 @@ fn cli_search_rerank_deadline(config: &Config) -> std::time::Duration {
         .search
         .reranker
         .timeout_secs
-        .min(config.api.search_db_deadline_secs)
+        .min(config.api.search_query_deadline_secs)
         .max(1);
     std::time::Duration::from_secs(deadline_secs)
 }

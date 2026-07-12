@@ -35,12 +35,13 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
-- **Hermes/REST search**: propagate an 8-second caller budget and correlation
-  ID through one daemon-wide search deadline, reserve time for BM25 and
-  original-ranking fallbacks, return redacted stage/boundary metadata, and
-  expose aggregate timeout/fallback telemetry instead of allowing serial
-  hybrid and reranker deadlines to outlive the tool call (#711).
-- **REST search**: when `bm25_fallback` is disabled, embedding timeout/exhausted
+- **Hermes/REST search**: end-to-end query deadline defaults to ~4 minutes
+  (`api.search_query_deadline_secs = 240`), is hot-reloadable without a hard
+  ceiling, is snapshotted at query admission, and is shared as remaining budget
+  across embedding/DB/rerank/fallback. Hermes transport discovers the daemon
+  policy via `/api/status` so transport does not opaque-timeout before the
+  daemon deadline; stage defaults no longer truncate local models at 30s (#711).
+- **Hermes/REST search**: when `bm25_fallback` is disabled, embedding timeout/exhausted
   primary budget and hybrid DB timeout again return `504 Gateway Timeout`
   instead of `200 []`, restoring the historical REST contract so backend
   failure is not indistinguishable from zero hits (#711).

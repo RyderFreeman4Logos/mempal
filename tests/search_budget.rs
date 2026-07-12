@@ -30,11 +30,12 @@ struct TestEnv {
 
 impl TestEnv {
     fn new(config_suffix: &str) -> Self {
-        Self::with_options(true, 30, config_suffix)
+        Self::with_options(true, 30, 30, config_suffix)
     }
 
     fn with_options(
         bm25_fallback: bool,
+        search_query_deadline_secs: u64,
         search_db_deadline_secs: u64,
         config_suffix: &str,
     ) -> Self {
@@ -58,6 +59,7 @@ bm25_fallback = {bm25_fallback}
 search_deadline_secs = 30
 
 [api]
+search_query_deadline_secs = {search_query_deadline_secs}
 search_db_deadline_secs = {search_db_deadline_secs}
 {config_suffix}
 "#,
@@ -71,6 +73,11 @@ search_db_deadline_secs = {search_db_deadline_secs}
             db_path,
             config_path,
         }
+    }
+
+    fn rewrite_and_reload(&self, content: &str) {
+        fs::write(&self.config_path, content).expect("rewrite config");
+        ConfigHandle::harness_reload_from_path(&self.config_path);
     }
 
     fn db(&self) -> Database {
@@ -261,7 +268,7 @@ async fn slow_embedder_uses_bm25_within_single_caller_budget() {
 #[tokio::test]
 async fn embedding_timeout_without_bm25_fallback_returns_gateway_timeout() {
     let _guard = TEST_LOCK.lock().await;
-    let env = TestEnv::with_options(false, 30, "");
+    let env = TestEnv::with_options(false, 30, 30, "");
     insert_search_drawer(
         &env.db(),
         "drawer_embed_timeout_no_fallback",
@@ -290,7 +297,7 @@ async fn embedding_timeout_without_bm25_fallback_returns_gateway_timeout() {
 #[tokio::test]
 async fn hybrid_db_timeout_without_bm25_fallback_returns_gateway_timeout() {
     let _guard = TEST_LOCK.lock().await;
-    let env = TestEnv::with_options(false, 1, "");
+    let env = TestEnv::with_options(false, 30, 1, "");
     insert_search_drawer(
         &env.db(),
         "drawer_hybrid_timeout_no_fallback",
@@ -394,4 +401,172 @@ top_k = 50
         assert_eq!(telemetry.stage_timeout_counts.get("rerank"), Some(&1));
         assert_eq!(telemetry.fallback_counts.get("original_ranking"), Some(&1));
     }
+}
+
+#[tokio::test]
+async fn default_query_deadline_is_around_four_minutes_not_a_hard_ceiling() {
+    let _guard = TEST_LOCK.lock().await;
+    // Explicit defaults matching production defaults: ~240s E2E, not a fixed max.
+    let env = TestEnv::with_options(true, 240, 240, "");
+    insert_search_drawer(
+        &env.db(),
+        "drawer_default_deadline",
+        "alpha durable preference",
+        4,
+    );
+    let state = env.state(Arc::new(FailingEmbedderFactory));
+    let (status, headers, _body) = get_json(
+        state,
+        "/api/search?q=alpha&scope=global&top_k=5&correlation_id=default-deadline",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let metadata = search_metadata(&headers);
+    assert_eq!(metadata["deadline_ms"], 240_000);
+    assert_eq!(metadata["correlation_id"], "default-deadline");
+
+    let (status_code, _status_headers, status_body) =
+        get_json(env.state(Arc::new(FailingEmbedderFactory)), "/api/status").await;
+    assert_eq!(status_code, StatusCode::OK);
+    assert_eq!(status_body["search_policy"]["query_deadline_secs"], 240);
+    // 240s is a default, not a hard ceiling: longer values remain configurable.
+    assert!(
+        ConfigHandle::current().api.search_query_deadline_secs <= 10_000,
+        "query deadline must remain operator-configurable without a hidden hard max"
+    );
+}
+
+#[tokio::test]
+async fn configured_query_deadline_above_four_minutes_is_honored() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::with_options(true, 600, 600, "");
+    insert_search_drawer(
+        &env.db(),
+        "drawer_long_deadline",
+        "alpha durable preference",
+        4,
+    );
+    let state = env.state(Arc::new(FailingEmbedderFactory));
+    let (status, headers, _body) = get_json(
+        state,
+        "/api/search?q=alpha&scope=global&top_k=5&correlation_id=long-deadline",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let metadata = search_metadata(&headers);
+    assert_eq!(metadata["deadline_ms"], 600_000);
+    assert_ne!(metadata["deadline_ms"], 240_000);
+}
+
+#[tokio::test]
+async fn shorter_caller_deadline_wins_and_cannot_exceed_configured() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::with_options(true, 240, 240, "");
+    insert_search_drawer(
+        &env.db(),
+        "drawer_caller_deadline",
+        "alpha durable preference",
+        4,
+    );
+    let state = env.state(Arc::new(FailingEmbedderFactory));
+
+    let (status, headers, _body) = get_json(
+        state.clone(),
+        "/api/search?q=alpha&scope=global&top_k=5&deadline_ms=1500&correlation_id=short-caller",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let metadata = search_metadata(&headers);
+    assert_eq!(metadata["deadline_ms"], 1_500);
+
+    let (status, headers, _body) = get_json(
+        state,
+        "/api/search?q=alpha&scope=global&top_k=5&deadline_ms=999999&correlation_id=long-caller",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let metadata = search_metadata(&headers);
+    assert_eq!(metadata["deadline_ms"], 240_000);
+}
+
+#[tokio::test]
+async fn hot_reload_changes_subsequent_query_deadline_only() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::with_options(true, 120, 120, "");
+    insert_search_drawer(
+        &env.db(),
+        "drawer_hot_reload_deadline",
+        "alpha durable preference",
+        4,
+    );
+    let state = env.state(Arc::new(FailingEmbedderFactory));
+    let (status, headers, _body) = get_json(
+        state.clone(),
+        "/api/search?q=alpha&scope=global&top_k=5&correlation_id=before-reload",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(search_metadata(&headers)["deadline_ms"], 120_000);
+
+    let reloaded = format!(
+        r#"
+db_path = "{}"
+
+[config_hot_reload]
+enabled = false
+
+[search]
+bm25_fallback = true
+
+[embed.retry]
+search_deadline_secs = 30
+
+[api]
+search_query_deadline_secs = 480
+search_db_deadline_secs = 480
+"#,
+        env.db_path.display()
+    );
+    env.rewrite_and_reload(&reloaded);
+
+    let (status, headers, _body) = get_json(
+        state,
+        "/api/search?q=alpha&scope=global&top_k=5&correlation_id=after-reload",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(search_metadata(&headers)["deadline_ms"], 480_000);
+}
+
+#[tokio::test]
+async fn stages_share_remaining_budget_without_serial_timeout_addition() {
+    let _guard = TEST_LOCK.lock().await;
+    // Total E2E budget 2s; slow embed would take 5s alone. Shared budget forces
+    // BM25 fallback well under the sum of independent stage timeouts.
+    let env = TestEnv::with_options(true, 2, 2, "");
+    insert_search_drawer(
+        &env.db(),
+        "drawer_shared_budget",
+        "alpha exact durable preference",
+        4,
+    );
+    let state = env.state(Arc::new(SlowEmbedderFactory));
+    let started = StdInstant::now();
+    let (status, headers, body) = get_json(
+        state,
+        "/api/search?q=alpha&scope=global&top_k=5&correlation_id=shared-budget",
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "shared budget must not serialize independent full stage timeouts; elapsed={elapsed:?}"
+    );
+    let results = body.as_array().expect("search result array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["search_mode"], "bm25_only");
+    let metadata = search_metadata(&headers);
+    assert_eq!(metadata["deadline_ms"], 2_000);
+    assert_eq!(metadata["fallback_used"], json!(["bm25"]));
 }

@@ -1027,7 +1027,8 @@ For daemon profiles, configure the REST address in `~/.mempal/config.toml`:
 [api]
 enabled = true
 addr = "127.0.0.1:3080"
-search_db_deadline_secs = 30
+search_query_deadline_secs = 240
+search_db_deadline_secs = 240
 ```
 
 If you run multiple mempal daemons, assign each profile a different loopback
@@ -1035,13 +1036,11 @@ port such as `127.0.0.1:3081`. `mempal doctor rest` reports whether the binary
 has REST support, whether the endpoint is reachable, which required routes are
 present, and which process owns the configured port when there is a collision.
 
-REST search runs inside the daemon process and uses the daemon-owned async
-database pool. Explicit full-corpus searches should use `scope=global` (or
-`scope=all_projects`) and remain bounded by `api.search_db_deadline_secs`: if a
-database stage exceeds the deadline, the response returns partial/fallback
-results with `mempal-warnings` and `search-mode` headers instead of hanging.
-Automatic hooks and Hermes provider prefetches should continue to pass
-project/profile filters and avoid implicit global searches.
+REST search shares one E2E deadline (`api.search_query_deadline_secs`, ~4m
+default, hot-reloadable) across routing/embedding/DB/fallback/rerank; stages
+use remaining budget, not stacked timeouts. Over-budget stages return
+partial/fallback results with `mempal-warnings` and `search-mode`. Hooks and
+Hermes prefetches should keep project filters and avoid implicit global search.
 
 Endpoints:
 

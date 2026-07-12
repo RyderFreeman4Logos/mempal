@@ -32,7 +32,7 @@ const DEFAULT_LLM_RETRY_INTERVAL_SECS: u64 = 2;
 const DEFAULT_LLM_MAX_CONCURRENT: usize = 16;
 const DEFAULT_LLM_ENDPOINT_PRIORITY: i32 = 0;
 const DEFAULT_MEMORY_INTELLIGENCE_TIMEOUT_SECS: u64 = 1800;
-const DEFAULT_SEARCH_DEADLINE_SECS: u64 = 30;
+const DEFAULT_SEARCH_DEADLINE_SECS: u64 = 240;
 const DEFAULT_SEARCH_PREVIEW_CHARS: usize = 120;
 const DEFAULT_SEARCH_TUNNEL_FANOUT_CAP: usize = 5;
 const DEFAULT_SEARCH_TUNNEL_HINTS_DISPLAY_CAP: usize = 8;
@@ -42,7 +42,7 @@ const DEFAULT_SEARCH_DECAY_HALF_LIFE_DAYS: u64 = 90;
 const DEFAULT_SEARCH_DECAY_STEP_FULL_DAYS: u64 = 30;
 const DEFAULT_SEARCH_DECAY_STEP_REDUCED_WEIGHT: f64 = 0.5;
 const DEFAULT_SEARCH_BM25_FALLBACK: bool = true;
-const DEFAULT_SEARCH_RERANKER_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_SEARCH_RERANKER_TIMEOUT_SECS: u64 = 240;
 const DEFAULT_SEARCH_RERANKER_TOP_K: usize = 50;
 const DEFAULT_TURN_STORAGE_MODE: TurnStorageMode = TurnStorageMode::RawEvidence;
 const DEFAULT_TURN_IMPORTANCE: i32 = 0;
@@ -59,7 +59,8 @@ const DEFAULT_SESSION_REVIEW_MIN_LENGTH: usize = 100;
 const DEFAULT_SESSION_REVIEW_TRAILING_MESSAGES: usize = 1;
 const DEFAULT_API_WRITE_QUEUE_CAPACITY: usize = 1_000;
 const DEFAULT_API_WRITE_DRAIN_TIMEOUT_SECS: u64 = 30;
-const DEFAULT_API_SEARCH_DB_DEADLINE_SECS: u64 = 30;
+const DEFAULT_API_SEARCH_QUERY_DEADLINE_SECS: u64 = 240;
+const DEFAULT_API_SEARCH_DB_DEADLINE_SECS: u64 = 240;
 const DEFAULT_HOTPATCH_MIN_IMPORTANCE_STARS: i32 = 4;
 const DEFAULT_HOTPATCH_MAX_SUGGESTION_LENGTH: usize = 80;
 const DEFAULT_IMPORTANCE_DECAY_RATE: f64 = 0.01;
@@ -336,9 +337,9 @@ impl Config {
                 "api.write_drain_timeout_secs must be greater than 0".to_string(),
             ));
         }
-        if self.api.search_db_deadline_secs == 0 {
+        if self.api.search_query_deadline_secs == 0 || self.api.search_db_deadline_secs == 0 {
             return Err(ConfigError::InvalidConfig(
-                "api.search_db_deadline_secs must be greater than 0".to_string(),
+                "api search deadlines must be greater than 0".to_string(),
             ));
         }
         if !(0..=5).contains(&self.turns.default_importance) {
@@ -1309,17 +1310,11 @@ impl Default for HooksSessionEndConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ApiConfig {
-    /// Start the REST API server automatically when the daemon starts.
-    /// Requires the binary to be built with `--features rest`.
     pub enabled: bool,
-    /// Address to bind the REST API server on.
     pub addr: String,
-    /// Maximum number of pending REST write requests before new writes get 503.
     pub write_queue_capacity: usize,
-    /// Maximum time to wait for queued REST writes during graceful shutdown.
     pub write_drain_timeout_secs: u64,
-    /// Maximum time a REST search may spend in synchronous database work before
-    /// returning a partial/fallback response.
+    pub search_query_deadline_secs: u64,
     pub search_db_deadline_secs: u64,
 }
 
@@ -1330,6 +1325,7 @@ impl Default for ApiConfig {
             addr: "127.0.0.1:3080".to_string(),
             write_queue_capacity: DEFAULT_API_WRITE_QUEUE_CAPACITY,
             write_drain_timeout_secs: DEFAULT_API_WRITE_DRAIN_TIMEOUT_SECS,
+            search_query_deadline_secs: DEFAULT_API_SEARCH_QUERY_DEADLINE_SECS,
             search_db_deadline_secs: DEFAULT_API_SEARCH_DB_DEADLINE_SECS,
         }
     }

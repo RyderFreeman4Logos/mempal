@@ -86,6 +86,10 @@ struct SearchExecution {
     state: ApiState,
     telemetry: super::state::SearchTelemetryGuard,
     budget: SearchBudget,
+    /// Admission-time DB stage cap (remaining E2E budget still wins).
+    db_stage_deadline: Duration,
+    /// Admission-time rerank stage cap (remaining E2E budget still wins).
+    rerank_stage_deadline: Duration,
     correlation_id: String,
     query: SearchQuery,
     route: RouteDecision,
@@ -107,8 +111,13 @@ pub(super) async fn search_handler(
     headers: HeaderMap,
     Query(query): Query<SearchQuery>,
 ) -> Result<Response, ApiError> {
+    // Snapshot config at admission so hot-reload affects only subsequent queries.
     let config = ConfigHandle::current();
-    let total_deadline = caller_deadline(&query, config.api.search_db_deadline_secs)?;
+    let query_deadline_secs = config.api.search_query_deadline_secs;
+    let db_stage_deadline = Duration::from_secs(config.api.search_db_deadline_secs);
+    let embed_stage_deadline = Duration::from_secs(config.embed.retry.search_deadline_secs);
+    let rerank_stage_deadline = Duration::from_secs(config.search.reranker.timeout_secs);
+    let total_deadline = caller_deadline(&query, query_deadline_secs)?;
     let budget = SearchBudget::new(total_deadline);
     let correlation_id = safe_correlation_id(query.correlation_id.as_deref());
     let (scope, scope_label) = resolve_api_search_scope(&query, config.as_ref())?;
@@ -118,7 +127,6 @@ pub(super) async fn search_handler(
         ..SearchOptions::default()
     };
     let top_k = query.top_k.unwrap_or(10);
-    let db_deadline = Duration::from_secs(config.api.search_db_deadline_secs);
     let telemetry = state.search_telemetry().start(
         search_client_from_headers(&headers),
         scope_label,
@@ -134,7 +142,7 @@ pub(super) async fn search_handler(
 
     telemetry.set_stage(SearchTelemetryStage::Routing.as_str());
     let route_started = Instant::now();
-    let route_limit = budget.route_limit(db_deadline);
+    let route_limit = budget.route_limit(db_stage_deadline);
     let route = resolve_route_bounded(&state, &query, search_mode, route_limit).await?;
     route_elapsed += Instant::now().saturating_duration_since(route_started);
     let route = match route {
@@ -161,9 +169,7 @@ pub(super) async fn search_handler(
     } else {
         telemetry.set_stage(SearchTelemetryStage::Embedding.as_str());
         let embed_started = Instant::now();
-        let embed_limit = budget.primary_limit(Duration::from_secs(
-            vector_search_circuit.search_deadline_secs,
-        ));
+        let embed_limit = budget.primary_limit(embed_stage_deadline);
         let embed_result = if embed_limit.is_zero() {
             None
         } else {
@@ -218,6 +224,8 @@ pub(super) async fn search_handler(
         state,
         telemetry,
         budget,
+        db_stage_deadline,
+        rerank_stage_deadline,
         correlation_id,
         query,
         route,
@@ -241,6 +249,8 @@ async fn finish_search(execution: SearchExecution) -> Result<Response, ApiError>
         state,
         telemetry,
         budget,
+        db_stage_deadline,
+        rerank_stage_deadline,
         correlation_id,
         query,
         route,
@@ -256,13 +266,12 @@ async fn finish_search(execution: SearchExecution) -> Result<Response, ApiError>
         query_vector,
         bm25_fallback_enabled,
     } = execution;
-    let config = ConfigHandle::current();
-    let db_deadline = Duration::from_secs(config.api.search_db_deadline_secs);
+    // Use admission-time stage caps only — do not re-read hot-reloaded config.
     let mut results = Vec::new();
     if let Some(query_vector) = query_vector {
         telemetry.set_stage(SearchTelemetryStage::HybridDb.as_str());
         let search_started = Instant::now();
-        let hybrid_limit = budget.primary_limit(db_deadline);
+        let hybrid_limit = budget.primary_limit(db_stage_deadline);
         let hybrid = run_hybrid_search_bounded(
             &state,
             RestHybridSearchRequest {
@@ -299,7 +308,7 @@ async fn finish_search(execution: SearchExecution) -> Result<Response, ApiError>
                         scope,
                         search_options,
                         top_k,
-                        deadline: budget.fallback_limit(db_deadline),
+                        deadline: budget.fallback_limit(db_stage_deadline),
                         stage: SearchTelemetryStage::Bm25FallbackDb,
                         search_mode: SearchMode::Bm25Only,
                     },
@@ -324,7 +333,7 @@ async fn finish_search(execution: SearchExecution) -> Result<Response, ApiError>
                         scope,
                         search_options,
                         top_k,
-                        deadline: budget.fallback_limit(db_deadline),
+                        deadline: budget.fallback_limit(db_stage_deadline),
                         stage: SearchTelemetryStage::Bm25FallbackDb,
                         search_mode: SearchMode::Bm25Only,
                     },
@@ -346,7 +355,7 @@ async fn finish_search(execution: SearchExecution) -> Result<Response, ApiError>
     } else {
         telemetry.set_stage(SearchTelemetryStage::Bm25Db.as_str());
         let bm25_started = Instant::now();
-        let bm25_limit = budget.fallback_limit(db_deadline);
+        let bm25_limit = budget.fallback_limit(db_stage_deadline);
         let outcome = run_rest_bm25_search_bounded(
             &state,
             RestBm25SearchRequest {
@@ -375,7 +384,8 @@ async fn finish_search(execution: SearchExecution) -> Result<Response, ApiError>
     telemetry.set_stage(SearchTelemetryStage::Rerank.as_str());
     let rerank_started = Instant::now();
     if !results.is_empty() {
-        let rerank_limit = budget.remaining();
+        // Final stage: remaining shared E2E budget capped by admission-time stage timeout.
+        let rerank_limit = rerank_stage_deadline.min(budget.remaining());
         let original_results = results.clone();
         let rerank = if rerank_limit.is_zero() {
             None
@@ -580,8 +590,11 @@ fn rest_search_read_telemetry(
     .with_search_mode(search_mode.as_str())
 }
 
-fn caller_deadline(query: &SearchQuery, configured_secs: u64) -> Result<Duration, ApiError> {
-    let configured = Duration::from_secs(configured_secs);
+fn caller_deadline(
+    query: &SearchQuery,
+    configured_query_deadline_secs: u64,
+) -> Result<Duration, ApiError> {
+    let configured = Duration::from_secs(configured_query_deadline_secs);
     let Some(deadline_ms) = query.deadline_ms else {
         return Ok(configured);
     };
@@ -595,6 +608,7 @@ fn caller_deadline(query: &SearchQuery, configured_secs: u64) -> Result<Duration
             ),
         ));
     }
+    // Shorter caller deadline wins; callers cannot bypass the configured ceiling.
     Ok(requested.min(configured))
 }
 
