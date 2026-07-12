@@ -1313,11 +1313,6 @@ def _mcp_tool_with_hard_timeout(
     def _alarm_handler(signum: int, frame: Any) -> None:
         nonlocal hard_timed_out
         hard_timed_out = True
-        client._hard_killed = True
-        try:
-            client.proc.kill()
-        except Exception:
-            pass
         raise TimeoutError(f'MCP tool {tool_name} hard timeout after {timeout}s')
 
     signal.signal(signal.SIGALRM, _alarm_handler)
@@ -1516,7 +1511,14 @@ def mcp_start_initialized() -> McpClient:
         client.notify('notifications/initialized')
         return client
     except BaseException:
-        client.close()
+        try:
+            client.close()
+        except Exception:
+            pass
+        try:
+            terminate_and_reap_owned_mcp_children(timeout=5.0)
+        except Exception:
+            pass
         raise
 
 

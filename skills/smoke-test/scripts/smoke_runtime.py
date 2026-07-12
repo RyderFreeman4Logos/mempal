@@ -20,12 +20,15 @@ from typing import Any, Callable, MutableMapping
 MAX_CLEANUP_DRAWER_IDS = 1024
 MAX_CLEANUP_DRAWER_ID_BYTES = 512
 MAX_CLEANUP_MANIFEST_BYTES = 256 * 1024
+MAX_MCP_RESPONSE_BYTES = 1024 * 1024
+_MCP_READ_CHUNK_BYTES = 64 * 1024
 
 __all__ = [
     "CleanupManifest",
     "MAX_CLEANUP_DRAWER_IDS",
     "MAX_CLEANUP_DRAWER_ID_BYTES",
     "MAX_CLEANUP_MANIFEST_BYTES",
+    "MAX_MCP_RESPONSE_BYTES",
     "McpClient",
     "OwnedSubprocessRegistry",
     "finalize_cleanup_manifest",
@@ -211,11 +214,15 @@ class McpClient:
             bufsize=1,
         )
         registry.register(self.proc, "mcp_stdio")
+        if self.proc.stdout is None:
+            raise RuntimeError("mcp stdout unavailable")
+        self._stdout_fd = self.proc.stdout.fileno()
+        os.set_blocking(self._stdout_fd, False)
+        self._response_buffer = bytearray()
         self.proc_io_before = read_proc_io(self.proc.pid)
         self.next_id = 1
         self._closed = False
         self._close_result = False
-        self._hard_killed = False
 
     def __del__(self) -> None:
         stderr_file = getattr(self, "stderr_file", None)
@@ -235,7 +242,7 @@ class McpClient:
         self,
         method: str,
         params: dict[str, Any] | None = None,
-        timeout: int = 120,
+        timeout: float = 120,
     ) -> dict[str, Any]:
         message_id = self.next_id
         self.next_id += 1
@@ -255,28 +262,52 @@ class McpClient:
             message["params"] = params
         self.send(message)
 
-    def read_response(self, message_id: int, timeout: int) -> dict[str, Any]:
-        if self.proc.stdout is None:
-            raise RuntimeError("mcp stdout unavailable")
+    def read_response(self, message_id: int, timeout: float) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            remaining = max(0.1, deadline - time.monotonic())
-            ready, _, _ = select.select([self.proc.stdout], [], [], remaining)
+        while True:
+            response = self._take_buffered_response(message_id)
+            if response is not None:
+                return response
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"mcp response timeout for {message_id}")
+            ready, _, _ = select.select([self._stdout_fd], [], [], remaining)
             if not ready:
                 continue
-            line = self.proc.stdout.readline()
-            if not line:
+            try:
+                chunk = os.read(self._stdout_fd, _MCP_READ_CHUNK_BYTES)
+            except BlockingIOError:
+                continue
+            if not chunk:
                 raise RuntimeError("mcp eof")
+            self._response_buffer.extend(chunk)
+
+    def _take_buffered_response(self, message_id: int) -> dict[str, Any] | None:
+        while True:
+            newline_index = self._response_buffer.find(b"\n")
+            if newline_index < 0:
+                if len(self._response_buffer) > MAX_MCP_RESPONSE_BYTES:
+                    raise ValueError(
+                        f"mcp response exceeds {MAX_MCP_RESPONSE_BYTES} bytes"
+                    )
+                return None
+            if newline_index > MAX_MCP_RESPONSE_BYTES:
+                raise ValueError(f"mcp response exceeds {MAX_MCP_RESPONSE_BYTES} bytes")
+            line = bytes(self._response_buffer[:newline_index])
+            del self._response_buffer[: newline_index + 1]
+            if not line:
+                continue
             message = json.loads(line)
+            if not isinstance(message, dict):
+                raise ValueError("mcp response must be a JSON object")
             if message.get("id") == message_id:
                 return message
-        raise TimeoutError(f"mcp response timeout for {message_id}")
 
     def tool(
         self,
         name: str,
         arguments: dict[str, Any],
-        timeout: int = 120,
+        timeout: float = 120,
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         started_at = time.monotonic()
         try:
@@ -308,7 +339,8 @@ class McpClient:
         if self._closed:
             return self._close_result
         self._closed = True
-        killed = self._hard_killed
+        killed = False
+        reaped = False
         try:
             self.notify("notifications/exit")
         except Exception:
@@ -319,48 +351,41 @@ class McpClient:
         except OSError:
             pass
         proc_io_after = self._read_proc_io(self.proc.pid)
-        try:
-            self.proc.wait(timeout=1)
-        except subprocess.TimeoutExpired:
+        reaped = _wait_for_reap(self.proc, timeout=1)
+        if not reaped:
             try:
                 self.proc.terminate()
-            except ProcessLookupError:
+            except OSError:
                 pass
+            reaped = _wait_for_reap(self.proc, timeout=1)
+        if not reaped:
             try:
-                self.proc.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                try:
-                    killed = True
-                    self.proc.kill()
-                except ProcessLookupError:
-                    pass
-                try:
-                    self.proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-        except (ChildProcessError, OSError):
-            pass
+                self.proc.kill()
+                killed = True
+            except OSError:
+                pass
+            reaped = _wait_for_reap(self.proc, timeout=5)
         proc_io_after = proc_io_after or self._read_proc_io(self.proc.pid)
         self._record_proc_io_delta(
             "mcp_stdio_child_processes", self.proc_io_before, proc_io_after
         )
-        self._record_lifecycle(killed)
+        self._record_lifecycle(killed, reaped)
         try:
             self.stderr_file.close()
         except OSError:
             pass
         _close_process_streams(self.proc)
-        if self.proc.returncode is not None:
+        if reaped:
             self._registry.unregister(self.proc)
-        self._close_result = self.proc.returncode is not None
+        self._close_result = reaped
         return self._close_result
 
-    def _record_lifecycle(self, killed: bool) -> None:
+    def _record_lifecycle(self, killed: bool, reaped: bool) -> None:
         receipt = self._lifecycle_receipt
         receipt["process_count"] = int(receipt.get("process_count", 0)) + 1
         roles = receipt.setdefault("roles", {})
         roles["mcp_stdio"] = int(roles.get("mcp_stdio", 0)) + 1
-        if self.proc.returncode is not None:
+        if reaped:
             receipt["exited_count"] = int(receipt.get("exited_count", 0)) + 1
         else:
             receipt.setdefault("exited_count", 0)
@@ -385,26 +410,23 @@ def terminate_and_reap_owned_processes(
     deadline = time.monotonic() + max(timeout, 0.0)
 
     for process_id, process in list(registry.items()):
+        reaped = False
         if process.poll() is None:
             try:
                 process.terminate()
-            except ProcessLookupError:
+            except OSError:
                 pass
         remaining = max(0.0, deadline - time.monotonic())
-        try:
-            process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired:
+        reaped = _wait_for_reap(process, timeout=remaining)
+        if not reaped:
             try:
                 process.kill()
                 killed_count += 1
-            except ProcessLookupError:
+            except OSError:
                 pass
-            try:
-                process.wait(timeout=max(timeout, 0.1))
-            except subprocess.TimeoutExpired:
-                continue
-        except (ChildProcessError, OSError):
-            pass
+            reaped = _wait_for_reap(process, timeout=max(timeout, 0.1))
+        if not reaped:
+            continue
         _close_process_streams(process)
         registry.pop(process_id, None)
         reaped_count += 1
@@ -415,6 +437,14 @@ def terminate_and_reap_owned_processes(
         "remaining_count": len(registry),
         "killed_count": killed_count,
     }
+
+
+def _wait_for_reap(process: subprocess.Popen[Any], timeout: float) -> bool:
+    try:
+        process.wait(timeout=timeout)
+    except (subprocess.TimeoutExpired, ChildProcessError, OSError):
+        return False
+    return True
 
 
 def _close_process_streams(process: subprocess.Popen[Any]) -> None:

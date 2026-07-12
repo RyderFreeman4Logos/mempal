@@ -13,7 +13,7 @@ current cleanup-safe IDs in a mode-`0600` file under `/tmp`. The manifest contai
 only IDs returned by the current run; it never contains marker text, requests,
 responses, or memory content. Verified cleanup removes IDs from the manifest and
 deletes the file when no IDs remain. On failure with unresolved IDs, the final JSON
-reports `cleanup_manifest_path` without copying any IDs into diagnostics. Resume
+reports `cleanup_manifest_path` plus `cleanup_pending_count` without copying any IDs into diagnostics. Resume
 cleanup only from that exact manifest; never reconstruct authority from search.
 
 ## Reversible CLI CRUD outline

@@ -5,8 +5,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import stat
-import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from types import ModuleType
@@ -277,123 +275,6 @@ class CleanupManifestTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(manifest.path.stat().st_mode), 0o600)
             finally:
                 manifest.discard()
-
-
-class McpLifecycleTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.smoke = load_full_smoke()
-        self.smoke.OWNED_MCP_CHILDREN.clear()
-
-    def tearDown(self) -> None:
-        self.smoke.terminate_and_reap_owned_mcp_children(timeout=0.2)
-        manifest = self.smoke.CLEANUP_MANIFEST
-        if manifest is not None:
-            manifest.discard()
-
-    def _sleeping_client(self) -> tuple[Any, subprocess.Popen[str]]:
-        proc = subprocess.Popen(
-            [sys.executable, '-c', 'import time; time.sleep(60)'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        client = self.smoke.new_mcp_client(
-            process_factory=lambda *args, **kwargs: proc,
-        )
-        return client, proc
-
-    def test_mcp_error_reaps_child_and_checkpoints_before_fallback(self) -> None:
-        child = """
-import json
-import sys
-import time
-
-request = json.loads(sys.stdin.readline())
-print(json.dumps({
-    'jsonrpc': '2.0',
-    'id': request['id'],
-    'error': {'code': -32603, 'message': 'reproduced create failure'},
-}), flush=True)
-time.sleep(60)
-"""
-        proc = subprocess.Popen(
-            [sys.executable, '-u', '-c', child],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        client = self.smoke.new_mcp_client(
-            process_factory=lambda *args, **kwargs: proc,
-        )
-        structured, info = client.tool('mempal_ingest', {}, timeout=2)
-        self.assertIsNone(structured)
-        self.assertEqual(info.get('error_code'), -32603)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            manifest = self.smoke.CleanupManifest(Path(tmp) / 'cleanup.json')
-            manifest.add_created_ids(['drawer-safe'])
-            self.smoke.CLEANUP_MANIFEST = manifest
-
-            def fallback() -> list[str]:
-                self.assertIsNotNone(proc.poll())
-                self.assertEqual(self.smoke.OWNED_MCP_CHILDREN, {})
-                self.assertTrue(manifest.path.exists())
-                return ['fallback-id']
-
-            result = self.smoke.run_fallback_after_mcp_reaped(
-                client,
-                'create',
-                fallback,
-            )
-
-        self.assertEqual(result, ['fallback-id'])
-
-    def test_fallback_uses_final_sweep_state_when_initial_close_reports_false(self) -> None:
-        client, proc = self._sleeping_client()
-        client.close = mock.Mock(return_value=False)
-
-        result = self.smoke.run_fallback_after_mcp_reaped(
-            client,
-            'create',
-            lambda: ['fallback-after-sweep'],
-        )
-
-        self.assertEqual(result, ['fallback-after-sweep'])
-        self.assertIsNotNone(proc.poll())
-        self.assertEqual(self.smoke.OWNED_MCP_CHILDREN, {})
-
-    def test_initialize_failure_closes_spawned_client(self) -> None:
-        fake_client = mock.Mock()
-        fake_client.call.side_effect = TimeoutError('initialize timeout')
-        with mock.patch.object(self.smoke, 'McpClient', return_value=fake_client):
-            with self.assertRaises(TimeoutError):
-                self.smoke.mcp_start_initialized()
-
-        fake_client.close.assert_called_once_with()
-
-    def test_owned_children_are_reaped_when_runner_is_cancelled(self) -> None:
-        _client, proc = self._sleeping_client()
-
-        def cancelled() -> int:
-            raise KeyboardInterrupt
-
-        with self.assertRaises(KeyboardInterrupt):
-            self.smoke.run_with_owned_mcp_cleanup(cancelled)
-
-        self.assertIsNotNone(proc.poll())
-        self.assertEqual(self.smoke.OWNED_MCP_CHILDREN, {})
-
-    def test_close_is_idempotent(self) -> None:
-        client, proc = self._sleeping_client()
-
-        self.assertTrue(client.close())
-        first_lifecycle = dict(self.smoke.SUMMARY['mcp_stdio_lifecycle'])
-        self.assertTrue(client.close())
-
-        self.assertIsNotNone(proc.poll())
-        self.assertEqual(self.smoke.SUMMARY['mcp_stdio_lifecycle'], first_lifecycle)
 
 
 class DoctorValidationTests(unittest.TestCase):

@@ -107,7 +107,7 @@ Never downgrade a failed CRUD path to pass because another surface worked. Repor
 - [ ] MCP CRUD passes or is explicitly skipped/unavailable; failures are not hidden by CLI success.
 - [ ] **MCP ingest external-fallback count is reported as a degradation signal.** The legacy `mcp_ingest_fallback_to_cli` key counts both CLI operation-wait recovery and REST fallback; non-zero means MCP ingest did not return cleanup IDs directly.
 - [ ] **Every MCP write fallback runs only after every runner-owned MCP stdio child is closed and reaped.** A surviving owned holder blocks fallback and fails the run.
-- [ ] **Unresolved exact cleanup IDs remain in a mode-`0600` atomic `/tmp` manifest.** Failure JSON reports only `cleanup_manifest_path`; verified cleanup removes the file.
+- [ ] **Unresolved exact cleanup IDs remain in a mode-`0600` atomic `/tmp` manifest.** Failure JSON reports only `cleanup_manifest_path` and `cleanup_pending_count`; verified cleanup removes the file.
 - [ ] REST/MCP checks do not leave extra processes or DB holders.
 - [ ] Memory/I/O before/after is summarized aggregate-only.
 - [ ] Worktree remains clean except intentional skill/code changes.
