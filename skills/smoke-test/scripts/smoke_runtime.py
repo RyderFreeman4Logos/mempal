@@ -17,6 +17,22 @@ from pathlib import Path
 from typing import Any, Callable, MutableMapping
 
 
+MAX_CLEANUP_DRAWER_IDS = 1024
+MAX_CLEANUP_DRAWER_ID_BYTES = 512
+MAX_CLEANUP_MANIFEST_BYTES = 256 * 1024
+
+__all__ = [
+    "CleanupManifest",
+    "MAX_CLEANUP_DRAWER_IDS",
+    "MAX_CLEANUP_DRAWER_ID_BYTES",
+    "MAX_CLEANUP_MANIFEST_BYTES",
+    "McpClient",
+    "OwnedSubprocessRegistry",
+    "finalize_cleanup_manifest",
+    "terminate_and_reap_owned_processes",
+]
+
+
 class CleanupManifest:
     """Persist only cleanup-authorized drawer IDs using atomic replacement."""
 
@@ -33,6 +49,10 @@ class CleanupManifest:
 
     def checkpoint(self) -> None:
         """Atomically persist the current cleanup receipt with mode 0600."""
+        self._checkpoint(self._pending)
+
+    def _checkpoint(self, pending: list[str]) -> None:
+        serialized = self._serialize(pending)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path: Path | None = None
         try:
@@ -45,28 +65,40 @@ class CleanupManifest:
             ) as handle:
                 temporary_path = Path(handle.name)
                 os.chmod(handle.fileno(), 0o600)
-                json.dump({"cleanup_drawer_ids": self._pending}, handle, sort_keys=True)
-                handle.write("\n")
+                handle.write(serialized)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary_path, self.path)
-            os.chmod(self.path, 0o600)
+            self._pending = list(pending)
             self._fsync_parent()
         finally:
             if temporary_path is not None and temporary_path.exists():
                 temporary_path.unlink()
 
     def add_created_ids(self, drawer_ids: list[str]) -> None:
+        pending = list(self._pending)
         for drawer_id in drawer_ids:
-            if drawer_id and drawer_id not in self._pending:
-                self._pending.append(drawer_id)
-        self.checkpoint()
+            if not isinstance(drawer_id, str):
+                raise ValueError("cleanup drawer IDs must be strings")
+            drawer_id_bytes = len(drawer_id.encode("utf-8"))
+            if drawer_id_bytes == 0 or drawer_id_bytes > MAX_CLEANUP_DRAWER_ID_BYTES:
+                raise ValueError(
+                    "cleanup drawer IDs must be non-empty and no longer than "
+                    f"{MAX_CLEANUP_DRAWER_ID_BYTES} bytes"
+                )
+            if drawer_id not in pending:
+                pending.append(drawer_id)
+            if len(pending) > MAX_CLEANUP_DRAWER_IDS:
+                raise ValueError(
+                    f"cleanup manifest accepts at most {MAX_CLEANUP_DRAWER_IDS} drawer IDs"
+                )
+        self._checkpoint(pending)
 
     def mark_cleaned(self, drawer_ids: list[str]) -> None:
         cleaned = set(drawer_ids)
-        self._pending = [drawer_id for drawer_id in self._pending if drawer_id not in cleaned]
-        if self._pending:
-            self.checkpoint()
+        pending = [drawer_id for drawer_id in self._pending if drawer_id not in cleaned]
+        if pending:
+            self._checkpoint(pending)
         else:
             self.discard()
 
@@ -74,18 +106,30 @@ class CleanupManifest:
         try:
             self.path.unlink()
         except FileNotFoundError:
+            self._pending = []
             return
+        self._pending = []
         self._fsync_parent()
 
     def _fsync_parent(self) -> None:
-        try:
-            directory_fd = os.open(self.path.parent, os.O_RDONLY)
-        except OSError:
-            return
+        directory_fd = os.open(self.path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+
+    @staticmethod
+    def _serialize(pending: list[str]) -> str:
+        serialized = json.dumps(
+            {"cleanup_drawer_ids": pending},
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+        if len(serialized.encode("utf-8")) > MAX_CLEANUP_MANIFEST_BYTES:
+            raise ValueError(
+                f"cleanup manifest exceeds {MAX_CLEANUP_MANIFEST_BYTES} bytes"
+            )
+        return serialized
 
 
 def finalize_cleanup_manifest(
@@ -94,11 +138,13 @@ def finalize_cleanup_manifest(
 ) -> None:
     """Expose a recovery receipt only while cleanup-authorized IDs remain."""
     summary.pop("cleanup_manifest_path", None)
+    summary.pop("cleanup_pending_count", None)
     if manifest is None:
         return
     if manifest.pending_count > 0:
         manifest.checkpoint()
         summary["cleanup_manifest_path"] = str(manifest.path)
+        summary["cleanup_pending_count"] = manifest.pending_count
     else:
         manifest.discard()
 
