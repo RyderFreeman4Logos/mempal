@@ -31,6 +31,7 @@ __all__ = [
     "MAX_MCP_RESPONSE_BYTES",
     "McpClient",
     "OwnedSubprocessRegistry",
+    "cleanup_exact_ids",
     "finalize_cleanup_manifest",
     "terminate_and_reap_owned_processes",
 ]
@@ -179,6 +180,34 @@ class OwnedSubprocessRegistry:
                 self._roles.pop(process_id, None)
         receipt["roles"] = role_counts
         return receipt
+
+
+def cleanup_exact_ids(
+    drawer_ids: list[str],
+    *,
+    checkpoint: Callable[[], None],
+    delete: Callable[[str], bool],
+    verify_absent: Callable[[str], bool],
+    mark_cleaned: Callable[[list[str]], None],
+) -> dict[str, int]:
+    """Delete each exact ID and retire authority only after absence is proven."""
+    unique_ids = list(dict.fromkeys(drawer_ids))
+    deleted_count = 0
+    verified_absent_count = 0
+    for drawer_id in unique_ids:
+        checkpoint()
+        if delete(drawer_id):
+            deleted_count += 1
+        if verify_absent(drawer_id):
+            mark_cleaned([drawer_id])
+            verified_absent_count += 1
+    return {
+        "attempted_count": len(unique_ids),
+        "deleted_count": deleted_count,
+        "delete_failed_attempt_count": len(unique_ids) - deleted_count,
+        "verified_absent_count": verified_absent_count,
+        "failed_count": len(unique_ids) - verified_absent_count,
+    }
 
 
 class McpClient:

@@ -50,7 +50,7 @@ A smoke report is complete when:
 - CLI CRUD creates, reads/searches/contexts, updates, pin/unpins, deletes, and verifies cleanup using exact `created_drawer_ids` only;
 - MCP CRUD passes or is explicitly skipped/unavailable; MCP failures are not hidden by CLI success;
 - every MCP write fallback starts only after every runner-owned MCP stdio child is closed and reaped;
-- unresolved exact cleanup IDs remain recoverable through the mode-`0600` atomic manifest whose path, but not IDs, appears in failure JSON;
+- unresolved exact cleanup IDs remain recoverable through the mode-`0600` atomic manifest whose path and pending count, but not IDs, appear in failure JSON;
 - REST/MCP checks leave no extra processes or DB holders;
 - all exact-created smoke IDs are cleaned, while intentional real-memory writes are preserved;
 - memory and I/O before/after are summarized aggregate-only;

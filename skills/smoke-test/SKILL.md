@@ -103,7 +103,7 @@ Never downgrade a failed CRUD path to pass because another surface worked. Repor
 - [ ] **Daemon binary consistency check passes** (exe path matches installed binary, not deleted).
 - [ ] Read-only matrix exits 0 or failures are classified by command/error class.
 - [ ] **`doctor --format json` probe verifies schema version match and no critical warnings.**
-- [ ] CLI CRUD creates, reads/searches/contexts, updates, pin/unpins, deletes, and verifies cleanup using only `created_drawer_ids`.
+- [ ] CLI CRUD creates, reads/searches/contexts, updates, pin/unpins, deletes, and verifies each exact `created_drawer_ids` value is absent before retiring cleanup authority.
 - [ ] MCP CRUD passes or is explicitly skipped/unavailable; failures are not hidden by CLI success.
 - [ ] **MCP ingest external-fallback count is reported as a degradation signal.** The legacy `mcp_ingest_fallback_to_cli` key counts both CLI operation-wait recovery and REST fallback; non-zero means MCP ingest did not return cleanup IDs directly.
 - [ ] **Every MCP write fallback runs only after every runner-owned MCP stdio child is closed and reaped.** A surviving owned holder blocks fallback and fails the run.

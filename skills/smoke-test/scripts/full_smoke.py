@@ -74,6 +74,7 @@ CONFORMANCE_MATRIX_PATH = 'docs/conformance-matrix.md'
 DEFAULT_RERANKER_TIMEOUT_SECS = 60
 DEFAULT_RERANKER_TOP_K = 50
 MAX_RERANKER_SMOKE_TIMEOUT_SECS = 240
+MCP_RESOURCE_NOT_FOUND_ERROR_CODE = -32002
 RERANKER_PROBES = (
     'reranker_endpoint_reachable',
     'reranker_reorders_results',
@@ -1173,23 +1174,25 @@ def count_marker_matches(value: Any, room: str) -> int:
 
 def delete_exact_ids_cli(drawer_ids: list[str], label: str, room: str | None = None) -> dict[str, Any]:
     unique_ids = list(dict.fromkeys(drawer_ids))
-    deleted = 0
-    failed = 0
     stdout_bytes = 0
     stderr_bytes = 0
-    for drawer_id in unique_ids:
-        _checkpoint_manifest()
-        proc = run_child_process(
-            ['mempal', 'delete', drawer_id],
-            timeout=60,
-            io_category='cli_child_processes',
-        )
+
+    def delete(drawer_id: str) -> bool:
+        nonlocal stdout_bytes, stderr_bytes
+        proc = run_child_process(['mempal', 'delete', drawer_id], timeout=60, io_category='cli_child_processes')
         stdout_bytes += len(proc['stdout'])
         stderr_bytes += len(proc['stderr'])
-        if proc['returncode'] == 0:
-            deleted += 1
-        else:
-            failed += 1
+        return proc['returncode'] == 0
+
+    def verify_absent(drawer_id: str) -> bool:
+        nonlocal stdout_bytes, stderr_bytes
+        proc = run_child_process(['mempal', 'view', drawer_id, '--all-projects'], timeout=60, io_category='cli_child_processes')
+        stdout_bytes += len(proc['stdout'])
+        stderr_bytes += len(proc['stderr'])
+        expected = f'drawer {drawer_id} not found'.encode()
+        return proc['returncode'] != 0 and expected in proc['stderr']
+
+    result = _SMOKE_RUNTIME.cleanup_exact_ids(unique_ids, checkpoint=_checkpoint_manifest, delete=delete, verify_absent=verify_absent, mark_cleaned=_mark_verified_cleaned)
     active_matches_after_deletes: int | None = None
     if unique_ids and room is not None:
         rc, _out, _err, parsed, _shape = run_cli(
@@ -1200,25 +1203,10 @@ def delete_exact_ids_cli(drawer_ids: list[str], label: str, room: str | None = N
         )
         if rc == 0:
             active_matches_after_deletes = count_marker_matches(parsed, room)
-            if active_matches_after_deletes == 0:
-                _mark_verified_cleaned(unique_ids)
-    result = {
-        'attempted_count': len(unique_ids),
-        'deleted_count': deleted,
-        'failed_count': failed,
-        'stdout_bytes': stdout_bytes,
-        'stderr_bytes': stderr_bytes,
-    }
+    result.update({'stdout_bytes': stdout_bytes, 'stderr_bytes': stderr_bytes})
     if active_matches_after_deletes is not None:
         result['active_matches_after_deletes'] = active_matches_after_deletes
-    note(
-        label,
-        failed == 0
-        or deleted > 0
-        or not unique_ids
-        or active_matches_after_deletes == 0,
-        **result,
-    )
+    note(label, result['failed_count'] == 0, **result)
     return result
 
 
@@ -1503,6 +1491,23 @@ def run_fallback_after_mcp_reaped(
     return result
 
 
+def run_exact_cli_cleanup_after_mcp(drawer_ids: list[str], label: str) -> Any:
+    """Run exact CLI cleanup only after the owned MCP registry is empty."""
+    return run_fallback_after_mcp_reaped(None, label, lambda: delete_exact_ids_cli(drawer_ids, label + '_delete', room='mcp'))
+
+
+def delete_exact_ids_mcp(client: McpClient, drawer_ids: list[str]) -> dict[str, int]:
+    def delete(drawer_id: str) -> bool:
+        structured, info = client.tool('mempal_delete', {'drawer_id': drawer_id}, timeout=60)
+        return bool(info.get('ok')) and isinstance(structured, dict) and structured.get('deleted') is True
+
+    def verify_absent(drawer_id: str) -> bool:
+        _structured, info = client.tool('mempal_read_drawer', {'drawer_id': drawer_id, 'all_projects': True}, timeout=60)
+        return info.get('error_code') == MCP_RESOURCE_NOT_FOUND_ERROR_CODE
+
+    return _SMOKE_RUNTIME.cleanup_exact_ids(drawer_ids, checkpoint=_checkpoint_manifest, delete=delete, verify_absent=verify_absent, mark_cleaned=_mark_verified_cleaned)
+
+
 def mcp_start_initialized() -> McpClient:
     client = new_mcp_client()
     try:
@@ -1740,7 +1745,7 @@ def mcp_crud() -> list[str]:
         mcp_update_ok = bool(upd_ids) and (bool(uinfo.get('ok')) or mcp_upd_recovered) and update_recovery.get('recovered_via') != 'rest_fallback'
         note('mcp_update', mcp_update_ok, created_id_count=len(upd_ids), **recovery_fields(update_recovery), **without_ok(uinfo))
         if not upd_ids:
-            delete_exact_ids_cli(cleanup_ids, 'mcp_cleanup_after_update_failure', room='mcp')
+            run_exact_cli_cleanup_after_mcp(cleanup_ids, 'mcp_cleanup_after_update_failure')
             note(
                 'mcp_inconclusive_no_cleanup_id',
                 False,
@@ -1756,26 +1761,16 @@ def mcp_crud() -> list[str]:
         structured, info = client.tool('mempal_read_drawer', {'drawer_id': upd_ids[0], 'all_projects': True}, timeout=60)
         note('mcp_read_updated', bool(info.get('ok')), **without_ok(info))
 
-        deleted = 0
-        delete_false_count = 0
-        for drawer_id in list(dict.fromkeys(cleanup_ids)):
-            _checkpoint_manifest()
-            structured, dinfo = client.tool('mempal_delete', {'drawer_id': drawer_id}, timeout=60)
-            ok = bool(dinfo.get('ok')) and isinstance(structured, dict) and structured.get('deleted') is True
-            if ok:
-                deleted += 1
-            else:
-                delete_false_count += 1
+        cleanup_result = delete_exact_ids_mcp(client, cleanup_ids)
+        deleted = cleanup_result['deleted_count']
+        delete_false_count = cleanup_result['delete_failed_attempt_count']
         SUMMARY['cleanup']['mcp_deleted_count'] = deleted
         post, pinfo = client.tool('mempal_search', {'query': MARKER, 'top_k': 5, 'all_projects': True}, timeout=180)
         post_matches = count_marker_matches(post, 'mcp')
-        cleanup_verified = bool(pinfo.get('ok')) and post_matches == 0
-        if cleanup_verified:
-            _mark_verified_cleaned(cleanup_ids)
-        else:
-            SUMMARY['cleanup']['failures'] += delete_false_count
-        note('mcp_delete_batch', cleanup_verified, attempted_count=len(set(cleanup_ids)), deleted_count=deleted, delete_false_count=delete_false_count)
-        note('mcp_crud', cleanup_verified and deleted > 0, created_id_count=len(cleanup_ids), deleted_count=deleted, delete_false_count=delete_false_count, post_delete_active_matches=post_matches)
+        cleanup_verified = cleanup_result['failed_count'] == 0
+        SUMMARY['cleanup']['failures'] += cleanup_result['failed_count']
+        note('mcp_delete_batch', cleanup_verified, **cleanup_result)
+        note('mcp_crud', cleanup_verified and bool(pinfo.get('ok')) and post_matches == 0 and deleted > 0, created_id_count=len(cleanup_ids), deleted_count=deleted, delete_false_count=delete_false_count, post_delete_active_matches=post_matches)
         if 'mempal_status' in tool_names:
             structured, sinfo = client.tool('mempal_status', {}, timeout=30)
             note('mcp_status_last', bool(sinfo.get('ok')), **without_ok(sinfo))
@@ -1788,20 +1783,12 @@ def mcp_crud() -> list[str]:
             client.close()
             client = None
         # If MCP CRUD failed after exposing cleanup-safe IDs, clean them by exact ID.
-        if SUMMARY['groups'].get('mcp_crud', {}).get('ok') is not True and cleanup_ids:
-            cleanup_result = run_fallback_after_mcp_reaped(
-                None,
-                'fallback_cli_cleanup',
-                lambda: delete_exact_ids_cli(
-                    cleanup_ids,
-                    'mcp_fallback_cli_cleanup_delete',
-                    room='mcp',
-                ),
-            )
+        if SUMMARY['groups'].get('mcp_crud', {}).get('ok') is not True and cleanup_ids and CLEANUP_MANIFEST is not None and CLEANUP_MANIFEST.pending_count > 0:
+            cleanup_result = run_exact_cli_cleanup_after_mcp(cleanup_ids, 'mcp_fallback_cli_cleanup')
             if isinstance(cleanup_result, dict):
                 note(
                     'mcp_fallback_cli_cleanup',
-                    cleanup_result.get('active_matches_after_deletes') == 0,
+                    cleanup_result.get('failed_count') == 0,
                     exact_id_count=len(set(cleanup_ids)),
                     deleted_count=cleanup_result.get('deleted_count', 0),
                 )

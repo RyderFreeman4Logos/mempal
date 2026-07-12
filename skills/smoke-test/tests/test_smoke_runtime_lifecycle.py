@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 import tempfile
@@ -106,6 +107,129 @@ time.sleep(60)
         self.assertEqual(result, ["fallback-after-sweep"])
         self.assertIsNotNone(proc.poll())
         self.assertEqual(self.smoke.OWNED_MCP_CHILDREN, {})
+
+    def test_exact_cli_cleanup_does_not_trust_empty_marker_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / "cleanup.json")
+            manifest.add_created_ids(["drawer-a", "drawer-b"])
+            self.smoke.CLEANUP_MANIFEST = manifest
+
+            def child_result(command: list[str], **kwargs: Any) -> dict[str, Any]:
+                del kwargs
+                if command[:2] == ["mempal", "delete"]:
+                    return {
+                        "returncode": 0 if command[2] == "drawer-a" else 1,
+                        "stdout": b"",
+                        "stderr": b"",
+                    }
+                if command[2] == "drawer-a":
+                    return {
+                        "returncode": 1,
+                        "stdout": b"",
+                        "stderr": b"drawer drawer-a not found",
+                    }
+                return {"returncode": 0, "stdout": b"still present", "stderr": b""}
+
+            with mock.patch.object(
+                self.smoke,
+                "run_child_process",
+                side_effect=child_result,
+            ):
+                with mock.patch.object(
+                    self.smoke,
+                    "run_cli",
+                    return_value=(0, b"", b"", {"results": []}, {}),
+                ):
+                    result = self.smoke.delete_exact_ids_cli(
+                        ["drawer-a", "drawer-b"],
+                        "unit_cleanup",
+                        room="mcp",
+                    )
+
+            self.assertEqual(result["verified_absent_count"], 1)
+            self.assertEqual(result["failed_count"], 1)
+            self.assertEqual(result["active_matches_after_deletes"], 0)
+            self.assertEqual(
+                json.loads(manifest.path.read_text(encoding="utf-8")),
+                {"cleanup_drawer_ids": ["drawer-b"]},
+            )
+
+    def test_exact_mcp_cleanup_checkpoints_each_verified_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / "cleanup.json")
+            manifest.add_created_ids(["drawer-a", "drawer-b"])
+            self.smoke.CLEANUP_MANIFEST = manifest
+            client = mock.Mock()
+            client.tool.side_effect = [
+                ({"deleted": True}, {"ok": True}),
+                (None, {"ok": False, "error_code": -32002}),
+                (None, {"ok": False, "error_code": -32603}),
+                ({"drawer_id": "drawer-b"}, {"ok": True}),
+            ]
+
+            result = self.smoke.delete_exact_ids_mcp(
+                client,
+                ["drawer-a", "drawer-b"],
+            )
+
+            self.assertEqual(result["verified_absent_count"], 1)
+            self.assertEqual(result["failed_count"], 1)
+            self.assertEqual(
+                json.loads(manifest.path.read_text(encoding="utf-8")),
+                {"cleanup_drawer_ids": ["drawer-b"]},
+            )
+
+    def test_exact_cleanup_exception_retains_only_unverified_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / "cleanup.json")
+            manifest.add_created_ids(["drawer-a", "drawer-b"])
+
+            def delete(drawer_id: str) -> bool:
+                if drawer_id == "drawer-b":
+                    raise RuntimeError("injected second delete failure")
+                return True
+
+            with self.assertRaisesRegex(RuntimeError, "second delete failure"):
+                self.smoke._SMOKE_RUNTIME.cleanup_exact_ids(
+                    ["drawer-a", "drawer-b"],
+                    checkpoint=manifest.checkpoint,
+                    delete=delete,
+                    verify_absent=lambda drawer_id: drawer_id == "drawer-a",
+                    mark_cleaned=manifest.mark_cleaned,
+                )
+
+            self.assertEqual(
+                json.loads(manifest.path.read_text(encoding="utf-8")),
+                {"cleanup_drawer_ids": ["drawer-b"]},
+            )
+
+    def test_unreaped_child_blocks_exact_cli_cleanup(self) -> None:
+        process = mock.Mock()
+        process.pid = 424243
+        process.poll.return_value = None
+        process.wait.side_effect = OSError("wait proof unavailable")
+        process.stdin = None
+        process.stdout = None
+        process.stderr = None
+        self.smoke.OWNED_MCP_REGISTRY.register(process, "mcp_stdio")
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / "cleanup.json")
+            manifest.add_created_ids(["drawer-a"])
+            self.smoke.CLEANUP_MANIFEST = manifest
+            with mock.patch.object(self.smoke, "delete_exact_ids_cli") as cleanup:
+                result = self.smoke.run_exact_cli_cleanup_after_mcp(
+                    ["drawer-a"],
+                    "blocked_cleanup",
+                )
+
+            self.assertEqual(result, [])
+            cleanup.assert_not_called()
+            self.assertEqual(manifest.pending_count, 1)
+            self.assertTrue(manifest.path.exists())
+            self.assertIn(process.pid, self.smoke.OWNED_MCP_CHILDREN)
+        process.wait.side_effect = None
+        process.wait.return_value = 0
+        self.smoke.terminate_and_reap_owned_mcp_children(timeout=0.01)
 
     def test_initialize_failure_closes_spawned_client(self) -> None:
         fake_client = mock.Mock()
