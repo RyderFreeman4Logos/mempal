@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+import urllib.error
 from typing import Dict, List, Optional, Tuple
 
 
@@ -26,16 +27,43 @@ class FakeResponse:
     def getheaders(self) -> List[Tuple[str, str]]:
         return [("content-type", "application/json")]
 
-    def read(self) -> bytes:
+    def read(self, amount: Optional[int] = None) -> bytes:
+        del amount
         return b'[{"drawer_id":"drawer-transport"}]'
 
 
+class ErrorResponse:
+    status = 503
+    reason = "Service Unavailable"
+
+    def __init__(self, body: bytes, content_length: Optional[int]) -> None:
+        self.body = body
+        self.content_length = content_length
+        self.read_amounts: List[Optional[int]] = []
+        self.closed = False
+
+    def getheaders(self) -> List[Tuple[str, str]]:
+        if self.content_length is None:
+            return [("transfer-encoding", "chunked")]
+        return [("content-length", str(self.content_length))]
+
+    def read(self, amount: Optional[int] = None) -> bytes:
+        self.read_amounts.append(amount)
+        if amount is None:
+            raise AssertionError("error response must never be read without a bound")
+        return self.body[:amount]
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FakeConnection:
-    def __init__(self) -> None:
+    def __init__(self, response: Optional[object] = None) -> None:
         self.sock = FakeSocket()
         self.connected = False
         self.closed = False
         self.requests: List[Tuple[str, str, Dict[str, str]]] = []
+        self.response = response or FakeResponse()
 
     def connect(self) -> None:
         self.connected = True
@@ -43,8 +71,8 @@ class FakeConnection:
     def request(self, method: str, target: str, headers: Dict[str, str]) -> None:
         self.requests.append((method, target, dict(headers)))
 
-    def getresponse(self) -> FakeResponse:
-        return FakeResponse()
+    def getresponse(self) -> object:
+        return self.response
 
     def close(self) -> None:
         self.closed = True
@@ -76,6 +104,38 @@ class SearchTransportTests(unittest.TestCase):
         self.assertEqual(response.payload[0]["drawer_id"], "drawer-transport")
         self.assertEqual(response.headers["content-type"], "application/json")
         self.assertTrue(connection.closed)
+
+    def test_oversized_content_length_error_body_is_bounded_and_discarded(self) -> None:
+        response = ErrorResponse(b"x" * (64 * 1024 + 2), 10 * 1024 * 1024)
+
+        error = self._request_error(response)
+        self.addCleanup(error.close)
+
+        self.assertEqual(response.read_amounts, [64 * 1024 + 1])
+        self.assertEqual(error.read(), b"")
+        self.assertTrue(response.closed)
+
+    def test_unknown_length_error_body_is_bounded_and_discarded(self) -> None:
+        response = ErrorResponse(b"x" * (64 * 1024 + 2), None)
+
+        error = self._request_error(response)
+        self.addCleanup(error.close)
+
+        self.assertEqual(response.read_amounts, [64 * 1024 + 1])
+        self.assertEqual(error.read(), b"")
+        self.assertTrue(response.closed)
+
+    def _request_error(self, response: ErrorResponse) -> urllib.error.HTTPError:
+        connection = FakeConnection(response)
+        transport = SearchTransport(
+            "http://127.0.0.1:3080",
+            connection_factory=lambda *_args: connection,
+        )
+
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            transport.get_json("/api/search")
+        self.assertTrue(connection.closed)
+        return raised.exception
 
 
 if __name__ == "__main__":

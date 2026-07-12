@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, Mapping, Optional
 __all__ = ["SearchTransport", "SearchTransportResponse"]
 
 _DEFAULT_CONNECT_TIMEOUT_SECS = 2.0
+_REST_ERROR_BODY_MAX_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -89,8 +90,8 @@ class SearchTransport:
                 for key, value in response.getheaders()
                 if value is not None
             }
-            body = response.read()
             if not 200 <= int(response.status) <= 299:
+                body = _read_bounded_error_body(response)
                 raise urllib.error.HTTPError(
                     absolute_url,
                     int(response.status),
@@ -98,6 +99,7 @@ class SearchTransport:
                     headers,
                     io.BytesIO(body),
                 )
+            body = response.read()
             payload = json.loads(body.decode("utf-8"))
             return SearchTransportResponse(payload, headers)
         finally:
@@ -134,3 +136,14 @@ def _query_value(value: Any) -> Any:
     if isinstance(value, bool):
         return "true" if value else "false"
     return value
+
+
+def _read_bounded_error_body(response: Any) -> bytes:
+    """Read only the structured-error budget and discard oversized bodies."""
+    try:
+        body = response.read(_REST_ERROR_BODY_MAX_BYTES + 1)
+    finally:
+        response.close()
+    if not isinstance(body, bytes) or len(body) > _REST_ERROR_BODY_MAX_BYTES:
+        return b""
+    return body
