@@ -68,6 +68,7 @@ SUMMARY: dict[str, Any] = {
 OWNED_MCP_REGISTRY = _SMOKE_RUNTIME.OwnedSubprocessRegistry()
 OWNED_MCP_CHILDREN: dict[int, subprocess.Popen[Any]] = OWNED_MCP_REGISTRY.processes
 CLEANUP_MANIFEST: CleanupManifest | None = CleanupManifest()
+_PROC_IO_RECEIPT_TARGETS: dict[tuple[str, str], dict[str, Any]] = {}
 
 PROC_IO_KEYS = ('read_bytes', 'write_bytes', 'cancelled_write_bytes', 'rchar', 'wchar')
 CONFORMANCE_MATRIX_PATH = 'docs/conformance-matrix.md'
@@ -460,16 +461,16 @@ def proc_io_aggregate() -> dict[str, Any]:
     }
 
 
-def record_proc_io_delta(category: str, before: dict[str, int] | None, after: dict[str, int] | None) -> None:
-    aggregate = SUMMARY['io'].setdefault(category, proc_io_aggregate())
-    aggregate['process_count'] += 1
-    delta = io_delta(before, after)
-    if delta is None:
-        aggregate['missing_process_count'] += 1
-        return
-    aggregate['sampled_process_count'] += 1
-    for key in PROC_IO_KEYS:
-        aggregate[key] += max(0, int(delta.get(key, 0)))
+def record_proc_io_delta(
+    category: str,
+    before: dict[str, int] | None,
+    after: dict[str, int] | None,
+    receipt_id: str | None = None,
+) -> None:
+    _SMOKE_RUNTIME.record_proc_io_delta(
+        SUMMARY['io'], _PROC_IO_RECEIPT_TARGETS, PROC_IO_KEYS,
+        category, before, after, receipt_id,
+    )
 
 
 def wait_exited_without_reap(pid: int, timeout: float) -> bool | None:
@@ -1290,13 +1291,14 @@ def _mcp_tool_with_hard_timeout(
     client: 'McpClient',
     tool_name: str,
     args: dict[str, Any],
-    timeout: int,
+    timeout: float,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Interrupt a blocked MCP readline and synchronously reap its process."""
     result_box: dict[str, Any] = {}
     hard_timed_out = False
+    timer = signal.ITIMER_REAL
     old_handler = signal.getsignal(signal.SIGALRM)
-    old_timer = signal.setitimer(signal.ITIMER_REAL, 0)
+    old_timer = signal.setitimer(timer, 0)
 
     def _alarm_handler(signum: int, frame: Any) -> None:
         nonlocal hard_timed_out
@@ -1304,7 +1306,7 @@ def _mcp_tool_with_hard_timeout(
         raise TimeoutError(f'MCP tool {tool_name} hard timeout after {timeout}s')
 
     signal.signal(signal.SIGALRM, _alarm_handler)
-    signal.alarm(timeout)
+    signal.setitimer(timer, timeout)
     try:
         structured, info = client.tool(tool_name, args, timeout=timeout + 5)
         result_box['structured'] = structured
@@ -1312,11 +1314,13 @@ def _mcp_tool_with_hard_timeout(
     except Exception as exc:
         result_box['info'] = {'ok': False, 'error_type': type(exc).__name__}
     finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
-        signal.setitimer(signal.ITIMER_REAL, *old_timer)
-        if hard_timed_out:
-            client.close()
+        signal.setitimer(timer, 0)
+        try:
+            if hard_timed_out:
+                client.close()
+        finally:
+            signal.signal(signal.SIGALRM, old_handler)
+            signal.setitimer(timer, *old_timer)
 
     if 'info' in result_box:
         return result_box.get('structured'), result_box['info']

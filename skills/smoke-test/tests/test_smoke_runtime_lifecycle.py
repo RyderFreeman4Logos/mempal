@@ -518,6 +518,63 @@ time.sleep(60)
                 *original_timer,
             )
 
+    def test_hard_timeout_reaps_before_restoring_raising_periodic_alarm(self) -> None:
+        original_handler = self.smoke.signal.getsignal(self.smoke.signal.SIGALRM)
+        original_timer = self.smoke.signal.setitimer(self.smoke.signal.ITIMER_REAL, 0)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        client = self.smoke.new_mcp_client(
+            process_factory=lambda *args, **kwargs: proc,
+        )
+        observations: list[tuple[bool, bool]] = []
+
+        class PriorTimerRaised(Exception):
+            pass
+
+        def raising_prior_handler(signum: int, frame: Any) -> None:
+            del signum, frame
+            self.smoke.signal.setitimer(self.smoke.signal.ITIMER_REAL, 0)
+            observations.append(
+                (
+                    proc.poll() is not None,
+                    proc.pid not in self.smoke.OWNED_MCP_CHILDREN,
+                )
+            )
+            raise PriorTimerRaised
+
+        client.tool = mock.Mock(
+            side_effect=lambda *args, **kwargs: self.smoke.time.sleep(1)
+        )
+        try:
+            self.smoke.signal.signal(self.smoke.signal.SIGALRM, raising_prior_handler)
+            self.smoke.signal.setitimer(self.smoke.signal.ITIMER_REAL, 0.01, 0.01)
+
+            with self.assertRaises(PriorTimerRaised):
+                structured, info = self.smoke._mcp_tool_with_hard_timeout(
+                    client,
+                    "mempal_ingest",
+                    {},
+                    timeout=0.1,
+                )
+                self.assertIsNone(structured)
+                self.assertEqual(info["error_type"], "TimeoutError")
+                self.smoke.time.sleep(0.2)
+
+            self.assertEqual(observations, [(True, True)])
+        finally:
+            self.smoke.signal.setitimer(self.smoke.signal.ITIMER_REAL, 0)
+            self.smoke.signal.signal(self.smoke.signal.SIGALRM, original_handler)
+            self.smoke.signal.setitimer(
+                self.smoke.signal.ITIMER_REAL,
+                *original_timer,
+            )
+            self.smoke.terminate_and_reap_owned_mcp_children(timeout=0.2)
+
     def test_owned_children_are_reaped_when_runner_is_cancelled(self) -> None:
         _client, proc = self._sleeping_client()
 
@@ -540,6 +597,189 @@ time.sleep(60)
 
         self.assertIsNotNone(proc.poll())
         self.assertEqual(self.smoke.SUMMARY["mcp_stdio_lifecycle"], first_lifecycle)
+
+    def test_close_can_retry_after_interruption(self) -> None:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        client = self.smoke.new_mcp_client(
+            process_factory=lambda *args, **kwargs: proc,
+        )
+        client._read_proc_io = mock.Mock(
+            side_effect=[KeyboardInterrupt, None, None],
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            client.close()
+
+        self.assertIn(proc.pid, self.smoke.OWNED_MCP_CHILDREN)
+        self.assertTrue(client.close())
+        first_lifecycle = dict(self.smoke.SUMMARY["mcp_stdio_lifecycle"])
+        self.assertTrue(client.close())
+
+        self.assertIsNotNone(proc.poll())
+        self.assertEqual(self.smoke.OWNED_MCP_CHILDREN, {})
+        self.assertEqual(self.smoke.SUMMARY["mcp_stdio_lifecycle"], first_lifecycle)
+
+    def test_close_can_retry_when_stream_cleanup_is_interrupted(self) -> None:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        client = self.smoke.new_mcp_client(
+            process_factory=lambda *args, **kwargs: proc,
+        )
+        client.notify = mock.Mock(wraps=client.notify)
+        close_streams = self.smoke._SMOKE_RUNTIME._close_process_streams
+        close_attempts = 0
+
+        def interrupt_stream_cleanup_once(process: subprocess.Popen[Any]) -> None:
+            nonlocal close_attempts
+            close_attempts += 1
+            if close_attempts == 1:
+                raise KeyboardInterrupt
+            close_streams(process)
+
+        with mock.patch.object(
+            self.smoke._SMOKE_RUNTIME,
+            "_close_process_streams",
+            side_effect=interrupt_stream_cleanup_once,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                client.close()
+
+            first_lifecycle = dict(self.smoke.SUMMARY["mcp_stdio_lifecycle"])
+            self.assertTrue(client.close())
+
+        self.assertEqual(close_attempts, 2)
+        self.assertEqual(client.notify.call_count, 1)
+        self.assertEqual(self.smoke.SUMMARY["mcp_stdio_lifecycle"], first_lifecycle)
+        self.assertIsNotNone(proc.poll())
+        self.assertEqual(self.smoke.OWNED_MCP_CHILDREN, {})
+
+    def test_close_can_retry_when_terminate_is_interrupted(self) -> None:
+        client, proc = self._sleeping_client()
+        terminate = proc.terminate
+        proc.kill = mock.Mock(wraps=proc.kill)
+        proc.terminate = mock.Mock(side_effect=KeyboardInterrupt)
+
+        with self.assertRaises(KeyboardInterrupt):
+            client.close()
+
+        proc.terminate.side_effect = terminate
+        self.assertTrue(client.close())
+        self.assertEqual(proc.terminate.call_count, 1)
+        self.assertGreaterEqual(proc.kill.call_count, 1)
+        self.assertIsNotNone(proc.poll())
+        self.assertEqual(self.smoke.OWNED_MCP_CHILDREN, {})
+
+    def test_close_can_retry_when_kill_is_interrupted(self) -> None:
+        child = """
+import signal
+import time
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+print('ready', flush=True)
+time.sleep(60)
+"""
+        proc = subprocess.Popen(
+            [sys.executable, "-u", "-c", child],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(proc.stdout.readline(), "ready\n")
+        client = self.smoke.new_mcp_client(
+            process_factory=lambda *args, **kwargs: proc,
+        )
+        proc.terminate = mock.Mock(wraps=proc.terminate)
+        kill = proc.kill
+        proc.kill = mock.Mock(side_effect=KeyboardInterrupt)
+
+        with self.assertRaises(KeyboardInterrupt):
+            client.close()
+
+        proc.kill.side_effect = kill
+        self.assertTrue(client.close())
+        self.assertEqual(proc.terminate.call_count, 1)
+        self.assertEqual(proc.kill.call_count, 2)
+        self.assertIsNotNone(proc.poll())
+        self.assertEqual(self.smoke.OWNED_MCP_CHILDREN, {})
+
+    def test_close_can_retry_when_io_receipt_is_interrupted(self) -> None:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        client = self.smoke.new_mcp_client(
+            process_factory=lambda *args, **kwargs: proc,
+        )
+        record_io = client._record_proc_io_delta
+        record_calls = 0
+
+        def record_then_interrupt(*args: Any) -> None:
+            nonlocal record_calls
+            record_calls += 1
+            record_io(*args)
+            if record_calls == 1:
+                raise KeyboardInterrupt
+
+        client._record_proc_io_delta = record_then_interrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            client.close()
+
+        self.assertTrue(client.close())
+        self.assertEqual(record_calls, 2)
+        self.assertEqual(
+            self.smoke.SUMMARY["io"]["mcp_stdio_child_processes"]["process_count"],
+            1,
+        )
+        self.assertIsNotNone(proc.poll())
+        self.assertEqual(self.smoke.OWNED_MCP_CHILDREN, {})
+
+    def test_close_can_retry_when_lifecycle_receipt_is_interrupted(self) -> None:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        client = self.smoke.new_mcp_client(
+            process_factory=lambda *args, **kwargs: proc,
+        )
+        record_lifecycle = client._record_lifecycle
+        record_calls = 0
+
+        def record_then_interrupt(killed: bool, reaped: bool) -> None:
+            nonlocal record_calls
+            record_calls += 1
+            record_lifecycle(killed, reaped)
+            if record_calls == 1:
+                raise KeyboardInterrupt
+
+        client._record_lifecycle = record_then_interrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            client.close()
+
+        self.assertTrue(client.close())
+        self.assertEqual(record_calls, 2)
+        self.assertEqual(self.smoke.SUMMARY["mcp_stdio_lifecycle"]["process_count"], 1)
+        self.assertIsNotNone(proc.poll())
+        self.assertEqual(self.smoke.OWNED_MCP_CHILDREN, {})
 
 
 if __name__ == "__main__":

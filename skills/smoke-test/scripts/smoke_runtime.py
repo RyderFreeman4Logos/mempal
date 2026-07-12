@@ -33,6 +33,7 @@ __all__ = [
     "OwnedSubprocessRegistry",
     "cleanup_exact_ids",
     "finalize_cleanup_manifest",
+    "record_proc_io_delta",
     "terminate_and_reap_owned_processes",
 ]
 
@@ -214,6 +215,41 @@ def cleanup_exact_ids(
     }
 
 
+def record_proc_io_delta(
+    summary_io: MutableMapping[str, Any],
+    receipt_targets: MutableMapping[tuple[str, str], dict[str, Any]],
+    io_keys: tuple[str, ...],
+    category: str,
+    before: dict[str, int] | None,
+    after: dict[str, int] | None,
+    receipt_id: str | None,
+) -> None:
+    """Apply one process I/O contribution idempotently by receipt identity."""
+    empty = {
+        "process_count": 0,
+        "sampled_process_count": 0,
+        "missing_process_count": 0,
+        **{key: 0 for key in io_keys},
+    }
+    aggregate = summary_io.setdefault(category, empty)
+    receipt_key = (category, receipt_id) if receipt_id is not None else None
+    if receipt_key is not None and receipt_key in receipt_targets:
+        summary_io[category] = dict(receipt_targets[receipt_key])
+        return
+    updated = dict(aggregate) if receipt_key is not None else aggregate
+    updated["process_count"] += 1
+    if before is None or after is None:
+        updated["missing_process_count"] += 1
+    else:
+        updated["sampled_process_count"] += 1
+        for key in io_keys:
+            delta = after.get(key, 0) - before.get(key, 0)
+            updated[key] += max(0, int(delta))
+    if receipt_key is not None:
+        receipt_targets[receipt_key] = updated
+        summary_io[category] = dict(updated)
+
+
 class McpClient:
     """Owned JSON-RPC stdio client with bounded, observable shutdown."""
 
@@ -225,7 +261,7 @@ class McpClient:
         registry: OwnedSubprocessRegistry,
         read_proc_io: Callable[[int | None], dict[str, int] | None],
         record_proc_io_delta: Callable[
-            [str, dict[str, int] | None, dict[str, int] | None], None
+            [str, dict[str, int] | None, dict[str, int] | None, str | None], None
         ],
         json_shape: Callable[[Any], Any],
         lifecycle_receipt: MutableMapping[str, Any],
@@ -256,6 +292,10 @@ class McpClient:
         self.next_id = 1
         self._closed = False
         self._close_result = False
+        self._close_steps: set[str] = set()
+        self._close_killed = False
+        self._close_reaped = False
+        self._lifecycle_receipt_target: dict[str, Any] | None = None
 
     def __del__(self) -> None:
         stderr_file = getattr(self, "stderr_file", None)
@@ -371,61 +411,75 @@ class McpClient:
         """Close the server with wait, terminate, and kill escalation."""
         if self._closed:
             return self._close_result
-        self._closed = True
-        killed = False
-        reaped = False
-        try:
-            self.notify("notifications/exit")
-        except Exception:
-            pass
+        if "notify_exit" not in self._close_steps:
+            self._close_steps.add("notify_exit")
+            try:
+                self.notify("notifications/exit")
+            except Exception:
+                pass
         try:
             if self.proc.stdin is not None and not self.proc.stdin.closed:
                 self.proc.stdin.close()
         except OSError:
             pass
         proc_io_after = self._read_proc_io(self.proc.pid)
-        reaped = _wait_for_reap(self.proc, timeout=1)
-        if not reaped:
-            try:
-                self.proc.terminate()
-            except OSError:
-                pass
-            reaped = _wait_for_reap(self.proc, timeout=1)
-        if not reaped:
-            try:
-                self.proc.kill()
-                killed = True
-            except OSError:
-                pass
-            reaped = _wait_for_reap(self.proc, timeout=5)
+        if not self._close_reaped:
+            self._close_reaped = _wait_for_reap(self.proc, timeout=1)
+        if not self._close_reaped:
+            if "terminate" not in self._close_steps:
+                self._close_steps.add("terminate")
+                try:
+                    self.proc.terminate()
+                except OSError:
+                    pass
+            self._close_reaped = _wait_for_reap(self.proc, timeout=1)
+        if not self._close_reaped:
+            if "kill" not in self._close_steps:
+                try:
+                    self.proc.kill()
+                    self._close_killed = True
+                except OSError:
+                    pass
+                else:
+                    self._close_steps.add("kill")
+            self._close_reaped = _wait_for_reap(self.proc, timeout=5)
+        if not self._close_reaped:
+            self._close_result = False
+            return self._close_result
         proc_io_after = proc_io_after or self._read_proc_io(self.proc.pid)
-        self._record_proc_io_delta(
-            "mcp_stdio_child_processes", self.proc_io_before, proc_io_after
-        )
-        self._record_lifecycle(killed, reaped)
+        if "record_io" not in self._close_steps:
+            self._record_proc_io_delta(
+                "mcp_stdio_child_processes",
+                self.proc_io_before,
+                proc_io_after,
+                f"mcp_stdio:{self.proc.pid}",
+            )
+            self._close_steps.add("record_io")
+        if "record_lifecycle" not in self._close_steps:
+            self._record_lifecycle(self._close_killed, self._close_reaped)
+            self._close_steps.add("record_lifecycle")
         try:
             self.stderr_file.close()
         except OSError:
             pass
         _close_process_streams(self.proc)
-        if reaped:
-            self._registry.unregister(self.proc)
-        self._close_result = reaped
+        self._registry.unregister(self.proc)
+        self._close_result = self._close_reaped
+        self._closed = True
         return self._close_result
 
     def _record_lifecycle(self, killed: bool, reaped: bool) -> None:
         receipt = self._lifecycle_receipt
-        receipt["process_count"] = int(receipt.get("process_count", 0)) + 1
-        roles = receipt.setdefault("roles", {})
-        roles["mcp_stdio"] = int(roles.get("mcp_stdio", 0)) + 1
-        if reaped:
-            receipt["exited_count"] = int(receipt.get("exited_count", 0)) + 1
-        else:
-            receipt.setdefault("exited_count", 0)
-        if killed:
-            receipt["killed_count"] = int(receipt.get("killed_count", 0)) + 1
-        else:
-            receipt.setdefault("killed_count", 0)
+        if self._lifecycle_receipt_target is None:
+            target = dict(receipt)
+            roles = dict(receipt.get("roles", {}))
+            roles["mcp_stdio"] = int(roles.get("mcp_stdio", 0)) + 1
+            target["roles"] = roles
+            target["process_count"] = int(receipt.get("process_count", 0)) + 1
+            target["exited_count"] = int(receipt.get("exited_count", 0)) + int(reaped)
+            target["killed_count"] = int(receipt.get("killed_count", 0)) + int(killed)
+            self._lifecycle_receipt_target = target
+        receipt.update(self._lifecycle_receipt_target)
 
 
 def terminate_and_reap_owned_processes(
