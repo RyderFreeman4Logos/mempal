@@ -423,11 +423,32 @@ fn holder_is_live(holder: &DbAdmissionHolder) -> bool {
     {
         super::process_identity::process_identity_matches(holder.pid, &holder.process_identity)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
-        holder.pid == std::process::id()
-            && holder.process_identity == super::process_identity::current_process_identity()
+        if holder.pid == std::process::id() {
+            return holder.process_identity == super::process_identity::current_process_identity();
+        }
+        retain_holder_for_liveness(imp::foreign_process_liveness(holder.pid))
     }
+    #[cfg(not(unix))]
+    {
+        if holder.pid == std::process::id() {
+            return holder.process_identity == super::process_identity::current_process_identity();
+        }
+        retain_holder_for_liveness(ProcessLiveness::Unverifiable)
+    }
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessLiveness {
+    Dead,
+    Unverifiable,
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+const fn retain_holder_for_liveness(liveness: ProcessLiveness) -> bool {
+    matches!(liveness, ProcessLiveness::Unverifiable)
 }
 
 fn admission_token(owner_identity: &str, generation: u64, acquired_at_unix_secs: u64) -> String {
@@ -470,6 +491,23 @@ mod imp {
             _ => Err(error),
         }
     }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn foreign_process_liveness(pid: u32) -> super::ProcessLiveness {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return super::ProcessLiveness::Unverifiable;
+        };
+        // SAFETY: Signal 0 performs an existence/permission probe only. The
+        // converted PID is passed by value and no Rust memory is exposed.
+        let result = unsafe { libc::kill(pid, 0) };
+        if result == 0 {
+            return super::ProcessLiveness::Unverifiable;
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(code) if code == libc::ESRCH => super::ProcessLiveness::Dead,
+            _ => super::ProcessLiveness::Unverifiable,
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -478,6 +516,13 @@ mod imp {
     use std::io;
 
     pub fn try_lock_exclusive(_file: &File) -> Result<bool, io::Error> {
-        Ok(true)
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "profile database admission requires cross-process file locking",
+        ))
     }
 }
+
+#[cfg(test)]
+#[path = "db_admission_tests.rs"]
+mod tests;
