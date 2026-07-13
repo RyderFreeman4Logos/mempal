@@ -52,6 +52,22 @@ impl ReindexProgressStore {
         )
     }
 
+    pub fn upsert_running_on_connection(
+        &self,
+        conn: &rusqlite::Connection,
+        source_path: &str,
+        last_processed_chunk_id: Option<i64>,
+        embedder_name: &str,
+    ) -> Result<()> {
+        Self::upsert_on_connection(
+            conn,
+            source_path,
+            last_processed_chunk_id,
+            embedder_name,
+            "running",
+        )
+    }
+
     pub fn mark_paused(
         &self,
         source_path: &str,
@@ -152,9 +168,25 @@ impl ReindexProgressStore {
         embedder_name: &str,
         status: &str,
     ) -> Result<()> {
-        let now = now_secs();
         let conn = self.open_connection()?;
-        conn.connection().execute(
+        Self::upsert_on_connection(
+            conn.connection(),
+            source_path,
+            last_processed_chunk_id,
+            embedder_name,
+            status,
+        )
+    }
+
+    fn upsert_on_connection(
+        conn: &rusqlite::Connection,
+        source_path: &str,
+        last_processed_chunk_id: Option<i64>,
+        embedder_name: &str,
+        status: &str,
+    ) -> Result<()> {
+        let now = now_secs();
+        conn.execute(
             r#"
             INSERT INTO reindex_progress (
                 source_path,

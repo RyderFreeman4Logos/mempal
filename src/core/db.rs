@@ -751,6 +751,14 @@ impl Database {
         project_id: Option<&str>,
         content: Option<&str>,
     ) -> Result<(), DbError> {
+        if !self.conn.is_autocommit() {
+            return self.record_gating_audit_in_current_transaction(
+                candidate_hash,
+                decision,
+                project_id,
+                content,
+            );
+        }
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = self.record_gating_audit_in_current_transaction(
             candidate_hash,
@@ -4992,7 +5000,10 @@ impl Database {
         let mut last_rowid: i64 = -1;
 
         loop {
-            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            let owns_transaction = self.conn.is_autocommit();
+            if owns_transaction {
+                self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            }
             let result: std::result::Result<(usize, i64), DbError> = (|| {
                 let sql = r#"
                     UPDATE drawers SET
@@ -5027,7 +5038,9 @@ impl Database {
             })();
             match result {
                 Ok((n, new_last_rowid)) => {
-                    self.conn.execute_batch("COMMIT")?;
+                    if owns_transaction {
+                        self.conn.execute_batch("COMMIT")?;
+                    }
                     total += n;
                     if n == 0 || new_last_rowid == last_rowid {
                         break;
@@ -5035,7 +5048,9 @@ impl Database {
                     last_rowid = new_last_rowid;
                 }
                 Err(e) => {
-                    let _ = self.conn.execute_batch("ROLLBACK");
+                    if owns_transaction {
+                        let _ = self.conn.execute_batch("ROLLBACK");
+                    }
                     return Err(e);
                 }
             }

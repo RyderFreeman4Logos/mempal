@@ -202,6 +202,16 @@ impl Database {
     where
         E: From<DbError>,
     {
+        if !self.conn.is_autocommit() {
+            if let Some(lease) = lease {
+                self.runtime_writer_lease_cleanup_expired_tx(true)
+                    .map_err(E::from)?;
+                self.require_runtime_writer_lease_tx(lease, operation)
+                    .map_err(E::from)?;
+            }
+            return write();
+        }
+
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(DbError::from)

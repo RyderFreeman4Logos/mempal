@@ -6483,16 +6483,18 @@ async fn ingest_stdin_command(
     let writer_lease = acquire_cli_ingest_writer_lease(db, "ingest-stdin")?;
 
     if exact_duplicate.is_some() {
-        writer_lease.ensure_active("finalize duplicate stdin ingest")?;
-        finalize_exact_duplicate_stdin_ingest(ExactDuplicateStdinIngest {
-            db,
-            wing: &resolved.wing,
-            json: options.json,
-            record: &record,
-            stats: &mut stats,
-            drawer_id: &drawer_id,
-            is_pinned: resolved.is_pinned,
-            superseded_drawer_id: superseded_drawer_id.as_deref(),
+        writer_lease.write_fenced(db, "finalize duplicate stdin ingest", |db| {
+            finalize_exact_duplicate_stdin_ingest(ExactDuplicateStdinIngest {
+                db,
+                wing: &resolved.wing,
+                json: options.json,
+                record: &record,
+                stats: &mut stats,
+                drawer_id: &drawer_id,
+                is_pinned: resolved.is_pinned,
+                superseded_drawer_id: superseded_drawer_id.as_deref(),
+            })?;
+            Ok(())
         })?;
         return Ok(());
     }
@@ -6528,14 +6530,16 @@ async fn ingest_stdin_command(
             gating_decision = Some(tier2.decision);
         }
         if let Some(decision) = gating_decision.as_ref() {
-            writer_lease.ensure_active("record stdin gating audit")?;
-            db.record_gating_audit(
-                &drawer_id,
-                decision,
-                resolved.project_id.as_deref(),
-                Some(&resolved.content),
-            )
-            .with_context(|| format!("failed to record gating audit for {drawer_id}"))?;
+            writer_lease.write_fenced(db, "record stdin gating audit", |db| {
+                db.record_gating_audit(
+                    &drawer_id,
+                    decision,
+                    resolved.project_id.as_deref(),
+                    Some(&resolved.content),
+                )
+                .with_context(|| format!("failed to record gating audit for {drawer_id}"))?;
+                Ok(())
+            })?;
             if decision.is_rejected() {
                 stats.dropped_by_gate = 1;
                 stats.drawer_ids.clear();
@@ -6610,23 +6614,29 @@ async fn ingest_stdin_command(
         link_superseded_drawer(&mut drawer, old_id);
     }
 
-    writer_lease.ensure_active("insert stdin drawer")?;
-    db.insert_drawer_with_project_validity(
-        &drawer,
-        resolved.project_id.as_deref(),
-        None,
-        resolved.valid_from.as_deref(),
-        resolved.valid_until.as_deref(),
-    )
-    .with_context(|| format!("failed to insert drawer {}", drawer.id))?;
-    writer_lease.ensure_active("insert stdin vector")?;
-    db.insert_vector_with_project(&drawer_id, &vector, resolved.project_id.as_deref())
-        .with_context(|| format!("failed to insert vector for drawer {drawer_id}"))?;
+    writer_lease.write_fenced(db, "insert stdin drawer", |db| {
+        db.insert_drawer_with_project_validity(
+            &drawer,
+            resolved.project_id.as_deref(),
+            None,
+            resolved.valid_from.as_deref(),
+            resolved.valid_until.as_deref(),
+        )
+        .with_context(|| format!("failed to insert drawer {}", drawer.id))?;
+        Ok(())
+    })?;
+    writer_lease.write_fenced(db, "insert stdin vector", |db| {
+        db.insert_vector_with_project(&drawer_id, &vector, resolved.project_id.as_deref())
+            .with_context(|| format!("failed to insert vector for drawer {drawer_id}"))?;
+        Ok(())
+    })?;
 
     if let Some(old_id) = superseded_drawer_id.as_deref() {
-        writer_lease.ensure_active("supersede stdin replacement target")?;
-        db.supersede_drawer(old_id, &format!("replaced by {drawer_id}"))
-            .with_context(|| format!("failed to supersede drawer {old_id}"))?;
+        writer_lease.write_fenced(db, "supersede stdin replacement target", |db| {
+            db.supersede_drawer(old_id, &format!("replaced by {drawer_id}"))
+                .with_context(|| format!("failed to supersede drawer {old_id}"))?;
+            Ok(())
+        })?;
         stats.superseded_drawer_id = Some(old_id.to_string());
     }
 
@@ -6634,16 +6644,20 @@ async fn ingest_stdin_command(
     {
         let config_snap = ConfigHandle::current();
         if config_snap.repair.enabled {
-            writer_lease.ensure_active("record stdin repair signal")?;
-            mempal::repair::try_record_failure(
-                db.path(),
-                &drawer_id,
-                &drawer.content,
-                &resolved.wing,
-                resolved.room.as_deref(),
-                resolved.project_id.as_deref(),
-                &config_snap.repair,
-            );
+            writer_lease.write_fenced(db, "record stdin repair signal", |db| {
+                if let Err(error) = mempal::repair::try_record_failure_on_connection(
+                    db.conn(),
+                    &drawer_id,
+                    &drawer.content,
+                    &resolved.wing,
+                    resolved.room.as_deref(),
+                    resolved.project_id.as_deref(),
+                    &config_snap.repair,
+                ) {
+                    tracing::warn!(error = %error, drawer_id, "failure event write failed");
+                }
+                Ok(())
+            })?;
         }
     }
 
@@ -7066,12 +7080,18 @@ async fn checkpoint_command(
                 ..drawer
             };
 
-            writer_lease.ensure_active("insert checkpoint drawer")?;
-            db.insert_drawer_with_project(&drawer, project_id.as_deref())
-                .with_context(|| format!("failed to insert checkpoint drawer {}", drawer.id))?;
-            writer_lease.ensure_active("insert checkpoint vector")?;
-            db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
-                .with_context(|| format!("failed to insert vector for checkpoint {drawer_id}"))?;
+            writer_lease.write_fenced(db, "insert checkpoint drawer", |db| {
+                db.insert_drawer_with_project(&drawer, project_id.as_deref())
+                    .with_context(|| format!("failed to insert checkpoint drawer {}", drawer.id))?;
+                Ok(())
+            })?;
+            writer_lease.write_fenced(db, "insert checkpoint vector", |db| {
+                db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
+                    .with_context(|| {
+                        format!("failed to insert vector for checkpoint {drawer_id}")
+                    })?;
+                Ok(())
+            })?;
 
             println!("checkpoint saved: {drawer_id}");
         }
@@ -7143,13 +7163,16 @@ async fn checkpoint_command(
             } else {
                 let writer_lease = acquire_cli_content_writer_lease(db, "checkpoint-cleanup")?;
                 let now_ts = iso_timestamp();
-                writer_lease.ensure_active("cleanup checkpoint drawers")?;
-                let affected = db.conn().execute(
-                    "UPDATE drawers SET deleted_at = ?1 \
-                     WHERE wing = 'session-checkpoint' AND deleted_at IS NULL \
-                     AND added_at < ?2",
-                    [&now_ts, &cutoff_ts],
-                )?;
+                let affected =
+                    writer_lease.write_fenced(db, "cleanup checkpoint drawers", |db| {
+                        let affected = db.conn().execute(
+                            "UPDATE drawers SET deleted_at = ?1 \
+                             WHERE wing = 'session-checkpoint' AND deleted_at IS NULL \
+                             AND added_at < ?2",
+                            [&now_ts, &cutoff_ts],
+                        )?;
+                        Ok(affected)
+                    })?;
                 println!("deleted {affected} checkpoints older than {cutoff_ts}");
             }
         }
@@ -9319,10 +9342,12 @@ fn recompute_effective_importance_command(db: &Database) -> Result<()> {
         imp.decay_rate, imp.floor, imp.boost_cap
     );
     let writer_lease = acquire_maintenance_writer_lease(db, "recompute-effective-importance")?;
-    writer_lease.ensure_active("recompute effective_importance")?;
-    let updated = db
-        .recompute_all_effective_importance(now_ms, imp.decay_rate, imp.floor, imp.boost_cap)
-        .context("failed to recompute effective_importance")?;
+    let updated = writer_lease.write_fenced(db, "recompute effective_importance", |db| {
+        let updated = db
+            .recompute_all_effective_importance(now_ms, imp.decay_rate, imp.floor, imp.boost_cap)
+            .context("failed to recompute effective_importance")?;
+        Ok(updated)
+    })?;
     println!("updated {updated} drawers");
     Ok(())
 }
@@ -9453,14 +9478,18 @@ async fn reindex_command_by_embedder(
             );
             resume_checkpoint = None;
         }
-        writer_lease.ensure_active("stash vectors before recreate")?;
-        let stash = db
-            .stash_vectors_before_recreate()
-            .context("failed to stash existing vectors before recreate")?;
-        writer_lease.ensure_active("recreate vector table")?;
-        println!("recreating drawer_vectors with {new_dim} dimensions...");
-        db.recreate_vectors_table(new_dim)
-            .context("failed to recreate vectors table")?;
+        let stash = writer_lease.write_fenced(db, "stash vectors before recreate", |db| {
+            let stash = db
+                .stash_vectors_before_recreate()
+                .context("failed to stash existing vectors before recreate")?;
+            Ok(stash)
+        })?;
+        writer_lease.write_fenced(db, "recreate vector table", |db| {
+            println!("recreating drawer_vectors with {new_dim} dimensions...");
+            db.recreate_vectors_table(new_dim)
+                .context("failed to recreate vectors table")?;
+            Ok(())
+        })?;
         stash
     } else if mode.stale_only {
         println!("stale-only reindex preserving existing drawer_vectors table");
@@ -9533,25 +9562,38 @@ async fn reindex_command_by_embedder(
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("embedder returned no vector during reindex"))?;
-        writer_lease.ensure_active("write reindex vector")?;
-        db.conn()
-            .execute("DELETE FROM drawer_vectors WHERE id = ?1", [&row.id])
-            .with_context(|| format!("failed to clear existing vector for {}", row.id))?;
-        writer_lease.ensure_active("insert reindex vector")?;
-        db.insert_vector_with_project(&row.id, &vector, row.project_id.as_deref())
-            .with_context(|| format!("failed to insert vector for {}", row.id))?;
-        writer_lease.ensure_active("record reindex metadata")?;
-        record_reindex_metadata(
-            db,
-            &row.id,
-            CURRENT_VECTOR_INDEX_VERSION,
-            &target_fingerprint_for_reindex,
-        )
-        .with_context(|| format!("failed to record reindex metadata for {}", row.id))?;
-        writer_lease.ensure_active("persist reindex checkpoint")?;
-        progress_store_for_reindex
-            .upsert_running(&row.source_path, Some(row.chunk_index), embedder_name)
-            .context("failed to persist reindex checkpoint")?;
+        writer_lease.write_fenced(db, "write reindex vector", |db| {
+            db.conn()
+                .execute("DELETE FROM drawer_vectors WHERE id = ?1", [&row.id])
+                .with_context(|| format!("failed to clear existing vector for {}", row.id))?;
+            Ok(())
+        })?;
+        writer_lease.write_fenced(db, "insert reindex vector", |db| {
+            db.insert_vector_with_project(&row.id, &vector, row.project_id.as_deref())
+                .with_context(|| format!("failed to insert vector for {}", row.id))?;
+            Ok(())
+        })?;
+        writer_lease.write_fenced(db, "record reindex metadata", |db| {
+            record_reindex_metadata(
+                db,
+                &row.id,
+                CURRENT_VECTOR_INDEX_VERSION,
+                &target_fingerprint_for_reindex,
+            )
+            .with_context(|| format!("failed to record reindex metadata for {}", row.id))?;
+            Ok(())
+        })?;
+        writer_lease.write_fenced(db, "persist reindex checkpoint", |db| {
+            progress_store_for_reindex
+                .upsert_running_on_connection(
+                    db.conn(),
+                    &row.source_path,
+                    Some(row.chunk_index),
+                    embedder_name,
+                )
+                .context("failed to persist reindex checkpoint")?;
+            Ok(())
+        })?;
         done += 1;
         last_processed = Some((row.source_path.clone(), row.chunk_index));
         println!("  {done}/{total}");
