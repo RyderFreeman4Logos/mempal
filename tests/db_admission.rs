@@ -1,5 +1,6 @@
 use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
 
+use mempal::core::AsyncDb;
 use mempal::core::db_admission::{
     DbAdmissionConfig, DbAdmissionError, DbAdmissionRequest, DbHolderClass, ProfileDbAdmission,
 };
@@ -120,4 +121,28 @@ fn concurrent_registration_never_oversubscribes_profile_budget() {
         .count();
     assert_eq!(reported, 2);
     assert_eq!(admitted, 2);
+}
+
+#[test]
+fn async_pool_holds_admission_for_its_full_lifetime() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    let pool = AsyncDb::open_for(&db_path, 2, DbHolderClass::Mcp).expect("async pool");
+
+    let active = ProfileDbAdmission::snapshot(&db_path).expect("active snapshot");
+    assert_eq!(
+        active.active_holders,
+        1,
+        "pool={:?}",
+        pool.resource_snapshot()
+    );
+    assert_eq!(active.holders[0].holder_class, DbHolderClass::Mcp);
+
+    drop(pool);
+    assert_eq!(
+        ProfileDbAdmission::snapshot(&db_path)
+            .expect("released snapshot")
+            .active_holders,
+        0
+    );
 }

@@ -44,6 +44,9 @@ pub(crate) fn daemon_owner_matches_process(owner: &str, pid: u32) -> bool {
 /// Verify the process birth identity recorded by daemon-owned status.
 #[cfg(target_os = "linux")]
 pub(crate) fn process_identity_matches(pid: u32, expected: &str) -> bool {
+    if pid == std::process::id() {
+        return current_process_identity() == expected;
+    }
     linux_process_identity(pid).as_deref() == Some(expected)
 }
 
@@ -143,6 +146,15 @@ mod tests {
         assert!(!daemon_owner_matches_process(
             &format!("{DAEMON_OWNER_PREFIX}{}-previous-start", std::process::id()),
             std::process::id()
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn current_process_identity_matches_inside_pid_namespaces() {
+        assert!(process_identity_matches(
+            std::process::id(),
+            current_process_identity()
         ));
     }
 }

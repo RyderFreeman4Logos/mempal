@@ -115,6 +115,7 @@ use super::ingest_payload::{
     PreparedIngestOperation, QueuedWriteOperation, decode_queued_ingest_operation,
     run_durable_delete,
 };
+use super::resource_usage;
 use super::timeline::{TimelineRequest, TimelineResponse};
 use super::tools::{
     BriefMcpRequest, BriefMcpResponse, ChunkerStatsDto, ContextRequest, ContextResponse,
@@ -137,13 +138,12 @@ use super::tools::{
     MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, OperationStatusRequest,
     PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto, Phase3Request,
     Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse,
-    ProcessResourceUsageDto, ProjectsListResponse, ProjectsResumeRequest, ProjectsResumeResponse,
-    QueueFailureBucketDto, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse,
-    ReadDrawersRequest, ReadDrawersResponse, ResearchAdapterPlanDto, ResearchIngestPlanDto,
-    ResourceCounterDto, ResourceUsageDto, RetrievalScopeRequest, RetrievedKnowledgeCardDto,
-    RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto,
-    ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, SkillDto,
-    SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount, SqliteResourceUsageDto,
+    ProjectsListResponse, ProjectsResumeRequest, ProjectsResumeResponse, QueueFailureBucketDto,
+    QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
+    ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievalScopeRequest,
+    RetrievedKnowledgeCardDto, RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto,
+    RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse,
+    SearchResultDto, SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount,
     StatusDetail, StatusRequest, StatusResponse, StatusScope, SystemWarning, TaxonomyEntryDto,
     TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto,
     TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
@@ -4980,21 +4980,10 @@ impl MempalMcpServer {
         let llm_endpoint_label = |base_url: &str| {
             endpoint_policy_diagnostic_label(remote_call_policy, RemoteCallService::Llm, base_url)
         };
-        let process_report =
-            crate::process_diagnostics::inspect_process_memory(std::process::id() as i32);
-        let sqlite_resource = self
-            .async_db
-            .get()
-            .map(|db| SqliteResourceUsageDto::from(db.resource_snapshot()))
-            .unwrap_or_else(|| SqliteResourceUsageDto {
-                async_pool_loaded: false,
-                ..SqliteResourceUsageDto::default()
-            });
-        let resource_usage = ResourceUsageDto {
-            process: ProcessResourceUsageDto::from(process_report),
-            sqlite: sqlite_resource,
-            counters: ResourceCounterDto::from(crate::observability::resource_counters()),
-        };
+        let resource_usage = resource_usage::build_resource_usage(
+            &self.db_path,
+            self.async_db.get().map(|db| db.resource_snapshot()),
+        );
         let hook_admission = crate::hook_diagnostics::hook_admission_stats(
             self.db_path.parent().unwrap_or_else(|| Path::new(".")),
             crate::hook::MAX_INLINE_PAYLOAD_BYTES as u64,
