@@ -233,10 +233,10 @@ pub fn spawn_failure_detection(
 
 /// Open a fresh connection and write a failure event.
 fn write_failure_event_to_path(db_path: &Path, args: &FailureEventArgs<'_>) -> anyhow::Result<()> {
-    use rusqlite::Connection;
-    let conn = Connection::open(db_path)?;
+    let admitted = crate::core::db_connection::AdmittedSqliteConnection::open_default(db_path)?;
+    let conn = admitted.connection();
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    record_failure_event(&conn, args)?;
+    record_failure_event(conn, args)?;
     Ok(())
 }
 

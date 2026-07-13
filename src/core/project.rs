@@ -155,6 +155,8 @@ pub enum ProjectError {
     DatabaseBusy,
     #[error("failed to run project migration query")]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Database(#[from] super::db::DbError),
 }
 
 pub fn resolve_project_id(
@@ -311,7 +313,8 @@ where
     let mut batch_index = 0usize;
 
     loop {
-        let conn = Connection::open(db_path)?;
+        let admitted = super::db_connection::AdmittedSqliteConnection::open_default(db_path)?;
+        let conn = admitted.connection();
         conn.busy_timeout(Duration::from_millis(0))?;
         match conn.execute_batch("BEGIN IMMEDIATE") {
             Ok(()) => {}
@@ -328,15 +331,15 @@ where
         }
 
         let result = (|| {
-            let ids = collect_batch_ids(&conn, wing.as_deref())?;
+            let ids = collect_batch_ids(conn, wing.as_deref())?;
             if ids.is_empty() {
                 conn.execute_batch("COMMIT")?;
                 return Ok(None);
             }
 
-            update_project_ids(&conn, "drawers", &ids, &project_id)?;
-            update_project_ids(&conn, "drawer_vectors", &ids, &project_id)?;
-            let remaining = count_remaining(&conn, wing.as_deref())?;
+            update_project_ids(conn, "drawers", &ids, &project_id)?;
+            update_project_ids(conn, "drawer_vectors", &ids, &project_id)?;
+            let remaining = count_remaining(conn, wing.as_deref())?;
             conn.execute_batch("COMMIT")?;
             Ok(Some((ids.len(), remaining)))
         })();

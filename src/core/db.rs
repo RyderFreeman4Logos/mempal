@@ -50,14 +50,6 @@ pub const VECTOR_DISTANCE_METRIC: &str = "cosine";
 /// long-lived daemon and MCP processes (#525). High-throughput maintenance
 /// paths that need a larger cache must opt in explicitly.
 pub(crate) const SQLITE_CACHE_SIZE_KIB_DEFAULT: i64 = -16_384;
-/// SQLite page cache budget for issue #311's large-DB stale reindex path.
-///
-/// Negative `PRAGMA cache_size` values are KiB, so `-262144` is 256 MiB.
-/// That is enough to avoid the default 2 MiB cache thrash on ~10 GiB stores,
-/// while staying far below the 4 GiB peak-memory cap. The reindex speedup is
-/// still the O(n) snapshot work-list; do not replace it with multi-GiB cache or
-/// `mmap_size`.
-pub(crate) const SQLITE_CACHE_SIZE_KIB_256_MIB: i64 = -262_144;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 

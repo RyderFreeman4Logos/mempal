@@ -552,7 +552,15 @@ pub fn operation_telemetry_summary(
     db: &Database,
     options: OperationTelemetrySummaryOptions,
 ) -> Result<Vec<OperationTelemetrySummaryRow>> {
-    if !operation_telemetry_table_exists(db.conn())? {
+    let table_exists = db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='operation_telemetry')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("failed to check operation telemetry table")?;
+    if !table_exists {
         return Ok(Vec::new());
     }
 
@@ -650,17 +658,6 @@ pub fn operation_telemetry_summary(
     Ok(summaries)
 }
 
-fn operation_telemetry_table_exists(conn: &Connection) -> Result<bool> {
-    let exists = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='operation_telemetry')",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .context("failed to check operation telemetry table")?;
-    Ok(exists == 1)
-}
-
 pub fn render_operation_telemetry_summary(
     rows: &[OperationTelemetrySummaryRow],
     format: OperationTelemetryFormat,
@@ -674,10 +671,12 @@ pub fn render_operation_telemetry_summary(
 }
 
 fn record_operation_telemetry_path(path: &Path, record: OperationTelemetryRecord) -> Result<()> {
-    let conn = Connection::open(path).context("failed to open telemetry database")?;
+    let admitted = crate::core::db_connection::AdmittedSqliteConnection::open_default(path)
+        .context("failed to open telemetry database")?;
+    let conn = admitted.connection();
     conn.busy_timeout(Duration::from_millis(10))
         .context("failed to set telemetry busy timeout")?;
-    insert_operation_telemetry(&conn, record)
+    insert_operation_telemetry(conn, record)
 }
 
 fn insert_operation_telemetry(conn: &Connection, record: OperationTelemetryRecord) -> Result<()> {

@@ -13,6 +13,9 @@ use tokio::sync::Semaphore;
 
 use super::config::scrub_sensitive_text;
 use super::db::{ensure_wal_journal_mode, rusqlite_error_is_lock};
+use super::queue_connection_admission as queue_admission;
+
+pub use super::queue_connection_admission::queue_stats_readonly;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 const STARTUP_RECLAIM_STALE_SECS: i64 = 60;
@@ -25,11 +28,14 @@ pub const LAST_ERROR_MAX_BYTES: usize = 4 * 1024;
 pub const DEFAULT_MAX_INGEST_ACTIVE_BYTES: u64 = 64 * 1024 * 1024;
 const INGEST_ASYNC_KIND: &str = "ingest_async";
 const OVERSIZE_REJECTION_TOTAL_KEY: &str = "queue.admission.rejected_oversize.total";
-
 #[derive(Debug, Error)]
 pub enum QueueError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Admission(#[from] super::db_admission::DbAdmissionError),
+    #[error("queue database does not exist: {0}")]
+    DatabaseMissing(PathBuf),
     #[error("pending message not found: {0}")]
     MessageNotFound(String),
     #[error("pending message claim lost: {0}")]
@@ -232,6 +238,7 @@ struct ConnectionCache {
     claim_writer: Arc<Mutex<Option<Connection>>>,
     writer: Arc<Mutex<Option<Connection>>>,
     reader: Arc<Mutex<Option<Connection>>>,
+    admission: queue_admission::QueueConnectionAdmission,
     #[cfg(any(test, feature = "db-test-seam"))]
     claim_open_count: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "db-test-seam"))]
@@ -244,6 +251,7 @@ impl ConnectionCache {
             claim_writer: Arc::new(Mutex::new(None)),
             writer: Arc::new(Mutex::new(None)),
             reader: Arc::new(Mutex::new(None)),
+            admission: queue_admission::QueueConnectionAdmission::new(),
             #[cfg(any(test, feature = "db-test-seam"))]
             claim_open_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "db-test-seam"))]
@@ -764,7 +772,7 @@ impl PendingMessageStore {
         Ok(store)
     }
 
-    fn fork_connection_cache(&self) -> Self {
+    pub(super) fn fork_connection_cache(&self) -> Self {
         Self {
             db_path: self.db_path.clone(),
             config: self.config,
@@ -1322,7 +1330,7 @@ impl PendingMessageStore {
             if let Some(record) = operation_status_from_pending(conn, id)? {
                 return Ok(Some(record));
             }
-            operation_status_from_completion(conn, id)
+            super::queue_queries::operation_status_from_completion(conn, id)
         })
     }
 
@@ -1840,16 +1848,28 @@ impl PendingMessageStore {
         &self,
         busy_timeout: Option<Duration>,
     ) -> Result<Connection> {
+        self.connection_cache.admission.ensure(&self.db_path)?;
         let conn = Connection::open(&self.db_path)?;
         conn.busy_timeout(busy_timeout.unwrap_or(DEFAULT_BUSY_TIMEOUT))?;
+        conn.pragma_update(
+            None,
+            "cache_size",
+            queue_admission::QUEUE_SQLITE_CACHE_SIZE_KIB,
+        )?;
         ensure_wal_journal_mode(&conn)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(conn)
     }
 
     fn open_query_connection(&self) -> Result<Connection> {
+        self.connection_cache.admission.ensure(&self.db_path)?;
         let conn = Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+        conn.pragma_update(
+            None,
+            "cache_size",
+            queue_admission::QUEUE_SQLITE_CACHE_SIZE_KIB,
+        )?;
         conn.pragma_update(None, "query_only", "ON")?;
         Ok(conn)
     }
@@ -2122,56 +2142,10 @@ fn operation_status_from_pending(
     .map_err(QueueError::from)
 }
 
-fn operation_status_from_completion(
+pub(super) fn compute_queue_stats(
     conn: &Connection,
-    id: &str,
-) -> Result<Option<PendingOperationRecord>> {
-    conn.query_row(
-        r#"
-            SELECT message_id,
-                   kind,
-                   created_at,
-                   claimed_at,
-                   completed_at,
-                   op_state,
-                   result_drawer_id,
-                   rejected_reason,
-                   failure_detail,
-                   result_json
-            FROM pending_message_completions
-            WHERE message_id = ?1
-            "#,
-        [id],
-        |row| {
-            Ok(PendingOperationRecord {
-                id: row.get(0)?,
-                kind: row.get(1)?,
-                created_at: row.get(2)?,
-                claimed_at: row.get(3)?,
-                completed_at: row.get(4)?,
-                op_state: row.get(5)?,
-                result_drawer_id: row.get(6)?,
-                rejected_reason: row.get(7)?,
-                failure_detail: row.get(8)?,
-                result_json: row.get(9)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(QueueError::from)
-}
-
-/// Open a WAL-mode-compatible read-only connection and return queue statistics.
-///
-/// Unlike `PendingMessageStore::new(...).stats()`, this skips `reclaim_stale` and
-/// opens with `SQLITE_OPEN_READ_ONLY` so WAL readers never block daemon write transactions.
-/// Used by `mempal status` to avoid the ~5s lock contention described in issue #182.
-pub fn queue_stats_readonly(path: &Path) -> Result<QueueStats> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    compute_queue_stats(&conn, DEFAULT_MAX_INGEST_ACTIVE_BYTES)
-}
-
-fn compute_queue_stats(conn: &Connection, ingest_payload_limit_bytes: u64) -> Result<QueueStats> {
+    ingest_payload_limit_bytes: u64,
+) -> Result<QueueStats> {
     let mut pending = 0i64;
     let mut claimed = 0i64;
     let mut failed = 0i64;

@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use thiserror::Error;
 
-use super::db::SQLITE_CACHE_SIZE_KIB_256_MIB;
+use super::db_connection::AdmittedSqliteConnection;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReindexProgressRow {
@@ -20,6 +20,8 @@ pub struct ReindexProgressRow {
 pub enum ReindexProgressError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Database(#[from] super::db::DbError),
 }
 
 pub type Result<T> = std::result::Result<T, ReindexProgressError>;
@@ -100,7 +102,7 @@ impl ReindexProgressStore {
     ) -> Result<usize> {
         let now = now_secs();
         let conn = self.open_connection()?;
-        let updated = conn.execute(
+        let updated = conn.connection().execute(
             FINALIZE_COMPLETED_RUNNING_ROWS_SQL,
             params![current_index_version, target_fingerprint, now],
         )?;
@@ -134,8 +136,11 @@ impl ReindexProgressStore {
         };
 
         let row = match embedder_name {
-            Some(name) => conn.query_row(sql, [name], map_row).optional()?,
-            None => conn.query_row(sql, [], map_row).optional()?,
+            Some(name) => conn
+                .connection()
+                .query_row(sql, [name], map_row)
+                .optional()?,
+            None => conn.connection().query_row(sql, [], map_row).optional()?,
         };
         Ok(row)
     }
@@ -149,7 +154,7 @@ impl ReindexProgressStore {
     ) -> Result<()> {
         let now = now_secs();
         let conn = self.open_connection()?;
-        conn.execute(
+        conn.connection().execute(
             r#"
             INSERT INTO reindex_progress (
                 source_path,
@@ -177,10 +182,8 @@ impl ReindexProgressStore {
         Ok(())
     }
 
-    fn open_connection(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.db_path)?;
-        conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_256_MIB)?;
-        Ok(conn)
+    fn open_connection(&self) -> Result<AdmittedSqliteConnection> {
+        AdmittedSqliteConnection::open_default(&self.db_path).map_err(ReindexProgressError::from)
     }
 }
 
