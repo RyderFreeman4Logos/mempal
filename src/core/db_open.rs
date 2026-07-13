@@ -21,6 +21,14 @@ impl Database {
         Self::open_with_mode(path, OpenMode::QueryOnly, true)
     }
 
+    /// Open a non-mutating connection with a caller-selected busy timeout.
+    pub fn open_query_only_with_busy_timeout(
+        path: &Path,
+        busy_timeout: Duration,
+    ) -> Result<Self, DbError> {
+        Self::open_with_mode_and_busy_timeout(path, OpenMode::QueryOnly, busy_timeout, true)
+    }
+
     pub(crate) fn open_unadmitted(path: &Path) -> Result<Self, DbError> {
         Self::open_with_mode(path, OpenMode::ReadWrite, false)
     }

@@ -309,6 +309,14 @@ async fn test_mcp_status_surfaces_queue_stats() {
             .configured_cache_bytes,
         256 * 1024 * 1024
     );
+    assert_eq!(response.resource_usage.daemon_recovery.phase, "healthy");
+    assert_eq!(
+        response
+            .resource_usage
+            .daemon_recovery
+            .restart_budget_remaining,
+        3
+    );
     assert_eq!(response.queue_stats.pending, 1);
     assert_eq!(response.queue_stats.claimed, 0);
     assert_eq!(response.queue_stats.active_payload_bytes, 7);

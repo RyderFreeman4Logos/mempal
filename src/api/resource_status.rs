@@ -14,6 +14,7 @@ pub(super) struct ResourceUsageStatus {
     sqlite: SqliteResourceUsageStatus,
     profile_admission: ProfileAdmissionStatus,
     memory_pressure: crate::system_memory::MemoryPressureSnapshot,
+    daemon_recovery: DaemonRecoveryStatus,
     counters: ResourceCounterStatus,
 }
 
@@ -29,7 +30,38 @@ pub(super) fn build_resource_usage(
             .unwrap_or_default(),
         profile_admission: ProfileAdmissionStatus::inspect(db_path),
         memory_pressure: crate::system_memory::inspect_memory_pressure(),
+        daemon_recovery: DaemonRecoveryStatus::inspect(db_path.parent().unwrap_or(db_path)),
         counters: ResourceCounterStatus::from(crate::observability::resource_counters()),
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+struct DaemonRecoveryStatus {
+    phase: String,
+    recent_fault_count: usize,
+    restart_budget_remaining: usize,
+    cooldown_remaining_secs: u64,
+    last_fault: Option<String>,
+    error: Option<String>,
+}
+
+impl DaemonRecoveryStatus {
+    fn inspect(mempal_home: &Path) -> Self {
+        match crate::daemon_recovery::DaemonRecovery::new(mempal_home).snapshot() {
+            Ok(snapshot) => Self {
+                phase: snapshot.phase.as_str().to_string(),
+                recent_fault_count: snapshot.recent_fault_count,
+                restart_budget_remaining: snapshot.restart_budget_remaining,
+                cooldown_remaining_secs: snapshot.cooldown_remaining_secs,
+                last_fault: snapshot.last_fault.map(|fault| fault.as_str().to_string()),
+                error: None,
+            },
+            Err(error) => Self {
+                phase: "unavailable".to_string(),
+                error: Some(error.to_string()),
+                ..Self::default()
+            },
+        }
     }
 }
 
@@ -173,7 +205,7 @@ mod tests {
     use crate::core::db_admission::{DbAdmissionRequest, DbHolderClass};
 
     #[test]
-    fn status_serializes_profile_admission_and_memory_pressure() {
+    fn status_serializes_profile_admission_memory_pressure_and_recovery() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("palace.db");
         let _holder = ProfileDbAdmission::acquire(
@@ -191,5 +223,6 @@ mod tests {
             "api"
         );
         assert!(value["memory_pressure"].is_object());
+        assert_eq!(value["daemon_recovery"]["phase"], "healthy");
     }
 }

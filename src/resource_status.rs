@@ -104,6 +104,32 @@ pub fn print_profile_resource_status(db_path: &Path, indent: &str) {
     if let Some(error) = memory.error {
         println!("{indent}error: {error}");
     }
+
+    println!("Daemon Recovery:");
+    match crate::daemon_recovery::DaemonRecovery::new(db_path.parent().unwrap_or(db_path))
+        .snapshot()
+    {
+        Ok(snapshot) => {
+            println!("{indent}phase: {}", snapshot.phase.as_str());
+            println!(
+                "{indent}recent_fault_count: {}",
+                snapshot.recent_fault_count
+            );
+            println!(
+                "{indent}restart_budget_remaining: {}",
+                snapshot.restart_budget_remaining
+            );
+            println!(
+                "{indent}cooldown_remaining_secs: {}",
+                snapshot.cooldown_remaining_secs
+            );
+            println!(
+                "{indent}last_fault: {}",
+                snapshot.last_fault.map_or("none", |fault| fault.as_str())
+            );
+        }
+        Err(error) => println!("{indent}error: {error}"),
+    }
 }
 
 fn optional_u64(value: Option<u64>) -> String {

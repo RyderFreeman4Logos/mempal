@@ -101,16 +101,16 @@ impl DaemonWriteObserver {
         }
     }
 
-    pub async fn maybe_log_stall(&self, store: &AsyncPendingMessageStore) {
+    pub async fn maybe_log_stall(&self, store: &AsyncPendingMessageStore) -> bool {
         let _io_burst =
             crate::observability::IoBurstGuard::start(crate::observability::IoOperationPath::Queue);
         let now = unix_secs();
         let Some(diagnostic) = self.stall_diagnostic(store, now).await else {
-            return;
+            return false;
         };
         let last_log = self.inner.last_stall_log_secs.load(Ordering::Relaxed);
         if now.saturating_sub(last_log) < DAEMON_STALL_LOG_THROTTLE_SECONDS {
-            return;
+            return false;
         }
         if self
             .inner
@@ -118,7 +118,7 @@ impl DaemonWriteObserver {
             .compare_exchange(last_log, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
-            return;
+            return false;
         }
 
         tracing::error!(
@@ -128,6 +128,7 @@ impl DaemonWriteObserver {
             uptime_secs = diagnostic.uptime_secs,
             "daemon write stall detected: queued messages exist but no successful write has completed for at least 5 minutes"
         );
+        true
     }
 
     async fn stall_diagnostic(

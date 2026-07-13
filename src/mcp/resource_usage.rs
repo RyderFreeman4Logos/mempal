@@ -26,6 +26,7 @@ pub(crate) fn build_resource_usage(
         sqlite,
         profile_admission,
         memory_pressure: MemoryPressureDto::from(crate::system_memory::inspect_memory_pressure()),
+        daemon_recovery: DaemonRecoveryDto::inspect(db_path.parent().unwrap_or(db_path)),
         counters: ResourceCounterDto::from(crate::observability::resource_counters()),
     }
 }
@@ -36,7 +37,40 @@ pub struct ResourceUsageDto {
     pub sqlite: SqliteResourceUsageDto,
     pub profile_admission: ProfileDbAdmissionDto,
     pub memory_pressure: MemoryPressureDto,
+    pub daemon_recovery: DaemonRecoveryDto,
     pub counters: ResourceCounterDto,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DaemonRecoveryDto {
+    pub phase: String,
+    pub recent_fault_count: usize,
+    pub restart_budget_remaining: usize,
+    pub cooldown_remaining_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fault: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl DaemonRecoveryDto {
+    fn inspect(mempal_home: &Path) -> Self {
+        match crate::daemon_recovery::DaemonRecovery::new(mempal_home).snapshot() {
+            Ok(snapshot) => Self {
+                phase: snapshot.phase.as_str().to_string(),
+                recent_fault_count: snapshot.recent_fault_count,
+                restart_budget_remaining: snapshot.restart_budget_remaining,
+                cooldown_remaining_secs: snapshot.cooldown_remaining_secs,
+                last_fault: snapshot.last_fault.map(|fault| fault.as_str().to_string()),
+                error: None,
+            },
+            Err(error) => Self {
+                phase: "unavailable".to_string(),
+                error: Some(error.to_string()),
+                ..Self::default()
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

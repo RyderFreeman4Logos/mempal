@@ -5585,6 +5585,23 @@ impl Database {
         name: Option<&str>,
     ) -> Result<Vec<RuntimeWriterLease>, DbError> {
         self.with_immediate_tx(|| self.runtime_writer_lease_cleanup_expired_tx(true))?;
+        self.runtime_writer_lease_status_query(name)
+    }
+
+    /// Inspect writer leases without cleanup writes, for query-only health probes.
+    pub fn runtime_writer_lease_status_read_only(
+        &self,
+        name: Option<&str>,
+    ) -> Result<Vec<RuntimeWriterLease>, DbError> {
+        let mut leases = self.runtime_writer_lease_status_query(name)?;
+        leases.retain(|lease| lease.remaining_secs > 0);
+        Ok(leases)
+    }
+
+    fn runtime_writer_lease_status_query(
+        &self,
+        name: Option<&str>,
+    ) -> Result<Vec<RuntimeWriterLease>, DbError> {
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64)

@@ -16,6 +16,7 @@ pub mod daemon;
 pub mod daemon_bootstrap;
 pub(crate) mod daemon_process;
 pub mod daemon_readiness;
+pub mod daemon_recovery;
 pub mod daemon_singleton;
 pub mod daemon_status;
 #[cfg(target_os = "linux")]

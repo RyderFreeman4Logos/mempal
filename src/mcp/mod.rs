@@ -9,8 +9,8 @@ mod timeline;
 mod tools;
 
 pub use resource_usage::{
-    MemoryPressureDto, ProcessResourceUsageDto, ProfileDbAdmissionDto, ProfileDbHolderDto,
-    ResourceCounterDto, ResourceUsageDto, SqliteResourceUsageDto,
+    DaemonRecoveryDto, MemoryPressureDto, ProcessResourceUsageDto, ProfileDbAdmissionDto,
+    ProfileDbHolderDto, ResourceCounterDto, ResourceUsageDto, SqliteResourceUsageDto,
 };
 pub use server::{IngestDrainWorkerHandle, MempalMcpServer, daemon_ingest_ipc_available_for_path};
 pub use timeline::{TimelineRequest, TimelineResponse};

@@ -101,8 +101,25 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         let db = context.db.lock().await;
         db.path().to_path_buf()
     };
+    let recovery = crate::daemon_recovery::DaemonRecovery::new(&context.mempal_home);
+    if recovery
+        .admit_start()
+        .context("failed to inspect daemon restart budget")?
+        == crate::daemon_recovery::RestartDecision::CooldownRequired
+    {
+        let snapshot = recovery
+            .snapshot()
+            .context("failed to read exhausted daemon restart budget")?;
+        anyhow::bail!(
+            "daemon restart budget exhausted; cooldown_remaining_secs={}",
+            snapshot.cooldown_remaining_secs
+        );
+    }
+    let recovery_faults =
+        crate::daemon_recovery::DaemonRecoveryFaultReporter::new(recovery.clone());
     global_embed_status().set_audit_db_path(Some(db_path.clone()));
-    let writer_lease = acquire_daemon_writer_lease(context, &db_path).await?;
+    let writer_lease =
+        acquire_daemon_writer_lease(context, &db_path, recovery_faults.clone()).await?;
     let requeued_writer_lease_failures = context
         .store
         .requeue_writer_lease_failures_for_daemon_start(writer_lease.lease().owner.clone())
@@ -176,6 +193,9 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     };
 
     if !context.config.hooks.enabled {
+        recovery
+            .record_recovered()
+            .context("failed to mark daemon recovery complete")?;
         eprintln!("hooks not enabled; daemon running REST API only (no worker loop)");
         // Keep the process alive for the REST server.
         #[cfg(feature = "rest")]
@@ -241,6 +261,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         context.write_observer.clone(),
         context.store.clone(),
         Duration::from_secs(60),
+        recovery_faults,
     );
     let endpoint_requeue_handle = spawn_endpoint_recovery_requeue_worker(
         context.store.clone(),
@@ -316,9 +337,10 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         limit = DAEMON_HOOK_WORKER_LIMIT,
         "daemon hook workers started"
     );
+    recovery
+        .record_recovered()
+        .context("failed to mark daemon recovery complete")?;
     loop {
-        context.write_observer.maybe_log_stall(&context.store).await;
-
         if shutdown_requested() {
             tracing::info!("shutdown requested; stopping daemon loop");
             break;
@@ -389,8 +411,13 @@ struct RuntimeWriterLeaseHandle {
 }
 
 impl RuntimeWriterLeaseHandle {
-    fn new(db_path: PathBuf, lease: RuntimeWriterLease) -> Self {
-        let heartbeat = spawn_runtime_writer_lease_heartbeat(db_path.clone(), lease.clone());
+    fn new(
+        db_path: PathBuf,
+        lease: RuntimeWriterLease,
+        recovery_faults: crate::daemon_recovery::DaemonRecoveryFaultReporter,
+    ) -> Self {
+        let heartbeat =
+            spawn_runtime_writer_lease_heartbeat(db_path.clone(), lease.clone(), recovery_faults);
         Self {
             db_path,
             lease,
@@ -415,23 +442,37 @@ impl Drop for RuntimeWriterLeaseHandle {
 async fn acquire_daemon_writer_lease(
     context: &DaemonContext,
     db_path: &Path,
+    recovery_faults: crate::daemon_recovery::DaemonRecoveryFaultReporter,
 ) -> Result<RuntimeWriterLeaseHandle> {
     let metadata = json!({
         "command": "daemon",
         "db_path": db_path.to_string_lossy(),
     })
     .to_string();
-    let lease = {
+    let lease_result = {
         let db = context.db.lock().await;
         db.runtime_writer_lease_acquire_for_daemon_start(
             SQLITE_WRITER_LEASE_NAME,
             DAEMON_WRITER_LEASE_TTL_SECS,
             Some(&metadata),
         )
-        .context("failed to acquire daemon writer lease")?
+    };
+    let lease = match lease_result {
+        Ok(lease) => lease,
+        Err(error) => {
+            if crate::core::db::db_error_is_sqlite_lock(&error) {
+                recovery_faults
+                    .record_fault_once(crate::daemon_recovery::RecoveryFault::DatabaseLocked);
+            }
+            return Err(error).context("failed to acquire daemon writer lease");
+        }
     };
     match lease {
-        Some(lease) => Ok(RuntimeWriterLeaseHandle::new(db_path.to_path_buf(), lease)),
+        Some(lease) => Ok(RuntimeWriterLeaseHandle::new(
+            db_path.to_path_buf(),
+            lease,
+            recovery_faults,
+        )),
         None => {
             let active = {
                 let db = context.db.lock().await;
@@ -450,6 +491,7 @@ async fn acquire_daemon_writer_lease(
 fn spawn_runtime_writer_lease_heartbeat(
     db_path: PathBuf,
     lease: RuntimeWriterLease,
+    recovery_faults: crate::daemon_recovery::DaemonRecoveryFaultReporter,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(DAEMON_WRITER_LEASE_RENEW_INTERVAL);
@@ -469,12 +511,22 @@ fn spawn_runtime_writer_lease_heartbeat(
                         owner = %lease.owner,
                         "daemon writer lease was lost; requesting shutdown"
                     );
+                    recovery_faults
+                        .record_fault_once(crate::daemon_recovery::RecoveryFault::WriterLeaseLost);
                     #[cfg(unix)]
                     request_shutdown_and_notify();
                     break;
                 }
                 Ok(Err(error)) => {
                     tracing::warn!(error = %error, "failed to renew daemon writer lease");
+                    if anyhow_error_is_sqlite_lock(&error) {
+                        recovery_faults.record_fault_once(
+                            crate::daemon_recovery::RecoveryFault::DatabaseLocked,
+                        );
+                        #[cfg(unix)]
+                        request_shutdown_and_notify();
+                        break;
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(error = %error, "writer lease heartbeat task failed");
@@ -966,6 +1018,7 @@ fn spawn_stall_watchdog(
     observer: crate::daemon_bootstrap::DaemonWriteObserver,
     store: AsyncPendingMessageStore,
     interval: Duration,
+    recovery_faults: crate::daemon_recovery::DaemonRecoveryFaultReporter,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -975,7 +1028,13 @@ fn spawn_stall_watchdog(
             if shutdown_requested() {
                 break;
             }
-            observer.maybe_log_stall(&store).await;
+            if observer.maybe_log_stall(&store).await {
+                recovery_faults
+                    .record_fault_once(crate::daemon_recovery::RecoveryFault::WriteStall);
+                #[cfg(unix)]
+                request_shutdown_and_notify();
+                break;
+            }
         }
     })
 }

@@ -157,6 +157,33 @@ fn runtime_writer_lease_acquire_renew_release() {
 }
 
 #[test]
+fn runtime_writer_read_only_status_filters_expired_without_cleanup_write() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("test.db");
+    let db = Database::open(&path).expect("open writer");
+    db.runtime_writer_lease_acquire("sqlite-writer", "owner", "maintenance", 1, None)
+        .expect("acquire lease")
+        .expect("writer lease");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let reader = Database::open_query_only(&path).expect("open query-only reader");
+    assert!(
+        reader
+            .runtime_writer_lease_status_read_only(Some("sqlite-writer"))
+            .expect("read-only lease status")
+            .is_empty()
+    );
+
+    let raw = rusqlite::Connection::open(&path).expect("open raw verifier");
+    let row_count: i64 = raw
+        .query_row("SELECT COUNT(*) FROM runtime_writer_leases", [], |row| {
+            row.get(0)
+        })
+        .expect("count retained lease row");
+    assert_eq!(row_count, 1, "query-only status must not clean up rows");
+}
+
+#[test]
 fn runtime_writer_lease_conflicts_until_expiry() {
     let db = open_test_db();
 
