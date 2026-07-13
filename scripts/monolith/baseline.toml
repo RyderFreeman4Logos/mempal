@@ -301,10 +301,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/llm/worker.rs"
 kind = "source"
-baseline_tokens = 12037
-baseline_lines = 1453
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 12300
+baseline_lines = 1480
+issue = "680"
+rationale = "Writer-lease generation fence threaded through run_llm_worker; #680 review F1 correctness fix"
 
 [[files]]
 path = "src/longmemeval.rs"

@@ -275,6 +275,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                 let status = llm_status.clone();
                 let db = async_db.clone();
                 let observer = write_observer.clone();
+                let lease = writer_lease.lease().clone();
                 tokio::spawn(async move {
                     if let Err(e) = crate::llm::worker::run_llm_worker(
                         store,
@@ -282,6 +283,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                         status,
                         db,
                         observer,
+                        lease,
                     )
                     .await
                     {
