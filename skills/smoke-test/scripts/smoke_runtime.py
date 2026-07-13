@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""Crash-safe runtime primitives for the aggregate smoke test.
+
+This module deliberately knows nothing about mempal commands or response
+payloads.  It owns the two process-local contracts that must survive failures:
+the cleanup receipt and the registry of child processes started by the runner.
+"""
+from __future__ import annotations
+
+import json
+import os
+import select
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Callable, MutableMapping
+
+
+MAX_CLEANUP_DRAWER_IDS = 1024
+MAX_CLEANUP_DRAWER_ID_BYTES = 512
+MAX_CLEANUP_MANIFEST_BYTES = 256 * 1024
+MAX_MCP_RESPONSE_BYTES = 1024 * 1024
+_MCP_READ_CHUNK_BYTES = 64 * 1024
+
+__all__ = [
+    "CleanupManifest",
+    "MAX_CLEANUP_DRAWER_IDS",
+    "MAX_CLEANUP_DRAWER_ID_BYTES",
+    "MAX_CLEANUP_MANIFEST_BYTES",
+    "MAX_MCP_RESPONSE_BYTES",
+    "McpClient",
+    "OwnedSubprocessRegistry",
+    "cleanup_exact_ids",
+    "finalize_cleanup_manifest",
+    "record_proc_io_delta",
+    "terminate_and_reap_owned_processes",
+]
+
+
+class CleanupManifest:
+    """Persist only cleanup-authorized drawer IDs using atomic replacement."""
+
+    def __init__(self, path: Path | None = None) -> None:
+        if path is None:
+            name = f"mempal-smoke-cleanup-{os.getpid()}-{os.urandom(8).hex()}.json"
+            path = Path("/tmp") / name
+        self.path = path
+        self._pending: list[str] = []
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
+    def checkpoint(self) -> None:
+        """Atomically persist the current cleanup receipt with mode 0600."""
+        self._checkpoint(self._pending)
+
+    def _checkpoint(self, pending: list[str]) -> None:
+        serialized = self._serialize(pending)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                os.chmod(handle.fileno(), 0o600)
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, self.path)
+            self._pending = list(pending)
+            self._fsync_parent()
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                temporary_path.unlink()
+
+    def add_created_ids(self, drawer_ids: list[str]) -> None:
+        pending = list(self._pending)
+        for drawer_id in drawer_ids:
+            if not isinstance(drawer_id, str):
+                raise ValueError("cleanup drawer IDs must be strings")
+            drawer_id_bytes = len(drawer_id.encode("utf-8"))
+            if drawer_id_bytes == 0 or drawer_id_bytes > MAX_CLEANUP_DRAWER_ID_BYTES:
+                raise ValueError(
+                    "cleanup drawer IDs must be non-empty and no longer than "
+                    f"{MAX_CLEANUP_DRAWER_ID_BYTES} bytes"
+                )
+            if drawer_id not in pending:
+                pending.append(drawer_id)
+            if len(pending) > MAX_CLEANUP_DRAWER_IDS:
+                raise ValueError(
+                    f"cleanup manifest accepts at most {MAX_CLEANUP_DRAWER_IDS} drawer IDs"
+                )
+        self._checkpoint(pending)
+
+    def mark_cleaned(self, drawer_ids: list[str]) -> None:
+        cleaned = set(drawer_ids)
+        pending = [drawer_id for drawer_id in self._pending if drawer_id not in cleaned]
+        if pending:
+            self._checkpoint(pending)
+        else:
+            self.discard()
+
+    def discard(self) -> None:
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            self._pending = []
+            return
+        self._pending = []
+        self._fsync_parent()
+
+    def _fsync_parent(self) -> None:
+        directory_fd = os.open(self.path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    @staticmethod
+    def _serialize(pending: list[str]) -> str:
+        serialized = json.dumps(
+            {"cleanup_drawer_ids": pending},
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+        if len(serialized.encode("utf-8")) > MAX_CLEANUP_MANIFEST_BYTES:
+            raise ValueError(
+                f"cleanup manifest exceeds {MAX_CLEANUP_MANIFEST_BYTES} bytes"
+            )
+        return serialized
+
+
+def finalize_cleanup_manifest(
+    manifest: CleanupManifest | None,
+    summary: MutableMapping[str, Any],
+    *,
+    checkpoint: bool = True,
+) -> None:
+    """Expose a recovery receipt only while cleanup-authorized IDs remain."""
+    summary.pop("cleanup_manifest_path", None)
+    summary.pop("cleanup_pending_count", None)
+    if manifest is None:
+        return
+    if manifest.pending_count > 0:
+        if checkpoint:
+            manifest.checkpoint()
+        if manifest.path.exists():
+            summary["cleanup_manifest_path"] = str(manifest.path)
+            summary["cleanup_pending_count"] = manifest.pending_count
+    else:
+        manifest.discard()
+
+
+class OwnedSubprocessRegistry:
+    """Track runner-owned subprocesses and provide a bounded shutdown sweep."""
+
+    def __init__(self) -> None:
+        self.processes: dict[int, subprocess.Popen[Any]] = {}
+        self._roles: dict[int, str] = {}
+
+    def register(self, process: subprocess.Popen[Any], role: str) -> None:
+        self.processes[process.pid] = process
+        self._roles[process.pid] = role
+
+    def unregister(self, process: subprocess.Popen[Any]) -> None:
+        self.processes.pop(process.pid, None)
+        self._roles.pop(process.pid, None)
+
+    def terminate_and_reap(self, timeout: float = 1.0) -> dict[str, Any]:
+        initial_ids = list(self.processes)
+        role_counts: dict[str, int] = {}
+        for process_id in initial_ids:
+            role = self._roles.get(process_id, "unclassified")
+            role_counts[role] = role_counts.get(role, 0) + 1
+        receipt = terminate_and_reap_owned_processes(self.processes, timeout)
+        for process_id in initial_ids:
+            if process_id not in self.processes:
+                self._roles.pop(process_id, None)
+        receipt["roles"] = role_counts
+        return receipt
+
+
+def cleanup_exact_ids(
+    drawer_ids: list[str],
+    *,
+    checkpoint: Callable[[], None],
+    delete: Callable[[str], bool],
+    verify_absent: Callable[[str], bool],
+    mark_cleaned: Callable[[list[str]], None],
+) -> dict[str, int]:
+    """Delete each exact ID and retire authority only after absence is proven."""
+    unique_ids = list(dict.fromkeys(drawer_ids))
+    deleted_count = 0
+    verified_absent_count = 0
+    for drawer_id in unique_ids:
+        checkpoint()
+        if delete(drawer_id):
+            deleted_count += 1
+        if verify_absent(drawer_id):
+            mark_cleaned([drawer_id])
+            verified_absent_count += 1
+    return {
+        "attempted_count": len(unique_ids),
+        "deleted_count": deleted_count,
+        "delete_failed_attempt_count": len(unique_ids) - deleted_count,
+        "verified_absent_count": verified_absent_count,
+        "failed_count": len(unique_ids) - verified_absent_count,
+    }
+
+
+def record_proc_io_delta(
+    summary_io: MutableMapping[str, Any],
+    receipt_targets: MutableMapping[tuple[str, str], dict[str, Any]],
+    io_keys: tuple[str, ...],
+    category: str,
+    before: dict[str, int] | None,
+    after: dict[str, int] | None,
+    receipt_id: str | None,
+) -> None:
+    """Apply one process I/O contribution idempotently by receipt identity."""
+    empty = {
+        "process_count": 0,
+        "sampled_process_count": 0,
+        "missing_process_count": 0,
+        **{key: 0 for key in io_keys},
+    }
+    aggregate = summary_io.setdefault(category, empty)
+    receipt_key = (category, receipt_id) if receipt_id is not None else None
+    if receipt_key is not None and receipt_key in receipt_targets:
+        summary_io[category] = dict(receipt_targets[receipt_key])
+        return
+    updated = dict(aggregate) if receipt_key is not None else aggregate
+    updated["process_count"] += 1
+    if before is None or after is None:
+        updated["missing_process_count"] += 1
+    else:
+        updated["sampled_process_count"] += 1
+        for key in io_keys:
+            delta = after.get(key, 0) - before.get(key, 0)
+            updated[key] += max(0, int(delta))
+    if receipt_key is not None:
+        receipt_targets[receipt_key] = updated
+        summary_io[category] = dict(updated)
+
+
+class McpClient:
+    """Owned JSON-RPC stdio client with bounded, observable shutdown."""
+
+    def __init__(
+        self,
+        *,
+        command: list[str],
+        cwd: Path,
+        registry: OwnedSubprocessRegistry,
+        read_proc_io: Callable[[int | None], dict[str, int] | None],
+        record_proc_io_delta: Callable[
+            [str, dict[str, int] | None, dict[str, int] | None, str | None], None
+        ],
+        json_shape: Callable[[Any], Any],
+        lifecycle_receipt: MutableMapping[str, Any],
+        process_factory: Callable[..., subprocess.Popen[Any]] = subprocess.Popen,
+    ) -> None:
+        self.stderr_file = tempfile.TemporaryFile()
+        self._registry = registry
+        self._read_proc_io = read_proc_io
+        self._record_proc_io_delta = record_proc_io_delta
+        self._json_shape = json_shape
+        self._lifecycle_receipt = lifecycle_receipt
+        self.proc = process_factory(
+            command,
+            cwd=str(cwd),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self.stderr_file,
+            text=True,
+            bufsize=1,
+        )
+        registry.register(self.proc, "mcp_stdio")
+        if self.proc.stdout is None:
+            raise RuntimeError("mcp stdout unavailable")
+        self._stdout_fd = self.proc.stdout.fileno()
+        os.set_blocking(self._stdout_fd, False)
+        self._response_buffer = bytearray()
+        self.proc_io_before = read_proc_io(self.proc.pid)
+        self.next_id = 1
+        self._closed = False
+        self._close_result = False
+        self._close_steps: set[str] = set()
+        self._close_killed = False
+        self._close_reaped = False
+        self._lifecycle_receipt_target: dict[str, Any] | None = None
+
+    def __del__(self) -> None:
+        stderr_file = getattr(self, "stderr_file", None)
+        if stderr_file is not None and not stderr_file.closed:
+            try:
+                stderr_file.close()
+            except OSError:
+                pass
+
+    def send(self, message: dict[str, Any]) -> None:
+        if self.proc.stdin is None:
+            raise RuntimeError("mcp stdin unavailable")
+        self.proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        self.proc.stdin.flush()
+
+    def call(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        timeout: float = 120,
+    ) -> dict[str, Any]:
+        message_id = self.next_id
+        self.next_id += 1
+        self.send(
+            {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "method": method,
+                "params": params or {},
+            }
+        )
+        return self.read_response(message_id, timeout)
+
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        self.send(message)
+
+    def read_response(self, message_id: int, timeout: float) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while True:
+            response = self._take_buffered_response(message_id)
+            if response is not None:
+                return response
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"mcp response timeout for {message_id}")
+            ready, _, _ = select.select([self._stdout_fd], [], [], remaining)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(self._stdout_fd, _MCP_READ_CHUNK_BYTES)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                raise RuntimeError("mcp eof")
+            self._response_buffer.extend(chunk)
+
+    def _take_buffered_response(self, message_id: int) -> dict[str, Any] | None:
+        while True:
+            newline_index = self._response_buffer.find(b"\n")
+            if newline_index < 0:
+                if len(self._response_buffer) > MAX_MCP_RESPONSE_BYTES:
+                    raise ValueError(
+                        f"mcp response exceeds {MAX_MCP_RESPONSE_BYTES} bytes"
+                    )
+                return None
+            if newline_index > MAX_MCP_RESPONSE_BYTES:
+                raise ValueError(f"mcp response exceeds {MAX_MCP_RESPONSE_BYTES} bytes")
+            line = bytes(self._response_buffer[:newline_index])
+            del self._response_buffer[: newline_index + 1]
+            if not line:
+                continue
+            message = json.loads(line)
+            if not isinstance(message, dict):
+                raise ValueError("mcp response must be a JSON object")
+            if message.get("id") == message_id:
+                return message
+
+    def tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        timeout: float = 120,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        started_at = time.monotonic()
+        try:
+            message = self.call(
+                "tools/call",
+                {"name": name, "arguments": arguments},
+                timeout=timeout,
+            )
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            if "error" in message:
+                encoded_error = json.dumps(message["error"]).encode()
+                return None, {
+                    "ok": False,
+                    "latency_ms": elapsed_ms,
+                    "error_code": message["error"].get("code"),
+                    "error_message_bytes": len(encoded_error),
+                }
+            structured = message.get("result", {}).get("structuredContent")
+            return structured, {
+                "ok": isinstance(structured, dict),
+                "latency_ms": elapsed_ms,
+                "shape": self._json_shape(structured),
+            }
+        except Exception as error:
+            return None, {"ok": False, "error_type": type(error).__name__}
+
+    def close(self) -> bool:
+        """Close the server with wait, terminate, and kill escalation."""
+        if self._closed:
+            return self._close_result
+        if "notify_exit" not in self._close_steps:
+            self._close_steps.add("notify_exit")
+            try:
+                self.notify("notifications/exit")
+            except Exception:
+                pass
+        try:
+            if self.proc.stdin is not None and not self.proc.stdin.closed:
+                self.proc.stdin.close()
+        except OSError:
+            pass
+        proc_io_after = self._read_proc_io(self.proc.pid)
+        if not self._close_reaped:
+            self._close_reaped = _wait_for_reap(self.proc, timeout=1)
+        if not self._close_reaped:
+            if "terminate" not in self._close_steps:
+                self._close_steps.add("terminate")
+                try:
+                    self.proc.terminate()
+                except OSError:
+                    pass
+            self._close_reaped = _wait_for_reap(self.proc, timeout=1)
+        if not self._close_reaped:
+            if "kill" not in self._close_steps:
+                try:
+                    self.proc.kill()
+                    self._close_killed = True
+                except OSError:
+                    pass
+                else:
+                    self._close_steps.add("kill")
+            self._close_reaped = _wait_for_reap(self.proc, timeout=5)
+        if not self._close_reaped:
+            self._close_result = False
+            return self._close_result
+        proc_io_after = proc_io_after or self._read_proc_io(self.proc.pid)
+        if "record_io" not in self._close_steps:
+            self._record_proc_io_delta(
+                "mcp_stdio_child_processes",
+                self.proc_io_before,
+                proc_io_after,
+                f"mcp_stdio:{self.proc.pid}",
+            )
+            self._close_steps.add("record_io")
+        if "record_lifecycle" not in self._close_steps:
+            self._record_lifecycle(self._close_killed, self._close_reaped)
+            self._close_steps.add("record_lifecycle")
+        try:
+            self.stderr_file.close()
+        except OSError:
+            pass
+        _close_process_streams(self.proc)
+        self._registry.unregister(self.proc)
+        self._close_result = self._close_reaped
+        self._closed = True
+        return self._close_result
+
+    def _record_lifecycle(self, killed: bool, reaped: bool) -> None:
+        receipt = self._lifecycle_receipt
+        if self._lifecycle_receipt_target is None:
+            target = dict(receipt)
+            roles = dict(receipt.get("roles", {}))
+            roles["mcp_stdio"] = int(roles.get("mcp_stdio", 0)) + 1
+            target["roles"] = roles
+            target["process_count"] = int(receipt.get("process_count", 0)) + 1
+            target["exited_count"] = int(receipt.get("exited_count", 0)) + int(reaped)
+            target["killed_count"] = int(receipt.get("killed_count", 0)) + int(killed)
+            self._lifecycle_receipt_target = target
+        receipt.update(self._lifecycle_receipt_target)
+
+
+def terminate_and_reap_owned_processes(
+    registry: MutableMapping[int, subprocess.Popen[Any]],
+    timeout: float = 1.0,
+) -> dict[str, Any]:
+    """Terminate, kill if necessary, and reap every process in ``registry``.
+
+    The returned receipt intentionally contains counts only.  Process IDs are
+    operational data and must not enter the smoke JSON lifecycle summary.
+    """
+    initial_count = len(registry)
+    reaped_count = 0
+    killed_count = 0
+    deadline = time.monotonic() + max(timeout, 0.0)
+
+    for process_id, process in list(registry.items()):
+        reaped = False
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        remaining = max(0.0, deadline - time.monotonic())
+        reaped = _wait_for_reap(process, timeout=remaining)
+        if not reaped:
+            try:
+                process.kill()
+                killed_count += 1
+            except OSError:
+                pass
+            reaped = _wait_for_reap(process, timeout=max(timeout, 0.1))
+        if not reaped:
+            continue
+        _close_process_streams(process)
+        registry.pop(process_id, None)
+        reaped_count += 1
+
+    return {
+        "initial_count": initial_count,
+        "reaped_count": reaped_count,
+        "remaining_count": len(registry),
+        "killed_count": killed_count,
+    }
+
+
+def _wait_for_reap(process: subprocess.Popen[Any], timeout: float) -> bool:
+    try:
+        process.wait(timeout=timeout)
+    except (subprocess.TimeoutExpired, ChildProcessError, OSError):
+        return False
+    return True
+
+
+def _close_process_streams(process: subprocess.Popen[Any]) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is None or stream.closed:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import stat
 import tempfile
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 import unittest
+from unittest import mock
 
 
 def load_full_smoke() -> ModuleType:
@@ -109,6 +112,169 @@ class ReceiptExtractionTests(unittest.TestCase):
             b"error: database is locked\n"
         )
         self.assertEqual(self.smoke.classify_stderr(stderr), "database_locked")
+
+
+class CleanupManifestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.smoke = load_full_smoke()
+
+    def test_manifest_is_private_atomic_and_contains_only_cleanup_ids(self) -> None:
+        manifest = self.smoke.CleanupManifest()
+        try:
+            self.assertEqual(manifest.path.parent, Path('/tmp'))
+
+            manifest.checkpoint()
+            manifest.add_created_ids(['drawer-a', 'drawer-b'])
+
+            self.assertEqual(stat.S_IMODE(manifest.path.stat().st_mode), 0o600)
+            self.assertEqual(
+                json.loads(manifest.path.read_text(encoding='utf-8')),
+                {'cleanup_drawer_ids': ['drawer-a', 'drawer-b']},
+            )
+            self.assertNotIn('raw drawer', manifest.path.read_text(encoding='utf-8'))
+            self.assertEqual(list(manifest.path.parent.glob(f'.{manifest.path.name}.*')), [])
+        finally:
+            manifest.discard()
+
+    def test_manifest_survives_partial_cleanup_and_deletes_after_verified_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / 'cleanup.json')
+            manifest.add_created_ids(['drawer-a', 'drawer-b'])
+
+            manifest.mark_cleaned(['drawer-a'])
+            self.assertTrue(manifest.path.exists())
+            self.assertEqual(manifest.pending_count, 1)
+
+            manifest.mark_cleaned(['drawer-b'])
+            self.assertFalse(manifest.path.exists())
+            self.assertEqual(manifest.pending_count, 0)
+
+    def test_manifest_rejects_invalid_ids_without_changing_pending_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / 'cleanup.json')
+            manifest.add_created_ids(['drawer-safe'])
+            original = manifest.path.read_bytes()
+
+            invalid_inputs = [
+                [''],
+                [123],
+                ['x' * (self.smoke._SMOKE_RUNTIME.MAX_CLEANUP_DRAWER_ID_BYTES + 1)],
+                [
+                    f'drawer-{index}'
+                    for index in range(
+                        self.smoke._SMOKE_RUNTIME.MAX_CLEANUP_DRAWER_IDS + 1
+                    )
+                ],
+            ]
+            for drawer_ids in invalid_inputs:
+                with self.subTest(drawer_ids_type=type(drawer_ids[0]).__name__):
+                    with self.assertRaises(ValueError):
+                        manifest.add_created_ids(drawer_ids)
+                    self.assertEqual(manifest.pending_count, 1)
+                    self.assertEqual(manifest.path.read_bytes(), original)
+
+    def test_manifest_rejects_oversized_serialized_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / 'cleanup.json')
+            drawer_ids = [
+                f'{index:04d}-' + ('x' * 500)
+                for index in range(self.smoke._SMOKE_RUNTIME.MAX_CLEANUP_DRAWER_IDS)
+            ]
+
+            with self.assertRaises(ValueError):
+                manifest.add_created_ids(drawer_ids)
+
+            self.assertEqual(manifest.pending_count, 0)
+            self.assertFalse(manifest.path.exists())
+
+    def test_checkpoint_replace_failure_preserves_prior_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / 'cleanup.json')
+            manifest.add_created_ids(['drawer-a'])
+            original = manifest.path.read_bytes()
+
+            with mock.patch.object(
+                self.smoke._SMOKE_RUNTIME.os,
+                'replace',
+                side_effect=OSError('injected replace failure'),
+            ):
+                with self.assertRaisesRegex(OSError, 'injected replace failure'):
+                    manifest.add_created_ids(['drawer-b'])
+
+            self.assertEqual(manifest.pending_count, 1)
+            self.assertEqual(manifest.path.read_bytes(), original)
+            self.assertEqual(list(manifest.path.parent.glob(f'.{manifest.path.name}.*')), [])
+
+    def test_checkpoint_parent_fsync_failure_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / 'cleanup.json')
+            real_open = self.smoke._SMOKE_RUNTIME.os.open
+
+            def fail_directory_open(path: Any, flags: int, *args: Any) -> int:
+                if Path(path) == manifest.path.parent:
+                    raise OSError('injected directory open failure')
+                return real_open(path, flags, *args)
+
+            with mock.patch.object(
+                self.smoke._SMOKE_RUNTIME.os,
+                'open',
+                side_effect=fail_directory_open,
+            ):
+                with self.assertRaisesRegex(OSError, 'injected directory open failure'):
+                    manifest.add_created_ids(['drawer-a'])
+
+            self.assertEqual(manifest.pending_count, 1)
+            self.assertEqual(
+                json.loads(manifest.path.read_text(encoding='utf-8')),
+                {'cleanup_drawer_ids': ['drawer-a']},
+            )
+
+    def test_created_id_is_checkpointed_before_next_operation_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / 'cleanup.json')
+            with self.assertRaisesRegex(RuntimeError, 'next operation failed'):
+                manifest.add_created_ids(['drawer-created'])
+                raise RuntimeError('next operation failed')
+
+            self.assertEqual(
+                json.loads(manifest.path.read_text(encoding='utf-8')),
+                {'cleanup_drawer_ids': ['drawer-created']},
+            )
+            self.assertEqual(stat.S_IMODE(manifest.path.stat().st_mode), 0o600)
+
+    def test_unrelated_failure_with_zero_pending_does_not_report_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / 'cleanup.json')
+            self.smoke.CLEANUP_MANIFEST = manifest
+            summary = {'overall_ok': False, 'failures': ['unrelated_failure']}
+
+            self.smoke.finalize_cleanup_manifest(summary)
+
+            self.assertNotIn('cleanup_manifest_path', summary)
+            self.assertFalse(manifest.path.exists())
+
+    def test_pending_manifest_finalization_discloses_only_path_and_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / 'cleanup.json')
+            self.smoke.CLEANUP_MANIFEST = manifest
+            try:
+                manifest.add_created_ids(['exact-private-drawer-id'])
+                summary: dict[str, Any] = {}
+
+                self.smoke.finalize_cleanup_manifest(summary)
+
+                self.assertEqual(
+                    summary,
+                    {
+                        'cleanup_manifest_path': str(manifest.path),
+                        'cleanup_pending_count': 1,
+                    },
+                )
+                self.assertNotIn('exact-private-drawer-id', repr(summary))
+                self.assertTrue(manifest.path.exists())
+                self.assertEqual(stat.S_IMODE(manifest.path.stat().st_mode), 0o600)
+            finally:
+                manifest.discard()
 
 
 class DoctorValidationTests(unittest.TestCase):
