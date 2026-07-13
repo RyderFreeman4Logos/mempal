@@ -392,6 +392,7 @@ fn test_daemon_context_bootstrap_ordering() {
     assert_eq!(
         stages,
         vec![
+            BootstrapEvent::RecoveryAdmitted,
             BootstrapEvent::Daemonize,
             BootstrapEvent::RuntimeInit,
             BootstrapEvent::ConfigHandleBootstrap,

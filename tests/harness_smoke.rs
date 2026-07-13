@@ -573,6 +573,7 @@ log_path = "{}"
     assert_eq!(
         seen,
         vec![
+            BootstrapEvent::RecoveryAdmitted,
             BootstrapEvent::Daemonize,
             BootstrapEvent::RuntimeInit,
             BootstrapEvent::ConfigHandleBootstrap,

@@ -15,6 +15,9 @@ use crate::core::{
     db::Database,
     queue::AsyncPendingMessageStore,
 };
+use crate::daemon_recovery::{
+    DaemonRecovery, DaemonRecoveryFaultReporter, RecoveryFault, RestartDecision,
+};
 use anyhow::{Context, Result};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
@@ -65,6 +68,8 @@ pub struct DaemonContext {
     pub config: std::sync::Arc<crate::core::config::Config>,
     pub mempal_home: PathBuf,
     pub log_path: PathBuf,
+    pub(crate) recovery: DaemonRecovery,
+    pub(crate) recovery_faults: DaemonRecoveryFaultReporter,
     // Drop order matters: remove the pidfile (pid_guard) BEFORE releasing the
     // singleton lock (lock_guard), so a successor that wins the lock never
     // observes a stale pidfile pointing at the just-stopped daemon.
@@ -255,6 +260,26 @@ fn bootstrap_inner(
         }
     };
 
+    // Install the profile-wide restart controller after singleton admission,
+    // but before daemonizing or opening SQLite. Startup remediation and the
+    // worker generation must therefore share one bounded recovery budget.
+    let recovery = DaemonRecovery::new(&mempal_home);
+    if recovery
+        .admit_start()
+        .context("failed to inspect daemon restart budget")?
+        == RestartDecision::CooldownRequired
+    {
+        let snapshot = recovery
+            .snapshot()
+            .context("failed to read exhausted daemon restart budget")?;
+        anyhow::bail!(
+            "daemon restart budget exhausted; cooldown_remaining_secs={}",
+            snapshot.cooldown_remaining_secs
+        );
+    }
+    let recovery_faults = DaemonRecoveryFaultReporter::new(recovery.clone());
+    emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::RecoveryAdmitted);
+
     // harness-point: PR0
     emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::Daemonize);
     perform_daemonize(foreground, &mempal_home, &log_path)?;
@@ -279,7 +304,7 @@ fn bootstrap_inner(
 
     // harness-point: PR0
     emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::DbOpen);
-    let (db, async_db, store) = open_daemon_storage_with_remediation(&db_path)?;
+    let (db, async_db, store) = open_daemon_storage_with_remediation(&db_path, &recovery_faults)?;
     let db = Arc::new(AsyncMutex::new(db));
     let write_observer = DaemonWriteObserver::new();
 
@@ -300,6 +325,8 @@ fn bootstrap_inner(
         config,
         mempal_home,
         log_path,
+        recovery,
+        recovery_faults,
         _pid_guard: pid_guard,
         _lock_guard: lock_guard,
     })
@@ -307,8 +334,9 @@ fn bootstrap_inner(
 
 fn open_daemon_storage_with_remediation(
     db_path: &Path,
+    recovery_faults: &DaemonRecoveryFaultReporter,
 ) -> Result<(Database, AsyncDb, AsyncPendingMessageStore)> {
-    match open_daemon_storage_once(db_path) {
+    let result = match open_daemon_storage_once(db_path) {
         Ok(handles) => Ok(handles),
         Err(error) if is_sqlite_lock_error(&error) => {
             #[cfg(target_os = "linux")]
@@ -321,7 +349,11 @@ fn open_daemon_storage_with_remediation(
             }
         }
         Err(error) => Err(error),
+    };
+    if result.as_ref().is_err_and(is_sqlite_lock_error) {
+        recovery_faults.record_fault_once(RecoveryFault::DatabaseLocked);
     }
+    result
 }
 
 fn open_daemon_storage_once(

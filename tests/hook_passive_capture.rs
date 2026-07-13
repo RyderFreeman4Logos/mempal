@@ -1006,6 +1006,7 @@ fn test_no_sqlite_before_daemonize() {
     assert_eq!(
         seen,
         vec![
+            BootstrapEvent::RecoveryAdmitted,
             BootstrapEvent::Daemonize,
             BootstrapEvent::RuntimeInit,
             BootstrapEvent::ConfigHandleBootstrap,

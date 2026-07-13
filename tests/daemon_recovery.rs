@@ -1,3 +1,6 @@
+use std::fs;
+
+use mempal::daemon_bootstrap::DaemonContext;
 use mempal::daemon_recovery::{
     DaemonRecovery, DaemonRecoveryFaultReporter, DaemonRecoveryState, RecoveryFault, RecoveryPhase,
     RestartDecision,
@@ -95,4 +98,66 @@ fn one_process_generation_consumes_at_most_one_fault_slot() {
     let snapshot = recovery.snapshot().expect("recovery snapshot");
     assert_eq!(snapshot.recent_fault_count, 1);
     assert_eq!(snapshot.last_fault, Some(RecoveryFault::WriteStall));
+}
+
+#[test]
+fn restart_budget_admission_precedes_storage_bootstrap() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let mempal_home = tempdir.path().join(".mempal");
+    fs::create_dir_all(&mempal_home).expect("create mempal home");
+    let db_path = mempal_home.join("palace.db");
+    let config_path = mempal_home.join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+db_path = "{}"
+
+[embedder]
+backend = "stub"
+
+[daemon]
+log_path = "{}"
+"#,
+            db_path.display(),
+            mempal_home.join("daemon.log").display()
+        ),
+    )
+    .expect("write config");
+
+    let recovery = DaemonRecovery::new(&mempal_home);
+    let mut final_decision = RestartDecision::RestartAllowed;
+    for _ in 0..mempal::daemon_recovery::MAX_RESTARTS_PER_WINDOW {
+        final_decision = recovery
+            .record_fault(RecoveryFault::DatabaseLocked)
+            .expect("record recovery fault");
+    }
+    assert_eq!(final_decision, RestartDecision::CooldownRequired);
+
+    let runtime_root = tempdir.path().join("runtime");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let error = match DaemonContext::bootstrap_with_events_for_test(
+        config_path,
+        true,
+        Some(tx),
+        &runtime_root,
+    ) {
+        Ok(context) => {
+            drop(context);
+            panic!("cooldown must reject daemon bootstrap")
+        }
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("daemon restart budget exhausted"),
+        "unexpected bootstrap error: {error:#}"
+    );
+    assert!(
+        rx.blocking_recv().is_none(),
+        "cooldown must reject bootstrap before daemonizing or opening SQLite"
+    );
+    assert!(!db_path.exists(), "cooldown must prevent database creation");
 }

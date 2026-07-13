@@ -101,22 +101,8 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         let db = context.db.lock().await;
         db.path().to_path_buf()
     };
-    let recovery = crate::daemon_recovery::DaemonRecovery::new(&context.mempal_home);
-    if recovery
-        .admit_start()
-        .context("failed to inspect daemon restart budget")?
-        == crate::daemon_recovery::RestartDecision::CooldownRequired
-    {
-        let snapshot = recovery
-            .snapshot()
-            .context("failed to read exhausted daemon restart budget")?;
-        anyhow::bail!(
-            "daemon restart budget exhausted; cooldown_remaining_secs={}",
-            snapshot.cooldown_remaining_secs
-        );
-    }
-    let recovery_faults =
-        crate::daemon_recovery::DaemonRecoveryFaultReporter::new(recovery.clone());
+    let recovery = context.recovery.clone();
+    let recovery_faults = context.recovery_faults.clone();
     global_embed_status().set_audit_db_path(Some(db_path.clone()));
     let writer_lease =
         acquire_daemon_writer_lease(context, &db_path, recovery_faults.clone()).await?;
