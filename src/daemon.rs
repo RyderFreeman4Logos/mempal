@@ -407,11 +407,7 @@ impl Drop for RuntimeWriterLeaseHandle {
     fn drop(&mut self) {
         self.heartbeat.abort();
         if let Ok(db) = Database::open(&self.db_path) {
-            let _ = db.runtime_writer_lease_release(
-                &self.lease.name,
-                &self.lease.owner,
-                &self.lease.session_id,
-            );
+            let _ = db.runtime_writer_lease_release(&self.lease);
         }
     }
 }
@@ -510,13 +506,8 @@ fn renew_daemon_writer_lease_with_retry(
 fn renew_daemon_writer_lease_once(db_path: &Path, lease: &RuntimeWriterLease) -> Result<bool> {
     let db = Database::open_with_busy_timeout(db_path, DAEMON_WRITER_LEASE_RENEW_BUSY_TIMEOUT)
         .context("failed to open DB for writer lease renew")?;
-    db.runtime_writer_lease_renew(
-        &lease.name,
-        &lease.owner,
-        &lease.session_id,
-        DAEMON_WRITER_LEASE_TTL_SECS,
-    )
-    .context("failed to renew daemon writer lease")
+    db.runtime_writer_lease_renew(lease, DAEMON_WRITER_LEASE_TTL_SECS)
+        .context("failed to renew daemon writer lease")
 }
 
 fn anyhow_error_is_sqlite_lock(error: &anyhow::Error) -> bool {
@@ -559,14 +550,12 @@ fn ensure_daemon_runtime_writer_lease_active(
     let Some(lease) = lease else {
         return Ok(());
     };
-    let active = db
-        .runtime_writer_lease_is_active(&lease.name, &lease.owner, &lease.session_id)
-        .with_context(|| {
-            format!(
-                "failed to verify daemon writer lease `{}` before {operation}",
-                lease.name
-            )
-        })?;
+    let active = db.runtime_writer_lease_is_active(lease).with_context(|| {
+        format!(
+            "failed to verify daemon writer lease `{}` before {operation}",
+            lease.name
+        )
+    })?;
     if active {
         Ok(())
     } else {
@@ -4897,7 +4886,7 @@ mod tests {
             .expect("queued hook claimed");
 
         assert!(
-            db.runtime_writer_lease_release(&lease.name, &lease.owner, &lease.session_id)
+            db.runtime_writer_lease_release(&lease)
                 .expect("release daemon writer lease"),
             "test must force the daemon writer lease to be lost"
         );

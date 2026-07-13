@@ -236,7 +236,7 @@ fn ensure_runtime_writer_lease_active(
         return Ok(());
     };
     let active = db
-        .runtime_writer_lease_is_active(&lease.name, &lease.owner, &lease.session_id)
+        .runtime_writer_lease_is_active(lease)
         .map_err(|source| IngestError::RuntimeWriterLeaseCheck { operation, source })?;
     if active {
         Ok(())

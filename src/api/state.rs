@@ -92,7 +92,13 @@ impl ApiState {
     pub(crate) async fn async_db(&self) -> Result<AsyncDb, DbError> {
         let db_path = self.db_path.clone();
         self.async_db
-            .get_or_try_init(|| async move { AsyncDb::open(&db_path, API_ASYNC_DB_READERS) })
+            .get_or_try_init(|| async move {
+                AsyncDb::open_for(
+                    &db_path,
+                    API_ASYNC_DB_READERS,
+                    crate::core::db_admission::DbHolderClass::Api,
+                )
+            })
             .await
             .cloned()
     }

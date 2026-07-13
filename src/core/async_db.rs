@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 use super::db::{Database, DbError, SQLITE_CACHE_SIZE_KIB_DEFAULT};
+use super::db_admission::{DbAdmissionRequest, DbHolderClass, ProfileDbAdmission};
 
 /// Hard cap on the aggregate SQLite page cache across all pooled connections.
 ///
@@ -110,9 +111,9 @@ impl ConnPool {
 
     fn open_one(path: &Path, query_only: bool) -> Result<Database, DbError> {
         if query_only {
-            Database::open_query_only(path)
+            Database::open_query_only_unadmitted(path)
         } else {
-            Database::open(path)
+            Database::open_unadmitted(path)
         }
     }
 
@@ -144,6 +145,7 @@ impl ConnPool {
 pub struct AsyncDb {
     readers: Arc<ConnPool>,
     writer: Arc<ConnPool>,
+    _admission: Arc<ProfileDbAdmission>,
     /// Injected cold-read latency for the runtime-liveness / read-concurrency
     /// regression tests (#345). Never present in production builds.
     #[cfg(any(test, feature = "db-test-seam"))]
@@ -160,6 +162,7 @@ pub struct AsyncDb {
 #[derive(Clone)]
 pub struct QueryOnlyAsyncDb {
     readers: Arc<ConnPool>,
+    _admission: Arc<ProfileDbAdmission>,
     #[cfg(any(test, feature = "db-test-seam"))]
     read_delay: Option<Duration>,
 }
@@ -172,6 +175,14 @@ impl AsyncDb {
     /// [`PAGE_CACHE_BUDGET_MIB`] (issue #311). `n_read` is clamped up to at
     /// least 1 so the read pool always has a connection to hand out.
     pub fn open(path: &Path, n_read: usize) -> Result<Self, DbError> {
+        Self::open_for(path, n_read, DbHolderClass::current_process())
+    }
+
+    pub fn open_for(
+        path: &Path,
+        n_read: usize,
+        holder_class: DbHolderClass,
+    ) -> Result<Self, DbError> {
         let n_read = n_read.max(1);
         let per_conn_mib = (-SQLITE_CACHE_SIZE_KIB_DEFAULT) / 1024;
         let conns = (n_read as i64) + 1;
@@ -184,11 +195,20 @@ impl AsyncDb {
             });
         }
 
+        let admission = ProfileDbAdmission::acquire(
+            path,
+            DbAdmissionRequest::new(
+                holder_class,
+                conns as usize,
+                (requested_mib as u64) * 1024 * 1024,
+            ),
+        )?;
         let writer = ConnPool::open(path, 1, false)?;
         let readers = ConnPool::open(path, n_read, true)?;
         Ok(Self {
             readers: Arc::new(readers),
             writer: Arc::new(writer),
+            _admission: Arc::new(admission),
             #[cfg(any(test, feature = "db-test-seam"))]
             read_delay: None,
             #[cfg(any(test, feature = "db-test-seam"))]
@@ -324,6 +344,14 @@ impl QueryOnlyAsyncDb {
     /// [`PAGE_CACHE_BUDGET_MIB`]. `n_read` is clamped up to at least 1 so the
     /// read pool always has a connection to hand out.
     pub fn open(path: &Path, n_read: usize) -> Result<Self, DbError> {
+        Self::open_for(path, n_read, DbHolderClass::current_process())
+    }
+
+    pub fn open_for(
+        path: &Path,
+        n_read: usize,
+        holder_class: DbHolderClass,
+    ) -> Result<Self, DbError> {
         let n_read = n_read.max(1);
         let per_conn_mib = (-SQLITE_CACHE_SIZE_KIB_DEFAULT) / 1024;
         let requested_mib = (n_read as i64) * per_conn_mib;
@@ -335,9 +363,14 @@ impl QueryOnlyAsyncDb {
             });
         }
 
+        let admission = ProfileDbAdmission::acquire(
+            path,
+            DbAdmissionRequest::new(holder_class, n_read, (requested_mib as u64) * 1024 * 1024),
+        )?;
         let readers = ConnPool::open(path, n_read, true)?;
         Ok(Self {
             readers: Arc::new(readers),
+            _admission: Arc::new(admission),
             #[cfg(any(test, feature = "db-test-seam"))]
             read_delay: None,
         })
@@ -549,329 +582,5 @@ fn rusqlite_error_is_sqlite_interrupt(error: &rusqlite::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    /// T1 — runtime-liveness (the core #345 property). On a single-worker
-    /// runtime a ticker must keep advancing while an off-runtime read with a
-    /// 300 ms cold-read delay is outstanding. RED if `run_read` ran its closure
-    /// inline on the worker (ticker frozen at 0); GREEN with `spawn_blocking`.
-    #[tokio::test(flavor = "current_thread")]
-    async fn t1_runtime_liveness_read_off_runtime() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let adb = AsyncDb::open(&tmp.path().join("palace.db"), 4)
-            .expect("open async db")
-            .with_read_delay(Duration::from_millis(300));
-
-        let ticks = Arc::new(AtomicU64::new(0));
-        let ticks_bg = Arc::clone(&ticks);
-        let ticker = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                ticks_bg.fetch_add(1, Ordering::SeqCst);
-            }
-        });
-
-        let out: i64 = adb.run_read(|_db| Ok(1)).await.expect("off-runtime read");
-        ticker.abort();
-
-        assert_eq!(out, 1);
-        let observed = ticks.load(Ordering::SeqCst);
-        assert!(
-            observed >= 5,
-            "ticker advanced {observed} times during a 300ms off-runtime read; expected >= 5 \
-             (read must not occupy the only runtime worker)"
-        );
-    }
-
-    /// T2 — read concurrency up to N. Four concurrent 200 ms reads must finish
-    /// in well under their serial sum. RED on a single-shared-connection model
-    /// (serializes to ~800 ms); GREEN on the `n_read = 4` read pool (~200 ms).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn t2_read_concurrency_up_to_n() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let adb = AsyncDb::open(&tmp.path().join("palace.db"), 4)
-            .expect("open async db")
-            .with_read_delay(Duration::from_millis(200));
-
-        let start = std::time::Instant::now();
-        let mut handles = Vec::new();
-        for _ in 0..4 {
-            let adb = adb.clone();
-            handles.push(tokio::spawn(
-                async move { adb.run_read(|_db| Ok(1_i64)).await },
-            ));
-        }
-        for handle in handles {
-            handle.await.expect("join").expect("read");
-        }
-        let elapsed = start.elapsed();
-
-        assert!(
-            elapsed < Duration::from_millis(400),
-            "4 concurrent 200ms reads took {elapsed:?}; expected < 400ms (reads run in parallel \
-             across the pool, not serialized)"
-        );
-    }
-
-    /// Every reader connection must enforce `query_only`, carry the low-RSS
-    /// cache profile, and carry no `mmap`.
-    #[tokio::test]
-    async fn readers_are_query_only_low_cache_without_mmap() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let adb = AsyncDb::open(&tmp.path().join("palace.db"), 4).expect("open async db");
-
-        let (query_only, cache_size, mmap_size): (i64, i64, i64) = adb
-            .run_read(|db| {
-                let query_only = db
-                    .conn()
-                    .query_row("PRAGMA query_only", [], |row| row.get(0))?;
-                let cache_size = db
-                    .conn()
-                    .query_row("PRAGMA cache_size", [], |row| row.get(0))?;
-                let mmap_size = db
-                    .conn()
-                    .query_row("PRAGMA mmap_size", [], |row| row.get(0))?;
-                Ok((query_only, cache_size, mmap_size))
-            })
-            .await
-            .expect("read pragmas");
-
-        assert_eq!(query_only, 1, "readers must be query_only");
-        assert_eq!(
-            cache_size, SQLITE_CACHE_SIZE_KIB_DEFAULT,
-            "long-lived read pools must use the low-RSS cache profile"
-        );
-        assert_eq!(mmap_size, 0, "issue #311: pooled readers must not add mmap");
-    }
-
-    /// The writer connection must be writable (not flagged `query_only`).
-    #[tokio::test]
-    async fn writer_is_writable() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let adb = AsyncDb::open(&tmp.path().join("palace.db"), 4).expect("open async db");
-
-        let query_only: i64 = adb
-            .run_write(|db| {
-                Ok(db
-                    .conn()
-                    .query_row("PRAGMA query_only", [], |row| row.get(0))?)
-            })
-            .await
-            .expect("read writer pragma");
-
-        assert_eq!(query_only, 0, "writer must allow writes");
-    }
-
-    /// Startup must reject a read pool whose aggregate page cache would blow the
-    /// long-lived process budget; the default-sized pool must be accepted.
-    #[test]
-    fn open_rejects_oversized_read_pool() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let path = tmp.path().join("palace.db");
-
-        // (n_read + 1) × 16 MiB: n_read = 15 ⇒ 16 conns ⇒ 256 MiB == budget.
-        AsyncDb::open(&path, 15).expect("at-budget pool opens");
-
-        // n_read = 16 ⇒ 17 conns ⇒ 272 MiB > 256 MiB budget.
-        let result = AsyncDb::open(&path, 16);
-        assert!(
-            matches!(result, Err(DbError::PoolCacheBudgetExceeded { .. })),
-            "oversized pool must be rejected with PoolCacheBudgetExceeded"
-        );
-    }
-
-    #[test]
-    fn resource_snapshot_reports_configured_page_cache_budget() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let adb = AsyncDb::open(&tmp.path().join("palace.db"), RESOURCE_BOUNDED_READERS)
-            .expect("open async db");
-
-        let snapshot = adb.resource_snapshot();
-
-        assert_eq!(snapshot.reader_connections, RESOURCE_BOUNDED_READERS);
-        assert_eq!(snapshot.writer_connections, 1);
-        assert_eq!(snapshot.total_connections, RESOURCE_BOUNDED_READERS + 1);
-        assert_eq!(
-            snapshot.per_connection_cache_kib,
-            SQLITE_CACHE_SIZE_KIB_DEFAULT
-        );
-        assert_eq!(snapshot.per_connection_cache_bytes, 16 * 1024 * 1024);
-        assert_eq!(
-            snapshot.configured_page_cache_bytes,
-            48 * 1024 * 1024,
-            "daemon/MCP/API default async DB pool must stay well below old GiB-scale cache"
-        );
-    }
-
-    #[test]
-    fn reader_only_async_pool_does_not_open_writer() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let path = tmp.path().join("palace.db");
-        Database::open(&path).expect("create database");
-        let adb = QueryOnlyAsyncDb::open(&path, RESOURCE_BOUNDED_READERS)
-            .expect("open query-only async db");
-
-        let snapshot = adb.resource_snapshot();
-
-        assert_eq!(snapshot.reader_connections, RESOURCE_BOUNDED_READERS);
-        assert_eq!(
-            snapshot.writer_connections, 0,
-            "reader-only async pool must not open a writer connection"
-        );
-        assert_eq!(snapshot.total_connections, RESOURCE_BOUNDED_READERS);
-        assert_eq!(
-            snapshot.configured_page_cache_bytes,
-            32 * 1024 * 1024,
-            "query-only MCP pool should budget only reader page caches"
-        );
-    }
-
-    #[tokio::test]
-    async fn reader_only_async_pool_runs_bounded_read_without_writer() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let path = tmp.path().join("palace.db");
-        Database::open(&path).expect("create database");
-        let adb = QueryOnlyAsyncDb::open(&path, 1).expect("open query-only async db");
-        let deadline = Instant::now() + Duration::from_secs(1);
-
-        let query_only = adb
-            .run_read_anyhow_until(deadline, |db| {
-                db.conn()
-                    .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
-                    .map_err(anyhow::Error::new)
-            })
-            .await
-            .expect("bounded read");
-
-        assert_eq!(query_only, 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_db_error_read_keeps_permit_until_checkin() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1).expect("open async db");
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let adb_for_cancel = adb.clone();
-
-        let handle = tokio::spawn(async move {
-            adb_for_cancel
-                .run_read(move |_db| {
-                    let _ = started_tx.send(());
-                    std::thread::sleep(Duration::from_millis(300));
-                    Ok::<_, DbError>(1_i64)
-                })
-                .await
-        });
-
-        started_rx.await.expect("blocking read started");
-        handle.abort();
-        let abort_err = handle.await.expect_err("read task should be cancelled");
-        assert!(abort_err.is_cancelled(), "read task must be cancelled");
-
-        let blocked = tokio::time::timeout(
-            Duration::from_millis(100),
-            adb.run_read(|_db| Ok::<_, DbError>(2_i64)),
-        )
-        .await;
-        assert!(
-            blocked.is_err(),
-            "cancelled read must retain its permit until the blocking task checks the connection in"
-        );
-
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let out = adb
-            .run_read(|_db| Ok::<_, DbError>(3_i64))
-            .await
-            .expect("reader recovers after cancelled blocking task returns");
-        assert_eq!(out, 3);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_anyhow_read_keeps_permit_until_checkin() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1).expect("open async db");
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let adb_for_cancel = adb.clone();
-
-        let handle = tokio::spawn(async move {
-            adb_for_cancel
-                .run_read_anyhow(move |_db| {
-                    let _ = started_tx.send(());
-                    std::thread::sleep(Duration::from_millis(300));
-                    Ok(1_i64)
-                })
-                .await
-        });
-
-        started_rx.await.expect("blocking read started");
-        handle.abort();
-        let abort_err = handle.await.expect_err("read task should be cancelled");
-        assert!(abort_err.is_cancelled(), "read task must be cancelled");
-
-        let blocked = tokio::time::timeout(
-            Duration::from_millis(100),
-            adb.run_read_anyhow(|_db| Ok(2_i64)),
-        )
-        .await;
-        assert!(
-            blocked.is_err(),
-            "cancelled anyhow read must retain its permit until the blocking task checks the connection in"
-        );
-
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let out = adb
-            .run_read_anyhow(|_db| Ok(3_i64))
-            .await
-            .expect("reader recovers after cancelled blocking task returns");
-        assert_eq!(out, 3);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn deadline_anyhow_read_interrupts_sqlite_and_releases_reader() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1).expect("open async db");
-        let start = Instant::now();
-        let deadline = start + Duration::from_millis(100);
-        let error = adb
-            .run_read_anyhow_until(deadline, |db| {
-                db.conn()
-                    .query_row(
-                        r#"
-                        WITH RECURSIVE seq(n) AS (
-                            SELECT 1
-                            UNION ALL
-                            SELECT n + 1 FROM seq WHERE n < 100000000
-                        )
-                        SELECT sum(n) FROM seq
-                        "#,
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .map(|_| ())
-                    .map_err(anyhow::Error::new)
-            })
-            .await
-            .expect_err("deadline must interrupt the SQLite scan");
-        assert!(
-            anyhow_error_is_read_deadline_exceeded(&error),
-            "deadline error should be explicit, got {error:#}"
-        );
-        let interrupted_after = start.elapsed();
-        assert!(
-            interrupted_after >= Duration::from_millis(50),
-            "deadline must be reached by SQLite progress_handler, not the pre-deadline fast path; \
-             elapsed {interrupted_after:?}"
-        );
-
-        let recovery = tokio::time::timeout(
-            Duration::from_millis(100),
-            adb.run_read_anyhow(|_db| Ok(7_i64)),
-        )
-        .await
-        .expect("reader must be checked in as soon as SQLite is interrupted")
-        .expect("recovery read");
-        assert_eq!(recovery, 7);
-    }
-}
+#[path = "async_db_tests.rs"]
+mod tests;

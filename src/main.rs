@@ -5270,17 +5270,13 @@ impl MaintenanceWriterLeaseGuard {
                 self.lease.name
             )
         })?;
-        db.runtime_writer_lease_is_active(
-            &self.lease.name,
-            &self.lease.owner,
-            &self.lease.session_id,
-        )
-        .with_context(|| {
-            format!(
-                "failed to verify writer lease `{}` before {operation}",
-                self.lease.name
-            )
-        })
+        db.runtime_writer_lease_is_active(&self.lease)
+            .with_context(|| {
+                format!(
+                    "failed to verify writer lease `{}` before {operation}",
+                    self.lease.name
+                )
+            })
     }
 }
 
@@ -5300,11 +5296,7 @@ impl Drop for MaintenanceWriterLeaseGuard {
             heartbeat.stop_and_join();
         }
         if let Ok(db) = Database::open(&self.db_path) {
-            let _ = db.runtime_writer_lease_release(
-                &self.lease.name,
-                &self.lease.owner,
-                &self.lease.session_id,
-            );
+            let _ = db.runtime_writer_lease_release(&self.lease);
         }
     }
 }
@@ -5576,13 +5568,8 @@ fn renew_maintenance_writer_lease_once(db_path: &Path, lease: &RuntimeWriterLeas
                 lease.name
             )
         })?;
-    db.runtime_writer_lease_renew(
-        &lease.name,
-        &lease.owner,
-        &lease.session_id,
-        MAINTENANCE_WRITER_LEASE_TTL_SECS,
-    )
-    .with_context(|| format!("failed to renew writer lease `{}`", lease.name))
+    db.runtime_writer_lease_renew(lease, MAINTENANCE_WRITER_LEASE_TTL_SECS)
+        .with_context(|| format!("failed to renew writer lease `{}`", lease.name))
 }
 
 #[derive(Debug, Default)]
@@ -24741,16 +24728,12 @@ api_model = "text-embedding-3-large"
             let db = Database::open(&self.db_path).map_err(|error| {
                 mempal::embed::EmbedError::Runtime(format!("open db in test embedder: {error}"))
             })?;
-            db.runtime_writer_lease_release(
-                &self.lease.name,
-                &self.lease.owner,
-                &self.lease.session_id,
-            )
-            .map_err(|error| {
-                mempal::embed::EmbedError::Runtime(format!(
-                    "release writer lease in test embedder: {error}"
-                ))
-            })?;
+            db.runtime_writer_lease_release(&self.lease)
+                .map_err(|error| {
+                    mempal::embed::EmbedError::Runtime(format!(
+                        "release writer lease in test embedder: {error}"
+                    ))
+                })?;
             Ok(texts.iter().map(|text| test_vector(text)).collect())
         }
 
@@ -25123,12 +25106,8 @@ api_model = "text-embedding-3-large"
         let daemon_lease = hold_daemon_writer_lease(&db);
         let _rejudge_lease =
             acquire_historical_rejudge_writer_lease(&db).expect("rejudge scoped writer lease");
-        db.runtime_writer_lease_release(
-            &daemon_lease.name,
-            &daemon_lease.owner,
-            &daemon_lease.session_id,
-        )
-        .expect("release daemon writer lease");
+        db.runtime_writer_lease_release(&daemon_lease)
+            .expect("release daemon writer lease");
 
         let error = project_command(
             &db,
@@ -27011,12 +26990,8 @@ threshold = 0.7
     }
 
     fn release_writer_lease_for_test(db: &Database, lease: &MaintenanceWriterLeaseGuard) {
-        db.runtime_writer_lease_release(
-            &lease.lease().name,
-            &lease.lease().owner,
-            &lease.lease().session_id,
-        )
-        .expect("release writer lease");
+        db.runtime_writer_lease_release(lease.lease())
+            .expect("release writer lease");
     }
 
     fn assert_writer_lease_lost_before(error: &anyhow::Error, operation: &str) {
@@ -28611,12 +28586,8 @@ threshold = 0.7
         assert_eq!(active_drawer_count(&db), 0);
         assert_eq!(db.deleted_drawer_count().expect("deleted count"), 1);
         assert!(
-            db.runtime_writer_lease_is_active(
-                &daemon_lease.name,
-                &daemon_lease.owner,
-                &daemon_lease.session_id
-            )
-            .expect("check daemon writer lease"),
+            db.runtime_writer_lease_is_active(&daemon_lease)
+                .expect("check daemon writer lease"),
             "historical rejudge must not steal or release the daemon sqlite-writer lease"
         );
         assert!(
@@ -28654,12 +28625,8 @@ threshold = 0.7
             "{rendered}"
         );
         assert!(
-            db.runtime_writer_lease_is_active(
-                &daemon_lease.name,
-                &daemon_lease.owner,
-                &daemon_lease.session_id
-            )
-            .expect("check daemon writer lease"),
+            db.runtime_writer_lease_is_active(&daemon_lease)
+                .expect("check daemon writer lease"),
             "rejudge scoped lease conflict must not disturb the daemon sqlite-writer lease"
         );
     }
@@ -32030,12 +31997,8 @@ threshold = 0.7
 
         assert!(renewed);
         assert!(
-            db.runtime_writer_lease_is_active(
-                &writer_lease.lease().name,
-                &writer_lease.lease().owner,
-                &writer_lease.lease().session_id,
-            )
-            .expect("lease remains active after retry")
+            db.runtime_writer_lease_is_active(writer_lease.lease())
+                .expect("lease remains active after retry")
         );
     }
 
@@ -32310,12 +32273,8 @@ threshold = 0.7
         assert_eq!(persisted.status, "running");
         assert_eq!(persisted.last_processed_rowid, Some(2));
         assert!(
-            db.runtime_writer_lease_is_active(
-                &daemon_lease.name,
-                &daemon_lease.owner,
-                &daemon_lease.session_id
-            )
-            .expect("check daemon writer lease"),
+            db.runtime_writer_lease_is_active(&daemon_lease)
+                .expect("check daemon writer lease"),
             "deferred checkpoint must not disturb the live daemon sqlite-writer lease"
         );
     }
@@ -32355,12 +32314,8 @@ threshold = 0.7
         assert_eq!(persisted.status, "running");
         assert_eq!(persisted.last_processed_rowid, Some(2));
         assert!(
-            db.runtime_writer_lease_is_active(
-                &daemon_lease.name,
-                &daemon_lease.owner,
-                &daemon_lease.session_id
-            )
-            .expect("check daemon writer lease"),
+            db.runtime_writer_lease_is_active(&daemon_lease)
+                .expect("check daemon writer lease"),
             "deferred checkpoint must not disturb the live daemon sqlite-writer lease"
         );
     }

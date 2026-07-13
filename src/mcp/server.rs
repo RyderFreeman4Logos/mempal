@@ -360,7 +360,7 @@ impl McpIngestWriterLeaseGuard {
                     db_path.display()
                 )
             })?;
-            db.runtime_writer_lease_release(&lease.name, &lease.owner, &lease.session_id)
+            db.runtime_writer_lease_release(&lease)
                 .context("failed to release MCP ingest writer lease")?;
             Ok::<(), anyhow::Error>(())
         })
@@ -382,11 +382,7 @@ impl Drop for McpIngestWriterLeaseGuard {
         if !self.released
             && let Ok(db) = Database::open(&self.db_path)
         {
-            let _ = db.runtime_writer_lease_release(
-                &self.lease.name,
-                &self.lease.owner,
-                &self.lease.session_id,
-            );
+            let _ = db.runtime_writer_lease_release(&self.lease);
         }
     }
 }
@@ -454,11 +450,7 @@ impl Drop for McpContentWriterLeaseGuard {
             heartbeat.abort();
         }
         if let Ok(db) = Database::open(&self.db_path) {
-            let _ = db.runtime_writer_lease_release(
-                &self.lease.name,
-                &self.lease.owner,
-                &self.lease.session_id,
-            );
+            let _ = db.runtime_writer_lease_release(&self.lease);
         }
     }
 }
@@ -472,7 +464,7 @@ fn ensure_mcp_runtime_writer_lease_active(
         return Ok(());
     };
     let active = db
-        .runtime_writer_lease_is_active(&lease.name, &lease.owner, &lease.session_id)
+        .runtime_writer_lease_is_active(lease)
         .map_err(|error| database_write_refused_error(db.path(), operation, &error))?;
     if active {
         Ok(())
@@ -2122,7 +2114,12 @@ impl MempalMcpServer {
             .get_or_try_init(|| async move {
                 let display_path = db_path.display().to_string();
                 tokio::task::spawn_blocking(move || {
-                    QueryOnlyAsyncDb::open(&db_path, RESOURCE_BOUNDED_READERS).with_context(|| {
+                    QueryOnlyAsyncDb::open_for(
+                        &db_path,
+                        RESOURCE_BOUNDED_READERS,
+                        crate::core::db_admission::DbHolderClass::Mcp,
+                    )
+                    .with_context(|| {
                         format!(
                             "failed to open MCP query-only async database pool for {display_path}"
                         )
@@ -2162,7 +2159,12 @@ impl MempalMcpServer {
             .get_or_try_init(|| async move {
                 let display_path = db_path.display().to_string();
                 tokio::task::spawn_blocking(move || {
-                    AsyncDb::open(&db_path, RESOURCE_BOUNDED_READERS).with_context(|| {
+                    AsyncDb::open_for(
+                        &db_path,
+                        RESOURCE_BOUNDED_READERS,
+                        crate::core::db_admission::DbHolderClass::Mcp,
+                    )
+                    .with_context(|| {
                         format!("failed to open MCP async database pool for {display_path}")
                     })
                 })
@@ -3341,7 +3343,7 @@ fn renew_mcp_writer_lease_once(
     ttl_secs: u64,
 ) -> anyhow::Result<bool> {
     let db = Database::open_with_busy_timeout(db_path, MCP_WRITER_LEASE_RENEW_BUSY_TIMEOUT)?;
-    Ok(db.runtime_writer_lease_renew(&lease.name, &lease.owner, &lease.session_id, ttl_secs)?)
+    Ok(db.runtime_writer_lease_renew(lease, ttl_secs)?)
 }
 
 fn resolve_mcp_ingest_controls(
@@ -14684,7 +14686,7 @@ pattern_boost = 0.2
     fn release_test_ingest_writer_lease(db_path: &Path, lease: &RuntimeWriterLease) {
         let db = Database::open(db_path).expect("open db");
         assert!(
-            db.runtime_writer_lease_release(&lease.name, &lease.owner, &lease.session_id)
+            db.runtime_writer_lease_release(lease)
                 .expect("release test ingest writer lease"),
             "test ingest writer lease should be active before release"
         );
@@ -20173,12 +20175,8 @@ prototypes = ["keep"]
             .expect("acquire writer lease after fact check")
             .expect("content writer lease should be released after fact check");
         assert!(
-            db.runtime_writer_lease_release(
-                &post_release_lease.name,
-                &post_release_lease.owner,
-                &post_release_lease.session_id
-            )
-            .expect("release post fact-check writer lease")
+            db.runtime_writer_lease_release(&post_release_lease)
+                .expect("release post fact-check writer lease")
         );
     }
 

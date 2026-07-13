@@ -327,8 +327,12 @@ fn open_daemon_storage_once(
     db_path: &Path,
 ) -> Result<(Database, AsyncDb, AsyncPendingMessageStore)> {
     let db = Database::open(db_path).context("failed to open daemon database")?;
-    let async_db = AsyncDb::open(db_path, RESOURCE_BOUNDED_READERS)
-        .context("failed to open daemon async database")?;
+    let async_db = AsyncDb::open_for(
+        db_path,
+        RESOURCE_BOUNDED_READERS,
+        crate::core::db_admission::DbHolderClass::Daemon,
+    )
+    .context("failed to open daemon async database")?;
     let store = AsyncPendingMessageStore::new(db.path()).context("failed to open pending queue")?;
     Ok((db, async_db, store))
 }

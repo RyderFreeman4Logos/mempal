@@ -383,6 +383,8 @@ pub enum DbError {
     },
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Admission(#[from] super::db_admission::DbAdmissionError),
     #[error("failed to parse taxonomy keywords JSON")]
     Json(#[from] serde_json::Error),
     #[error("invalid source_type stored in database: {0}")]
@@ -476,6 +478,7 @@ pub(crate) struct ReindexSourceScopeSummary {
 pub struct Database {
     conn: Connection,
     path: PathBuf,
+    _admission: Option<super::db_admission::ProfileDbAdmission>,
 }
 
 /// Novelty audit row to insert with a database-side mutation.
@@ -598,86 +601,12 @@ fn validate_vector_metric(metric: &str) -> Result<&str, DbError> {
     }
 }
 
+#[path = "db_open.rs"]
+mod db_open;
+#[path = "db_writer_lease_restore.rs"]
+mod db_writer_lease_restore;
+
 impl Database {
-    pub fn open(path: &Path) -> Result<Self, DbError> {
-        Self::open_with_mode(path, OpenMode::ReadWrite)
-    }
-
-    /// Open a read-write database connection with a caller-selected SQLite busy timeout.
-    pub fn open_with_busy_timeout(path: &Path, busy_timeout: Duration) -> Result<Self, DbError> {
-        Self::open_with_mode_and_busy_timeout(path, OpenMode::ReadWrite, busy_timeout)
-    }
-
-    pub fn open_read_only(path: &Path) -> Result<Self, DbError> {
-        Self::open_with_mode(path, OpenMode::ReadOnly)
-    }
-
-    /// Open a non-mutating connection for read paths that must not run startup
-    /// writes such as WAL mode changes or migrations.
-    pub fn open_query_only(path: &Path) -> Result<Self, DbError> {
-        Self::open_with_mode(path, OpenMode::QueryOnly)
-    }
-
-    fn open_with_mode(path: &Path, mode: OpenMode) -> Result<Self, DbError> {
-        Self::open_with_mode_and_busy_timeout(path, mode, Duration::from_secs(5))
-    }
-
-    fn open_with_mode_and_busy_timeout(
-        path: &Path,
-        mode: OpenMode,
-        busy_timeout: Duration,
-    ) -> Result<Self, DbError> {
-        if mode.allows_write() {
-            if let Some(parent) = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-            {
-                fs::create_dir_all(parent).map_err(|source| DbError::CreateDir {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
-            }
-        }
-
-        register_sqlite_vec()?;
-
-        let conn = match mode {
-            OpenMode::ReadOnly => {
-                Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?
-            }
-            OpenMode::QueryOnly => {
-                Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?
-            }
-            OpenMode::ReadWrite => Connection::open(path)?,
-        };
-        conn.busy_timeout(busy_timeout)?;
-        conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_DEFAULT)?;
-        register_math_functions(&conn)?;
-        if matches!(mode, OpenMode::QueryOnly) {
-            conn.pragma_update(None, "query_only", "ON")?;
-        }
-        if mode.allows_write() {
-            ensure_wal_journal_mode(&conn)?;
-            conn.pragma_update(None, "synchronous", "NORMAL")?;
-            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-            apply_migrations(&conn)?;
-            db_fork_ext::apply_fork_ext_migrations(&conn)?;
-        }
-
-        Ok(Self {
-            conn,
-            path: path.to_path_buf(),
-        })
-    }
-
-    pub fn conn(&self) -> &Connection {
-        &self.conn
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn insert_drawer(&self, drawer: &Drawer) -> Result<(), DbError> {
         self.insert_drawer_with_project(drawer, None)
     }
@@ -5418,6 +5347,7 @@ impl Database {
     ) -> Result<Option<RuntimeWriterLease>, DbError> {
         let mut session_id = String::new();
         let mut acquired = false;
+        let mut generation = 0_u64;
         let mut acquired_at = String::new();
         let mut expires_at = String::new();
         let pid = std::process::id();
@@ -5431,7 +5361,7 @@ impl Database {
                 let previous_daemon = self
                     .conn
                     .query_row(
-                        "SELECT owner, pid, boot_id, session_id \
+                        "SELECT owner, pid, boot_id, session_id, generation \
                          FROM runtime_writer_leases \
                          WHERE name = ?1 AND mode = 'daemon'",
                         [name],
@@ -5441,12 +5371,18 @@ impl Database {
                                 row.get::<_, i64>(1)?,
                                 row.get::<_, Option<String>>(2)?,
                                 row.get::<_, String>(3)?,
+                                row.get::<_, i64>(4)?,
                             ))
                         },
                     )
                     .optional()?;
-                if let Some((previous_owner, previous_pid, previous_boot_id, previous_session_id)) =
-                    previous_daemon
+                if let Some((
+                    previous_owner,
+                    previous_pid,
+                    previous_boot_id,
+                    previous_session_id,
+                    previous_generation,
+                )) = previous_daemon
                 {
                     let previous_is_live = u32::try_from(previous_pid).ok().is_some_and(|pid| {
                         runtime_writer_daemon_is_live_holder(
@@ -5458,8 +5394,13 @@ impl Database {
                     if !previous_is_live {
                         self.conn.execute(
                             "DELETE FROM runtime_writer_leases \
-                             WHERE name = ?1 AND owner = ?2 AND session_id = ?3",
-                            params![name, previous_owner, previous_session_id],
+                             WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4",
+                            params![
+                                name,
+                                previous_owner,
+                                previous_session_id,
+                                previous_generation
+                            ],
                         )?;
                     }
                 }
@@ -5470,13 +5411,34 @@ impl Database {
             expires_at = crate::cowork::peek::format_rfc3339(
                 now_time + std::time::Duration::from_secs(ttl_secs),
             );
+            let holder_exists = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runtime_writer_leases WHERE name = ?1)",
+                [name],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if holder_exists != 0 {
+                return Ok(());
+            }
+            self.conn.execute(
+                "INSERT INTO runtime_writer_lease_generations (name, last_generation) \
+                 VALUES (?1, 1) \
+                 ON CONFLICT(name) DO UPDATE SET last_generation = last_generation + 1",
+                [name],
+            )?;
+            let generation_i64 = self.conn.query_row(
+                "SELECT last_generation FROM runtime_writer_lease_generations WHERE name = ?1",
+                [name],
+                |row| row.get::<_, i64>(0),
+            )?;
+            generation = u64::try_from(generation_i64).unwrap_or(u64::MAX);
             let rows = self.conn.execute(
                 "INSERT OR IGNORE INTO runtime_writer_leases \
-                 (name, owner, pid, boot_id, session_id, acquired_at, expires_at, heartbeat_at, mode, metadata_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?6, ?8, ?9)",
+                 (name, owner, generation, pid, boot_id, session_id, acquired_at, expires_at, heartbeat_at, mode, metadata_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?7, ?9, ?10)",
                 params![
                     name,
                     owner,
+                    generation as i64,
                     pid as i64,
                     &boot_id,
                     &session_id,
@@ -5494,6 +5456,7 @@ impl Database {
             Ok(Some(RuntimeWriterLease {
                 name: name.to_string(),
                 owner: owner.to_string(),
+                generation,
                 pid,
                 boot_id,
                 session_id,
@@ -5511,9 +5474,24 @@ impl Database {
 
     pub fn runtime_writer_lease_renew(
         &self,
+        lease: &RuntimeWriterLease,
+        ttl_secs: u64,
+    ) -> Result<bool, DbError> {
+        self.runtime_writer_lease_renew_fenced(
+            &lease.name,
+            &lease.owner,
+            &lease.session_id,
+            lease.generation,
+            ttl_secs,
+        )
+    }
+
+    pub fn runtime_writer_lease_renew_fenced(
+        &self,
         name: &str,
         owner: &str,
         session_id: &str,
+        generation: u64,
         ttl_secs: u64,
     ) -> Result<bool, DbError> {
         let mut renewed = false;
@@ -5525,9 +5503,16 @@ impl Database {
             );
             let rows = self.conn.execute(
                 "UPDATE runtime_writer_leases \
-                 SET expires_at = ?4, heartbeat_at = ?5 \
-                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3",
-                params![name, owner, session_id, &expires_at, &now],
+                 SET expires_at = ?5, heartbeat_at = ?6 \
+                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4",
+                params![
+                    name,
+                    owner,
+                    session_id,
+                    generation as i64,
+                    &expires_at,
+                    &now
+                ],
             )?;
             renewed = rows > 0;
             Ok(())
@@ -5537,17 +5522,30 @@ impl Database {
 
     pub fn runtime_writer_lease_is_active(
         &self,
+        lease: &RuntimeWriterLease,
+    ) -> Result<bool, DbError> {
+        self.runtime_writer_lease_is_active_fenced(
+            &lease.name,
+            &lease.owner,
+            &lease.session_id,
+            lease.generation,
+        )
+    }
+
+    pub fn runtime_writer_lease_is_active_fenced(
+        &self,
         name: &str,
         owner: &str,
         session_id: &str,
+        generation: u64,
     ) -> Result<bool, DbError> {
         self.with_immediate_tx(|| self.runtime_writer_lease_cleanup_expired_tx(true))?;
         let active = self.conn.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM runtime_writer_leases
-                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3
+                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4
              )",
-            params![name, owner, session_id],
+            params![name, owner, session_id, generation as i64],
             |row| row.get::<_, i64>(0),
         )?;
         Ok(active != 0)
@@ -5555,87 +5553,31 @@ impl Database {
 
     pub fn runtime_writer_lease_release(
         &self,
+        lease: &RuntimeWriterLease,
+    ) -> Result<bool, DbError> {
+        self.runtime_writer_lease_release_fenced(
+            &lease.name,
+            &lease.owner,
+            &lease.session_id,
+            lease.generation,
+        )
+    }
+
+    pub fn runtime_writer_lease_release_fenced(
+        &self,
         name: &str,
         owner: &str,
         session_id: &str,
+        generation: u64,
     ) -> Result<bool, DbError> {
         self.with_immediate_tx(|| {
             let rows = self.conn.execute(
                 "DELETE FROM runtime_writer_leases \
-                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3",
-                params![name, owner, session_id],
+                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4",
+                params![name, owner, session_id, generation as i64],
             )?;
             Ok(rows > 0)
         })
-    }
-
-    /// Restore a previously-owned runtime writer lease only when the recorded
-    /// holder is still alive and no holder currently owns the same lease name.
-    ///
-    /// This is a crash-recovery primitive for long maintenance commands whose
-    /// heartbeat lost the row to a transient cleanup race. It deliberately does
-    /// not steal from any visible holder, including expired-but-live holders.
-    pub fn runtime_writer_lease_restore_if_unheld(
-        &self,
-        lease: &RuntimeWriterLease,
-        ttl_secs: u64,
-    ) -> Result<bool, DbError> {
-        let mut restored = false;
-        self.with_immediate_tx(|| {
-            self.runtime_writer_lease_cleanup_expired_tx(true)?;
-            if !runtime_writer_lease_holder_is_live(
-                &lease.owner,
-                lease.pid,
-                lease.boot_id.as_deref(),
-                &lease.mode,
-            ) {
-                return Ok(());
-            }
-            let same_lease_exists = self.conn.query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM runtime_writer_leases
-                     WHERE name = ?1 AND owner = ?2 AND session_id = ?3
-                 )",
-                params![&lease.name, &lease.owner, &lease.session_id],
-                |row| row.get::<_, i64>(0),
-            )?;
-            if same_lease_exists != 0 {
-                restored = true;
-                return Ok(());
-            }
-            let holder_count = self.conn.query_row(
-                "SELECT COUNT(*) FROM runtime_writer_leases WHERE name = ?1",
-                params![&lease.name],
-                |row| row.get::<_, i64>(0),
-            )?;
-            if holder_count != 0 {
-                return Ok(());
-            }
-            let now_time = SystemTime::now();
-            let now = crate::cowork::peek::format_rfc3339(now_time);
-            let expires_at = crate::cowork::peek::format_rfc3339(
-                now_time + Duration::from_secs(ttl_secs),
-            );
-            let rows = self.conn.execute(
-                "INSERT OR IGNORE INTO runtime_writer_leases \
-                 (name, owner, pid, boot_id, session_id, acquired_at, expires_at, heartbeat_at, mode, metadata_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?6, ?8, ?9)",
-                params![
-                    &lease.name,
-                    &lease.owner,
-                    lease.pid as i64,
-                    &lease.boot_id,
-                    &lease.session_id,
-                    &now,
-                    &expires_at,
-                    &lease.mode,
-                    &lease.metadata_json,
-                ],
-            )?;
-            restored = rows > 0;
-            Ok(())
-        })?;
-        Ok(restored)
     }
 
     pub fn runtime_writer_lease_status(
@@ -5648,29 +5590,31 @@ impl Database {
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0);
         let collect_row = |row: &rusqlite::Row| -> rusqlite::Result<RuntimeWriterLease> {
-            let expires_at: String = row.get(6)?;
+            let expires_at: String = row.get(7)?;
             let remaining_secs = crate::cowork::peek::parse_rfc3339(&expires_at)
                 .map(|expires| (expires - now_secs).max(0))
                 .unwrap_or(0);
-            let pid_i64: i64 = row.get(2)?;
+            let generation_i64: i64 = row.get(2)?;
+            let pid_i64: i64 = row.get(3)?;
             Ok(RuntimeWriterLease {
                 name: row.get(0)?,
                 owner: row.get(1)?,
+                generation: u64::try_from(generation_i64).unwrap_or(0),
                 pid: u32::try_from(pid_i64).unwrap_or(0),
-                boot_id: row.get(3)?,
-                session_id: row.get(4)?,
-                acquired_at: row.get(5)?,
+                boot_id: row.get(4)?,
+                session_id: row.get(5)?,
+                acquired_at: row.get(6)?,
                 expires_at,
-                heartbeat_at: row.get(7)?,
-                mode: row.get(8)?,
-                metadata_json: row.get(9)?,
+                heartbeat_at: row.get(8)?,
+                mode: row.get(9)?,
+                metadata_json: row.get(10)?,
                 remaining_secs,
             })
         };
         let mut leases = Vec::new();
         if let Some(name) = name {
             let mut stmt = self.conn.prepare(
-                "SELECT name, owner, pid, boot_id, session_id, acquired_at, expires_at, heartbeat_at, mode, metadata_json \
+                "SELECT name, owner, generation, pid, boot_id, session_id, acquired_at, expires_at, heartbeat_at, mode, metadata_json \
                  FROM runtime_writer_leases WHERE name = ?1",
             )?;
             for row in stmt.query_map([name], collect_row)? {
@@ -5678,7 +5622,7 @@ impl Database {
             }
         } else {
             let mut stmt = self.conn.prepare(
-                "SELECT name, owner, pid, boot_id, session_id, acquired_at, expires_at, heartbeat_at, mode, metadata_json \
+                "SELECT name, owner, generation, pid, boot_id, session_id, acquired_at, expires_at, heartbeat_at, mode, metadata_json \
                  FROM runtime_writer_leases ORDER BY name ASC",
             )?;
             for row in stmt.query_map([], collect_row)? {
@@ -5755,7 +5699,7 @@ impl Database {
     ) -> Result<usize, DbError> {
         let expired = {
             let mut stmt = self.conn.prepare(
-                "SELECT name, owner, pid, boot_id, session_id, mode \
+                "SELECT name, owner, pid, boot_id, session_id, generation, mode \
                  FROM runtime_writer_leases \
                  WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')",
             )?;
@@ -5766,14 +5710,15 @@ impl Database {
                     row.get::<_, i64>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
         let mut removed = 0;
-        for (name, owner, pid, boot_id, session_id, mode) in expired {
+        for (name, owner, pid, boot_id, session_id, generation, mode) in expired {
             let preserve_live_holder = preserve_live_holders
                 && u32::try_from(pid).ok().is_some_and(|pid| {
                     runtime_writer_lease_holder_is_live(&owner, pid, boot_id.as_deref(), &mode)
@@ -5783,8 +5728,8 @@ impl Database {
             }
             removed += self.conn.execute(
                 "DELETE FROM runtime_writer_leases \
-                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3",
-                params![name, owner, session_id],
+                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4",
+                params![name, owner, session_id, generation],
             )?;
         }
         Ok(removed)
@@ -7922,7 +7867,7 @@ mod tests {
             .expect("force lease expiry");
 
         assert!(
-            db.runtime_writer_lease_is_active(&lease.name, &lease.owner, &lease.session_id)
+            db.runtime_writer_lease_is_active(&lease)
                 .expect("check runtime writer lease active"),
             "current live process must retain its runtime writer lease after delayed heartbeat"
         );
@@ -7932,7 +7877,7 @@ mod tests {
         assert_eq!(expired_status.len(), 1);
         assert_eq!(expired_status[0].remaining_secs, 0);
         assert!(
-            db.runtime_writer_lease_renew(&lease.name, &lease.owner, &lease.session_id, 300)
+            db.runtime_writer_lease_renew(&lease, 300)
                 .expect("renew delayed live runtime writer lease"),
             "delayed live runtime writer lease must be renewable after expiry"
         );
@@ -8159,6 +8104,7 @@ mod tests {
             &db_path,
             OpenMode::QueryOnly,
             Duration::from_millis(25),
+            true,
         )
         .expect("query-only reader opens without startup writes");
         let query_only: i64 = reader

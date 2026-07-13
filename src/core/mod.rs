@@ -6,6 +6,7 @@ pub mod case_skill;
 pub mod compaction;
 pub mod config;
 pub mod db;
+pub mod db_admission;
 pub(crate) mod deadline;
 pub use async_db::{AsyncDb, QueryOnlyAsyncDb};
 pub mod decay;

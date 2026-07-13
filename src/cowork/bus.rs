@@ -1119,13 +1119,13 @@ fn ensure_capture_writer_lease_active(
     lease: &RuntimeWriterLease,
     operation: &'static str,
 ) -> Result<(), BusError> {
-    let active = db
-        .runtime_writer_lease_is_active(&lease.name, &lease.owner, &lease.session_id)
-        .map_err(|source| BusError::CaptureWriterLeaseVerify {
+    let active = db.runtime_writer_lease_is_active(lease).map_err(|source| {
+        BusError::CaptureWriterLeaseVerify {
             operation,
             lease_name: lease.name.clone(),
             source,
-        })?;
+        }
+    })?;
     if active {
         Ok(())
     } else {
