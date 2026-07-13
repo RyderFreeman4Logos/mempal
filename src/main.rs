@@ -17794,8 +17794,12 @@ fn append_audit_entry_with_writer_lease(
     command: &str,
     details: &serde_json::Value,
 ) -> Result<()> {
-    ensure_maintenance_writer_lease_active(writer_lease, operation)?;
-    append_audit_entry(db, command, details)
+    match writer_lease {
+        Some(lease) => {
+            lease.write_fenced(db, operation, |db| append_audit_entry(db, command, details))
+        }
+        None => append_audit_entry(db, command, details),
+    }
 }
 
 fn historical_rejudge_effective_backup_dir(
@@ -20737,8 +20741,12 @@ fn save_historical_rejudge_checkpoint_with_writer_lease(
     writer_lease: Option<&MaintenanceWriterLeaseGuard>,
     operation: &'static str,
 ) -> Result<()> {
-    ensure_maintenance_writer_lease_active(writer_lease, operation)?;
-    save_historical_rejudge_checkpoint(db, checkpoint)
+    match writer_lease {
+        Some(lease) => lease.write_fenced(db, operation, |db| {
+            save_historical_rejudge_checkpoint(db, checkpoint)
+        }),
+        None => save_historical_rejudge_checkpoint(db, checkpoint),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20766,10 +20774,13 @@ fn save_historical_rejudge_checkpoint_with_writer_lease_outcome(
             return Ok(HistoricalRejudgeCheckpointPersistence::DeferredTransientLock);
         }
     }
-    historical_rejudge_checkpoint_persistence_outcome(
-        save_historical_rejudge_checkpoint(db, checkpoint),
-        status,
-    )
+    let result = match writer_lease {
+        Some(lease) => lease.write_fenced(db, operation, |db| {
+            save_historical_rejudge_checkpoint(db, checkpoint)
+        }),
+        None => save_historical_rejudge_checkpoint(db, checkpoint),
+    };
+    historical_rejudge_checkpoint_persistence_outcome(result, status)
 }
 
 fn persist_historical_rejudge_llm_retry_status_checkpoint(

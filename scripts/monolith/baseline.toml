@@ -317,8 +317,8 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/main.rs"
 kind = "source"
-baseline_tokens = 256840
-baseline_lines = 33220
+baseline_tokens = 256930
+baseline_lines = 33230
 issue = "680"
 rationale = "Writer-lease generation fence conversion of deep maintenance paths; #680 correctness fix"
 
