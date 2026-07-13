@@ -349,21 +349,40 @@ struct AdmissionPaths {
 
 impl AdmissionPaths {
     fn new(db_path: &Path) -> Result<Self, DbAdmissionError> {
-        // Canonicalize existing parent to prevent symlink aliases from
-        // bypassing the profile-wide admission budget.
+        // Canonicalize the full database path (parent + file) to prevent
+        // symlink and hard-link aliases from bypassing the profile-wide
+        // admission budget. If the db file doesn't exist yet (first open),
+        // canonicalize the parent and use the lexical filename.
         let raw_parent = db_path.parent().unwrap_or_else(|| Path::new("."));
         let parent = fs::canonicalize(raw_parent).unwrap_or_else(|_| raw_parent.to_path_buf());
         fs::create_dir_all(&parent).map_err(|source| DbAdmissionError::Io {
             path: parent.clone(),
             source,
         })?;
-        let file_name = db_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .ok_or(DbAdmissionError::InvalidRequest(
-                "database path must have a UTF-8 file name",
-            ))?;
+
+        // If the database file itself exists, canonicalize it to resolve
+        // symlinks at the file level. This ensures alias/palace.db and
+        // real/palace.db share one admission identity.
+        let file_name = {
+            let lexical = db_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .ok_or(DbAdmissionError::InvalidRequest(
+                    "database path must have a UTF-8 file name",
+                ))?;
+            let full_path = parent.join(lexical);
+            match fs::canonicalize(&full_path) {
+                Ok(canonical) => canonical
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| lexical.to_string()),
+                Err(_) => lexical.to_string(),
+            }
+        };
+
         Ok(Self {
             state_path: parent.join(format!(".{file_name}.admission.json")),
             lock_path: parent.join(format!(".{file_name}.admission.lock")),
