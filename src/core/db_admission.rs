@@ -349,9 +349,12 @@ struct AdmissionPaths {
 
 impl AdmissionPaths {
     fn new(db_path: &Path) -> Result<Self, DbAdmissionError> {
-        let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(|source| DbAdmissionError::Io {
-            path: parent.to_path_buf(),
+        // Canonicalize existing parent to prevent symlink aliases from
+        // bypassing the profile-wide admission budget.
+        let raw_parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = fs::canonicalize(raw_parent).unwrap_or_else(|_| raw_parent.to_path_buf());
+        fs::create_dir_all(&parent).map_err(|source| DbAdmissionError::Io {
+            path: parent.clone(),
             source,
         })?;
         let file_name = db_path

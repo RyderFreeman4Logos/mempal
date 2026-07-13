@@ -47,11 +47,13 @@ pub fn inspect_memory_pressure_at(
     // Walk ancestor cgroups to find the most constrained finite limit.
     // systemd/Kubernetes often sets memory.max on a parent while the leaf
     // shows "max". Without this, we miss real memory pressure.
-    // Always report the leaf's memory.current, but use the tightest ancestor max.
-    let cgroup_limit = cgroup_directory
+    // Use the current value from the same level as the chosen limit for
+    // consistent accounting scope.
+    let (cgroup_limit, cgroup_current) = cgroup_directory
         .as_ref()
-        .and_then(|leaf| effective_cgroup_limit(leaf, cgroup_root));
-    let cgroup_current = leaf_current;
+        .and_then(|leaf| effective_cgroup_limit(leaf, cgroup_root))
+        .map(|(limit, current_at)| (Some(limit), Some(current_at)))
+        .unwrap_or((None, leaf_current));
     let cgroup_usage_percent = cgroup_current
         .zip(cgroup_limit)
         .and_then(|(current, limit)| (limit > 0).then(|| current.saturating_mul(100) / limit));
@@ -78,17 +80,26 @@ pub fn inspect_memory_pressure_at(
 
 /// Walk from the leaf cgroup directory up to the cgroup root, returning the
 /// most constrained finite `memory.max` found at any ancestor level.
-fn effective_cgroup_limit(leaf: &Path, cgroup_root: &Path) -> Option<u64> {
+fn effective_cgroup_limit(leaf: &Path, cgroup_root: &Path) -> Option<(u64, u64)> {
     let root_canon = cgroup_root.canonicalize().ok()?;
     let mut current_dir = leaf.canonicalize().ok()?;
-    let mut best: Option<u64> = None;
+    let mut best: Option<(u64, u64, u64)> = None; // (limit, current_at_level, pressure_ratio)
     loop {
-        if let Ok(raw) = fs::read_to_string(current_dir.join("memory.max")) {
-            if let Some(limit) = parse_cgroup_limit(&raw) {
-                best = Some(best.map_or(limit, |prev| prev.min(limit)));
+        if let Ok(max_raw) = fs::read_to_string(current_dir.join("memory.max")) {
+            if let Some(limit) = parse_cgroup_limit(&max_raw) {
+                if limit > 0 {
+                    let current_at = read_u64(current_dir.join("memory.current")).unwrap_or(0);
+                    let ratio = current_at
+                        .saturating_mul(100)
+                        .checked_div(limit)
+                        .unwrap_or(0);
+                    best = Some(match best {
+                        Some((_, _, prev_ratio)) if prev_ratio >= ratio => best.unwrap(),
+                        _ => (limit, current_at, ratio),
+                    });
+                }
             }
         }
-        // Stop at the cgroup root.
         if current_dir == root_canon {
             break;
         }
@@ -97,7 +108,7 @@ fn effective_cgroup_limit(leaf: &Path, cgroup_root: &Path) -> Option<u64> {
             break;
         }
     }
-    best
+    best.map(|(limit, current_at, _)| (limit, current_at))
 }
 
 fn cgroup_v2_memory_directory(raw: &str, cgroup_root: &Path) -> Option<PathBuf> {
