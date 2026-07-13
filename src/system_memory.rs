@@ -42,10 +42,13 @@ pub fn inspect_memory_pressure_at(
     let cgroup_current = cgroup_directory
         .as_ref()
         .and_then(|directory| read_u64(directory.join("memory.current")));
+
+    // Walk ancestor cgroups to find the most constrained finite limit.
+    // systemd/Kubernetes often sets memory.max on a parent while the leaf
+    // shows "max". Without this, we miss real memory pressure.
     let cgroup_limit = cgroup_directory
         .as_ref()
-        .and_then(|directory| fs::read_to_string(directory.join("memory.max")).ok())
-        .and_then(|raw| parse_cgroup_limit(&raw));
+        .and_then(|leaf| effective_cgroup_limit(leaf, cgroup_root));
     let cgroup_usage_percent = cgroup_current
         .zip(cgroup_limit)
         .and_then(|(current, limit)| (limit > 0).then(|| current.saturating_mul(100) / limit));
@@ -68,6 +71,30 @@ pub fn inspect_memory_pressure_at(
             .is_some_and(|percent| percent >= HIGH_CGROUP_USAGE_PERCENT),
         error: (!errors.is_empty()).then(|| errors.join("; ")),
     }
+}
+
+/// Walk from the leaf cgroup directory up to the cgroup root, returning the
+/// most constrained finite `memory.max` found at any level.
+fn effective_cgroup_limit(leaf: &Path, cgroup_root: &Path) -> Option<u64> {
+    let root_canon = cgroup_root.canonicalize().ok()?;
+    let mut current = leaf.canonicalize().ok()?;
+    loop {
+        let max_path = current.join("memory.max");
+        if let Ok(raw) = fs::read_to_string(&max_path) {
+            if let Some(limit) = parse_cgroup_limit(&raw) {
+                return Some(limit);
+            }
+        }
+        // Stop at the cgroup root.
+        if current == root_canon {
+            break;
+        }
+        current = current.parent()?.to_path_buf();
+        if !current.starts_with(&root_canon) {
+            break;
+        }
+    }
+    None
 }
 
 fn cgroup_v2_memory_directory(raw: &str, cgroup_root: &Path) -> Option<PathBuf> {

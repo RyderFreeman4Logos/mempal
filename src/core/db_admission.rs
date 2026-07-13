@@ -19,6 +19,8 @@ const DEFAULT_MAX_HOLDERS: usize = 16;
 const DEFAULT_MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const ADMISSION_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const ADMISSION_LOCK_RETRY: Duration = Duration::from_millis(2);
+const ADMISSION_RELEASE_MAX_ATTEMPTS: u8 = 3;
+const ADMISSION_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -288,12 +290,32 @@ impl ProfileDbAdmission {
 
 impl Drop for ProfileDbAdmission {
     fn drop(&mut self) {
-        if let Err(error) = self.release() {
-            tracing::warn!(
-                %error,
-                admission_owner = %self.owner_identity,
-                "failed to release DB admission holder; budget slot may leak until process exit"
-            );
+        // Bounded retry: transient lock contention or I/O errors should not
+        // permanently leak the admission slot. Retry a few times before
+        // giving up and logging the leak.
+        for attempt in 1..=ADMISSION_RELEASE_MAX_ATTEMPTS {
+            match self.release() {
+                Ok(_) => return,
+                Err(error) => {
+                    if attempt < ADMISSION_RELEASE_MAX_ATTEMPTS {
+                        tracing::warn!(
+                            %error,
+                            admission_owner = %self.owner_identity,
+                            attempt,
+                            "failed to release DB admission holder; will retry"
+                        );
+                        std::thread::sleep(ADMISSION_RELEASE_RETRY_DELAY);
+                    } else {
+                        tracing::error!(
+                            %error,
+                            admission_owner = %self.owner_identity,
+                            "failed to release DB admission holder after {} attempts; \
+                             budget slot may leak until process exit",
+                            ADMISSION_RELEASE_MAX_ATTEMPTS
+                        );
+                    }
+                }
+            }
         }
     }
 }

@@ -22,6 +22,8 @@ pub const MAX_RESTARTS_PER_WINDOW: usize = 3;
 
 const LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const LOCK_RETRY: Duration = Duration::from_millis(2);
+const FAULT_PERSIST_MAX_ATTEMPTS: u8 = 3;
+const FAULT_PERSIST_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,8 +123,12 @@ impl DaemonRecoveryState {
 
     pub fn record_recovered(&mut self, now_secs: u64) {
         self.prune(now_secs);
-        self.phase = RecoveryPhase::Healthy;
-        self.cooldown_until_unix_secs = 0;
+        // Never clear an active Cooldown — the fault budget must be honored
+        // even if background workers briefly appear healthy.
+        if self.phase != RecoveryPhase::Cooldown {
+            self.phase = RecoveryPhase::Healthy;
+            self.cooldown_until_unix_secs = 0;
+        }
     }
 
     pub fn snapshot(&mut self, now_secs: u64) -> DaemonRecoverySnapshot {
@@ -192,25 +198,41 @@ impl DaemonRecoveryFaultReporter {
         {
             return;
         }
-        match self.recovery.record_fault(fault) {
-            Ok(decision) => tracing::error!(
-                ?fault,
-                ?decision,
-                "daemon recovery fault recorded; requesting bounded supervisor restart"
-            ),
-            Err(error) => {
-                // Persistence failed — restore the flag so a subsequent retry
-                // can attempt to record the fault again. Without this, the
-                // process could exit without deducting from the restart budget,
-                // allowing unbounded restart storms.
-                self.reported.store(false, Ordering::Release);
-                tracing::error!(
-                    ?fault,
-                    %error,
-                    "failed to persist daemon recovery fault; restored flag for retry"
-                );
+        // Bounded retry: if persistence fails (lock contention, I/O error),
+        // retry up to FAULT_PERSIST_MAX_ATTEMPTS times before giving up.
+        // This prevents unbounded restart storms when the fault budget
+        // cannot be reliably deducted.
+        for attempt in 1..=FAULT_PERSIST_MAX_ATTEMPTS {
+            match self.recovery.record_fault(fault) {
+                Ok(decision) => {
+                    tracing::error!(
+                        ?fault,
+                        ?decision,
+                        "daemon recovery fault recorded; requesting bounded supervisor restart"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        ?fault,
+                        %error,
+                        attempt,
+                        "failed to persist daemon recovery fault; will retry"
+                    );
+                    if attempt < FAULT_PERSIST_MAX_ATTEMPTS {
+                        std::thread::sleep(FAULT_PERSIST_RETRY_DELAY);
+                    }
+                }
             }
         }
+        // All retries exhausted — restore flag so a future caller can try again.
+        self.reported.store(false, Ordering::Release);
+        tracing::error!(
+            ?fault,
+            "daemon recovery fault could not be persisted after {} attempts; \
+             restored flag for future retry",
+            FAULT_PERSIST_MAX_ATTEMPTS
+        );
     }
 }
 
