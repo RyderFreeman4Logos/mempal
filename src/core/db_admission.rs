@@ -349,10 +349,10 @@ struct AdmissionPaths {
 
 impl AdmissionPaths {
     fn new(db_path: &Path) -> Result<Self, DbAdmissionError> {
-        // Canonicalize the full database path (parent + file) to prevent
-        // symlink and hard-link aliases from bypassing the profile-wide
-        // admission budget. If the db file doesn't exist yet (first open),
-        // canonicalize the parent and use the lexical filename.
+        // Canonicalize the full database path to prevent symlink and
+        // hard-link aliases from bypassing the profile-wide admission budget.
+        // Sidecar paths are derived from the canonical path so that all
+        // aliases of the same database file share one admission identity.
         let raw_parent = db_path.parent().unwrap_or_else(|| Path::new("."));
         let parent = fs::canonicalize(raw_parent).unwrap_or_else(|_| raw_parent.to_path_buf());
         fs::create_dir_all(&parent).map_err(|source| DbAdmissionError::Io {
@@ -360,32 +360,38 @@ impl AdmissionPaths {
             source,
         })?;
 
-        // If the database file itself exists, canonicalize it to resolve
-        // symlinks at the file level. This ensures alias/palace.db and
-        // real/palace.db share one admission identity.
-        let file_name = {
-            let lexical = db_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| !name.is_empty())
-                .ok_or(DbAdmissionError::InvalidRequest(
-                    "database path must have a UTF-8 file name",
-                ))?;
-            let full_path = parent.join(lexical);
-            match fs::canonicalize(&full_path) {
-                Ok(canonical) => canonical
+        let lexical_name = db_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or(DbAdmissionError::InvalidRequest(
+                "database path must have a UTF-8 file name",
+            ))?;
+
+        // Try canonicalizing the full db_path. If the file exists, this
+        // resolves all symlinks (including cross-directory ones) to the
+        // real path. Sidecars are then derived from the canonical parent
+        // and canonical filename, ensuring all aliases converge.
+        let full_path = parent.join(lexical_name);
+        let (sidecar_dir, sidecar_name) = match fs::canonicalize(&full_path) {
+            Ok(canonical) => {
+                let dir = canonical
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or(parent);
+                let name = canonical
                     .file_name()
-                    .and_then(|name| name.to_str())
-                    .filter(|name| !name.is_empty())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| lexical.to_string()),
-                Err(_) => lexical.to_string(),
+                    .and_then(|n| n.to_str())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or(lexical_name);
+                (dir, name.to_string())
             }
+            Err(_) => (parent, lexical_name.to_string()),
         };
 
         Ok(Self {
-            state_path: parent.join(format!(".{file_name}.admission.json")),
-            lock_path: parent.join(format!(".{file_name}.admission.lock")),
+            state_path: sidecar_dir.join(format!(".{sidecar_name}.admission.json")),
+            lock_path: sidecar_dir.join(format!(".{sidecar_name}.admission.lock")),
         })
     }
 }
@@ -472,6 +478,7 @@ fn holder_is_live(holder: &DbAdmissionHolder) -> bool {
     #[cfg(target_os = "linux")]
     {
         super::process_identity::process_identity_matches(holder.pid, &holder.process_identity)
+            .unwrap_or(true)
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {

@@ -93,10 +93,12 @@ fn effective_cgroup_limit(leaf: &Path, cgroup_root: &Path) -> Option<(u64, u64)>
                         .saturating_mul(100)
                         .checked_div(limit)
                         .unwrap_or(0);
-                    best = Some(match best {
-                        Some((_, _, prev_ratio)) if prev_ratio >= ratio => best.unwrap(),
-                        _ => (limit, current_at, ratio),
-                    });
+                    best = match best {
+                        Some((prev_limit, prev_current, prev_ratio)) if prev_ratio >= ratio => {
+                            Some((prev_limit, prev_current, prev_ratio))
+                        }
+                        _ => Some((limit, current_at, ratio)),
+                    };
                 }
             }
         }

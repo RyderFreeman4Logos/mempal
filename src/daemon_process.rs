@@ -39,7 +39,9 @@ impl DaemonProcess {
         let Ok(pid) = u32::try_from(self.pid) else {
             return false;
         };
-        self.is_current() && crate::core::process_identity::process_identity_matches(pid, expected)
+        self.is_current()
+            && crate::core::process_identity::process_identity_matches(pid, expected)
+                .unwrap_or(true)
     }
 }
 

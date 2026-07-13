@@ -42,12 +42,17 @@ pub(crate) fn daemon_owner_matches_process(owner: &str, pid: u32) -> bool {
 }
 
 /// Verify the process birth identity recorded by daemon-owned status.
+///
+/// Returns `Some(true)` if the identity matches, `Some(false)` if the
+/// process is confirmed dead (zombie/exited), and `None` if the process
+/// cannot be verified (PID namespace isolation, `hidepid`, etc.).
+/// Callers must retain holders when `None` is returned (fail-closed).
 #[cfg(target_os = "linux")]
-pub(crate) fn process_identity_matches(pid: u32, expected: &str) -> bool {
+pub(crate) fn process_identity_matches(pid: u32, expected: &str) -> Option<bool> {
     if pid == std::process::id() {
-        return current_process_identity() == expected;
+        return Some(current_process_identity() == expected);
     }
-    linux_process_identity(pid).as_deref() == Some(expected)
+    linux_process_identity(pid).map(|identity| identity == expected)
 }
 
 #[cfg(target_os = "linux")]
@@ -152,9 +157,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn current_process_identity_matches_inside_pid_namespaces() {
-        assert!(process_identity_matches(
-            std::process::id(),
-            current_process_identity()
-        ));
+        assert!(
+            process_identity_matches(std::process::id(), current_process_identity())
+                .unwrap_or(false)
+        );
     }
 }

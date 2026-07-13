@@ -119,6 +119,7 @@ pub fn read_embedder_status(mempal_home: &Path) -> io::Result<Option<DaemonEmbed
                 status.pid,
                 &status.process_identity,
             )
+            .unwrap_or(true)
         {
             return Ok(None);
         }
