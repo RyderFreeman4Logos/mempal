@@ -377,6 +377,15 @@ pub enum DbError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Admission(#[from] super::db_admission::DbAdmissionError),
+    #[error(
+        "runtime SQLite writer lease `{lease_name}` generation {generation} for {owner} was lost before {operation}"
+    )]
+    RuntimeWriterLeaseLost {
+        lease_name: String,
+        owner: String,
+        generation: u64,
+        operation: &'static str,
+    },
     #[error("failed to parse taxonomy keywords JSON")]
     Json(#[from] serde_json::Error),
     #[error("invalid source_type stored in database: {0}")]
@@ -595,6 +604,9 @@ fn validate_vector_metric(metric: &str) -> Result<&str, DbError> {
 
 #[path = "db_open.rs"]
 mod db_open;
+#[path = "db_writer_lease_fence.rs"]
+mod db_writer_lease_fence;
+pub use db_writer_lease_fence::{DrawerMergeWithNovelty, IngestBoostBatch};
 #[path = "db_writer_lease_restore.rs"]
 mod db_writer_lease_restore;
 
@@ -739,6 +751,32 @@ impl Database {
         project_id: Option<&str>,
         content: Option<&str>,
     ) -> Result<(), DbError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.record_gating_audit_in_current_transaction(
+            candidate_hash,
+            decision,
+            project_id,
+            content,
+        );
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn record_gating_audit_in_current_transaction(
+        &self,
+        candidate_hash: &str,
+        decision: &GatingDecision,
+        project_id: Option<&str>,
+        content: Option<&str>,
+    ) -> Result<(), DbError> {
         let explain_json = serde_json::to_string(decision)?;
         let created_at = super::utils::current_timestamp()
             .parse::<i64>()
@@ -763,10 +801,8 @@ impl Database {
             .is_rejected()
             .then(|| content.map(|text| truncate_preview(text, 500)))
             .flatten();
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<(), DbError> {
-            self.conn.execute(
-                r#"
+        self.conn.execute(
+            r#"
                 INSERT INTO gating_audit (
                     id,
                     candidate_hash,
@@ -784,38 +820,27 @@ impl Database {
                 )
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 "#,
-                params![
-                    id,
-                    candidate_hash,
-                    drawer_id,
-                    audit_decision,
-                    i64::from(decision.tier),
-                    decision.label.as_deref(),
-                    decision.gating_reason.as_deref(),
-                    decision.score,
-                    explain_json,
-                    retained_until,
-                    created_at,
-                    project_id,
-                    content_preview.as_deref(),
-                ],
-            )?;
-            if let Some(reason) = decision.drop_reason() {
-                self.increment_meta_counter(GATING_DROP_TOTAL_KEY)?;
-                self.increment_meta_counter(&format!("gating.dropped.{reason}"))?;
-            }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
+            params![
+                id,
+                candidate_hash,
+                drawer_id,
+                audit_decision,
+                i64::from(decision.tier),
+                decision.label.as_deref(),
+                decision.gating_reason.as_deref(),
+                decision.score,
+                explain_json,
+                retained_until,
+                created_at,
+                project_id,
+                content_preview.as_deref(),
+            ],
+        )?;
+        if let Some(reason) = decision.drop_reason() {
+            self.increment_meta_counter(GATING_DROP_TOTAL_KEY)?;
+            self.increment_meta_counter(&format!("gating.dropped.{reason}"))?;
         }
+        Ok(())
     }
 
     pub fn record_embed_failure(
@@ -1110,33 +1135,40 @@ impl Database {
         expected_merge_count: u32,
         audit: NoveltyAuditInsert<'_>,
     ) -> Result<(), DbError> {
-        self.ensure_vectors_table(vector.len())?;
-        let vector_json = serde_json::to_string(vector)?;
-        let content_hash = content_hash_hex(merged_content);
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<(), DbError> {
-            self.apply_drawer_merge_update(DrawerMergeUpdate {
+        self.update_drawer_after_merge_and_record_novelty_audit_fenced(
+            None,
+            DrawerMergeWithNovelty {
                 drawer_id,
                 merged_content,
                 updated_at,
+                vector,
+                expected_merge_count,
+                audit,
+            },
+        )
+    }
+
+    pub fn update_drawer_after_merge_and_record_novelty_audit_fenced(
+        &self,
+        lease: Option<&RuntimeWriterLease>,
+        merge: DrawerMergeWithNovelty<'_>,
+    ) -> Result<(), DbError> {
+        self.with_runtime_writer_lease_transaction(lease, "merge drawer", || {
+            self.ensure_vectors_table(merge.vector.len())?;
+            let vector_json = serde_json::to_string(merge.vector)?;
+            let content_hash = content_hash_hex(merge.merged_content);
+            self.apply_drawer_merge_update(DrawerMergeUpdate {
+                drawer_id: merge.drawer_id,
+                merged_content: merge.merged_content,
+                updated_at: merge.updated_at,
                 content_hash: &content_hash,
                 vector_json: &vector_json,
-                vector_len: vector.len(),
-                expected_merge_count,
+                vector_len: merge.vector.len(),
+                expected_merge_count: merge.expected_merge_count,
             })?;
-            self.insert_novelty_audit_row(audit)?;
+            self.insert_novelty_audit_row(merge.audit)?;
             Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
+        })
     }
 
     fn apply_drawer_merge_update(&self, update: DrawerMergeUpdate<'_>) -> Result<(), DbError> {
@@ -1566,125 +1598,7 @@ impl Database {
         drawer: &Drawer,
         vector: &[f32],
     ) -> Result<(), DbError> {
-        anchor::validate_anchor_domain(&drawer.domain, &drawer.anchor_kind)
-            .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
-        self.ensure_vectors_table(vector.len())?;
-
-        let existing = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
-                [drawer.id.as_str()],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-
-        if existing.is_none() {
-            self.insert_drawer(drawer)?;
-            return self.insert_vector(&drawer.id, vector);
-        }
-
-        let vector_json = serde_json::to_string(vector)?;
-        let content_hash = content_hash_hex(&drawer.content);
-
-        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
-        let result = (|| -> Result<(), DbError> {
-            self.conn.execute(
-                r#"
-                UPDATE drawers
-                SET content = ?2,
-                    wing = ?3,
-                    room = ?4,
-                    source_file = ?5,
-                    source_type = ?6,
-                    confidence = ?7,
-                    added_at = ?8,
-                    chunk_index = ?9,
-                    normalize_version = ?10,
-                    importance = ?11,
-                    memory_kind = ?12,
-                    domain = ?13,
-                    field = ?14,
-                    anchor_kind = ?15,
-                    anchor_id = ?16,
-                    parent_anchor_id = ?17,
-                    provenance = ?18,
-                    statement = ?19,
-                    tier = ?20,
-                    status = ?21,
-                    supporting_refs = ?22,
-                    counterexample_refs = ?23,
-                    teaching_refs = ?24,
-                    verification_refs = ?25,
-                    scope_constraints = ?26,
-                    trigger_hints = ?27,
-                    is_pinned = ?28,
-                    pin_order = ?29,
-                    supersedes = ?30,
-                    content_hash = ?31,
-                    valid_from = ?32,
-                    valid_until = NULL
-                WHERE id = ?1 AND deleted_at IS NULL
-                "#,
-                params![
-                    drawer.id.as_str(),
-                    drawer.content.as_str(),
-                    drawer.wing.as_str(),
-                    drawer.room.as_deref(),
-                    drawer.source_file.as_deref(),
-                    source_type_as_str(&drawer.source_type),
-                    drawer.confidence,
-                    drawer.added_at.as_str(),
-                    drawer.chunk_index,
-                    i64::from(drawer.normalize_version),
-                    drawer.importance,
-                    memory_kind_as_str(&drawer.memory_kind),
-                    memory_domain_as_str(&drawer.domain),
-                    drawer.field.as_str(),
-                    anchor_kind_as_str(&drawer.anchor_kind),
-                    drawer.anchor_id.as_str(),
-                    drawer.parent_anchor_id.as_deref(),
-                    drawer.provenance.as_ref().map(provenance_as_str),
-                    drawer.statement.as_deref(),
-                    drawer.tier.as_ref().map(knowledge_tier_as_str),
-                    drawer.status.as_ref().map(knowledge_status_as_str),
-                    encode_json(&drawer.supporting_refs)?,
-                    encode_json(&drawer.counterexample_refs)?,
-                    encode_json(&drawer.teaching_refs)?,
-                    encode_json(&drawer.verification_refs)?,
-                    drawer.scope_constraints.as_deref(),
-                    encode_optional_json(drawer.trigger_hints.as_ref())?,
-                    drawer.is_pinned,
-                    drawer.pin_order,
-                    drawer.supersedes.as_deref(),
-                    content_hash,
-                    drawer.added_at.as_str(),
-                ],
-            )?;
-
-            self.conn.execute(
-                "DELETE FROM drawer_vectors WHERE id = ?1",
-                [drawer.id.as_str()],
-            )?;
-            self.conn.execute(
-                "INSERT INTO drawer_vectors (id, embedding) VALUES (?1, vec_f32(?2))",
-                params![drawer.id.as_str(), vector_json.as_str()],
-            )?;
-            self.record_current_vector_metadata(&drawer.id, vector.len())?;
-
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT;")?;
-                Ok(())
-            }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(error)
-            }
-        }
+        self.upsert_drawer_and_replace_vector_fenced(None, drawer, vector)
     }
 
     pub fn novelty_candidates(
@@ -1962,30 +1876,44 @@ impl Database {
     }
 
     pub fn pin_drawer(&self, drawer_id: &str, pin_order: Option<i64>) -> Result<bool, DbError> {
-        if let Some(order) = pin_order {
-            return self.pin_drawer_with_order(drawer_id, Some(order));
-        }
+        self.pin_drawer_fenced(None, drawer_id, pin_order)
+    }
 
-        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
-        let result = (|| -> Result<bool, DbError> {
-            let resolved_order = self.conn.query_row(
-                "SELECT COALESCE(MAX(pin_order), -1) + 1 FROM drawers WHERE is_pinned = 1",
-                [],
-                |row| row.get::<_, Option<i64>>(0),
-            )?;
+    pub fn pin_drawer_fenced(
+        &self,
+        lease: Option<&RuntimeWriterLease>,
+        drawer_id: &str,
+        pin_order: Option<i64>,
+    ) -> Result<bool, DbError> {
+        self.with_runtime_writer_lease_transaction(lease, "pin drawer", || {
+            let resolved_order = match pin_order {
+                Some(order) => Some(order),
+                None => self.conn.query_row(
+                    "SELECT COALESCE(MAX(pin_order), -1) + 1 FROM drawers WHERE is_pinned = 1",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )?,
+            };
             self.pin_drawer_with_order(drawer_id, resolved_order)
-        })();
+        })
+    }
 
-        match result {
-            Ok(affected) => {
-                self.conn.execute_batch("COMMIT;")?;
-                Ok(affected)
+    pub fn pin_drawers_fenced(
+        &self,
+        lease: Option<&RuntimeWriterLease>,
+        drawer_ids: &[String],
+    ) -> Result<(), DbError> {
+        self.with_runtime_writer_lease_transaction(lease, "pin drawers", || {
+            for drawer_id in drawer_ids {
+                let resolved_order = self.conn.query_row(
+                    "SELECT COALESCE(MAX(pin_order), -1) + 1 FROM drawers WHERE is_pinned = 1",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )?;
+                self.pin_drawer_with_order(drawer_id, resolved_order)?;
             }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(error)
-            }
-        }
+            Ok(())
+        })
     }
 
     fn pin_drawer_with_order(
@@ -2214,6 +2142,38 @@ impl Database {
         project_id: Option<&str>,
         source_root: Option<&str>,
     ) -> Result<u64, DbError> {
+        self.replace_active_source_drawers_fenced(
+            None,
+            source_file,
+            wing,
+            room,
+            project_id,
+            source_root,
+        )
+    }
+
+    pub fn replace_active_source_drawers_fenced(
+        &self,
+        lease: Option<&RuntimeWriterLease>,
+        source_file: &str,
+        wing: &str,
+        room: Option<&str>,
+        project_id: Option<&str>,
+        source_root: Option<&str>,
+    ) -> Result<u64, DbError> {
+        self.with_runtime_writer_lease_transaction(lease, "replace source drawers", || {
+            self.replace_active_source_drawers_tx(source_file, wing, room, project_id, source_root)
+        })
+    }
+
+    fn replace_active_source_drawers_tx(
+        &self,
+        source_file: &str,
+        wing: &str,
+        room: Option<&str>,
+        project_id: Option<&str>,
+        source_root: Option<&str>,
+    ) -> Result<u64, DbError> {
         let mut statement = self.conn.prepare(
             r#"
             SELECT rowid, id, content
@@ -2238,7 +2198,7 @@ impl Database {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
 
-        self.delete_source_drawer_rows(rows, project_id, source_root)
+        self.delete_source_drawer_rows_tx(rows, project_id, source_root)
     }
 
     /// Hard-delete the active drawers for a source across ALL rooms in a scope.
@@ -2249,6 +2209,40 @@ impl Database {
     /// was routed into. The fork still scopes the delete by project/source_root,
     /// so cross-room replacement cannot delete another project or source root.
     pub fn replace_active_source_drawers_across_rooms(
+        &self,
+        source_file: &str,
+        wing: &str,
+        project_id: Option<&str>,
+        source_root: Option<&str>,
+    ) -> Result<u64, DbError> {
+        self.replace_active_source_drawers_across_rooms_fenced(
+            None,
+            source_file,
+            wing,
+            project_id,
+            source_root,
+        )
+    }
+
+    pub fn replace_active_source_drawers_across_rooms_fenced(
+        &self,
+        lease: Option<&RuntimeWriterLease>,
+        source_file: &str,
+        wing: &str,
+        project_id: Option<&str>,
+        source_root: Option<&str>,
+    ) -> Result<u64, DbError> {
+        self.with_runtime_writer_lease_transaction(lease, "replace source drawers", || {
+            self.replace_active_source_drawers_across_rooms_tx(
+                source_file,
+                wing,
+                project_id,
+                source_root,
+            )
+        })
+    }
+
+    fn replace_active_source_drawers_across_rooms_tx(
         &self,
         source_file: &str,
         wing: &str,
@@ -2278,13 +2272,13 @@ impl Database {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
 
-        self.delete_source_drawer_rows(rows, project_id, source_root)
+        self.delete_source_drawer_rows_tx(rows, project_id, source_root)
     }
 
     /// Transactionally hard-delete the given (rowid, id, content) drawer rows
     /// along with their FTS and vector entries. Shared by the room-scoped and
     /// across-rooms source replacement paths.
-    fn delete_source_drawer_rows(
+    fn delete_source_drawer_rows_tx(
         &self,
         rows: Vec<(i64, String, String)>,
         project_id: Option<&str>,
@@ -2294,18 +2288,16 @@ impl Database {
             return Ok(0);
         }
 
-        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
-        let result = (|| -> Result<u64, DbError> {
-            let fts_exists = self.table_exists("drawers_fts")?;
-            let vectors_exist = self.table_exists("drawer_vectors")?;
+        let fts_exists = self.table_exists("drawers_fts")?;
+        let vectors_exist = self.table_exists("drawer_vectors")?;
 
-            for (rowid, id, content) in &rows {
-                if fts_exists {
-                    self.delete_drawer_fts_row(*rowid, content)?;
-                }
-                if vectors_exist {
-                    self.conn.execute(
-                        r#"
+        for (rowid, id, content) in &rows {
+            if fts_exists {
+                self.delete_drawer_fts_row(*rowid, content)?;
+            }
+            if vectors_exist {
+                self.conn.execute(
+                    r#"
                         DELETE FROM drawer_vectors
                         WHERE id = ?1
                           AND ((?2 IS NULL AND project_id IS NULL) OR project_id = ?2)
@@ -2318,42 +2310,30 @@ impl Database {
                                 AND ((?4 IS NULL AND source_root IS NULL) OR source_root = ?4)
                           )
                         "#,
-                        params![id, project_id, rowid, source_root],
-                    )?;
-                }
-                // triples.source_drawer is a FK to drawers(id) (RESTRICT). Drop
-                // the dangling provenance link before the hard delete, otherwise
-                // deleting a drawer referenced by a KG triple fails with a
-                // FOREIGN KEY constraint error. The triple (a KG fact) is kept;
-                // only its stale source pointer is cleared.
-                self.conn.execute(
-                    "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
-                    [id],
+                    params![id, project_id, rowid, source_root],
                 )?;
-                self.conn.execute(
-                    r#"
+            }
+            // triples.source_drawer is a FK to drawers(id) (RESTRICT). Drop
+            // the dangling provenance link before the hard delete, otherwise
+            // deleting a drawer referenced by a KG triple fails with a
+            // FOREIGN KEY constraint error. The triple (a KG fact) is kept;
+            // only its stale source pointer is cleared.
+            self.conn.execute(
+                "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
+                [id],
+            )?;
+            self.conn.execute(
+                r#"
                     DELETE FROM drawers
                     WHERE rowid = ?1
                       AND ((?2 IS NULL AND project_id IS NULL) OR project_id = ?2)
                       AND ((?3 IS NULL AND source_root IS NULL) OR source_root = ?3)
                     "#,
-                    params![rowid, project_id, source_root],
-                )?;
-            }
-
-            Ok(rows.len() as u64)
-        })();
-
-        match result {
-            Ok(count) => {
-                self.conn.execute_batch("COMMIT;")?;
-                Ok(count)
-            }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(error)
-            }
+                params![rowid, project_id, source_root],
+            )?;
         }
+
+        Ok(rows.len() as u64)
     }
 
     fn table_exists(&self, table_name: &str) -> Result<bool, DbError> {
@@ -4913,7 +4893,25 @@ impl Database {
         decay_rate: f64,
         floor: f64,
     ) -> Result<(), DbError> {
-        if drawer_ids.is_empty() {
+        self.apply_ingest_boost_batch_fenced(
+            None,
+            IngestBoostBatch {
+                drawer_ids,
+                now_ms,
+                boost_per_access,
+                boost_cap,
+                decay_rate,
+                floor,
+            },
+        )
+    }
+
+    pub fn apply_ingest_boost_batch_fenced(
+        &self,
+        lease: Option<&RuntimeWriterLease>,
+        batch: IngestBoostBatch<'_>,
+    ) -> Result<(), DbError> {
+        if batch.drawer_ids.is_empty() {
             return Ok(());
         }
         let sql = r#"
@@ -4930,30 +4928,19 @@ impl Database {
             WHERE id = ?6 AND deleted_at IS NULL
         "#;
         let mut stmt = self.conn.prepare_cached(sql)?;
-        self.conn.execute_batch("BEGIN")?;
-        let result: Result<(), DbError> = (|| {
-            for id in drawer_ids {
+        self.with_runtime_writer_lease_transaction(lease, "apply ingest boost", || {
+            for id in batch.drawer_ids {
                 stmt.execute(rusqlite::params![
-                    boost_per_access,
-                    now_ms,
-                    decay_rate,
-                    floor,
-                    boost_cap,
+                    batch.boost_per_access,
+                    batch.now_ms,
+                    batch.decay_rate,
+                    batch.floor,
+                    batch.boost_cap,
                     id
                 ])?;
             }
             Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        })
     }
 
     /// Apply stale penalty: persist the multiplier in `stale_penalty_applied` and

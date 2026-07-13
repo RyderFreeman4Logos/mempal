@@ -147,6 +147,13 @@ pub struct FailureEventArgs<'a> {
     pub detected_at_ms: i64,
 }
 
+struct DetectedFailure {
+    event_id: String,
+    topic_sig: String,
+    failure_type: String,
+    detected_at_ms: i64,
+}
+
 /// Insert a failure_event row. Uses unix epoch milliseconds for detected_at.
 pub fn record_failure_event(
     conn: &Connection,
@@ -184,26 +191,66 @@ pub fn try_record_failure(
     project_id: Option<&str>,
     config: &RepairConfig,
 ) {
-    if let Some(failure_type) = detect_failure_keyword(content, &config.failure_keywords) {
-        let topic_sig = compute_topic_sig(content);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let event_id = new_event_id();
-        let args = FailureEventArgs {
-            event_id: &event_id,
-            drawer_id,
-            wing,
-            room,
-            topic_sig: &topic_sig,
-            failure_type: &failure_type,
-            project_id,
-            detected_at_ms: now_ms,
-        };
-        if let Err(e) = write_failure_event_to_path(db_path, &args) {
-            tracing::warn!(error = %e, drawer_id, "failure event write failed");
-        }
+    let Some(detected) = detect_failure(content, config) else {
+        return;
+    };
+    let args = failure_event_args(&detected, drawer_id, wing, room, project_id);
+    if let Err(e) = write_failure_event_to_path(db_path, &args) {
+        tracing::warn!(error = %e, drawer_id, "failure event write failed");
+    }
+}
+
+/// Detect and record a failure using the caller's SQLite connection.
+///
+/// Runtime writers use this entry point inside their generation-fenced write
+/// transaction so lease validation and the optional signal insert share one
+/// SQLite write lock.
+pub fn try_record_failure_on_connection(
+    conn: &Connection,
+    drawer_id: &str,
+    content: &str,
+    wing: &str,
+    room: Option<&str>,
+    project_id: Option<&str>,
+    config: &RepairConfig,
+) -> rusqlite::Result<()> {
+    let Some(detected) = detect_failure(content, config) else {
+        return Ok(());
+    };
+    let args = failure_event_args(&detected, drawer_id, wing, room, project_id);
+    record_failure_event(conn, &args)
+}
+
+fn detect_failure(content: &str, config: &RepairConfig) -> Option<DetectedFailure> {
+    let failure_type = detect_failure_keyword(content, &config.failure_keywords)?;
+    let detected_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    Some(DetectedFailure {
+        event_id: new_event_id(),
+        topic_sig: compute_topic_sig(content),
+        failure_type,
+        detected_at_ms,
+    })
+}
+
+fn failure_event_args<'a>(
+    detected: &'a DetectedFailure,
+    drawer_id: &'a str,
+    wing: &'a str,
+    room: Option<&'a str>,
+    project_id: Option<&'a str>,
+) -> FailureEventArgs<'a> {
+    FailureEventArgs {
+        event_id: &detected.event_id,
+        drawer_id,
+        wing,
+        room,
+        topic_sig: &detected.topic_sig,
+        failure_type: &detected.failure_type,
+        project_id,
+        detected_at_ms: detected.detected_at_ms,
     }
 }
 

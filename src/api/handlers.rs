@@ -892,6 +892,7 @@ async fn process_ingest_request(
                 &drawer_id,
                 chunk,
                 &db,
+                None,
                 project_id.as_deref(),
                 &config.ingest_gating.fact_check,
                 validated.confidence,

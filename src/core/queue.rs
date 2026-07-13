@@ -15,6 +15,9 @@ use super::config::scrub_sensitive_text;
 use super::db::{ensure_wal_journal_mode, rusqlite_error_is_lock};
 use super::queue_connection_admission as queue_admission;
 
+#[path = "queue_writer_lease_fence.rs"]
+mod queue_writer_lease_fence;
+
 pub use super::queue_connection_admission::queue_stats_readonly;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -59,6 +62,15 @@ pub enum QueueError {
         payload_bytes: u64,
         active_bytes: u64,
         limit_bytes: u64,
+    },
+    #[error(
+        "runtime SQLite writer lease `{lease_name}` generation {generation} for {owner} was lost before {operation}"
+    )]
+    RuntimeWriterLeaseLost {
+        lease_name: String,
+        owner: String,
+        generation: u64,
+        operation: &'static str,
     },
 }
 

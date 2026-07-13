@@ -6530,12 +6530,10 @@ async fn ingest_stdin_command(
 
         if !resolved.raw_turn
             && let Some(outcome) = evaluate_fact_check_gate(
-                {
-                    writer_lease.ensure_active("record stdin fact-check audit")?;
-                    &drawer_id
-                },
+                &drawer_id,
                 &resolved.content,
                 db,
+                Some(writer_lease.lease()),
                 resolved.project_id.as_deref(),
                 &config.ingest_gating.fact_check,
                 resolved.confidence,
