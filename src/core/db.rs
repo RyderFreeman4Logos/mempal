@@ -2801,7 +2801,10 @@ impl Database {
         let log_id = format!("consolidation_{}", &log_digest[..16]);
         let content_hash = content_hash_hex(merged_content);
 
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let owns_transaction = self.conn.is_autocommit();
+        if owns_transaction {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
         let result = (|| -> Result<(), DbError> {
             let (target_rowid, old_content, wing, room, project_id) = self
                 .conn
@@ -2923,6 +2926,10 @@ impl Database {
 
             Ok(())
         })();
+
+        if !owns_transaction {
+            return result;
+        }
 
         match result {
             Ok(()) => {

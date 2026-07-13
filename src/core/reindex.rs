@@ -105,6 +105,22 @@ impl ReindexProgressStore {
         )
     }
 
+    pub fn mark_failed_on_connection(
+        &self,
+        conn: &rusqlite::Connection,
+        source_path: &str,
+        last_processed_chunk_id: Option<i64>,
+        embedder_name: &str,
+    ) -> Result<()> {
+        Self::upsert_on_connection(
+            conn,
+            source_path,
+            last_processed_chunk_id,
+            embedder_name,
+            "failed",
+        )
+    }
+
     /// Finalize orphan `running` rows whose source drawers are already fully
     /// current for the active vector index.
     ///
@@ -116,9 +132,22 @@ impl ReindexProgressStore {
         current_index_version: &str,
         target_fingerprint: &str,
     ) -> Result<usize> {
-        let now = now_secs();
         let conn = self.open_connection()?;
-        let updated = conn.connection().execute(
+        self.finalize_completed_running_rows_on_connection(
+            conn.connection(),
+            current_index_version,
+            target_fingerprint,
+        )
+    }
+
+    pub fn finalize_completed_running_rows_on_connection(
+        &self,
+        conn: &rusqlite::Connection,
+        current_index_version: &str,
+        target_fingerprint: &str,
+    ) -> Result<usize> {
+        let now = now_secs();
+        let updated = conn.execute(
             FINALIZE_COMPLETED_RUNNING_ROWS_SQL,
             params![current_index_version, target_fingerprint, now],
         )?;

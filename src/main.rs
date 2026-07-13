@@ -8627,12 +8627,16 @@ fn consolidate_command(
             .iter()
             .map(|(drawer_id, _)| drawer_id.clone())
             .collect::<Vec<_>>();
-        ensure_maintenance_writer_lease_active(
-            writer_lease.as_ref(),
-            "merge consolidation cluster",
-        )?;
-        let result = merge_cluster(db, &drawer_ids, strategy, options.dry_run)
-            .context("failed to merge drawer cluster")?;
+        let result = match writer_lease.as_ref() {
+            Some(writer_lease) => {
+                writer_lease.write_fenced(db, "merge consolidation cluster", |db| {
+                    merge_cluster(db, &drawer_ids, strategy, options.dry_run)
+                        .context("failed to merge drawer cluster")
+                })?
+            }
+            None => merge_cluster(db, &drawer_ids, strategy, options.dry_run)
+                .context("failed to merge drawer cluster")?,
+        };
         processed += 1;
         if options.dry_run {
             println!(
@@ -9892,21 +9896,45 @@ async fn reindex_stale_batches(
                 delete_reindex_pending_ids(db, &failed_ids)
                     .context("failed to delete skipped stale reindex work")?;
                 for (source_path, chunk_index) in reindex_source_checkpoints(&rows) {
-                    ensure_maintenance_writer_lease_active(
-                        writer_lease,
-                        "record failed stale reindex checkpoint",
-                    )?;
-                    progress_store
-                        .mark_failed(&source_path, Some(chunk_index), embedder_name)
-                        .context("failed to record failed reindex checkpoint")?;
+                    match writer_lease {
+                        Some(writer_lease) => writer_lease.write_fenced(
+                            db,
+                            "record failed stale reindex checkpoint",
+                            |db| {
+                                progress_store
+                                    .mark_failed_on_connection(
+                                        db.conn(),
+                                        &source_path,
+                                        Some(chunk_index),
+                                        embedder_name,
+                                    )
+                                    .context("failed to record failed reindex checkpoint")?;
+                                Ok(())
+                            },
+                        )?,
+                        None => progress_store
+                            .mark_failed_on_connection(
+                                db.conn(),
+                                &source_path,
+                                Some(chunk_index),
+                                embedder_name,
+                            )
+                            .context("failed to record failed reindex checkpoint")?,
+                    }
                     failed_sources.insert(source_path);
                 }
                 continue;
             }
         };
-        ensure_maintenance_writer_lease_active(writer_lease, "write stale reindex vector batch")?;
-        let stats = write_reindex_vector_batch(db, &rows, &vectors, target_fingerprint)
-            .context("failed to write stale reindex batch")?;
+        let stats = match writer_lease {
+            Some(writer_lease) => {
+                writer_lease.write_fenced(db, "write stale reindex vector batch", |db| {
+                    write_reindex_vector_batch(db, &rows, &vectors, target_fingerprint)
+                })
+            }
+            None => write_reindex_vector_batch(db, &rows, &vectors, target_fingerprint),
+        }
+        .context("failed to write stale reindex batch")?;
         let pulled_ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
         ensure_maintenance_writer_lease_active(
             writer_lease,
@@ -9928,22 +9956,57 @@ async fn reindex_stale_batches(
             );
         }
         for (source_path, chunk_index) in reindex_source_checkpoints(&rows) {
-            ensure_maintenance_writer_lease_active(
-                writer_lease,
-                "persist stale reindex checkpoint",
-            )?;
-            let checkpoint = if failed_sources.contains(source_path.as_str()) {
-                progress_store.mark_failed(&source_path, Some(chunk_index), embedder_name)
-            } else {
-                progress_store.upsert_running(&source_path, Some(chunk_index), embedder_name)
+            let persist_checkpoint = |db: &Database| -> Result<()> {
+                let checkpoint = if failed_sources.contains(source_path.as_str()) {
+                    progress_store.mark_failed_on_connection(
+                        db.conn(),
+                        &source_path,
+                        Some(chunk_index),
+                        embedder_name,
+                    )
+                } else {
+                    progress_store.upsert_running_on_connection(
+                        db.conn(),
+                        &source_path,
+                        Some(chunk_index),
+                        embedder_name,
+                    )
+                };
+                checkpoint.context("failed to persist reindex checkpoint")
             };
-            checkpoint.context("failed to persist reindex checkpoint")?;
+            match writer_lease {
+                Some(writer_lease) => writer_lease.write_fenced(
+                    db,
+                    "persist stale reindex checkpoint",
+                    persist_checkpoint,
+                )?,
+                None => persist_checkpoint(db)?,
+            }
         }
     }
-    ensure_maintenance_writer_lease_active(writer_lease, "finalize stale reindex checkpoints")?;
-    progress_store
-        .finalize_completed_running_rows(CURRENT_VECTOR_INDEX_VERSION, target_fingerprint)
-        .context("failed to finalize completed reindex sources")?;
+    match writer_lease {
+        Some(writer_lease) => {
+            writer_lease.write_fenced(db, "finalize stale reindex checkpoints", |db| {
+                progress_store
+                    .finalize_completed_running_rows_on_connection(
+                        db.conn(),
+                        CURRENT_VECTOR_INDEX_VERSION,
+                        target_fingerprint,
+                    )
+                    .context("failed to finalize completed reindex sources")?;
+                Ok(())
+            })?
+        }
+        None => {
+            progress_store
+                .finalize_completed_running_rows_on_connection(
+                    db.conn(),
+                    CURRENT_VECTOR_INDEX_VERSION,
+                    target_fingerprint,
+                )
+                .context("failed to finalize completed reindex sources")?;
+        }
+    }
     if skipped_concurrent_update == 0 {
         println!("stale reindex complete: {processed} drawers");
     } else {
@@ -15138,14 +15201,17 @@ fn write_reindex_vector_batch(
 ) -> Result<ReindexBatchWriteStats> {
     use rusqlite::OptionalExtension;
 
-    db.conn()
-        .busy_timeout(std::time::Duration::from_millis(0))
-        .context("failed to set fail-fast busy timeout")?;
-    let begin = db.conn().execute_batch("BEGIN IMMEDIATE;");
-    db.conn()
-        .busy_timeout(std::time::Duration::from_secs(5))
-        .context("failed to restore busy timeout")?;
-    begin.context("failed to begin stale reindex batch transaction")?;
+    let owns_transaction = db.conn().is_autocommit();
+    if owns_transaction {
+        db.conn()
+            .busy_timeout(std::time::Duration::from_millis(0))
+            .context("failed to set fail-fast busy timeout")?;
+        let begin = db.conn().execute_batch("BEGIN IMMEDIATE;");
+        db.conn()
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .context("failed to restore busy timeout")?;
+        begin.context("failed to begin stale reindex batch transaction")?;
+    }
 
     let result = (|| -> Result<ReindexBatchWriteStats> {
         let mut stats = ReindexBatchWriteStats::default();
@@ -15179,6 +15245,10 @@ fn write_reindex_vector_batch(
         }
         Ok(stats)
     })();
+
+    if !owns_transaction {
+        return result;
+    }
 
     match result {
         Ok(stats) => {
@@ -17579,7 +17649,7 @@ async fn maintenance_rejudge_limited_command(
             db,
             writer_lease,
             "apply limited historical rejudge mutations",
-            || {
+            |db| {
                 let mutated_count = if candidate_ids.is_empty() {
                     0
                 } else {
@@ -19306,11 +19376,14 @@ fn prepare_historical_rejudge_checkpoint(
     backup_dir: Option<&Path>,
     writer_lease: Option<&MaintenanceWriterLeaseGuard>,
 ) -> Result<HistoricalRejudgeCheckpoint> {
-    ensure_maintenance_writer_lease_active(
-        writer_lease,
-        "prepare historical rejudge checkpoint storage",
-    )?;
-    ensure_historical_rejudge_checkpoint_storage(db)?;
+    match writer_lease {
+        Some(writer_lease) => writer_lease.write_fenced(
+            db,
+            "prepare historical rejudge checkpoint storage",
+            ensure_historical_rejudge_checkpoint_storage,
+        )?,
+        None => ensure_historical_rejudge_checkpoint_storage(db)?,
+    }
     let options_hash = historical_rejudge_options_hash(options, project_id, config_version)?;
 
     if options.resume {
@@ -19578,7 +19651,7 @@ fn start_historical_rejudge_checkpoint_with_observer(
         db,
         writer_lease,
         "start historical rejudge checkpoint",
-        || {
+        |db| {
             let snapshot_max_rowid = db
                 .historical_rejudge_scope_max_rowid(options.wing, options.room, project_id)
                 .context("failed to snapshot historical rejudge max rowid")?
@@ -20082,7 +20155,7 @@ fn process_prepared_historical_rejudge_work_items(
         db,
         writer_lease,
         "apply historical rejudge page mutations",
-        || {
+        |db| {
             let mutated_count = if backup_items.is_empty() {
                 0
             } else {
@@ -20492,21 +20565,6 @@ enum HistoricalRejudgeConfirmPendingPersistence {
     Keep(HistoricalRejudgeDecision),
 }
 
-fn mark_historical_rejudge_work_item_llm_confirm_pending_or_keep(
-    db: &Database,
-    run_id: &str,
-    drawer_rowid: i64,
-    proposal_score: f64,
-) -> Result<HistoricalRejudgeConfirmPendingPersistence> {
-    let result = mark_historical_rejudge_work_item_llm_confirm_pending(
-        db,
-        run_id,
-        drawer_rowid,
-        proposal_score,
-    );
-    historical_rejudge_confirm_pending_persistence_outcome(result, proposal_score)
-}
-
 fn mark_historical_rejudge_work_item_llm_confirm_pending_or_keep_with_writer_lease(
     db: &Database,
     run_id: &str,
@@ -20514,16 +20572,27 @@ fn mark_historical_rejudge_work_item_llm_confirm_pending_or_keep_with_writer_lea
     proposal_score: f64,
     writer_lease: Option<&MaintenanceWriterLeaseGuard>,
 ) -> Result<HistoricalRejudgeConfirmPendingPersistence> {
-    ensure_maintenance_writer_lease_active(
-        writer_lease,
-        "persist historical rejudge proposal confirmation backlog",
-    )?;
-    mark_historical_rejudge_work_item_llm_confirm_pending_or_keep(
-        db,
-        run_id,
-        drawer_rowid,
-        proposal_score,
-    )
+    let result = match writer_lease {
+        Some(writer_lease) => writer_lease.write_fenced(
+            db,
+            "persist historical rejudge proposal confirmation backlog",
+            |db| {
+                mark_historical_rejudge_work_item_llm_confirm_pending(
+                    db,
+                    run_id,
+                    drawer_rowid,
+                    proposal_score,
+                )
+            },
+        ),
+        None => mark_historical_rejudge_work_item_llm_confirm_pending(
+            db,
+            run_id,
+            drawer_rowid,
+            proposal_score,
+        ),
+    };
+    historical_rejudge_confirm_pending_persistence_outcome(result, proposal_score)
 }
 
 fn historical_rejudge_confirm_pending_persistence_outcome(
@@ -21327,10 +21396,12 @@ fn with_historical_rejudge_transaction_with_writer_lease<T>(
     db: &Database,
     writer_lease: Option<&MaintenanceWriterLeaseGuard>,
     operation_name: &'static str,
-    operation: impl FnOnce() -> Result<T>,
+    operation: impl FnOnce(&Database) -> Result<T>,
 ) -> Result<T> {
-    ensure_maintenance_writer_lease_active(writer_lease, operation_name)?;
-    with_historical_rejudge_transaction(db, operation)
+    match writer_lease {
+        Some(writer_lease) => writer_lease.write_fenced(db, operation_name, operation),
+        None => with_historical_rejudge_transaction(db, || operation(db)),
+    }
 }
 
 fn append_historical_rejudge_backup_items_durable(
@@ -22167,7 +22238,7 @@ fn maintenance_rejudge_apply_command(
             db,
             writer_lease,
             "apply historical rejudge artifact confirmations",
-            || delete_rejudge_backup_items_by_version_inner(db, &backup_items, hard_delete),
+            |db| delete_rejudge_backup_items_by_version_inner(db, &backup_items, hard_delete),
         )?
     } else {
         0
@@ -22423,28 +22494,16 @@ fn restore_rejudge_backup_item_transaction(
     conflict_policy: RejudgeRestoreConflictPolicy,
     writer_lease: Option<&MaintenanceWriterLeaseGuard>,
 ) -> Result<HistoricalRejudgeRestoreItemOutcome> {
-    ensure_maintenance_writer_lease_active(writer_lease, "restore historical rejudge backup item")?;
+    if let Some(writer_lease) = writer_lease {
+        return writer_lease.write_fenced(db, "restore historical rejudge backup item", |db| {
+            restore_rejudge_backup_item_mutation(db, item, backup, conflict_policy)
+        });
+    }
+
     db.conn()
         .execute_batch("BEGIN IMMEDIATE;")
         .context("failed to begin historical rejudge restore transaction")?;
-    let result = (|| -> Result<HistoricalRejudgeRestoreItemOutcome> {
-        let state = drawer_deleted_at(db, &item.drawer.id)?;
-        let outcome = rejudge_restore_outcome_for_state(state, conflict_policy);
-        if !outcome.would_restore {
-            return Ok(outcome);
-        }
-        if outcome.conflict {
-            delete_drawer_for_restore(db, &item.drawer.id)
-                .with_context(|| format!("failed to overwrite active drawer {}", item.drawer.id))?;
-        }
-        restore_rejudge_backup_item(db, item)?;
-        record_rejudge_restore_audit(db, item, backup)?;
-        Ok(HistoricalRejudgeRestoreItemOutcome {
-            restored: true,
-            audit_recorded: true,
-            ..outcome
-        })
-    })();
+    let result = restore_rejudge_backup_item_mutation(db, item, backup, conflict_policy);
 
     match result {
         Ok(outcome) => {
@@ -22460,6 +22519,30 @@ fn restore_rejudge_backup_item_transaction(
             Err(error)
         }
     }
+}
+
+fn restore_rejudge_backup_item_mutation(
+    db: &Database,
+    item: &HistoricalRejudgeBackupItem,
+    backup: &HistoricalRejudgeBackup,
+    conflict_policy: RejudgeRestoreConflictPolicy,
+) -> Result<HistoricalRejudgeRestoreItemOutcome> {
+    let state = drawer_deleted_at(db, &item.drawer.id)?;
+    let outcome = rejudge_restore_outcome_for_state(state, conflict_policy);
+    if !outcome.would_restore {
+        return Ok(outcome);
+    }
+    if outcome.conflict {
+        delete_drawer_for_restore(db, &item.drawer.id)
+            .with_context(|| format!("failed to overwrite active drawer {}", item.drawer.id))?;
+    }
+    restore_rejudge_backup_item(db, item)?;
+    record_rejudge_restore_audit(db, item, backup)?;
+    Ok(HistoricalRejudgeRestoreItemOutcome {
+        restored: true,
+        audit_recorded: true,
+        ..outcome
+    })
 }
 
 fn rejudge_restore_outcome_for_state(
@@ -29759,7 +29842,10 @@ threshold = 0.7
         .expect_err("restore with invalid vector must fail");
 
         assert!(
-            error.to_string().contains("failed to restore vector row"),
+            error.to_string().contains("failed to restore vector row")
+                || error
+                    .chain()
+                    .any(|cause| cause.to_string().contains("failed to restore vector row")),
             "{error}"
         );
         let drawer = db
@@ -31971,6 +32057,65 @@ threshold = 0.7
         assert_eq!(persisted.run_id, checkpoint.run_id);
         assert_eq!(persisted.last_processed_rowid, Some(2));
         assert_eq!(persisted.mutated_count, 1);
+    }
+
+    #[test]
+    fn consolidation_merge_runs_inside_writer_lease_fence() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "merge-a", "short", "notes", None);
+        insert_drawer(
+            &db,
+            "merge-b",
+            "the richer consolidation target",
+            "notes",
+            None,
+        );
+        // This regression covers transaction ownership; avoid coupling it to
+        // the fork-extension content trigger exercised by dedicated FTS tests.
+        db.conn()
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS drawers_au_fts;
+                 DROP TRIGGER IF EXISTS drawers_fts_after_update;",
+            )
+            .expect("drop content-update FTS trigger for transaction-focused test");
+        let writer_lease = acquire_maintenance_writer_lease(&db, "test-consolidation-fence")
+            .expect("writer lease");
+
+        let result = writer_lease.write_fenced(&db, "merge consolidation cluster", |db| {
+            merge_cluster(
+                db,
+                &["merge-a".to_string(), "merge-b".to_string()],
+                CompactionStrategy::RichestContent,
+                false,
+            )
+            .context("merge cluster inside writer fence")
+        });
+
+        let result = result.expect("fenced consolidation merge");
+        assert_eq!(result.cluster_size, 2);
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 1);
+    }
+
+    #[test]
+    fn stale_reindex_vector_batch_runs_inside_writer_lease_fence() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        db.recreate_vectors_table(3).expect("create vector table");
+        insert_drawer(&db, "reindex-fenced", "vector payload", "notes", None);
+        let rows = reindex_rows(&db).expect("load reindex row");
+        let writer_lease = acquire_maintenance_writer_lease(&db, "test-stale-reindex-fence")
+            .expect("writer lease");
+
+        let stats = writer_lease
+            .write_fenced(&db, "write stale reindex vector batch", |db| {
+                write_reindex_vector_batch(db, &rows, &[vec![0.0, 1.0, 0.0]], "test-fingerprint")
+            })
+            .expect("fenced stale reindex vector batch");
+
+        assert_eq!(stats.reindexed, 1);
+        assert_eq!(stats.skipped_concurrent_update, 0);
+        assert_eq!(db.vector_row_count().expect("vector count"), 1);
     }
 
     #[test]

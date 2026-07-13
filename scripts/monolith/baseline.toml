@@ -317,10 +317,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/main.rs"
 kind = "source"
-baseline_tokens = 256004
-baseline_lines = 33133
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 256840
+baseline_lines = 33220
+issue = "680"
+rationale = "Writer-lease generation fence conversion of deep maintenance paths; #680 correctness fix"
 
 [[files]]
 path = "src/markdown_export.rs"
