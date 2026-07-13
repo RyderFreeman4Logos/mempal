@@ -39,16 +39,19 @@ pub fn inspect_memory_pressure_at(
         .as_deref()
         .ok()
         .and_then(|raw| cgroup_v2_memory_directory(raw, cgroup_root));
-    let cgroup_current = cgroup_directory
+
+    let leaf_current = cgroup_directory
         .as_ref()
         .and_then(|directory| read_u64(directory.join("memory.current")));
 
     // Walk ancestor cgroups to find the most constrained finite limit.
     // systemd/Kubernetes often sets memory.max on a parent while the leaf
     // shows "max". Without this, we miss real memory pressure.
+    // Always report the leaf's memory.current, but use the tightest ancestor max.
     let cgroup_limit = cgroup_directory
         .as_ref()
         .and_then(|leaf| effective_cgroup_limit(leaf, cgroup_root));
+    let cgroup_current = leaf_current;
     let cgroup_usage_percent = cgroup_current
         .zip(cgroup_limit)
         .and_then(|(current, limit)| (limit > 0).then(|| current.saturating_mul(100) / limit));
@@ -74,27 +77,27 @@ pub fn inspect_memory_pressure_at(
 }
 
 /// Walk from the leaf cgroup directory up to the cgroup root, returning the
-/// most constrained finite `memory.max` found at any level.
+/// most constrained finite `memory.max` found at any ancestor level.
 fn effective_cgroup_limit(leaf: &Path, cgroup_root: &Path) -> Option<u64> {
     let root_canon = cgroup_root.canonicalize().ok()?;
-    let mut current = leaf.canonicalize().ok()?;
+    let mut current_dir = leaf.canonicalize().ok()?;
+    let mut best: Option<u64> = None;
     loop {
-        let max_path = current.join("memory.max");
-        if let Ok(raw) = fs::read_to_string(&max_path) {
+        if let Ok(raw) = fs::read_to_string(current_dir.join("memory.max")) {
             if let Some(limit) = parse_cgroup_limit(&raw) {
-                return Some(limit);
+                best = Some(best.map_or(limit, |prev| prev.min(limit)));
             }
         }
         // Stop at the cgroup root.
-        if current == root_canon {
+        if current_dir == root_canon {
             break;
         }
-        current = current.parent()?.to_path_buf();
-        if !current.starts_with(&root_canon) {
+        current_dir = current_dir.parent()?.to_path_buf();
+        if !current_dir.starts_with(&root_canon) {
             break;
         }
     }
-    None
+    best
 }
 
 fn cgroup_v2_memory_directory(raw: &str, cgroup_root: &Path) -> Option<PathBuf> {

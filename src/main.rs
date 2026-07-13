@@ -5216,6 +5216,22 @@ impl MaintenanceWriterLeaseGuard {
         }
     }
 
+    /// Execute a write closure atomically fenced by the writer-lease generation.
+    ///
+    /// The lease check and the write execute inside the same `BEGIN IMMEDIATE`
+    /// transaction, preventing a generation takeover between `ensure_active`
+    /// and the actual SQL mutation.
+    fn write_fenced<F, T>(&self, db: &Database, operation: &'static str, f: F) -> Result<T>
+    where
+        F: FnOnce(&Database) -> Result<T>,
+    {
+        if !self.active.load(std::sync::atomic::Ordering::SeqCst) {
+            return self.bail_lost(operation);
+        }
+        db.with_runtime_writer_lease_write(Some(&self.lease), operation, || f(db))
+            .with_context(|| format!("writer-lease fenced write failed for `{operation}`"))
+    }
+
     fn active_status(&self, operation: &'static str) -> Result<MaintenanceWriterLeaseCheck> {
         if !self.active.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(MaintenanceWriterLeaseCheck::Lost);
@@ -5730,8 +5746,10 @@ fn init_command(db: &Database, dir: &Path, dry_run: bool) -> Result<()> {
         for room in &rooms {
             let keywords = serde_json::to_string(&vec![room.clone()])
                 .context("failed to serialize taxonomy keywords")?;
-            writer_lease.ensure_active("insert init taxonomy room")?;
-            db.conn().execute("INSERT OR IGNORE INTO taxonomy (wing, room, display_name, keywords) VALUES (?1, ?2, ?3, ?4)", (&wing, room, room, keywords.as_str())).with_context(|| format!("failed to insert taxonomy room {room}"))?;
+            writer_lease.write_fenced(db, "insert init taxonomy room", |db| {
+                db.conn().execute("INSERT OR IGNORE INTO taxonomy (wing, room, display_name, keywords) VALUES (?1, ?2, ?3, ?4)", (&wing, room, room, keywords.as_str())).with_context(|| format!("failed to insert taxonomy room {room}"))?;
+                Ok(())
+            })?;
         }
     }
     println!("dry_run={dry_run}");

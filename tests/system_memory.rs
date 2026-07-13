@@ -17,7 +17,7 @@ fn linux_memory_pressure_reports_available_and_cgroup_budget() {
     .expect("meminfo fixture");
     fs::write(&process_cgroup, "0::/user.slice/mempal.scope\n").expect("membership fixture");
     fs::write(cgroup.join("memory.current"), "1\n").expect("root current fixture");
-    fs::write(cgroup.join("memory.max"), "2\n").expect("root max fixture");
+    fs::write(cgroup.join("memory.max"), "max\n").expect("root max fixture");
     fs::write(process_group.join("memory.current"), "805306368\n").expect("current fixture");
     fs::write(process_group.join("memory.max"), "1073741824\n").expect("max fixture");
 
