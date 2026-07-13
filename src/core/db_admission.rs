@@ -288,7 +288,13 @@ impl ProfileDbAdmission {
 
 impl Drop for ProfileDbAdmission {
     fn drop(&mut self) {
-        let _ = self.release();
+        if let Err(error) = self.release() {
+            tracing::warn!(
+                %error,
+                admission_owner = %self.owner_identity,
+                "failed to release DB admission holder; budget slot may leak until process exit"
+            );
+        }
     }
 }
 

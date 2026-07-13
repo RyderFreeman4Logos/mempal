@@ -262,7 +262,13 @@ impl AsyncDb {
         let delay = self.read_delay;
         #[cfg(not(any(test, feature = "db-test-seam")))]
         let delay: Option<Duration> = None;
-        exec(Arc::clone(&self.readers), delay, f).await
+        exec(
+            Arc::clone(&self.readers),
+            Arc::clone(&self._admission),
+            delay,
+            f,
+        )
+        .await
     }
 
     /// Run a read-only closure that returns [`anyhow::Result`] off the runtime.
@@ -279,7 +285,14 @@ impl AsyncDb {
         let delay = self.read_delay;
         #[cfg(not(any(test, feature = "db-test-seam")))]
         let delay: Option<Duration> = None;
-        exec_anyhow(Arc::clone(&self.readers), delay, None, f).await
+        exec_anyhow(
+            Arc::clone(&self.readers),
+            Arc::clone(&self._admission),
+            delay,
+            None,
+            f,
+        )
+        .await
     }
 
     /// Run a read-only [`anyhow::Result`] closure with a cooperative SQLite
@@ -301,7 +314,14 @@ impl AsyncDb {
         let delay = self.read_delay;
         #[cfg(not(any(test, feature = "db-test-seam")))]
         let delay: Option<Duration> = None;
-        exec_anyhow(Arc::clone(&self.readers), delay, Some(deadline), f).await
+        exec_anyhow(
+            Arc::clone(&self.readers),
+            Arc::clone(&self._admission),
+            delay,
+            Some(deadline),
+            f,
+        )
+        .await
     }
 
     /// Run a read-write closure against the single writer connection off the
@@ -316,7 +336,13 @@ impl AsyncDb {
         let delay = self.write_delay;
         #[cfg(not(any(test, feature = "db-test-seam")))]
         let delay: Option<Duration> = None;
-        exec(Arc::clone(&self.writer), delay, f).await
+        exec(
+            Arc::clone(&self.writer),
+            Arc::clone(&self._admission),
+            delay,
+            f,
+        )
+        .await
     }
 
     /// Run a read-write closure that returns [`anyhow::Result`] off the runtime.
@@ -333,7 +359,14 @@ impl AsyncDb {
         let delay = self.write_delay;
         #[cfg(not(any(test, feature = "db-test-seam")))]
         let delay: Option<Duration> = None;
-        exec_anyhow(Arc::clone(&self.writer), delay, None, f).await
+        exec_anyhow(
+            Arc::clone(&self.writer),
+            Arc::clone(&self._admission),
+            delay,
+            None,
+            f,
+        )
+        .await
     }
 }
 
@@ -411,7 +444,13 @@ impl QueryOnlyAsyncDb {
         let delay = self.read_delay;
         #[cfg(not(any(test, feature = "db-test-seam")))]
         let delay: Option<Duration> = None;
-        exec(Arc::clone(&self.readers), delay, f).await
+        exec(
+            Arc::clone(&self.readers),
+            Arc::clone(&self._admission),
+            delay,
+            f,
+        )
+        .await
     }
 
     /// Run a read-only closure that returns [`anyhow::Result`] off the runtime.
@@ -424,7 +463,14 @@ impl QueryOnlyAsyncDb {
         let delay = self.read_delay;
         #[cfg(not(any(test, feature = "db-test-seam")))]
         let delay: Option<Duration> = None;
-        exec_anyhow(Arc::clone(&self.readers), delay, None, f).await
+        exec_anyhow(
+            Arc::clone(&self.readers),
+            Arc::clone(&self._admission),
+            delay,
+            None,
+            f,
+        )
+        .await
     }
 
     /// Run a read-only [`anyhow::Result`] closure with a cooperative SQLite
@@ -442,7 +488,14 @@ impl QueryOnlyAsyncDb {
         let delay = self.read_delay;
         #[cfg(not(any(test, feature = "db-test-seam")))]
         let delay: Option<Duration> = None;
-        exec_anyhow(Arc::clone(&self.readers), delay, Some(deadline), f).await
+        exec_anyhow(
+            Arc::clone(&self.readers),
+            Arc::clone(&self._admission),
+            delay,
+            Some(deadline),
+            f,
+        )
+        .await
     }
 }
 
@@ -459,7 +512,17 @@ fn sqlite_cache_size_bytes(cache_size_kib: i64) -> u64 {
 /// checked out. On a closure panic (only observable with unwinding builds) the
 /// connection is dropped on the blocking thread and the pool self-heals on the
 /// next checkout.
-async fn exec<F, R>(pool: Arc<ConnPool>, delay: Option<Duration>, f: F) -> Result<R, DbError>
+///
+/// The `_admission` clone ensures the profile admission holder outlives the
+/// blocking task even if every AsyncDb facade is dropped while the closure
+/// is still executing — without this, the admission could be released and the
+/// budget slot reused while a real SQLite connection is still alive.
+async fn exec<F, R>(
+    pool: Arc<ConnPool>,
+    _admission: Arc<ProfileDbAdmission>,
+    delay: Option<Duration>,
+    f: F,
+) -> Result<R, DbError>
 where
     F: FnOnce(&Database) -> Result<R, DbError> + Send + 'static,
     R: Send + 'static,
@@ -472,14 +535,14 @@ where
     let checkin_pool = Arc::clone(&pool);
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let join = tokio::task::spawn_blocking(move || {
-        let permit = permit;
+        let _permit = permit;
+        let _admission = _admission; // keep admission alive until closure ends
         tracing::dispatcher::with_default(&dispatch, || {
             if let Some(d) = delay {
                 std::thread::sleep(d);
             }
             let out = f(&conn);
             checkin_pool.checkin(conn);
-            drop(permit);
             out
         })
     })
@@ -492,6 +555,7 @@ where
 
 async fn exec_anyhow<F, R>(
     pool: Arc<ConnPool>,
+    _admission: Arc<ProfileDbAdmission>,
     delay: Option<Duration>,
     deadline: Option<Instant>,
     f: F,
@@ -522,7 +586,8 @@ where
     let checkin_pool = Arc::clone(&pool);
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let join = tokio::task::spawn_blocking(move || {
-        let permit = permit;
+        let _permit = permit;
+        let _admission = _admission; // keep admission alive until closure ends
         tracing::dispatcher::with_default(&dispatch, || {
             if let Some(d) = delay {
                 std::thread::sleep(d);
@@ -538,7 +603,6 @@ where
                 conn.conn().progress_handler(0, None::<fn() -> bool>);
             }
             checkin_pool.checkin(conn);
-            drop(permit);
             match out {
                 Err(error) if should_map_read_deadline_error(deadline, &error) => {
                     Err(anyhow::Error::new(ReadDeadlineExceeded))

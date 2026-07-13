@@ -198,11 +198,18 @@ impl DaemonRecoveryFaultReporter {
                 ?decision,
                 "daemon recovery fault recorded; requesting bounded supervisor restart"
             ),
-            Err(error) => tracing::error!(
-                ?fault,
-                %error,
-                "failed to persist daemon recovery fault; requesting shutdown"
-            ),
+            Err(error) => {
+                // Persistence failed — restore the flag so a subsequent retry
+                // can attempt to record the fault again. Without this, the
+                // process could exit without deducting from the restart budget,
+                // allowing unbounded restart storms.
+                self.reported.store(false, Ordering::Release);
+                tracing::error!(
+                    ?fault,
+                    %error,
+                    "failed to persist daemon recovery fault; restored flag for retry"
+                );
+            }
         }
     }
 }

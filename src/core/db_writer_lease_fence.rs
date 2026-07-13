@@ -216,13 +216,16 @@ impl Database {
             write()
         })();
         match result {
-            Ok(value) => {
-                self.conn
-                    .execute_batch("COMMIT")
-                    .map_err(DbError::from)
-                    .map_err(E::from)?;
-                Ok(value)
-            }
+            Ok(value) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(value),
+                Err(commit_err) => {
+                    // ROLLBACK on COMMIT failure so the connection does not
+                    // return to the pool with an active transaction. Return
+                    // the original COMMIT error.
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(E::from(DbError::from(commit_err)))
+                }
+            },
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(error)
