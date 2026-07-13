@@ -1,7 +1,7 @@
 //! Privacy-safe host and cgroup memory pressure diagnostics.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,20 +18,33 @@ pub struct MemoryPressureSnapshot {
 }
 
 pub fn inspect_memory_pressure() -> MemoryPressureSnapshot {
-    inspect_memory_pressure_at(Path::new("/proc/meminfo"), Path::new("/sys/fs/cgroup"))
+    inspect_memory_pressure_at(
+        Path::new("/proc/meminfo"),
+        Path::new("/proc/self/cgroup"),
+        Path::new("/sys/fs/cgroup"),
+    )
 }
 
 /// Inspect caller-selected paths so deterministic tests never depend on the
 /// host's live cgroup or memory state.
 pub fn inspect_memory_pressure_at(
     meminfo_path: &Path,
+    process_cgroup_path: &Path,
     cgroup_root: &Path,
 ) -> MemoryPressureSnapshot {
     let meminfo = fs::read_to_string(meminfo_path);
     let available_memory_bytes = meminfo.as_deref().ok().and_then(parse_mem_available_bytes);
-    let cgroup_current = read_u64(cgroup_root.join("memory.current"));
-    let cgroup_limit = fs::read_to_string(cgroup_root.join("memory.max"))
+    let process_cgroup = fs::read_to_string(process_cgroup_path);
+    let cgroup_directory = process_cgroup
+        .as_deref()
         .ok()
+        .and_then(|raw| cgroup_v2_memory_directory(raw, cgroup_root));
+    let cgroup_current = cgroup_directory
+        .as_ref()
+        .and_then(|directory| read_u64(directory.join("memory.current")));
+    let cgroup_limit = cgroup_directory
+        .as_ref()
+        .and_then(|directory| fs::read_to_string(directory.join("memory.max")).ok())
         .and_then(|raw| parse_cgroup_limit(&raw));
     let cgroup_usage_percent = cgroup_current
         .zip(cgroup_limit)
@@ -39,6 +52,9 @@ pub fn inspect_memory_pressure_at(
     let mut errors = Vec::new();
     if meminfo.is_err() {
         errors.push("meminfo unavailable");
+    }
+    if process_cgroup.is_err() || cgroup_directory.is_none() {
+        errors.push("process cgroup membership unavailable");
     }
     if cgroup_current.is_none() {
         errors.push("cgroup memory.current unavailable");
@@ -52,6 +68,21 @@ pub fn inspect_memory_pressure_at(
             .is_some_and(|percent| percent >= HIGH_CGROUP_USAGE_PERCENT),
         error: (!errors.is_empty()).then(|| errors.join("; ")),
     }
+}
+
+fn cgroup_v2_memory_directory(raw: &str, cgroup_root: &Path) -> Option<PathBuf> {
+    let membership = raw.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next()?;
+        let controllers = fields.next()?;
+        let path = fields.next()?;
+        (hierarchy == "0" && controllers.is_empty()).then_some(path)
+    })?;
+    let relative = membership.strip_prefix('/')?;
+    let safe = Path::new(relative)
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)));
+    safe.then(|| cgroup_root.join(relative))
 }
 
 fn parse_mem_available_bytes(raw: &str) -> Option<u64> {
