@@ -582,6 +582,7 @@ fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
         .join("; ")
 }
 
+#[cfg(test)]
 fn ensure_daemon_runtime_writer_lease_active(
     db: &Database,
     lease: Option<&RuntimeWriterLease>,
@@ -1351,12 +1352,11 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
         let mempal_home = context.mempal_home.to_path_buf();
         let runtime_writer_lease = context.runtime_writer_lease.cloned();
         db.run_write_anyhow(move |db| {
-            ensure_daemon_runtime_writer_lease_active(
-                db,
+            db.with_runtime_writer_lease_write(
                 runtime_writer_lease.as_ref(),
                 "build daemon hook drawer records",
-            )?;
-            build_drawer_records(db, &envelope, &hook_payload, &config, &mempal_home)
+                || build_drawer_records(db, &envelope, &hook_payload, &config, &mempal_home),
+            )
         })
         .await?
     };
