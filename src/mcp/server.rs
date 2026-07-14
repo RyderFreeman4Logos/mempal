@@ -4969,10 +4969,16 @@ impl MempalMcpServer {
         let llm_endpoint_label = |base_url: &str| {
             endpoint_policy_diagnostic_label(remote_call_policy, RemoteCallService::Llm, base_url)
         };
-        let resource_usage = resource_usage::build_resource_usage(
-            &self.db_path,
-            self.async_db.get().map(|db| db.resource_snapshot()),
-        );
+        let resource_usage = tokio::task::spawn_blocking({
+            let db_path = self.db_path.clone();
+            let snapshot = self.async_db.get().map(|db| db.resource_snapshot());
+            move || resource_usage::build_resource_usage(&db_path, snapshot)
+        })
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(?err, "resource status spawn_blocking failed");
+            resource_usage::build_resource_usage_degraded()
+        });
         let hook_admission = crate::hook_diagnostics::hook_admission_stats(
             self.db_path.parent().unwrap_or_else(|| Path::new(".")),
             crate::hook::MAX_INLINE_PAYLOAD_BYTES as u64,

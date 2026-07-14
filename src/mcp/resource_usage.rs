@@ -31,6 +31,14 @@ pub(crate) fn build_resource_usage(
     }
 }
 
+/// Degraded status used when spawn_blocking panics or is cancelled.
+pub(crate) fn build_resource_usage_degraded() -> ResourceUsageDto {
+    ResourceUsageDto {
+        counters: ResourceCounterDto::from(crate::observability::resource_counters()),
+        ..ResourceUsageDto::default()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ResourceUsageDto {
     pub process: ProcessResourceUsageDto,

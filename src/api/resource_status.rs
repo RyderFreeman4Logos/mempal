@@ -8,7 +8,7 @@ use serde::Serialize;
 use crate::core::async_db::AsyncDbResourceSnapshot;
 use crate::core::db_admission::ProfileDbAdmission;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub(super) struct ResourceUsageStatus {
     process: ProcessResourceUsageStatus,
     sqlite: SqliteResourceUsageStatus,
@@ -31,6 +31,18 @@ pub(super) fn build_resource_usage(
         profile_admission: ProfileAdmissionStatus::inspect(db_path),
         memory_pressure: crate::system_memory::inspect_memory_pressure(),
         daemon_recovery: DaemonRecoveryStatus::inspect(db_path.parent().unwrap_or(db_path)),
+        counters: ResourceCounterStatus::from(crate::observability::resource_counters()),
+    }
+}
+
+/// Degraded status used when spawn_blocking panics or is cancelled.
+pub(super) fn build_resource_usage_degraded() -> ResourceUsageStatus {
+    ResourceUsageStatus {
+        process: ProcessResourceUsageStatus::default(),
+        sqlite: SqliteResourceUsageStatus::default(),
+        profile_admission: ProfileAdmissionStatus::default(),
+        memory_pressure: crate::system_memory::MemoryPressureSnapshot::default(),
+        daemon_recovery: DaemonRecoveryStatus::default(),
         counters: ResourceCounterStatus::from(crate::observability::resource_counters()),
     }
 }
@@ -65,7 +77,7 @@ impl DaemonRecoveryStatus {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 struct ProcessResourceUsageStatus {
     pid: i32,
     rss_bytes: Option<u64>,
@@ -182,7 +194,7 @@ struct ProfileAdmissionHolderStatus {
     configured_cache_bytes: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 struct ResourceCounterStatus {
     access_writeback_scheduled_total: u64,
     access_writeback_skipped_total: u64,

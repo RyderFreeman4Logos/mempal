@@ -1209,10 +1209,16 @@ async fn status_handler(
                 .to_string(),
         );
     }
-    let resource_usage = super::resource_status::build_resource_usage(
-        &state.db_path,
-        state.async_db_resource_snapshot(),
-    );
+    let resource_usage = tokio::task::spawn_blocking({
+        let db_path = state.db_path.clone();
+        let snapshot = state.async_db_resource_snapshot();
+        move || super::resource_status::build_resource_usage(&db_path, snapshot)
+    })
+    .await
+    .unwrap_or_else(|err| {
+        tracing::warn!(?err, "resource status spawn_blocking failed");
+        super::resource_status::build_resource_usage_degraded()
+    });
     let embed_endpoints = daemon_embed_config
         .embed
         .effective_endpoints()

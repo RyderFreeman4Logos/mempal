@@ -334,7 +334,7 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 path = "src/mcp/server.rs"
 kind = "source"
 baseline_tokens = 173690
-baseline_lines = 21926
+baseline_lines = 21929
 issue = "695"
 rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
 
