@@ -349,8 +349,8 @@ struct AdmissionPaths {
 
 impl AdmissionPaths {
     fn new(db_path: &Path) -> Result<Self, DbAdmissionError> {
-        // Canonicalize the full database path to prevent symlink and
-        // hard-link aliases from bypassing the profile-wide admission budget.
+        // Canonicalize the full database path to prevent symlink aliases
+        // from bypassing the profile-wide admission budget.
         let raw_parent = db_path.parent().unwrap_or_else(|| Path::new("."));
         let parent = fs::canonicalize(raw_parent).unwrap_or_else(|_| raw_parent.to_path_buf());
         fs::create_dir_all(&parent).map_err(|source| DbAdmissionError::Io {
@@ -366,12 +366,22 @@ impl AdmissionPaths {
                 "database path must have a UTF-8 file name",
             ))?;
 
-        // For an existing database file, use the canonical path (resolves
-        // symlinks). For hard-link identity, the admission state stores
-        // inode metadata so the acquire path can detect multi-link aliases.
         let full_path = parent.join(lexical_name);
         let (sidecar_dir, sidecar_name) = match fs::canonicalize(&full_path) {
             Ok(canonical) => {
+                // Reject hard-linked databases: each link would get an
+                // independent admission budget, and SQLite WAL/shm files
+                // are not designed for multi-link access.
+                #[cfg(unix)]
+                if let Ok(metadata) = fs::metadata(&canonical) {
+                    use std::os::unix::fs::MetadataExt;
+                    let nlink = metadata.nlink();
+                    if nlink > 1 {
+                        return Err(DbAdmissionError::InvalidRequest(
+                            "database file has multiple hard links; admission identity cannot be established safely",
+                        ));
+                    }
+                }
                 let dir = canonical
                     .parent()
                     .map(|p| p.to_path_buf())
