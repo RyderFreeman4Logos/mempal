@@ -1536,18 +1536,22 @@ impl PendingMessageStore {
     /// LLM tasks share the same storage table but are not embed queue work, so
     /// they are intentionally left untouched.
     pub fn retry_failed_embed_messages(&self) -> Result<u64> {
-        let now = now_secs();
         self.with_connection(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let outcome = requeue_failed_model_tasks(
-                &tx,
-                now,
-                "embedding",
-                self.config.max_ingest_active_bytes,
-            )?;
+            let retried = self.retry_failed_embed_messages_on_connection(&tx)?;
             tx.commit()?;
-            Ok(outcome.requeued)
+            Ok(retried)
         })
+    }
+
+    pub fn retry_failed_embed_messages_on_connection(&self, conn: &Connection) -> Result<u64> {
+        Ok(requeue_failed_model_tasks(
+            conn,
+            now_secs(),
+            "embedding",
+            self.config.max_ingest_active_bytes,
+        )?
+        .requeued)
     }
 
     /// Return a claimed message to pending without counting it as a failure.
@@ -1657,38 +1661,47 @@ impl PendingMessageStore {
         &self,
         filter: QueueFailureFilter,
     ) -> Result<QueueFailureActionOutcome> {
-        ensure_explicit_filter(&filter)?;
         self.with_connection(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let rows = matching_failed_rows(&tx, &filter)?;
-
-            let now = now_secs();
-            let mut active_ingest_bytes = active_payload_bytes_for_kind(&tx, INGEST_ASYNC_KIND)?;
-            let mut changed = 0u64;
-            for row in &rows {
-                let Some(payload_bytes) = admitted_requeue_payload_bytes(
-                    &tx,
-                    &row.id,
-                    &row.kind,
-                    active_ingest_bytes,
-                    self.config.max_ingest_active_bytes,
-                )?
-                else {
-                    continue;
-                };
-                let updated = requeue_failed_message(&tx, &row.id, now)?;
-                if updated > 0 {
-                    active_ingest_bytes = active_ingest_bytes.saturating_add(payload_bytes);
-                    changed = changed.saturating_add(updated);
-                }
-            }
+            let outcome = self.retry_failed_messages_on_connection(&tx, filter)?;
             tx.commit()?;
-            Ok(QueueFailureActionOutcome {
-                filter,
-                matched: rows.len() as u64,
-                changed,
-                buckets: buckets_from_rows(rows.iter()),
-            })
+            Ok(outcome)
+        })
+    }
+
+    pub fn retry_failed_messages_on_connection(
+        &self,
+        conn: &Connection,
+        filter: QueueFailureFilter,
+    ) -> Result<QueueFailureActionOutcome> {
+        ensure_explicit_filter(&filter)?;
+        let rows = matching_failed_rows(conn, &filter)?;
+
+        let now = now_secs();
+        let mut active_ingest_bytes = active_payload_bytes_for_kind(conn, INGEST_ASYNC_KIND)?;
+        let mut changed = 0u64;
+        for row in &rows {
+            let Some(payload_bytes) = admitted_requeue_payload_bytes(
+                conn,
+                &row.id,
+                &row.kind,
+                active_ingest_bytes,
+                self.config.max_ingest_active_bytes,
+            )?
+            else {
+                continue;
+            };
+            let updated = requeue_failed_message(conn, &row.id, now)?;
+            if updated > 0 {
+                active_ingest_bytes = active_ingest_bytes.saturating_add(payload_bytes);
+                changed = changed.saturating_add(updated);
+            }
+        }
+        Ok(QueueFailureActionOutcome {
+            filter,
+            matched: rows.len() as u64,
+            changed,
+            buckets: buckets_from_rows(rows.iter()),
         })
     }
 
@@ -1696,69 +1709,78 @@ impl PendingMessageStore {
         &self,
         filter: QueueFailureFilter,
     ) -> Result<QueueFailureActionOutcome> {
-        ensure_explicit_filter(&filter)?;
-        let completed_at = now_millis();
         self.with_connection(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let rows = matching_failed_rows(&tx, &filter)?;
-            let mut changed = 0u64;
-            for row in &rows {
-                let archive_reason = format!("queue_archive:{}", row.reason_code);
-                tx.execute(
-                    r#"
-                    INSERT INTO pending_message_completions (
-                        message_id,
-                        kind,
-                        created_at,
-                        claimed_at,
-                        completed_at,
-                        processing_ms,
-                        result_drawer_id,
-                        op_state,
-                        rejected_reason,
-                        failure_detail,
-                        result_json
-                    )
-                    SELECT id,
-                           kind,
-                           created_at * 1000,
-                           claimed_at,
-                           ?2,
-                           NULL,
-                           result_drawer_id,
-                           'failed',
-                           ?3,
-                           last_error,
-                           result_json
-                    FROM pending_messages
-                    WHERE id = ?1 AND status = 'failed'
-                    ON CONFLICT(message_id) DO UPDATE SET
-                        kind = excluded.kind,
-                        created_at = excluded.created_at,
-                        claimed_at = excluded.claimed_at,
-                        completed_at = excluded.completed_at,
-                        processing_ms = excluded.processing_ms,
-                        result_drawer_id = excluded.result_drawer_id,
-                        op_state = excluded.op_state,
-                        rejected_reason = excluded.rejected_reason,
-                        failure_detail = excluded.failure_detail,
-                        result_json = excluded.result_json
-                    "#,
-                    params![row.id.as_str(), completed_at, archive_reason.as_str()],
-                )?;
-                let deleted = tx.execute(
-                    "DELETE FROM pending_messages WHERE id = ?1 AND status = 'failed'",
-                    [row.id.as_str()],
-                )?;
-                changed = changed.saturating_add(deleted as u64);
-            }
+            let outcome = self.archive_failed_messages_on_connection(&tx, filter)?;
             tx.commit()?;
-            Ok(QueueFailureActionOutcome {
-                filter,
-                matched: rows.len() as u64,
-                changed,
-                buckets: buckets_from_rows(rows.iter()),
-            })
+            Ok(outcome)
+        })
+    }
+
+    pub fn archive_failed_messages_on_connection(
+        &self,
+        conn: &Connection,
+        filter: QueueFailureFilter,
+    ) -> Result<QueueFailureActionOutcome> {
+        ensure_explicit_filter(&filter)?;
+        let completed_at = now_millis();
+        let rows = matching_failed_rows(conn, &filter)?;
+        let mut changed = 0u64;
+        for row in &rows {
+            let archive_reason = format!("queue_archive:{}", row.reason_code);
+            conn.execute(
+                r#"
+                INSERT INTO pending_message_completions (
+                    message_id,
+                    kind,
+                    created_at,
+                    claimed_at,
+                    completed_at,
+                    processing_ms,
+                    result_drawer_id,
+                    op_state,
+                    rejected_reason,
+                    failure_detail,
+                    result_json
+                )
+                SELECT id,
+                       kind,
+                       created_at * 1000,
+                       claimed_at,
+                       ?2,
+                       NULL,
+                       result_drawer_id,
+                       'failed',
+                       ?3,
+                       last_error,
+                       result_json
+                FROM pending_messages
+                WHERE id = ?1 AND status = 'failed'
+                ON CONFLICT(message_id) DO UPDATE SET
+                    kind = excluded.kind,
+                    created_at = excluded.created_at,
+                    claimed_at = excluded.claimed_at,
+                    completed_at = excluded.completed_at,
+                    processing_ms = excluded.processing_ms,
+                    result_drawer_id = excluded.result_drawer_id,
+                    op_state = excluded.op_state,
+                    rejected_reason = excluded.rejected_reason,
+                    failure_detail = excluded.failure_detail,
+                    result_json = excluded.result_json
+                "#,
+                params![row.id.as_str(), completed_at, archive_reason.as_str()],
+            )?;
+            let deleted = conn.execute(
+                "DELETE FROM pending_messages WHERE id = ?1 AND status = 'failed'",
+                [row.id.as_str()],
+            )?;
+            changed = changed.saturating_add(deleted as u64);
+        }
+        Ok(QueueFailureActionOutcome {
+            filter,
+            matched: rows.len() as u64,
+            changed,
+            buckets: buckets_from_rows(rows.iter()),
         })
     }
 

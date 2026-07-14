@@ -11,7 +11,11 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::config::Config;
+use super::{
+    config::Config,
+    db::{Database, db_error_is_sqlite_lock},
+    types::RuntimeWriterLease,
+};
 
 pub const PROJECT_MIGRATION_BATCH_SIZE: usize = 1_000;
 pub const PROJECT_MIGRATION_RETRY_DELAYS_MS: [u64; 3] = [500, 1_000, 2_000];
@@ -359,6 +363,58 @@ where
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(error);
             }
+        }
+    }
+}
+
+pub fn migrate_null_project_ids_with_writer_lease<F>(
+    db: &Database,
+    project_id: &str,
+    wing: Option<&str>,
+    writer_lease: Option<&RuntimeWriterLease>,
+    mut on_event: F,
+) -> Result<(), ProjectError>
+where
+    F: FnMut(ProjectMigrationEvent),
+{
+    let project_id = validate_project_id(project_id)?;
+    let wing = wing.map(ToOwned::to_owned);
+    let mut batch_index = 0usize;
+
+    loop {
+        db.conn().busy_timeout(Duration::from_millis(0))?;
+        let result: Result<Option<(usize, usize)>, ProjectError> = db
+            .with_runtime_writer_lease_write(writer_lease, "migrate project id batch", || {
+                let ids = collect_batch_ids(db.conn(), wing.as_deref())?;
+                if ids.is_empty() {
+                    return Ok(None);
+                }
+
+                update_project_ids(db.conn(), "drawers", &ids, &project_id)?;
+                update_project_ids(db.conn(), "drawer_vectors", &ids, &project_id)?;
+                let remaining = count_remaining(db.conn(), wing.as_deref())?;
+                Ok(Some((ids.len(), remaining)))
+            });
+        db.conn().busy_timeout(Duration::from_secs(5))?;
+
+        match result {
+            Ok(Some((updated, remaining))) => {
+                batch_index += 1;
+                on_event(ProjectMigrationEvent::Progress(ProjectMigrationProgress {
+                    batch_index,
+                    updated,
+                    remaining,
+                }));
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => return Ok(()),
+            Err(ProjectError::Database(error)) if db_error_is_sqlite_lock(&error) => {
+                for delay_ms in PROJECT_MIGRATION_RETRY_DELAYS_MS {
+                    on_event(ProjectMigrationEvent::Busy { delay_ms });
+                    thread::sleep(Duration::from_millis(delay_ms));
+                }
+            }
+            Err(error) => return Err(error),
         }
     }
 }

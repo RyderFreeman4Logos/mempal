@@ -205,10 +205,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/core/queue.rs"
 kind = "source"
-baseline_tokens = 23869
-baseline_lines = 3140
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 23930
+baseline_lines = 3148
+issue = "680"
+rationale = "Transaction-aware queue helpers for writer-lease fenced writes; #680 correctness fix"
 
 [[files]]
 path = "src/core/types.rs"
@@ -237,10 +237,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/crystallize.rs"
 kind = "source"
-baseline_tokens = 6364
-baseline_lines = 861
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 6610
+baseline_lines = 896
+issue = "680"
+rationale = "Writer-lease fenced crystallization writes; #680 correctness fix"
 
 [[files]]
 path = "src/daemon.rs"
@@ -317,8 +317,8 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/main.rs"
 kind = "source"
-baseline_tokens = 256930
-baseline_lines = 33230
+baseline_tokens = 257470
+baseline_lines = 33308
 issue = "680"
 rationale = "Writer-lease generation fence conversion of deep maintenance paths; #680 correctness fix"
 
@@ -381,10 +381,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/sleep.rs"
 kind = "source"
-baseline_tokens = 7899
-baseline_lines = 1072
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 8345
+baseline_lines = 1150
+issue = "680"
+rationale = "Transaction-aware sleep helpers for writer-lease fenced writes; #680 correctness fix"
 
 [[files]]
 path = "src/wiki.rs"

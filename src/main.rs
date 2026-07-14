@@ -51,7 +51,7 @@ use mempal::core::{
     priming::PrimingRequest,
     project::{
         ProjectMigrationEvent, ProjectSearchScope, escape_project_id_for_display,
-        migrate_null_project_ids, resolve_project_id,
+        migrate_null_project_ids_with_writer_lease, resolve_project_id,
     },
     protocol::{DEFAULT_IDENTITY_HINT, MEMORY_PROTOCOL},
     reindex::ReindexProgressStore,
@@ -75,7 +75,9 @@ use mempal::cowork::{
     CoworkCaptureRequest, CreateSessionRequest, HandoffFilters, RegisterAgentRequest,
     SendOperation, SendRequest,
 };
-use mempal::crystallize::{CrystallizeOptions, CrystallizeSummary, run_crystallization};
+use mempal::crystallize::{
+    CrystallizeOptions, CrystallizeSummary, run_crystallization_with_writer_lease,
+};
 use mempal::doctor::{
     RestDoctorReport, build_doctor_report_with_daemon_status, build_rest_doctor_report,
 };
@@ -90,7 +92,10 @@ use mempal::ingest::{
     ingest_dir_with_options_and_writer_lease, ingest_file_with_options_and_writer_lease,
     normalize::{CURRENT_NORMALIZE_VERSION, NormalizeOptions, normalize_content_with_options},
     parsers::ParserMode,
-    reindex::{ReindexMode, ReindexOptions, ReindexReport, reindex_sources},
+    reindex::{
+        ReindexMode, ReindexOptions, ReindexReport, reindex_sources,
+        reindex_sources_with_writer_lease,
+    },
 };
 use mempal::knowledge_anchor::{PublishAnchorRequest, publish_anchor};
 use mempal::knowledge_card_backfill::{
@@ -133,7 +138,7 @@ use mempal::search::{
 };
 use mempal::sleep::{
     NremSummary, RemSummary, SalienceSummary, SleepCycleSummary, SleepPhaseSelection,
-    SleepRunOptions, run_sleep_cycle,
+    SleepRunOptions, run_sleep_cycle_with_writer_lease,
 };
 use mempal::wiki::{
     WikiBuildOptions, WikiVerifyOptions, build_wiki, current_wiki_unix_secs, verify_wiki,
@@ -5209,13 +5214,6 @@ impl MaintenanceWriterLeaseGuard {
         &self.lease
     }
 
-    fn ensure_active(&self, operation: &'static str) -> Result<()> {
-        match self.active_status(operation)? {
-            MaintenanceWriterLeaseCheck::Active => Ok(()),
-            MaintenanceWriterLeaseCheck::Lost => self.bail_lost(operation),
-        }
-    }
-
     /// Execute a write closure atomically fenced by the writer-lease generation.
     ///
     /// The lease check and the write execute inside the same `BEGIN IMMEDIATE`
@@ -5294,16 +5292,6 @@ impl MaintenanceWriterLeaseGuard {
                 )
             })
     }
-}
-
-fn ensure_maintenance_writer_lease_active(
-    lease: Option<&MaintenanceWriterLeaseGuard>,
-    operation: &'static str,
-) -> Result<()> {
-    if let Some(lease) = lease {
-        lease.ensure_active(operation)?;
-    }
-    Ok(())
 }
 
 impl Drop for MaintenanceWriterLeaseGuard {
@@ -8442,20 +8430,26 @@ fn effective_wake_up_text(drawer: &mempal::core::types::Drawer) -> &str {
 fn project_command(db: &Database, command: ProjectCommands) -> Result<()> {
     match command {
         ProjectCommands::Migrate { project, wing } => {
-            let _writer_lease = acquire_maintenance_writer_lease(db, "project-migrate")?;
-            migrate_null_project_ids(db.path(), &project, wing.as_deref(), |event| match event {
-                ProjectMigrationEvent::Busy { delay_ms } => {
-                    println!("batch busy, retrying in {delay_ms}ms");
-                    let _ = std::io::stdout().flush();
-                }
-                ProjectMigrationEvent::Progress(progress) => {
-                    println!(
-                        "batch {}: {} drawers updated, {} remaining",
-                        progress.batch_index, progress.updated, progress.remaining
-                    );
-                    let _ = std::io::stdout().flush();
-                }
-            })
+            let writer_lease = acquire_maintenance_writer_lease(db, "project-migrate")?;
+            migrate_null_project_ids_with_writer_lease(
+                db,
+                &project,
+                wing.as_deref(),
+                Some(writer_lease.lease()),
+                |event| match event {
+                    ProjectMigrationEvent::Busy { delay_ms } => {
+                        println!("batch busy, retrying in {delay_ms}ms");
+                        let _ = std::io::stdout().flush();
+                    }
+                    ProjectMigrationEvent::Progress(progress) => {
+                        println!(
+                            "batch {}: {} drawers updated, {} remaining",
+                            progress.batch_index, progress.updated, progress.remaining
+                        );
+                        let _ = std::io::stdout().flush();
+                    }
+                },
+            )
             .context("failed to migrate project ids")
         }
     }
@@ -8680,12 +8674,12 @@ fn sleep_command(db: &Database, config: &Config, options: SleepCommandOptions) -
     let current_dir = env::current_dir().ok();
     let project_id = resolve_project_id(None, config, current_dir.as_deref())
         .context("failed to resolve project id for sleep cycle")?;
-    let _writer_lease = if options.dry_run {
+    let writer_lease = if options.dry_run {
         None
     } else {
         Some(acquire_maintenance_writer_lease(db, "sleep")?)
     };
-    let summary = run_sleep_cycle(
+    let summary = run_sleep_cycle_with_writer_lease(
         db,
         config,
         SleepRunOptions {
@@ -8697,6 +8691,9 @@ fn sleep_command(db: &Database, config: &Config, options: SleepCommandOptions) -
             dry_run: options.dry_run,
             project_id,
         },
+        writer_lease
+            .as_ref()
+            .map(MaintenanceWriterLeaseGuard::lease),
     )
     .context("sleep cycle failed")?;
     print_sleep_summary(&summary);
@@ -8758,12 +8755,12 @@ async fn crystallize_command(
         None => resolve_project_id(None, config, current_dir.as_deref())
             .context("failed to resolve project id for crystallization")?,
     };
-    let _writer_lease = if options.dry_run {
+    let writer_lease = if options.dry_run {
         None
     } else {
         Some(acquire_cli_content_writer_lease(db, "crystallize")?)
     };
-    let summary = run_crystallization(
+    let summary = run_crystallization_with_writer_lease(
         db,
         config,
         CrystallizeOptions {
@@ -8771,6 +8768,9 @@ async fn crystallize_command(
             project_id,
             use_llm: true,
         },
+        writer_lease
+            .as_ref()
+            .map(MaintenanceWriterLeaseGuard::lease),
     )
     .await
     .context("auto-crystallization failed")?;
@@ -9112,21 +9112,34 @@ fn recompute_importance_command(db: &Database, only_zero: bool) -> Result<()> {
             (d.id, s)
         })
         .collect();
-    let _writer_lease = acquire_maintenance_writer_lease(db, "recompute-importance")?;
-    let updated = db
-        .bulk_update_importance(&updates)
-        .context("failed to apply importance scores")?;
+    let writer_lease = acquire_maintenance_writer_lease(db, "recompute-importance")?;
+    let mut updated = 0usize;
+    for chunk in updates.chunks(1_000) {
+        updated += writer_lease.write_fenced(db, "apply importance score batch", |db| {
+            let mut count = 0usize;
+            for (id, importance) in chunk {
+                db.conn().execute(
+                    "UPDATE drawers SET importance = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+                    rusqlite::params![importance, id],
+                )?;
+                count += 1;
+            }
+            Ok(count)
+        })?;
+    }
     println!("updated {updated} drawers with recomputed importance scores");
     Ok(())
 }
 
 fn reindex_failed_queue_command(db: &Database) -> Result<()> {
-    let _writer_lease = acquire_maintenance_writer_lease(db, "reindex-failed-queue")?;
+    let writer_lease = acquire_maintenance_writer_lease(db, "reindex-failed-queue")?;
     let store = mempal::core::queue::PendingMessageStore::new(db.path())
         .context("failed to open pending message queue")?;
-    let retried = store
-        .retry_failed_embed_messages()
-        .context("failed to requeue failed embed messages")?;
+    let retried = writer_lease.write_fenced(db, "requeue failed embed messages", |db| {
+        store
+            .retry_failed_embed_messages_on_connection(db.conn())
+            .context("failed to requeue failed embed messages")
+    })?;
     println!("requeued failed embed queue items: {retried}");
     Ok(())
 }
@@ -9197,10 +9210,12 @@ fn queue_retry_failed_command(
     if !args.execute {
         return Ok(());
     }
-    let _writer_lease = acquire_maintenance_writer_lease(db, "queue-retry-failed")?;
-    let outcome = store
-        .retry_failed_messages(filter)
-        .context("failed to retry failed queue rows")?;
+    let writer_lease = acquire_maintenance_writer_lease(db, "queue-retry-failed")?;
+    let outcome = writer_lease.write_fenced(db, "retry failed queue rows", |db| {
+        store
+            .retry_failed_messages_on_connection(db.conn(), filter)
+            .context("failed to retry failed queue rows")
+    })?;
     print_queue_action_outcome("retry_failed", &outcome, args.raw);
     Ok(())
 }
@@ -9219,10 +9234,12 @@ fn queue_archive_failed_command(
     if !args.execute {
         return Ok(());
     }
-    let _writer_lease = acquire_maintenance_writer_lease(db, "queue-archive-failed")?;
-    let outcome = store
-        .archive_failed_messages(filter)
-        .context("failed to archive failed queue rows")?;
+    let writer_lease = acquire_maintenance_writer_lease(db, "queue-archive-failed")?;
+    let outcome = writer_lease.write_fenced(db, "archive failed queue rows", |db| {
+        store
+            .archive_failed_messages_on_connection(db.conn(), filter)
+            .context("failed to archive failed queue rows")
+    })?;
     print_queue_action_outcome("archive_failed", &outcome, args.raw);
     Ok(())
 }
@@ -9842,15 +9859,32 @@ async fn reindex_stale_batches(
     // of an in-memory list expanded into `NOT IN (?, ?, ...)` placeholders,
     // whose bind-variable count would overflow SQLITE_MAX_VARIABLE_NUMBER
     // (32766) on a pathological run and crash the skip-continue (issue #304).
-    ensure_maintenance_writer_lease_active(writer_lease, "create stale reindex skip table")?;
-    ensure_reindex_skipped_table(db).context("failed to create reindex skip table")?;
-    ensure_maintenance_writer_lease_active(writer_lease, "reset stale reindex skip table")?;
-    db.conn()
-        .execute_batch(&format!("DELETE FROM {REINDEX_SKIPPED_TABLE};"))
-        .context("failed to reset reindex skip table")?;
-    ensure_maintenance_writer_lease_active(writer_lease, "snapshot stale reindex work")?;
-    build_reindex_stale_pending_rows(db, target_fingerprint, &target)
-        .context("failed to snapshot stale reindex work list")?;
+    match writer_lease {
+        Some(writer_lease) => {
+            writer_lease.write_fenced(db, "create stale reindex skip table", |db| {
+                ensure_reindex_skipped_table(db).context("failed to create reindex skip table")
+            })?;
+            writer_lease.write_fenced(db, "reset stale reindex skip table", |db| {
+                db.conn()
+                    .execute_batch(&format!("DELETE FROM {REINDEX_SKIPPED_TABLE};"))
+                    .context("failed to reset reindex skip table")?;
+                Ok(())
+            })?;
+            writer_lease.write_fenced(db, "snapshot stale reindex work", |db| {
+                build_reindex_stale_pending_rows(db, target_fingerprint, &target)
+                    .context("failed to snapshot stale reindex work list")?;
+                Ok(())
+            })?;
+        }
+        None => {
+            ensure_reindex_skipped_table(db).context("failed to create reindex skip table")?;
+            db.conn()
+                .execute_batch(&format!("DELETE FROM {REINDEX_SKIPPED_TABLE};"))
+                .context("failed to reset reindex skip table")?;
+            build_reindex_stale_pending_rows(db, target_fingerprint, &target)
+                .context("failed to snapshot stale reindex work list")?;
+        }
+    }
     let mut batch_index = 0usize;
     loop {
         let rows = pull_reindex_pending_batch(db, batch_size)
@@ -9883,18 +9917,33 @@ async fn reindex_stale_batches(
                 skipped_failed_batches += 1;
                 skipped_failed_drawers += rows.len();
                 let failed_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
-                ensure_maintenance_writer_lease_active(
-                    writer_lease,
-                    "record skipped stale reindex ids",
-                )?;
-                stage_reindex_skipped_ids(db, &failed_ids)
-                    .context("failed to record skipped drawer ids")?;
-                ensure_maintenance_writer_lease_active(
-                    writer_lease,
-                    "delete skipped stale reindex work",
-                )?;
-                delete_reindex_pending_ids(db, &failed_ids)
-                    .context("failed to delete skipped stale reindex work")?;
+                match writer_lease {
+                    Some(writer_lease) => {
+                        writer_lease.write_fenced(
+                            db,
+                            "record skipped stale reindex ids",
+                            |db| {
+                                stage_reindex_skipped_ids(db, &failed_ids)
+                                    .context("failed to record skipped drawer ids")
+                            },
+                        )?;
+                        writer_lease.write_fenced(
+                            db,
+                            "delete skipped stale reindex work",
+                            |db| {
+                                delete_reindex_pending_ids(db, &failed_ids)
+                                    .context("failed to delete skipped stale reindex work")?;
+                                Ok(())
+                            },
+                        )?;
+                    }
+                    None => {
+                        stage_reindex_skipped_ids(db, &failed_ids)
+                            .context("failed to record skipped drawer ids")?;
+                        delete_reindex_pending_ids(db, &failed_ids)
+                            .context("failed to delete skipped stale reindex work")?;
+                    }
+                }
                 for (source_path, chunk_index) in reindex_source_checkpoints(&rows) {
                     match writer_lease {
                         Some(writer_lease) => writer_lease.write_fenced(
@@ -9936,12 +9985,19 @@ async fn reindex_stale_batches(
         }
         .context("failed to write stale reindex batch")?;
         let pulled_ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
-        ensure_maintenance_writer_lease_active(
-            writer_lease,
-            "delete completed stale reindex work",
-        )?;
-        delete_reindex_pending_ids(db, &pulled_ids)
-            .context("failed to delete completed stale reindex work")?;
+        match writer_lease {
+            Some(writer_lease) => {
+                writer_lease.write_fenced(db, "delete completed stale reindex work", |db| {
+                    delete_reindex_pending_ids(db, &pulled_ids)
+                        .context("failed to delete completed stale reindex work")?;
+                    Ok(())
+                })?
+            }
+            None => {
+                delete_reindex_pending_ids(db, &pulled_ids)
+                    .context("failed to delete completed stale reindex work")?;
+            }
+        }
         processed += stats.reindexed;
         skipped_concurrent_update += stats.skipped_concurrent_update;
         if stats.skipped_concurrent_update == 0 {
@@ -10044,10 +10100,10 @@ async fn reindex_command_sources(
             .await
             .context("failed to plan reindex")?
     } else {
-        let _writer_lease = acquire_maintenance_writer_lease(db, "reindex-sources")?;
+        let writer_lease = acquire_maintenance_writer_lease(db, "reindex-sources")?;
         let embedder = build_embedder(config).await?;
         println!("embedder: {} ({}d)", embedder.name(), embedder.dimensions());
-        reindex_sources(db, &*embedder, options)
+        reindex_sources_with_writer_lease(db, &*embedder, options, Some(writer_lease.lease()))
             .await
             .context("failed to reindex sources")?
     };
@@ -14950,8 +15006,11 @@ fn stage_reindex_skipped_ids(db: &Database, ids: &[String]) -> Result<()> {
     }
     ensure_reindex_skipped_table(db)?;
     let conn = db.conn();
-    conn.execute_batch("BEGIN;")
-        .context("failed to begin reindex skip staging")?;
+    let owns_transaction = conn.is_autocommit();
+    if owns_transaction {
+        conn.execute_batch("BEGIN;")
+            .context("failed to begin reindex skip staging")?;
+    }
     let result = (|| -> Result<()> {
         let mut stmt = conn
             .prepare(&format!(
@@ -14964,6 +15023,9 @@ fn stage_reindex_skipped_ids(db: &Database, ids: &[String]) -> Result<()> {
         }
         Ok(())
     })();
+    if !owns_transaction {
+        return result;
+    }
     match result {
         Ok(()) => {
             conn.execute_batch("COMMIT;")
@@ -17886,7 +17948,6 @@ async fn maintenance_rejudge_all_command(
         return print_historical_rejudge_report(&report, options.format);
     }
 
-    ensure_maintenance_writer_lease_active(writer_lease, "prepare historical rejudge checkpoint")?;
     let mut checkpoint = prepare_historical_rejudge_checkpoint(
         db,
         options,
@@ -32187,8 +32248,11 @@ threshold = 0.7
                 .expect("release write lock");
         });
 
-        ensure_maintenance_writer_lease_active(Some(&writer_lease), "test lease verification")
-            .expect("writer lease verification must retry a transient SQLite lock");
+        match writer_lease.active_status("test lease verification") {
+            Ok(MaintenanceWriterLeaseCheck::Active) => {}
+            Ok(MaintenanceWriterLeaseCheck::Lost) => panic!("writer lease lost"),
+            Err(e) => panic!("writer lease verification failed: {e}"),
+        }
         release.join().expect("release thread");
     }
 
