@@ -351,8 +351,6 @@ impl AdmissionPaths {
     fn new(db_path: &Path) -> Result<Self, DbAdmissionError> {
         // Canonicalize the full database path to prevent symlink and
         // hard-link aliases from bypassing the profile-wide admission budget.
-        // Sidecar paths are derived from the canonical path so that all
-        // aliases of the same database file share one admission identity.
         let raw_parent = db_path.parent().unwrap_or_else(|| Path::new("."));
         let parent = fs::canonicalize(raw_parent).unwrap_or_else(|_| raw_parent.to_path_buf());
         fs::create_dir_all(&parent).map_err(|source| DbAdmissionError::Io {
@@ -368,10 +366,9 @@ impl AdmissionPaths {
                 "database path must have a UTF-8 file name",
             ))?;
 
-        // Try canonicalizing the full db_path. If the file exists, this
-        // resolves all symlinks (including cross-directory ones) to the
-        // real path. Sidecars are then derived from the canonical parent
-        // and canonical filename, ensuring all aliases converge.
+        // For an existing database file, use the canonical path (resolves
+        // symlinks). For hard-link identity, the admission state stores
+        // inode metadata so the acquire path can detect multi-link aliases.
         let full_path = parent.join(lexical_name);
         let (sidecar_dir, sidecar_name) = match fs::canonicalize(&full_path) {
             Ok(canonical) => {

@@ -20,7 +20,8 @@ pub(crate) fn current_process_identity() -> &'static str {
     CURRENT_PROCESS_IDENTITY
         .get_or_init(|| {
             #[cfg(target_os = "linux")]
-            if let Some(identity) = linux_process_identity(std::process::id()) {
+            if let LinuxProcessResult::Alive(identity) = linux_process_identity(std::process::id())
+            {
                 return identity;
             }
             fallback_process_identity()
@@ -31,7 +32,10 @@ pub(crate) fn current_process_identity() -> &'static str {
 /// Verify that a daemon owner still names the same process birth.
 pub(crate) fn daemon_owner_matches_process(owner: &str, pid: u32) -> bool {
     #[cfg(target_os = "linux")]
-    let identity = linux_process_identity(pid);
+    let identity = match linux_process_identity(pid) {
+        LinuxProcessResult::Alive(id) => Some(id),
+        _ => None,
+    };
     #[cfg(not(target_os = "linux"))]
     let identity = (pid == std::process::id()).then(|| current_process_identity().to_string());
 
@@ -41,18 +45,56 @@ pub(crate) fn daemon_owner_matches_process(owner: &str, pid: u32) -> bool {
         == Some(owner)
 }
 
+/// Process liveness classification for admission holder retention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessLiveness {
+    /// Identity matches — holder is alive.
+    Live,
+    /// Process is confirmed dead (no `/proc` entry, zombie, or identity mismatch).
+    Dead,
+    /// Cannot determine (permission denied, PID namespace isolation).
+    /// Callers must retain the holder (fail-closed).
+    Unverifiable,
+}
+
 /// Verify the process birth identity recorded by daemon-owned status.
 ///
-/// Returns `Some(true)` if the identity matches, `Some(false)` if the
-/// process is confirmed dead (zombie/exited), and `None` if the process
-/// cannot be verified (PID namespace isolation, `hidepid`, etc.).
-/// Callers must retain holders when `None` is returned (fail-closed).
+/// Returns [`ProcessLiveness::Live`] if the identity matches,
+/// [`ProcessLiveness::Dead`] if the process is confirmed dead or the
+/// identity doesn't match, and [`ProcessLiveness::Unverifiable`] if the
+/// process cannot be checked (PID namespace isolation, `hidepid`, etc.).
+#[cfg(target_os = "linux")]
+pub(crate) fn process_identity_liveness(pid: u32, expected: &str) -> ProcessLiveness {
+    if pid == std::process::id() {
+        return if current_process_identity() == expected {
+            ProcessLiveness::Live
+        } else {
+            ProcessLiveness::Dead
+        };
+    }
+    match linux_process_identity(pid) {
+        LinuxProcessResult::Alive(identity) => {
+            if identity == expected {
+                ProcessLiveness::Live
+            } else {
+                ProcessLiveness::Dead
+            }
+        }
+        LinuxProcessResult::Dead => ProcessLiveness::Dead,
+        LinuxProcessResult::Unverifiable => ProcessLiveness::Unverifiable,
+    }
+}
+
+/// Backwards-compatible bool wrapper for callers that only need match/no-match.
+/// Returns `Some(true)` on match, `Some(false)` on confirmed dead/mismatch,
+/// `None` on unverifiable.
 #[cfg(target_os = "linux")]
 pub(crate) fn process_identity_matches(pid: u32, expected: &str) -> Option<bool> {
-    if pid == std::process::id() {
-        return Some(current_process_identity() == expected);
+    match process_identity_liveness(pid, expected) {
+        ProcessLiveness::Live => Some(true),
+        ProcessLiveness::Dead => Some(false),
+        ProcessLiveness::Unverifiable => None,
     }
-    linux_process_identity(pid).map(|identity| identity == expected)
 }
 
 #[cfg(target_os = "linux")]
@@ -68,21 +110,47 @@ pub(crate) fn boot_id() -> Option<String> {
     None
 }
 
+/// Result of probing a Linux process identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinuxProcessResult {
+    /// Process exists and identity was computed.
+    Alive(String),
+    /// Process is confirmed dead (no `/proc` entry, zombie, or exited).
+    Dead,
+    /// Cannot determine (permission denied, namespace isolation).
+    Unverifiable,
+}
+
 #[cfg(target_os = "linux")]
-fn linux_process_identity(pid: u32) -> Option<String> {
+fn linux_process_identity(pid: u32) -> LinuxProcessResult {
     if pid == 0 {
-        return None;
+        return LinuxProcessResult::Dead;
     }
-    let boot_id = boot_id()?;
-    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
-    let start_ticks = parse_start_ticks(&stat)?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(boot_id.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(pid.to_string().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(start_ticks.to_string().as_bytes());
-    Some(hasher.finalize().to_hex()[..16].to_string())
+    let Some(boot_id) = boot_id() else {
+        return LinuxProcessResult::Unverifiable;
+    };
+    match std::fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => match parse_start_ticks(&stat) {
+            Some(start_ticks) => {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(boot_id.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(pid.to_string().as_bytes());
+                hasher.update(b"\0");
+                hasher.update(start_ticks.to_string().as_bytes());
+                LinuxProcessResult::Alive(hasher.finalize().to_hex()[..16].to_string())
+            }
+            // parse_start_ticks returns None for zombie/dead states — process is dead.
+            None => LinuxProcessResult::Dead,
+        },
+        Err(error) => match error.kind() {
+            // Entry doesn't exist — process has exited.
+            std::io::ErrorKind::NotFound => LinuxProcessResult::Dead,
+            // Permission denied or other access error — unverifiable.
+            std::io::ErrorKind::PermissionDenied => LinuxProcessResult::Unverifiable,
+            _ => LinuxProcessResult::Unverifiable,
+        },
+    }
 }
 
 fn fallback_process_identity() -> String {
