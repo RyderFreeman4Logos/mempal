@@ -123,6 +123,28 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
             .context("failed to prune expired audit logs")?;
     }
 
+    // Retention prune runs even when hooks workers are disabled so spool files
+    // still age out under age+reference budgets (CLI path: `hook retain-payloads`).
+    match crate::hook_payload::prune_hook_payloads(
+        &context.mempal_home,
+        &db_path,
+        context.config.hooks.payload_retention_days,
+    ) {
+        Ok(outcome) => {
+            tracing::info!(
+                scanned_files = outcome.scanned_files,
+                deleted_files = outcome.deleted_files,
+                referenced_files = outcome.referenced_files,
+                young_files = outcome.young_files,
+                retention_days = context.config.hooks.payload_retention_days,
+                "hook payload retention"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(?error, "hook payload retention failed at daemon startup");
+        }
+    }
+
     install_shutdown_handlers()?;
     tracing::info!("daemon log path: {}", context.log_path.display());
     write_daemon_embedder_status(
@@ -249,6 +271,11 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         Duration::from_secs(60),
         recovery_faults,
     );
+    let hook_payload_prune_handle = spawn_hook_payload_prune_worker(
+        context.mempal_home.clone(),
+        db_path.clone(),
+        context.config.hooks.payload_retention_days,
+    );
     let endpoint_requeue_handle = spawn_endpoint_recovery_requeue_worker(
         context.store.clone(),
         Arc::new(crate::core::config::ConfigHandle::current),
@@ -372,6 +399,8 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     tracing::info!("LLM workers stopped");
     stall_watchdog_handle.abort();
     let _ = stall_watchdog_handle.await;
+    hook_payload_prune_handle.abort();
+    let _ = hook_payload_prune_handle.await;
     endpoint_requeue_handle.abort();
     let _ = endpoint_requeue_handle.await;
     ingest_drain_worker.shutdown_and_drain().await;
@@ -1033,6 +1062,54 @@ fn spawn_stall_watchdog(
                 #[cfg(unix)]
                 request_shutdown_and_notify();
                 break;
+            }
+        }
+    })
+}
+
+/// Periodically prune unreferenced old hook-spool payload files.
+const HOOK_PAYLOAD_PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
+
+fn spawn_hook_payload_prune_worker(
+    mempal_home: PathBuf,
+    db_path: PathBuf,
+    retention_days: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(HOOK_PAYLOAD_PRUNE_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Run once soon after start, then hourly.
+        loop {
+            ticker.tick().await;
+            if shutdown_requested() {
+                break;
+            }
+            let home = mempal_home.clone();
+            let db = db_path.clone();
+            let days = retention_days;
+            let result = tokio::task::spawn_blocking(move || {
+                crate::hook_payload::prune_hook_payloads(&home, &db, days)
+            })
+            .await;
+            match result {
+                Ok(Ok(outcome)) => {
+                    if outcome.deleted_files > 0 || outcome.scanned_files > 0 {
+                        tracing::info!(
+                            scanned = outcome.scanned_files,
+                            deleted = outcome.deleted_files,
+                            referenced = outcome.referenced_files,
+                            young = outcome.young_files,
+                            retention_days = days,
+                            "hook-payload retention prune completed"
+                        );
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, "hook-payload retention prune failed");
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "hook-payload retention prune task join failed");
+                }
             }
         }
     })

@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::process::Command;
+use std::time::{Duration, SystemTime};
 
 use filetime::{FileTime, set_file_mtime};
 use mempal::core::{config::Config, db::Database, queue::PendingMessageStore};
@@ -80,4 +82,68 @@ fn hooks_payload_retention_days_defaults_to_seven_and_is_configurable() {
     let error = Config::parse("[hooks]\npayload_retention_days = 0\n")
         .expect_err("zero-day retention must be rejected");
     assert!(error.to_string().contains("payload_retention_days"));
+}
+
+#[test]
+fn daemon_startup_runs_hook_payload_retention_with_configured_age_budget() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mempal_home = tmp.path().join(".mempal");
+    let db_path = mempal_home.join("palace.db");
+    let spool = mempal_home.join(HOOK_SPOOL_DIR);
+    let log_path = mempal_home.join("daemon.log");
+    std::fs::create_dir_all(&spool).expect("create spool");
+    Database::open(&db_path).expect("initialize database");
+
+    let expired = spool.join("expired.json");
+    let within_budget = spool.join("within-budget.json");
+    write_old_payload(&expired, "expired raw payload");
+    std::fs::write(&within_budget, "retained raw payload").expect("write retained payload");
+    set_file_mtime(
+        &within_budget,
+        FileTime::from_system_time(SystemTime::now() - Duration::from_secs(8 * 86_400)),
+    )
+    .expect("age retained payload");
+
+    std::fs::write(
+        mempal_home.join("config.toml"),
+        format!(
+            "db_path = \"{}\"\n\n[hooks]\nenabled = false\npayload_retention_days = 30\n\n[daemon]\nlog_path = \"{}\"\n",
+            db_path.display(),
+            log_path.display()
+        ),
+    )
+    .expect("write daemon config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mempal"))
+        .args(["daemon", "--foreground"])
+        .env("HOME", tmp.path())
+        .env(
+            mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
+            mempal_home.join("runtime"),
+        )
+        .output()
+        .expect("run daemon startup");
+    assert!(
+        output.status.success(),
+        "daemon startup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !expired.exists(),
+        "daemon startup must prune expired payloads"
+    );
+    assert!(
+        within_budget.exists(),
+        "daemon startup must honor configured retention days"
+    );
+    let diagnostics = format!(
+        "{}\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        std::fs::read_to_string(&log_path).unwrap_or_default()
+    );
+    assert!(diagnostics.contains("hook payload retention"));
+    assert!(diagnostics.contains("scanned_files=2"));
+    assert!(diagnostics.contains("deleted_files=1"));
 }

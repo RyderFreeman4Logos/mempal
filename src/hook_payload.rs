@@ -31,6 +31,17 @@ pub fn prune_hook_payloads(
     db_path: &Path,
     retention_days: u64,
 ) -> Result<PruneOutcome> {
+    prune_hook_payloads_with_mode(mempal_home, db_path, retention_days, true)
+}
+
+/// Like [`prune_hook_payloads`], but when `execute` is false only reports what
+/// would be deleted (`deleted_files` counts candidates) without removing files.
+pub fn prune_hook_payloads_with_mode(
+    mempal_home: &Path,
+    db_path: &Path,
+    retention_days: u64,
+    execute: bool,
+) -> Result<PruneOutcome> {
     let spool_dir = mempal_home.join(HOOK_SPOOL_DIR);
     if !spool_dir.exists() {
         return Ok(PruneOutcome {
@@ -79,9 +90,11 @@ pub fn prune_hook_payloads(
             continue;
         }
 
-        // Old and unreferenced — delete.
-        std::fs::remove_file(&path)
-            .with_context(|| format!("failed to prune {}", path.display()))?;
+        // Old and unreferenced — delete (or count in dry-run).
+        if execute {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("failed to prune {}", path.display()))?;
+        }
         deleted_files += 1;
     }
 
