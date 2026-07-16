@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use mempal::core::db::Database;
 use mempal::xurl::ingest;
 use mempal::xurl::model::Tool;
+use mempal::xurl::parser::hermes::{HermesParseOptions, parse_hermes_db_with_options};
 use mempal::xurl::search::{self, SearchOptions};
 use mempal::xurl::store::{self, TurnFilter};
 use rusqlite::{Connection, params};
@@ -378,6 +379,61 @@ async fn ingest_hermes_options(
     )
     .await
     .expect("ingest Hermes source")
+}
+
+#[test]
+fn hermes_db_messages_join_their_own_session_metadata() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("state.db");
+    let conn = Connection::open(&path).expect("open Hermes fixture db");
+    conn.execute_batch(
+        "CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            title TEXT,
+            source TEXT,
+            cwd TEXT
+        );
+        CREATE TABLE messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp REAL NOT NULL,
+            active INTEGER NOT NULL,
+            compacted INTEGER NOT NULL
+        );
+        INSERT INTO sessions (id, title, source, cwd) VALUES
+            ('session-a', 'Session A', 'cli', '/repo/a'),
+            ('session-b', 'Session B', 'telegram', '/repo/b');
+        INSERT INTO messages
+            (id, session_id, role, content, timestamp, active, compacted) VALUES
+            ('message-a', 'session-a', 'user', 'alpha', 1.0, 1, 0),
+            ('message-b', 'session-b', 'assistant', 'beta', 2.0, 1, 0);",
+    )
+    .expect("create multi-session Hermes fixture");
+    drop(conn);
+
+    let options = HermesParseOptions::new("fallback", "default", false);
+    let turns = parse_hermes_db_with_options(&path, &options).expect("parse Hermes database");
+
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0].session_id, "session-a");
+    assert_eq!(
+        turns[0].metadata.session_title.as_deref(),
+        Some("Session A")
+    );
+    assert_eq!(turns[0].metadata.session_source.as_deref(), Some("cli"));
+    assert_eq!(turns[0].project_path.as_deref(), Some("/repo/a"));
+    assert_eq!(turns[1].session_id, "session-b");
+    assert_eq!(
+        turns[1].metadata.session_title.as_deref(),
+        Some("Session B")
+    );
+    assert_eq!(
+        turns[1].metadata.session_source.as_deref(),
+        Some("telegram")
+    );
+    assert_eq!(turns[1].project_path.as_deref(), Some("/repo/b"));
 }
 
 #[tokio::test]
