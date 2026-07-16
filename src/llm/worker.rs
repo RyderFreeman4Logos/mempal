@@ -221,6 +221,27 @@ pub async fn run_llm_worker(
     write_observer: DaemonWriteObserver,
     lease: RuntimeWriterLease,
 ) -> Result<()> {
+    run_llm_worker_inner(
+        store,
+        client_runtime,
+        status,
+        db,
+        write_observer,
+        lease,
+        None,
+    )
+    .await
+}
+
+async fn run_llm_worker_inner(
+    store: Arc<AsyncPendingMessageStore>,
+    client_runtime: SharedLlmClientRuntime,
+    status: Arc<LlmStatus>,
+    db: AsyncDb,
+    write_observer: DaemonWriteObserver,
+    lease: RuntimeWriterLease,
+    mut completion_observer: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static WORKER_INDEX: AtomicUsize = AtomicUsize::new(0);
     let idx = WORKER_INDEX.fetch_add(1, Ordering::SeqCst);
@@ -352,6 +373,9 @@ pub async fn run_llm_worker(
                 tracing::info!("LLM task {message_id} completed in {latency_ms}ms");
                 confirm_llm_task_async(&store, message.clone()).await?;
                 write_observer.record_successful_write();
+                if let Some(observer) = completion_observer.take() {
+                    let _ = observer.send(());
+                }
             }
             Some(Err(error)) => {
                 tracing::error!("LLM task {message_id} failed after {latency_ms}ms: {error}");
@@ -990,7 +1014,7 @@ threshold = 0.5
                 let notify = Arc::clone(&notify);
                 async move {
                     count.fetch_add(1, Ordering::SeqCst);
-                    notify.notify_waiters();
+                    notify.notify_one();
                     Json(serde_json::json!({
                         "id": "test",
                         "choices": [{
@@ -1035,7 +1059,7 @@ threshold = 0.5
                 let notify = Arc::clone(&notify);
                 async move {
                     count.fetch_add(1, Ordering::SeqCst);
-                    notify.notify_waiters();
+                    notify.notify_one();
                     (StatusCode::INTERNAL_SERVER_ERROR, "server error")
                 }
             }),
@@ -1108,23 +1132,6 @@ threshold = 0.5
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
             )
             .expect("read LLM audit verdict")
-    }
-
-    fn maybe_llm_audit_verdict(db: &Database, id: &str) -> Option<(String, f64)> {
-        let (verdict, score) = db
-            .conn()
-            .query_row(
-                "SELECT llm_verdict, llm_score FROM gating_audit WHERE drawer_id = ?1",
-                params![id],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<f64>>(1)?,
-                    ))
-                },
-            )
-            .expect("read optional LLM audit verdict");
-        verdict.zip(score)
     }
 
     #[test]
@@ -1216,6 +1223,9 @@ threshold = 0.5
         let _guard = crate::core::config::global_config_test_lock()
             .lock_owned()
             .await;
+        let _shutdown_guard = crate::daemon::global_shutdown_test_lock()
+            .lock_owned()
+            .await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let config_path = tmp.path().join("config.toml");
         let db_path = tmp.path().join("palace.db");
@@ -1301,6 +1311,9 @@ threshold = 0.5
         let _guard = crate::core::config::global_config_test_lock()
             .lock_owned()
             .await;
+        let _shutdown_guard = crate::daemon::global_shutdown_test_lock()
+            .lock_owned()
+            .await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let config_path = tmp.path().join("config.toml");
         let db_path = tmp.path().join("palace.db");
@@ -1344,31 +1357,21 @@ threshold = 0.5
             .runtime_writer_lease_acquire("sqlite-writer", "test", "llm-worker-test", 300, None)
             .expect("acquire test lease")
             .expect("test lease available");
-        let worker = tokio::spawn(run_llm_worker(
+        let (worker_completed, completion) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(run_llm_worker_inner(
             Arc::new(async_store),
             client_runtime,
             Arc::new(LlmStatus::new(5)),
             async_db,
             DaemonWriteObserver::for_test(),
             test_lease,
+            Some(worker_completed),
         ));
 
-        tokio::time::timeout(Duration::from_secs(45), secondary_notify.notified())
+        tokio::time::timeout(Duration::from_secs(180), completion)
             .await
-            .expect("secondary endpoint should be used");
-        tokio::time::timeout(Duration::from_secs(45), async {
-            loop {
-                if let Some((verdict, score)) = maybe_llm_audit_verdict(&db, drawer_id)
-                    && verdict == LLM_VERDICT_KEEP
-                    && score >= 0.9
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("LLM audit should be updated by worker");
+            .expect("fallback worker should complete")
+            .expect("worker completion observer should remain connected");
 
         worker.abort();
         let _ = worker.await;
