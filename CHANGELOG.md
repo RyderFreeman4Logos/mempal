@@ -10,6 +10,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
+- Optional ADK-Rust v1.0.0 post-retrieval evidence workflow with RRF-calibrated
+  relevance gating, typed score provenance, exact drawer/source citations,
+  raw-hit-backed hash/span verification, bounded fallback, and an additive
+  `mempal_search` MCP response (#742).
 - The daemon can run configured sleep/consolidation phases on an interval while
   reusing its process-wide SQLite writer lease (#726).
 - Baseline-aware `find-monolith-files` preflight gate that rejects new files

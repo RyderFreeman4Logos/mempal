@@ -12,6 +12,7 @@ pub(crate) mod deadline;
 pub use async_db::{AsyncDb, QueryOnlyAsyncDb};
 pub mod decay;
 pub mod design_insights;
+mod evidence_config;
 pub mod foresight;
 pub mod hot_reload;
 pub mod patterns;

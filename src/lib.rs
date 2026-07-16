@@ -27,6 +27,7 @@ pub mod durable_ingest;
 pub mod embed;
 pub mod endpoint_health;
 pub(crate) mod endpoint_pool;
+pub mod evidence_workflow;
 pub mod factcheck;
 pub mod field_taxonomy;
 pub mod hook;

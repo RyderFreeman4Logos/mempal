@@ -31,6 +31,7 @@ path = "src/main.rs"
 
 [features]
 default = []
+adk-rust = ["dep:adk-graph"]
 integration = []
 model2vec = ["dep:model2vec-rs"]
 onnx = ["dep:ort", "dep:ort-sys", "dep:tokenizers"]
@@ -41,6 +42,7 @@ rest = ["dep:axum", "dep:tower", "dep:tower-http"]
 db-test-seam = []
 
 [dependencies]
+adk-graph = { version = "=1.0.0", optional = true }
 anyhow = "1.0.103"
 arc-swap = "1"
 async-trait = "0.1"
@@ -63,6 +65,7 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmcp = { version = "1.4.0", features = ["client", "server", "macros", "schemars", "transport-async-rw", "transport-io"] }
 rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
+schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

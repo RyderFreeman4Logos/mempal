@@ -199,6 +199,12 @@ pub struct SearchRequest {
 
     /// Include drawers outside their validity window. Defaults to false.
     pub include_expired: Option<bool>,
+
+    /// Request a citation-preserving evidence pack alongside normal results.
+    /// Quality gating requires both the `adk-rust` Cargo feature and
+    /// `[evidence_workflow].enabled = true`; otherwise the pack reports the
+    /// unchanged bounded cited hits and an explicit fallback reason.
+    pub evidence: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -211,6 +217,10 @@ pub struct SearchResponse {
     pub warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
+    /// Optional ADK-Rust quality-gated evidence projection. Normal search
+    /// results remain unchanged for compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<crate::evidence_workflow::EvidencePack>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

@@ -5642,6 +5642,17 @@ impl MempalMcpServer {
             });
         }
         let results = rerank_outcome.results;
+        let evidence_score_type = match search_mode {
+            SearchMode::Hybrid => crate::evidence_workflow::EvidenceScoreType::Fused,
+            SearchMode::Bm25Only => crate::evidence_workflow::EvidenceScoreType::Lexical,
+        };
+        let evidence = crate::evidence_workflow::for_search(
+            request.evidence,
+            &config,
+            &results,
+            evidence_score_type,
+        )
+        .await;
 
         // Track hit drawer IDs for session-ingest boost (P13).
         let hit_ids: Vec<String> = results.iter().map(|r| r.drawer_id.clone()).collect();
@@ -5716,6 +5727,7 @@ impl MempalMcpServer {
             search_mode: search_mode.as_str().to_string(),
             warnings: response_warnings,
             system_warnings,
+            evidence,
         }))
     }
 
@@ -17406,20 +17418,7 @@ prototypes = ["keep"]
                 wing: wing.map(str::to_string),
                 room: room.map(str::to_string),
                 top_k: Some(top_k),
-                memory_kind: None,
-                domain: None,
-                field: None,
-                tier: None,
-                status: None,
-                anchor_kind: None,
-                with_neighbors: None,
-                project_id: None,
-                include_global: None,
-                all_projects: None,
-                scope: None,
-                disable_progressive: None,
-                include_raw_turns: None,
-                include_expired: None,
+                ..SearchRequest::default()
             }))
             .await
             .expect("search should succeed")
