@@ -36,6 +36,9 @@ fn run_delete(home: &Path, drawer_id: &str) -> Output {
     Command::new(mempal_bin())
         .args(["delete", drawer_id])
         .env("HOME", home)
+        // Keep fixture project identity independent of the developer's repo cwd
+        // (CLI default-scopes delete to the resolved project after #712).
+        .env("MEMPAL_PROJECT_ID", "cli-delete-fixture")
         .output()
         .expect("run mempal delete")
 }
@@ -107,7 +110,9 @@ fn insert_drawer(home: &Path, drawer_id: &str) {
             importance: 2,
         },
     );
-    db.insert_drawer(&drawer).expect("insert drawer");
+    // Match the project scope used by `run_delete` (MEMPAL_PROJECT_ID).
+    db.insert_drawer_with_project(&drawer, Some("cli-delete-fixture"))
+        .expect("insert drawer");
 }
 
 fn write_embed_config(home: &Path, base_url: &str) {
