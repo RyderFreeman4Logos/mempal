@@ -438,6 +438,11 @@ impl Config {
                 "hooks.daemon_claim_ttl_secs must be greater than 0".to_string(),
             ));
         }
+        if self.hooks.payload_retention_days == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "hooks.payload_retention_days must be greater than 0".to_string(),
+            ));
+        }
         if self.hooks.session_end.trailing_messages == 0 {
             return Err(ConfigError::InvalidConfig(
                 "hooks.session_end.trailing_messages must be greater than 0".to_string(),
@@ -1256,6 +1261,7 @@ pub struct HooksConfig {
     pub wing: String,
     pub daemon_poll_interval_ms: u64,
     pub daemon_claim_ttl_secs: u64,
+    pub payload_retention_days: u64,
     pub session_end: HooksSessionEndConfig,
 }
 
@@ -1272,6 +1278,7 @@ impl Default for HooksConfig {
             wing: DEFAULT_HOOK_WING.to_string(),
             daemon_poll_interval_ms: DEFAULT_HOOK_POLL_INTERVAL_MS,
             daemon_claim_ttl_secs: DEFAULT_HOOK_CLAIM_TTL_SECS,
+            payload_retention_days: 7,
             session_end: HooksSessionEndConfig::default(),
         }
     }
