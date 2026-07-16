@@ -148,6 +148,8 @@ pub struct DbAdmissionHolder {
     pub configured_cache_bytes: u64,
     token: String,
     process_identity: String,
+    #[serde(default)]
+    pid_namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +213,7 @@ impl ProfileDbAdmission {
         let generation = state.next_generation;
         let pid = std::process::id();
         let process_identity = super::process_identity::current_process_identity().to_string();
+        let pid_namespace = super::process_identity::current_pid_namespace();
         let owner_identity = format!("mempal-{}-{pid}-{process_identity}", request.holder_class);
         let acquired_at_unix_secs = unix_secs_now();
         let token = admission_token(&owner_identity, generation, acquired_at_unix_secs);
@@ -224,6 +227,7 @@ impl ProfileDbAdmission {
             configured_cache_bytes: request.configured_cache_bytes,
             token: token.clone(),
             process_identity,
+            pid_namespace,
         });
         state
             .holders
@@ -489,8 +493,14 @@ fn save_state(path: &Path, state: &AdmissionState) -> Result<(), DbAdmissionErro
 fn holder_is_live(holder: &DbAdmissionHolder) -> bool {
     #[cfg(target_os = "linux")]
     {
-        super::process_identity::process_identity_matches(holder.pid, &holder.process_identity)
-            .unwrap_or(true)
+        !matches!(
+            super::process_identity::process_identity_liveness(
+                holder.pid,
+                &holder.process_identity,
+                holder.pid_namespace.as_deref(),
+            ),
+            super::process_identity::ProcessLiveness::Dead
+        )
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {

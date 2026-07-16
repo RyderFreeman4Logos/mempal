@@ -1,4 +1,96 @@
+#[cfg(target_os = "linux")]
+use super::{
+    AdmissionPaths, DbAdmissionHolder, DbAdmissionRequest, DbHolderClass, ProfileDbAdmission,
+    holder_is_live,
+};
 use super::{ProcessLiveness, retain_holder_for_liveness};
+
+#[cfg(target_os = "linux")]
+fn holder(pid: u32, process_identity: &str, pid_namespace: Option<String>) -> DbAdmissionHolder {
+    DbAdmissionHolder {
+        holder_class: DbHolderClass::Mcp,
+        owner_identity: "test-holder".to_string(),
+        pid,
+        generation: 1,
+        acquired_at_unix_secs: 1,
+        connection_count: 1,
+        configured_cache_bytes: 1024,
+        token: "test-token".to_string(),
+        process_identity: process_identity.to_string(),
+        pid_namespace,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn new_holder_record_stores_pid_namespace_identity() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("palace.db");
+    let _admission = ProfileDbAdmission::acquire(
+        &db_path,
+        DbAdmissionRequest::new(DbHolderClass::Mcp, 1, 1024),
+    )
+    .expect("acquire holder");
+    let paths = AdmissionPaths::new(&db_path).expect("admission paths");
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(paths.state_path).expect("read admission state"))
+            .expect("parse admission state");
+    let expected = std::fs::read_link("/proc/self/ns/pid")
+        .expect("read current PID namespace")
+        .to_string_lossy()
+        .into_owned();
+
+    assert_eq!(state["holders"][0]["pid_namespace"], expected);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cross_pid_namespace_holders_are_retained_when_pid_conflicts_or_is_missing() {
+    for pid in [std::process::id(), u32::MAX] {
+        let foreign_holder = holder(
+            pid,
+            "foreign-process-birth",
+            Some("pid:[foreign]".to_string()),
+        );
+
+        assert!(
+            holder_is_live(&foreign_holder),
+            "foreign namespace holder with PID {pid} must be retained"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_process_in_current_pid_namespace_is_reclaimed() {
+    let pid_namespace = std::fs::read_link("/proc/self/ns/pid")
+        .expect("read current PID namespace")
+        .to_string_lossy()
+        .into_owned();
+    let missing_holder = holder(u32::MAX, "missing-process-birth", Some(pid_namespace));
+
+    assert!(!holder_is_live(&missing_holder));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_holder_without_pid_namespace_is_retained_fail_closed() {
+    let legacy_holder: DbAdmissionHolder = serde_json::from_value(serde_json::json!({
+        "holder_class": "mcp",
+        "owner_identity": "legacy-holder",
+        "pid": u32::MAX,
+        "generation": 1,
+        "acquired_at_unix_secs": 1,
+        "connection_count": 1,
+        "configured_cache_bytes": 1024,
+        "token": "legacy-token",
+        "process_identity": "missing-process-birth"
+    }))
+    .expect("deserialize legacy holder");
+
+    assert_eq!(legacy_holder.pid_namespace, None);
+    assert!(holder_is_live(&legacy_holder));
+}
 
 #[test]
 fn unverifiable_foreign_process_is_retained_fail_closed() {
