@@ -53,8 +53,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - **xurl/Hermes parser**: join every message to its matching session row so
   citation title, source, and cwd stay session-exact; filter rewound messages by
   enforcing `active = 1 OR compacted = 1` when Hermes `state.db` exposes those
-  columns. Legacy schemas without state columns preserve import-all behavior
-  (#741).
+  columns; and reconcile authoritative re-ingest snapshots by removing absent
+  source rows from lexical and vector search within the requested scope. Legacy
+  schemas without state columns preserve import-all behavior (#741).
 - **Hermes/REST search**: end-to-end query deadline defaults to ~4 minutes
   (`api.search_query_deadline_secs = 240`), is hot-reloadable without a hard
   ceiling, is snapshotted at query admission, and is shared as remaining budget

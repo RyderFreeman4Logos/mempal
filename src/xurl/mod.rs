@@ -3,6 +3,7 @@ pub mod embed;
 pub mod ingest;
 pub mod model;
 pub mod parser;
+pub(crate) mod reconcile;
 pub mod search;
 pub mod store;
 
