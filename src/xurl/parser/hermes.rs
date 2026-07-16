@@ -86,11 +86,35 @@ pub fn parse_hermes_db_with_options(
     let title_expr = optional_text_expr(&columns, &["session_title", "title"]);
     let source_expr = optional_text_expr(&columns, &["session_source", "source"]);
     let id_order = if columns.contains("id") { ", id" } else { "" };
+
+    // Build the canonical state predicate: only import rows that are
+    // active OR compacted. Rewound rows (both false) are non-canonical
+    // and must not be imported or returned.
+    //
+    // Both columns present: apply the canonical predicate.
+    // Neither column present: legacy schema, import all rows.
+    // Only one column present: partially compatible schema — cannot safely
+    // distinguish rewound from compacted history. Fail with a diagnostic
+    // rather than guessing (#741 requirement).
+    let has_active = columns.contains("active");
+    let has_compacted = columns.contains("compacted");
+    let state_predicate = match (has_active, has_compacted) {
+        (true, true) => "AND (active = 1 OR compacted = 1)",
+        (false, false) => "",
+        (active_only, _) => {
+            let missing = if active_only { "compacted" } else { "active" };
+            return Err(XurlError::Parse(format!(
+                "Hermes messages table has `active`/`compacted` state columns but only one is present (missing `{missing}`); \
+                 cannot safely determine canonical state — partial schema compatibility requires both columns or neither"
+            )));
+        }
+    };
+
     let sql = format!(
         "SELECT {message_id_expr}, role, content, timestamp, {session_id_expr}, \
          {cwd_expr}, {tool_name_expr}, {tool_call_id_expr}, {title_expr}, {source_expr} \
          FROM messages \
-         WHERE role IN ('user', 'assistant') \
+         WHERE role IN ('user', 'assistant') {state_predicate} \
          ORDER BY timestamp{id_order}"
     );
 
@@ -679,6 +703,101 @@ mod tests {
 
         assert!(!dir.path().join("state.db-wal").exists());
         assert!(!dir.path().join("state.db-shm").exists());
+    }
+
+    #[test]
+    fn hermes_parser_excludes_rewound_rows_with_state_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = Connection::open(&db_path).expect("open fixture db");
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                role      TEXT NOT NULL,
+                content   TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                active    INTEGER NOT NULL DEFAULT 1,
+                compacted INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO messages (role, content, timestamp, active, compacted) VALUES
+                ('user', 'active message', 1.0, 1, 0),
+                ('assistant', 'compacted history', 2.0, 0, 1),
+                ('user', 'rewound message', 3.0, 0, 0);",
+        )
+        .expect("create table with state columns");
+        drop(conn);
+
+        let turns = parse_hermes_db(&db_path, "s1", false).unwrap();
+        // Only active + compacted rows should be imported; rewound excluded.
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].content, "active message");
+        assert_eq!(turns[1].content, "compacted history");
+    }
+
+    #[test]
+    fn hermes_parser_legacy_schema_without_state_columns_imports_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        // Legacy schema without active/compacted columns — all rows imported.
+        setup_hermes_fixture(&db_path, &[("user", "legacy", 1.0)]);
+
+        let turns = parse_hermes_db(&db_path, "s1", false).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].content, "legacy");
+    }
+
+    #[test]
+    fn hermes_parser_rejects_active_only_partial_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = Connection::open(&db_path).expect("open fixture db");
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+            INSERT INTO messages (role, content, timestamp) VALUES ('user', 'hi', 1.0);",
+        )
+        .expect("create active-only table");
+        drop(conn);
+
+        let result = parse_hermes_db(&db_path, "s1", false);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("missing `compacted`"),
+            "error should mention missing compacted column: {err}"
+        );
+    }
+
+    #[test]
+    fn hermes_parser_rejects_compacted_only_partial_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = Connection::open(&db_path).expect("open fixture db");
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                compacted INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO messages (role, content, timestamp) VALUES ('user', 'hi', 1.0);",
+        )
+        .expect("create compacted-only table");
+        drop(conn);
+
+        let result = parse_hermes_db(&db_path, "s1", false);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("missing `active`"),
+            "error should mention missing active column: {err}"
+        );
     }
 
     #[test]
