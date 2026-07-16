@@ -1449,16 +1449,27 @@ fn validated_hook_payload_path(payload_path: &str, mempal_home: &Path) -> Result
     };
     let spool_root = fs::canonicalize(mempal_home.join(crate::hook::HOOK_SPOOL_DIR))
         .context("failed to canonicalize hook spool root")?;
-    let canonical_path = fs::canonicalize(&path)
-        .context("failed to canonicalize hook payload handle; path is missing or unreadable")?;
+    let canonical_path = fs::canonicalize(&path).map_err(|error| {
+        anyhow::Error::new(PayloadHandleMissing {
+            reason: format!(
+                "failed to canonicalize hook payload handle; path is missing or unreadable: {error}"
+            ),
+        })
+    })?;
     if !canonical_path.starts_with(&spool_root) {
-        anyhow::bail!("hook payload handle escapes hook spool root");
+        return Err(anyhow::Error::new(PayloadHandleMissing {
+            reason: "hook payload handle escapes hook spool root".to_string(),
+        }));
     }
     Ok(canonical_path)
 }
 
 fn read_bounded_hook_payload_handle(path: &Path) -> Result<String> {
-    let file = fs::File::open(path).context("failed to open hook payload handle")?;
+    let file = fs::File::open(path).map_err(|error| {
+        anyhow::Error::new(PayloadHandleMissing {
+            reason: format!("failed to open hook payload handle: {error}"),
+        })
+    })?;
     read_bounded_hook_payload_handle_from(file)
 }
 
@@ -2013,6 +2024,9 @@ fn queue_failure_disposition(error: &anyhow::Error) -> QueueFailureDisposition {
         {
             return QueueFailureDisposition::Terminal;
         }
+        if cause.downcast_ref::<PayloadHandleMissing>().is_some() {
+            return QueueFailureDisposition::Terminal;
+        }
         if let Some(llm_error) = cause.downcast_ref::<LlmError>() {
             if !llm_error.is_retryable() {
                 return QueueFailureDisposition::Terminal;
@@ -2037,6 +2051,14 @@ fn queue_retry_delay_from_duration(duration: Duration) -> QueueFailureDispositio
 #[derive(Debug, thiserror::Error)]
 #[error("automatic hook LLM gate terminal failure: {reason}")]
 struct AutomaticHookLlmGateTerminalFailure {
+    reason: String,
+}
+
+/// Unrecoverable payload handle failure — the referenced file is missing or
+/// unreadable. Retrying cannot reconstruct the payload, so this must dead-letter.
+#[derive(Debug, thiserror::Error)]
+#[error("hook payload handle is missing or unreadable: {reason}")]
+struct PayloadHandleMissing {
     reason: String,
 }
 
@@ -3828,10 +3850,11 @@ mod tests {
         AutomaticHookLlmGateTerminalFailure, ClaimBackoffState, ClaimNextSource, ClaimPollResult,
         DaemonEmbedder, DaemonIngestContext, EndpointRecoveryConfigProvider,
         EndpointRecoveryRequeuePlan, EndpointRecoveryRequeueState, HookPayloadBody,
-        HookWorkerState, automatic_hook_llm_gate_deadline, build_drawer_records,
-        compile_classifier_from_embedder, llm_worker_claim_enabled, poll_claim_next,
-        process_claimed_message_with_embedder, queue_failure_disposition, request_shutdown,
-        reset_shutdown_request, run_hook_worker, wait_for_hook_worker_or_tick, wing_from_cwd,
+        HookWorkerState, PayloadHandleMissing, automatic_hook_llm_gate_deadline,
+        build_drawer_records, compile_classifier_from_embedder, llm_worker_claim_enabled,
+        poll_claim_next, process_claimed_message_with_embedder, queue_failure_disposition,
+        request_shutdown, reset_shutdown_request, run_hook_worker, wait_for_hook_worker_or_tick,
+        wing_from_cwd,
     };
 
     #[test]
@@ -3859,6 +3882,42 @@ mod tests {
 
         assert_eq!(
             queue_failure_disposition(&decode_error),
+            QueueFailureDisposition::Terminal
+        );
+    }
+
+    #[test]
+    fn queue_failure_disposition_dead_letters_missing_payload_handle() {
+        let error = anyhow::Error::new(PayloadHandleMissing {
+            reason: "file not found".to_string(),
+        });
+        assert_eq!(
+            queue_failure_disposition(&error),
+            QueueFailureDisposition::Terminal
+        );
+    }
+
+    #[test]
+    fn queue_failure_disposition_dead_letters_missing_validated_payload_path() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mempal_home = tmp.path().join(".mempal");
+        let spool_root = mempal_home.join(crate::hook::HOOK_SPOOL_DIR);
+        std::fs::create_dir_all(&spool_root).expect("create hook spool");
+        let missing_path = spool_root.join("missing.json");
+
+        let error = super::validated_hook_payload_path(
+            missing_path.to_str().expect("UTF-8 test path"),
+            &mempal_home,
+        )
+        .expect_err("missing payload path must fail validation");
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<PayloadHandleMissing>().is_some())
+        );
+        assert_eq!(
+            queue_failure_disposition(&error),
             QueueFailureDisposition::Terminal
         );
     }
@@ -3910,6 +3969,22 @@ mod tests {
     }
 
     #[test]
+    fn read_bounded_hook_payload_handle_classifies_open_and_read_failures_as_terminal() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let open_error = super::read_bounded_hook_payload_handle(&tmp.path().join("missing.json"))
+            .expect_err("missing handle must fail to open");
+        let read_error = super::read_bounded_hook_payload_handle_from(&[0xff][..])
+            .expect_err("invalid UTF-8 handle must fail to read");
+
+        for error in [open_error, read_error] {
+            assert_eq!(
+                queue_failure_disposition(&error),
+                QueueFailureDisposition::Terminal
+            );
+        }
+    }
+
+    #[test]
     fn read_bounded_hook_payload_handle_stops_at_inline_limit_sentinel() {
         let read_bytes = Rc::new(Cell::new(0));
         let reader = CountingHookPayloadReader {
@@ -3922,6 +3997,10 @@ mod tests {
         let message = format!("{error:#}");
 
         assert_eq!(read_bytes.get(), super::MAX_HOOK_HANDLE_READ_BYTES);
+        assert_eq!(
+            queue_failure_disposition(&error),
+            QueueFailureDisposition::Terminal
+        );
         assert!(message.contains("exceeds inline admission limit"));
         assert!(message.contains(&format!(
             ">= {} bytes",
@@ -3995,6 +4074,10 @@ mod tests {
         let message = format!("{error:#}");
 
         assert!(message.contains("escapes hook spool root"));
+        assert_eq!(
+            queue_failure_disposition(&error),
+            QueueFailureDisposition::Terminal
+        );
         assert!(
             !message.contains("outside spool"),
             "diagnostic must not include rejected payload body"
