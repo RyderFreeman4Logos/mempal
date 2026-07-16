@@ -354,7 +354,7 @@ impl McpIngestWriterLeaseGuard {
         let db_path = self.db_path.clone();
         let lease = self.lease.clone();
         tokio::task::spawn_blocking(move || {
-            let db = Database::open(&db_path).with_context(|| {
+            let db = Database::open_lease_control(&db_path).with_context(|| {
                 format!(
                     "failed to open database to release MCP ingest writer lease: {}",
                     db_path.display()
@@ -380,7 +380,7 @@ impl Drop for McpIngestWriterLeaseGuard {
             heartbeat.abort();
         }
         if !self.released
-            && let Ok(db) = Database::open(&self.db_path)
+            && let Ok(db) = Database::open_lease_control(&self.db_path)
         {
             let _ = db.runtime_writer_lease_release(&self.lease);
         }
@@ -449,7 +449,7 @@ impl Drop for McpContentWriterLeaseGuard {
         if let Some(heartbeat) = self.heartbeat.take() {
             heartbeat.abort();
         }
-        if let Ok(db) = Database::open(&self.db_path) {
+        if let Ok(db) = Database::open_lease_control(&self.db_path) {
             let _ = db.runtime_writer_lease_release(&self.lease);
         }
     }
@@ -3331,7 +3331,8 @@ fn renew_mcp_writer_lease_once(
     lease: &RuntimeWriterLease,
     ttl_secs: u64,
 ) -> anyhow::Result<bool> {
-    let db = Database::open_with_busy_timeout(db_path, MCP_WRITER_LEASE_RENEW_BUSY_TIMEOUT)?;
+    let db =
+        Database::open_lease_control_with_timeout(db_path, MCP_WRITER_LEASE_RENEW_BUSY_TIMEOUT)?;
     Ok(db.runtime_writer_lease_renew(lease, ttl_secs)?)
 }
 

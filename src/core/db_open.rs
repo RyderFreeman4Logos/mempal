@@ -29,6 +29,21 @@ impl Database {
         Self::open_with_mode_and_busy_timeout(path, OpenMode::QueryOnly, busy_timeout, true)
     }
 
+    /// Open a database for lease control (heartbeat/release) WITHOUT acquiring
+    /// profile admission. This avoids consuming an admission slot at holder cap.
+    pub fn open_lease_control(path: &Path) -> Result<Self, DbError> {
+        Self::open_with_mode(path, OpenMode::ReadWrite, false)
+    }
+
+    /// Open a database for lease control with a custom busy timeout,
+    /// WITHOUT acquiring profile admission.
+    pub(crate) fn open_lease_control_with_timeout(
+        path: &Path,
+        busy_timeout: Duration,
+    ) -> Result<Self, DbError> {
+        Self::open_with_mode_and_busy_timeout(path, OpenMode::ReadWrite, busy_timeout, false)
+    }
+
     pub(crate) fn open_unadmitted(path: &Path) -> Result<Self, DbError> {
         Self::open_with_mode(path, OpenMode::ReadWrite, false)
     }
@@ -107,5 +122,29 @@ impl Database {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::db_admission::ProfileDbAdmission;
+
+    #[test]
+    fn db_admission_lease_control_opens_do_not_acquire_profile_admission() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let _admitted = Database::open(&db_path).expect("open admitted database");
+        let before = ProfileDbAdmission::snapshot(&db_path).expect("snapshot before lease control");
+
+        let _lease_control =
+            Database::open_lease_control(&db_path).expect("open lease-control database");
+        let _lease_control_with_timeout =
+            Database::open_lease_control_with_timeout(&db_path, Duration::from_millis(25))
+                .expect("open lease-control database with timeout");
+
+        let after = ProfileDbAdmission::snapshot(&db_path).expect("snapshot after lease control");
+        assert_eq!(after.active_holders, before.active_holders);
+        assert_eq!(after.holders, before.holders);
     }
 }

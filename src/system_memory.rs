@@ -88,7 +88,18 @@ fn effective_cgroup_limit(leaf: &Path, cgroup_root: &Path) -> Option<(u64, u64)>
         if let Ok(max_raw) = fs::read_to_string(current_dir.join("memory.max")) {
             if let Some(limit) = parse_cgroup_limit(&max_raw) {
                 if limit > 0 {
-                    let current_at = read_u64(current_dir.join("memory.current")).unwrap_or(0);
+                    // Skip this cgroup level when current usage is unreadable.
+                    // Substituting zero would fabricate low pressure.
+                    let Some(current_at) = read_u64(current_dir.join("memory.current")) else {
+                        if current_dir == root_canon {
+                            break;
+                        }
+                        current_dir = current_dir.parent()?.to_path_buf();
+                        if !current_dir.starts_with(&root_canon) {
+                            break;
+                        }
+                        continue;
+                    };
                     let ratio = current_at
                         .saturating_mul(100)
                         .checked_div(limit)
