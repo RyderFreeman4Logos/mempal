@@ -4,7 +4,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 struct TurnBestEntry {
-    score: f32,
     session_id: String,
     tool: String,
     role: String,
@@ -106,12 +105,12 @@ pub struct SearchOptions {
     pub remote_call_policy: RemoteCallPolicyConfig,
 }
 
-/// Semantic search over a bounded set of `conversation_turn_vectors` using brute-force cosine
-/// similarity.
+/// Semantic search over `conversation_turn_vectors` using brute-force cosine similarity.
 ///
-/// The query is embedded via `embedder`, then up to [`MAX_XURL_SEARCH_CANDIDATES`] matching
-/// vectors are scored. Multi-chunk turns are deduplicated by keeping the best-scoring chunk.
-/// Identical-content turns are deduplicated, keeping the highest-scored representative.
+/// All filter-matching vectors are scored first (exact ranking). Content/metadata is then
+/// hydrated only for the top [`MAX_XURL_SEARCH_CANDIDATES`] turns after score-ordered
+/// truncation — never via an unranked SQL `LIMIT`. Multi-chunk turns keep the best chunk;
+/// identical-content turns keep the highest-scored representative.
 /// Default filtering excludes CSA-delegated turns and non-human-provenance turns.
 ///
 /// If `opts.min_score` is set, hits below the floor are excluded;
@@ -181,120 +180,139 @@ pub async fn search<E: Embedder + ?Sized>(
         format!("WHERE {}", conditions.join(" AND "))
     };
 
-    let sql = format!(
-        "SELECT ctv.turn_id, ctv.vector, \
-         ct.session_id, ct.tool, ct.role, ct.content, ct.timestamp_epoch, ct.project_path, \
-         ct.hermes_profile, ct.session_title, ct.session_source, ct.message_id, \
-         ct.tool_name, ct.tool_call_id, ct.previous_message_id, ct.next_message_id \
+    // Phase 1: score every matching vector (exact ranking). Do not LIMIT here —
+    // unranked LIMIT would destroy top-k. Content is hydrated only for the
+    // score-ordered top MAX_XURL_SEARCH_CANDIDATES after ranking.
+    let score_sql = format!(
+        "SELECT ctv.turn_id, ctv.vector \
          FROM conversation_turn_vectors ctv \
          JOIN conversation_turns ct ON ct.id = ctv.turn_id \
-         {where_clause} \
-         LIMIT {MAX_XURL_SEARCH_CANDIDATES}"
+         {where_clause}"
     );
 
-    struct VectorRow {
-        turn_id: String,
-        vector: Vec<u8>,
-        session_id: String,
-        tool: String,
-        role: String,
-        content: String,
-        timestamp_epoch: f64,
-        project_path: Option<String>,
-        hermes_profile: Option<String>,
-        session_title: Option<String>,
-        session_source: Option<String>,
-        message_id: Option<String>,
-        tool_name: Option<String>,
-        tool_call_id: Option<String>,
-        previous_message_id: Option<String>,
-        next_message_id: Option<String>,
-    }
-
     let refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
-    let mut stmt = conn.prepare(&sql).map_err(XurlError::Database)?;
-    let rows: Vec<VectorRow> = stmt
-        .query_map(refs.as_slice(), |row| {
-            Ok(VectorRow {
-                turn_id: row.get(0)?,
-                vector: row.get(1)?,
-                session_id: row.get(2)?,
-                tool: row.get(3)?,
-                role: row.get(4)?,
-                content: row.get(5)?,
-                timestamp_epoch: row.get(6)?,
-                project_path: row.get(7)?,
-                hermes_profile: row.get(8)?,
-                session_title: row.get(9)?,
-                session_source: row.get(10)?,
-                message_id: row.get(11)?,
-                tool_name: row.get(12)?,
-                tool_call_id: row.get(13)?,
-                previous_message_id: row.get(14)?,
-                next_message_id: row.get(15)?,
-            })
-        })
+    let mut score_stmt = conn.prepare(&score_sql).map_err(XurlError::Database)?;
+    let scored_rows: Vec<(String, Vec<u8>)> = score_stmt
+        .query_map(refs.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(XurlError::Database)?
         .collect::<Result<_, _>>()
         .map_err(XurlError::Database)?;
 
-    // Score each chunk, deduplicate by turn_id keeping best score.
-    let mut best_by_turn: HashMap<String, TurnBestEntry> = HashMap::new();
-
-    for row in rows {
-        let vec = deserialize_vector(&row.vector);
+    // Best score per turn (multi-chunk → keep max).
+    let mut best_score_by_turn: HashMap<String, f32> = HashMap::new();
+    for (turn_id, vector_blob) in scored_rows {
+        let vec = deserialize_vector(&vector_blob);
         let score = cosine_similarity(&query_vec, &vec);
-        let entry = best_by_turn
-            .entry(row.turn_id.clone())
-            .or_insert(TurnBestEntry {
-                score: -1.0,
-                session_id: row.session_id,
-                tool: row.tool,
-                role: row.role,
-                content: row.content,
-                timestamp_epoch: row.timestamp_epoch,
-                source_path: row.project_path,
-                hermes_profile: row.hermes_profile,
-                session_title: row.session_title,
-                session_source: row.session_source,
-                message_id: row.message_id,
-                tool_name: row.tool_name,
-                tool_call_id: row.tool_call_id,
-                previous_message_id: row.previous_message_id,
-                next_message_id: row.next_message_id,
-            });
-        if score > entry.score {
-            entry.score = score;
+        best_score_by_turn
+            .entry(turn_id)
+            .and_modify(|best| {
+                if score > *best {
+                    *best = score;
+                }
+            })
+            .or_insert(score);
+    }
+
+    // Score-ordered top-k bound (correct semantic truncation).
+    let mut ranked_turns: Vec<(String, f32)> = best_score_by_turn.into_iter().collect();
+    ranked_turns.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    if ranked_turns.len() > MAX_XURL_SEARCH_CANDIDATES {
+        ranked_turns.truncate(MAX_XURL_SEARCH_CANDIDATES);
+    }
+
+    if ranked_turns.is_empty() {
+        return Ok(SearchResult {
+            hits: Vec::new(),
+            passing_total: 0,
+            best_score_below_floor: None,
+            total_candidates: 0,
+            min_score_floor: min_score,
+            warnings: Vec::new(),
+        });
+    }
+
+    // Phase 2: hydrate content/metadata only for the ranked top-N turns.
+    let placeholders = ranked_turns
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hydrate_sql = format!(
+        "SELECT id, session_id, tool, role, content, timestamp_epoch, project_path, \
+         hermes_profile, session_title, session_source, message_id, \
+         tool_name, tool_call_id, previous_message_id, next_message_id \
+         FROM conversation_turns \
+         WHERE id IN ({placeholders})"
+    );
+    let mut hydrate_params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ranked_turns.len());
+    for (turn_id, _) in &ranked_turns {
+        hydrate_params.push(turn_id);
+    }
+    let mut hydrate_stmt = conn.prepare(&hydrate_sql).map_err(XurlError::Database)?;
+    let mut metadata_by_id: HashMap<String, TurnBestEntry> = HashMap::new();
+    {
+        let mut rows = hydrate_stmt
+            .query(hydrate_params.as_slice())
+            .map_err(XurlError::Database)?;
+        while let Some(row) = rows.next().map_err(XurlError::Database)? {
+            let turn_id: String = row.get(0).map_err(XurlError::Database)?;
+            metadata_by_id.insert(
+                turn_id,
+                TurnBestEntry {
+                    session_id: row.get(1).map_err(XurlError::Database)?,
+                    tool: row.get(2).map_err(XurlError::Database)?,
+                    role: row.get(3).map_err(XurlError::Database)?,
+                    content: row.get(4).map_err(XurlError::Database)?,
+                    timestamp_epoch: row.get(5).map_err(XurlError::Database)?,
+                    source_path: row.get(6).map_err(XurlError::Database)?,
+                    hermes_profile: row.get(7).map_err(XurlError::Database)?,
+                    session_title: row.get(8).map_err(XurlError::Database)?,
+                    session_source: row.get(9).map_err(XurlError::Database)?,
+                    message_id: row.get(10).map_err(XurlError::Database)?,
+                    tool_name: row.get(11).map_err(XurlError::Database)?,
+                    tool_call_id: row.get(12).map_err(XurlError::Database)?,
+                    previous_message_id: row.get(13).map_err(XurlError::Database)?,
+                    next_message_id: row.get(14).map_err(XurlError::Database)?,
+                },
+            );
         }
     }
 
-    // Convert to SearchHit and sort by descending score.
-    let mut all_hits: Vec<SearchHit> = best_by_turn
-        .into_iter()
-        .map(|(turn_id, entry)| SearchHit {
+    let mut all_hits: Vec<SearchHit> = Vec::with_capacity(ranked_turns.len());
+    for (turn_id, score) in ranked_turns {
+        let Some(meta) = metadata_by_id.remove(&turn_id) else {
+            continue;
+        };
+        all_hits.push(SearchHit {
             turn_id,
-            session_id: entry.session_id,
-            tool: entry.tool,
-            role: entry.role,
-            content: entry.content,
-            timestamp_epoch: entry.timestamp_epoch,
-            score: entry.score,
-            source_path: entry.source_path,
-            hermes_profile: entry.hermes_profile,
-            session_title: entry.session_title,
-            session_source: entry.session_source,
-            message_id: entry.message_id,
-            tool_name: entry.tool_name,
-            tool_call_id: entry.tool_call_id,
-            previous_message_id: entry.previous_message_id,
-            next_message_id: entry.next_message_id,
-        })
-        .collect();
+            session_id: meta.session_id,
+            tool: meta.tool,
+            role: meta.role,
+            content: meta.content,
+            timestamp_epoch: meta.timestamp_epoch,
+            score,
+            source_path: meta.source_path,
+            hermes_profile: meta.hermes_profile,
+            session_title: meta.session_title,
+            session_source: meta.session_source,
+            message_id: meta.message_id,
+            tool_name: meta.tool_name,
+            tool_call_id: meta.tool_call_id,
+            previous_message_id: meta.previous_message_id,
+            next_message_id: meta.next_message_id,
+        });
+    }
 
+    // Already score-ordered from ranked_turns; keep stable desc order.
     all_hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.turn_id.cmp(&b.turn_id))
     });
 
     // Dedup by content hash: hits are sorted desc by score, so the first occurrence per
@@ -537,29 +555,112 @@ mod tests {
             .collect::<Vec<_>>();
         store::insert_turns(db.conn(), &turns).expect("insert turns");
 
-        let mut vector = Vec::new();
-        vector.extend_from_slice(&1.0_f32.to_le_bytes());
-        vector.extend_from_slice(&0.0_f32.to_le_bytes());
-        db.conn()
-            .execute(
-                "INSERT INTO conversation_turn_vectors (turn_id, chunk_index, vector) \
-                 SELECT id, 0, ?1 FROM conversation_turns",
-                rusqlite::params![vector],
-            )
-            .expect("insert vectors");
+        // Distinct scores: cosine([1,0], [1, y]) decreases as |y| increases.
+        // Highest scores are lowest turn_index (y = turn_index * 0.01).
+        let turn_ids: Vec<String> = db
+            .conn()
+            .prepare("SELECT id FROM conversation_turns ORDER BY timestamp_epoch ASC")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("ids");
+        for (index, turn_id) in turn_ids.iter().enumerate() {
+            let y = index as f32 * 0.01;
+            let mut vector = Vec::new();
+            vector.extend_from_slice(&1.0_f32.to_le_bytes());
+            vector.extend_from_slice(&y.to_le_bytes());
+            db.conn()
+                .execute(
+                    "INSERT INTO conversation_turn_vectors (turn_id, chunk_index, vector) VALUES (?1, 0, ?2)",
+                    rusqlite::params![turn_id, vector],
+                )
+                .expect("insert vector");
+        }
 
         let result = search(
             &db,
             &FixedEmbedder,
             "query",
             SearchOptions {
-                limit: 501,
+                limit: 10,
                 ..Default::default()
             },
         )
         .await
         .expect("search");
 
+        // Content hydration is bounded after score ranking.
         assert_eq!(result.total_candidates, 500);
+        // Top-k must be the highest-scoring (lowest y / earliest) turns, not arbitrary.
+        let expected: Vec<String> = (0..10).map(|i| format!("unique candidate {i}")).collect();
+        let contents: Vec<String> = result.hits.iter().map(|h| h.content.clone()).collect();
+        assert_eq!(contents, expected);
+        for window in result.hits.windows(2) {
+            assert!(window[0].score >= window[1].score);
+        }
+    }
+
+    #[tokio::test]
+    async fn xurl_search_rank_before_bound_preserves_true_topk() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tempdir.path().join("palace.db")).expect("open database");
+        // 20 turns; checking that the 3 best scores are returned when limit=3.
+        let turns = (0..20)
+            .map(|turn_index| RawTurn {
+                session_id: "topk".to_string(),
+                tool: Tool::Cc,
+                role: Role::User,
+                content: format!("candidate {turn_index}"),
+                timestamp_epoch: 1_748_000_000.0 + f64::from(turn_index),
+                project_path: None,
+                git_branch: None,
+                is_csa_delegated: false,
+                provenance: Provenance::Human,
+                turn_index,
+                metadata: TurnMetadata::default(),
+            })
+            .collect::<Vec<_>>();
+        store::insert_turns(db.conn(), &turns).expect("insert turns");
+        let turn_ids: Vec<String> = db
+            .conn()
+            .prepare("SELECT id FROM conversation_turns ORDER BY timestamp_epoch ASC")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("ids");
+        for (index, turn_id) in turn_ids.iter().enumerate() {
+            // Best match: index 19 → vector closest to [1,0]; worst: index 0.
+            let y = (19 - index) as f32;
+            let mut vector = Vec::new();
+            vector.extend_from_slice(&1.0_f32.to_le_bytes());
+            vector.extend_from_slice(&y.to_le_bytes());
+            db.conn()
+                .execute(
+                    "INSERT INTO conversation_turn_vectors (turn_id, chunk_index, vector) VALUES (?1, 0, ?2)",
+                    rusqlite::params![turn_id, vector],
+                )
+                .expect("insert vector");
+        }
+
+        let result = search(
+            &db,
+            &FixedEmbedder,
+            "query",
+            SearchOptions {
+                limit: 3,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+
+        assert_eq!(result.hits.len(), 3);
+        assert_eq!(result.hits[0].content, "candidate 19");
+        assert_eq!(result.hits[1].content, "candidate 18");
+        assert_eq!(result.hits[2].content, "candidate 17");
+        assert!(result.hits[0].score > result.hits[1].score);
+        assert!(result.hits[1].score > result.hits[2].score);
     }
 }
