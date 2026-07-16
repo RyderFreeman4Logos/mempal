@@ -31,6 +31,7 @@ def conclusion_request(
         "memory_kind": "profile_fact",
         "importance": importance,
         "source_type": "user_explicit",
+        "source": "hermes-session-conclusion",
     }
     if project_id:
         request["project_id"] = project_id

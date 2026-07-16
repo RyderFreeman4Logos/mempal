@@ -8,6 +8,7 @@ pub mod api;
 pub mod bench_matrix;
 pub mod bootstrap_events;
 pub mod brief;
+pub(crate) mod conclusion_kg;
 pub mod context;
 pub mod core;
 pub mod cowork;
