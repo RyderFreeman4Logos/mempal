@@ -257,7 +257,7 @@ fn cmd_runbook(format: &str) -> Result<()> {
     const STEPS: &[(&str, &str)] = &[
         (
             "Design-opportunity pass",
-            "For every non-trivial dev2merge/issue-drain issue, ask whether the user idea, review finding, incident, tool friction, or research result should become a durable artifact.",
+            "For every non-trivial dev2merge/issue-drain issue (post successful merge per assets/pr-bot/PATTERN.md step 12), ask whether the user idea, review finding, incident, tool friction, or research result should become a durable artifact.",
         ),
         (
             "Record",

@@ -26,6 +26,27 @@ created local files.
 9. **Continue loop** until `REVIEW_ROUND >= MAX_REVIEW_ROUNDS` (default 10).
 10. **Clean resubmission** if fixes accumulated.
 11. **Merge**: `gh pr merge --${MERGE_STRATEGY}`, sync local default branch.
+12. **Design-opportunity pass** (post-merge, only after successful merge): for non-trivial
+    `dev2merge` / `issue-drain` work, ask whether a reusable design insight should be
+    recorded. If yes, call:
+
+    ```
+    mempal insight record \
+      --source review-finding \
+      --scope issue \
+      --target github-issue \
+      --evidence <issue-or-session-ref> \
+      --summary <content-free-insight> \
+      --rule <acceptance-or-reusable-rule> \
+      --priority 4
+    ```
+
+    Summary and rule must be content-free (no secrets, no private repo paths that leak
+    credentials). If no reusable insight, explicitly note `no reusable insight` in the
+    agent closeout and skip `mempal insight record`. Drain later via
+    `mempal insight list --status open --min-priority 4` and
+    `mempal insight resolve <id> --actor <agent> --note <target-ref>` (see
+    `mempal insight runbook`).
 
 ## Path resolution contract
 
