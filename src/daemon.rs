@@ -1449,8 +1449,13 @@ fn validated_hook_payload_path(payload_path: &str, mempal_home: &Path) -> Result
     };
     let spool_root = fs::canonicalize(mempal_home.join(crate::hook::HOOK_SPOOL_DIR))
         .context("failed to canonicalize hook spool root")?;
-    let canonical_path = fs::canonicalize(&path)
-        .context("failed to canonicalize hook payload handle; path is missing or unreadable")?;
+    let canonical_path = fs::canonicalize(&path).map_err(|error| {
+        anyhow::Error::new(PayloadHandleMissing {
+            reason: format!(
+                "failed to canonicalize hook payload handle; path is missing or unreadable: {error}"
+            ),
+        })
+    })?;
     if !canonical_path.starts_with(&spool_root) {
         anyhow::bail!("hook payload handle escapes hook spool root");
     }
@@ -2013,6 +2018,9 @@ fn queue_failure_disposition(error: &anyhow::Error) -> QueueFailureDisposition {
         {
             return QueueFailureDisposition::Terminal;
         }
+        if cause.downcast_ref::<PayloadHandleMissing>().is_some() {
+            return QueueFailureDisposition::Terminal;
+        }
         if let Some(llm_error) = cause.downcast_ref::<LlmError>() {
             if !llm_error.is_retryable() {
                 return QueueFailureDisposition::Terminal;
@@ -2037,6 +2045,14 @@ fn queue_retry_delay_from_duration(duration: Duration) -> QueueFailureDispositio
 #[derive(Debug, thiserror::Error)]
 #[error("automatic hook LLM gate terminal failure: {reason}")]
 struct AutomaticHookLlmGateTerminalFailure {
+    reason: String,
+}
+
+/// Unrecoverable payload handle failure — the referenced file is missing or
+/// unreadable. Retrying cannot reconstruct the payload, so this must dead-letter.
+#[derive(Debug, thiserror::Error)]
+#[error("hook payload handle is missing or unreadable: {reason}")]
+struct PayloadHandleMissing {
     reason: String,
 }
 
@@ -3828,10 +3844,11 @@ mod tests {
         AutomaticHookLlmGateTerminalFailure, ClaimBackoffState, ClaimNextSource, ClaimPollResult,
         DaemonEmbedder, DaemonIngestContext, EndpointRecoveryConfigProvider,
         EndpointRecoveryRequeuePlan, EndpointRecoveryRequeueState, HookPayloadBody,
-        HookWorkerState, automatic_hook_llm_gate_deadline, build_drawer_records,
-        compile_classifier_from_embedder, llm_worker_claim_enabled, poll_claim_next,
-        process_claimed_message_with_embedder, queue_failure_disposition, request_shutdown,
-        reset_shutdown_request, run_hook_worker, wait_for_hook_worker_or_tick, wing_from_cwd,
+        HookWorkerState, PayloadHandleMissing, automatic_hook_llm_gate_deadline,
+        build_drawer_records, compile_classifier_from_embedder, llm_worker_claim_enabled,
+        poll_claim_next, process_claimed_message_with_embedder, queue_failure_disposition,
+        request_shutdown, reset_shutdown_request, run_hook_worker, wait_for_hook_worker_or_tick,
+        wing_from_cwd,
     };
 
     #[test]
@@ -3859,6 +3876,17 @@ mod tests {
 
         assert_eq!(
             queue_failure_disposition(&decode_error),
+            QueueFailureDisposition::Terminal
+        );
+    }
+
+    #[test]
+    fn queue_failure_disposition_dead_letters_missing_payload_handle() {
+        let error = anyhow::Error::new(PayloadHandleMissing {
+            reason: "file not found".to_string(),
+        });
+        assert_eq!(
+            queue_failure_disposition(&error),
             QueueFailureDisposition::Terminal
         );
     }

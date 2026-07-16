@@ -35,6 +35,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **Daemon/hooks**: missing or unreadable hook payload handles are now
+  dead-lettered as Terminal instead of retrying forever as
+  `invalid_queue_payload` (#721).
 - **install-from-source**: use `mise x rust@stable -- cargo` when mise is
   available, instead of raw `cargo` which requires a rustup default toolchain
   (#740).
