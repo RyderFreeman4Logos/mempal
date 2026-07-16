@@ -15,6 +15,7 @@ use crate::xurl::parser::{
         parse_hermes_jsonl_export,
     },
 };
+use crate::xurl::reconcile::{HermesReconcileScope, reconcile_hermes_snapshot};
 use crate::xurl::store;
 use crate::xurl::{XurlError, XurlResult};
 
@@ -34,6 +35,7 @@ pub struct IngestStats {
     pub turns_inserted: usize,
     pub turns_skipped: usize,
     pub turns_updated: usize,
+    pub turns_removed: usize,
     pub vectors_created: usize,
 }
 
@@ -139,7 +141,23 @@ fn parse_and_store_file(
         .unwrap_or("unknown")
         .to_string();
     let turns_parsed = turns.len();
-    let insert_stats = store::insert_turns(db.conn(), &turns)?;
+    let fallback_session_scope = (tool == Tool::Hermes
+        && !turns.is_empty()
+        && turns.iter().all(|turn| turn.session_id == fallback))
+    .then_some(fallback.as_str());
+    let insert_stats = if tool == Tool::Hermes {
+        reconcile_hermes_snapshot(
+            db.conn(),
+            &turns,
+            HermesReconcileScope {
+                profile: "default",
+                session_id: fallback_session_scope,
+                cwd: None,
+            },
+        )?
+    } else {
+        store::insert_turns(db.conn(), &turns)?
+    };
     let turn_ids = insert_stats.turn_ids.clone();
     Ok((filename, turns_parsed, insert_stats, turn_ids))
 }
@@ -154,7 +172,7 @@ fn parse_and_store_hermes_source(
         ));
     }
 
-    let (name, turns) = if let Some(path) = &options.export_jsonl {
+    let (name, turns, fallback_session_scope) = if let Some(path) = &options.export_jsonl {
         let parse_options = hermes_parse_options(options, "jsonl", path);
         let content = fs::read_to_string(path).map_err(XurlError::Io)?;
         let name = path
@@ -162,7 +180,11 @@ fn parse_and_store_hermes_source(
             .and_then(|value| value.to_str())
             .unwrap_or("hermes-export.jsonl")
             .to_string();
-        (name, parse_hermes_jsonl_export(&content, &parse_options)?)
+        (
+            name,
+            parse_hermes_jsonl_export(&content, &parse_options)?,
+            None,
+        )
     } else {
         let path = options.db_path.clone().unwrap_or_else(|| {
             default_hermes_db_path(&options.profile, options.hermes_home.as_deref())
@@ -173,11 +195,35 @@ fn parse_and_store_hermes_source(
             .and_then(|value| value.to_str())
             .unwrap_or("state.db")
             .to_string();
-        (name, parse_hermes_db_with_options(&path, &parse_options)?)
+        let turns = parse_hermes_db_with_options(&path, &parse_options)?;
+        // Legacy metadata-less databases use a source-scoped fallback session.
+        // Reconcile only that synthetic session so another source using the
+        // same profile is not treated as stale.
+        let fallback_session_scope = (!turns.is_empty()
+            && turns
+                .iter()
+                .all(|turn| turn.session_id == parse_options.fallback_session_id))
+        .then(|| parse_options.fallback_session_id.clone());
+        (name, turns, fallback_session_scope)
     };
 
     let turns_parsed = turns.len();
-    let insert_stats = store::insert_turns(db.conn(), &turns)?;
+    let insert_stats = if options.export_jsonl.is_some() {
+        store::insert_turns(db.conn(), &turns)?
+    } else {
+        reconcile_hermes_snapshot(
+            db.conn(),
+            &turns,
+            HermesReconcileScope {
+                profile: &options.profile,
+                session_id: options
+                    .session_id
+                    .as_deref()
+                    .or(fallback_session_scope.as_deref()),
+                cwd: options.cwd.as_deref(),
+            },
+        )?
+    };
     let turn_ids = insert_stats.turn_ids.clone();
     Ok((name, turns_parsed, insert_stats, turn_ids))
 }
@@ -309,6 +355,7 @@ pub async fn ingest_hermes_with_vector_fingerprint<E: Embedder + ?Sized>(
         turns_inserted: insert_stats.inserted,
         turns_skipped: insert_stats.skipped,
         turns_updated: insert_stats.updated,
+        turns_removed: insert_stats.removed,
         vectors_created: embed_stats.embedded,
     })
 }
@@ -356,6 +403,7 @@ async fn ingest_file_inner<E: Embedder + ?Sized>(
         turns_inserted: insert_stats.inserted,
         turns_skipped: insert_stats.skipped,
         turns_updated: insert_stats.updated,
+        turns_removed: insert_stats.removed,
         vectors_created: embed_stats.embedded,
     })
 }
@@ -416,6 +464,7 @@ async fn ingest_all_inner<E: Embedder + ?Sized>(
             total.turns_inserted += insert_stats.inserted;
             total.turns_skipped += insert_stats.skipped;
             total.turns_updated += insert_stats.updated;
+            total.turns_removed += insert_stats.removed;
             if let Some(f) = on_file_parsed {
                 f(&filename, turns_parsed);
             }
@@ -435,6 +484,7 @@ async fn ingest_all_inner<E: Embedder + ?Sized>(
                 total.turns_inserted += insert_stats.inserted;
                 total.turns_skipped += insert_stats.skipped;
                 total.turns_updated += insert_stats.updated;
+                total.turns_removed += insert_stats.removed;
                 if let Some(f) = on_file_parsed {
                     f(&filename, turns_parsed);
                 }
@@ -450,6 +500,7 @@ async fn ingest_all_inner<E: Embedder + ?Sized>(
             total.turns_inserted += insert_stats.inserted;
             total.turns_skipped += insert_stats.skipped;
             total.turns_updated += insert_stats.updated;
+            total.turns_removed += insert_stats.removed;
             if let Some(f) = on_file_parsed {
                 f(&filename, turns_parsed);
             }

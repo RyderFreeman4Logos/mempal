@@ -27,6 +27,7 @@ pub struct InsertStats {
     pub inserted: usize,
     pub skipped: usize,
     pub updated: usize,
+    pub removed: usize,
     pub turn_ids: Vec<String>,
 }
 

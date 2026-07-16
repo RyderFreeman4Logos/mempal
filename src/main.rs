@@ -14366,7 +14366,7 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                 println!("turns parsed:   {}", stats.turns_parsed);
                 println!("turns inserted: {}", stats.turns_inserted);
                 println!("turns skipped:  {}", stats.turns_skipped);
-                println!("turns updated:  {}", stats.turns_updated);
+                println!("turns +/-: {}/{}", stats.turns_updated, stats.turns_removed);
                 println!("vectors created:{}", stats.vectors_created);
             }
             Ok(())
@@ -14788,7 +14788,7 @@ async fn hermes_ingest_command(
         println!("turns parsed:   {}", stats.turns_parsed);
         println!("turns inserted: {}", stats.turns_inserted);
         println!("turns skipped:  {}", stats.turns_skipped);
-        println!("turns updated:  {}", stats.turns_updated);
+        println!("turns +/-: {}/{}", stats.turns_updated, stats.turns_removed);
         println!("vectors created:{}", stats.vectors_created);
     }
     Ok(())

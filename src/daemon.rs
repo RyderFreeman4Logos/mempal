@@ -1477,6 +1477,7 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
             turns_inserted = stats.turns_inserted,
             turns_skipped = stats.turns_skipped,
             turns_updated = stats.turns_updated,
+            turns_removed = stats.turns_removed,
             vectors_created = stats.vectors_created,
             "auto-ingested gated Hermes session turns"
         );
@@ -1788,10 +1789,7 @@ async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
     if kept_turns.is_empty() {
         return Ok(Some(crate::xurl::ingest::IngestStats {
             turns_parsed,
-            turns_inserted: 0,
-            turns_skipped: 0,
-            turns_updated: 0,
-            vectors_created: 0,
+            ..Default::default()
         }));
     }
 
@@ -1826,6 +1824,7 @@ async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
         turns_inserted: insert_stats.inserted,
         turns_skipped: insert_stats.skipped,
         turns_updated: insert_stats.updated,
+        turns_removed: 0,
         vectors_created,
     }))
 }
