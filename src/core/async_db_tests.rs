@@ -240,3 +240,68 @@ async fn deadline_anyhow_read_interrupts_sqlite_and_releases_reader() {
     .expect("recovery read");
     assert_eq!(recovery, 7);
 }
+
+#[tokio::test]
+async fn async_db_and_query_only_open_via_symlink_succeed() {
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let target_path = tempdir.path().join("target.db");
+    let link_path = tempdir.path().join("link.db");
+    Database::open(&target_path).expect("create target db");
+    symlink(&target_path, &link_path).expect("create symlink");
+
+    let adb = AsyncDb::open(&link_path, 2).expect("AsyncDb via symlink");
+    let expected = target_path.canonicalize().expect("target canon");
+    let value = adb
+        .run_read(move |db| {
+            assert_eq!(db.path().canonicalize().expect("canon"), expected);
+            Ok(db
+                .conn()
+                .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))?)
+        })
+        .await
+        .expect("read via admitted path");
+    assert_eq!(value, 1);
+
+    let qdb = QueryOnlyAsyncDb::open(&link_path, 2).expect("QueryOnlyAsyncDb via symlink");
+    let expected = target_path.canonicalize().expect("target canon");
+    let value = qdb
+        .run_read(move |db| {
+            assert_eq!(db.path().canonicalize().expect("canon"), expected);
+            Ok(db
+                .conn()
+                .query_row("SELECT 2", [], |row| row.get::<_, i64>(0))?)
+        })
+        .await
+        .expect("query-only read via admitted path");
+    assert_eq!(value, 2);
+}
+
+#[tokio::test]
+async fn async_db_symlink_retarget_does_not_divert_admitted_identity() {
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let target_a = tempdir.path().join("a.db");
+    let target_b = tempdir.path().join("b.db");
+    let link_path = tempdir.path().join("link.db");
+    Database::open(&target_a).expect("create a");
+    Database::open(&target_b).expect("create b");
+    symlink(&target_a, &link_path).expect("link to a");
+
+    let adb = AsyncDb::open(&link_path, 1).expect("open via symlink");
+    // Retarget the configured link after admission/open.
+    std::fs::remove_file(&link_path).expect("unlink");
+    symlink(&target_b, &link_path).expect("retarget to b");
+
+    let bound = adb
+        .run_read(|db| Ok(db.path().canonicalize().expect("canon")))
+        .await
+        .expect("read still works");
+    assert_eq!(
+        bound,
+        target_a.canonicalize().expect("a canon"),
+        "pools must stay bound to admitted identity a, not retargeted b"
+    );
+}

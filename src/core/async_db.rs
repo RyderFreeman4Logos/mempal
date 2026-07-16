@@ -203,8 +203,12 @@ impl AsyncDb {
                 (requested_mib as u64) * 1024 * 1024,
             ),
         )?;
-        let writer = ConnPool::open(path, 1, false)?;
-        let readers = ConnPool::open(path, n_read, true)?;
+        // Admission resolves identity (canonical path). Unadmitted pool opens must
+        // consume that resolved path only — never the original config path, which may
+        // be a symlink rejected by SQLITE_OPEN_NOFOLLOW / SymlinkDatabasePath.
+        let admitted_path = admission.database_path();
+        let writer = ConnPool::open(admitted_path, 1, false)?;
+        let readers = ConnPool::open(admitted_path, n_read, true)?;
         Ok(Self {
             readers: Arc::new(readers),
             writer: Arc::new(writer),
@@ -400,7 +404,9 @@ impl QueryOnlyAsyncDb {
             path,
             DbAdmissionRequest::new(holder_class, n_read, (requested_mib as u64) * 1024 * 1024),
         )?;
-        let readers = ConnPool::open(path, n_read, true)?;
+        // See AsyncDb::open_for — unadmitted pools open the admitted identity only.
+        let admitted_path = admission.database_path();
+        let readers = ConnPool::open(admitted_path, n_read, true)?;
         Ok(Self {
             readers: Arc::new(readers),
             _admission: Arc::new(admission),
