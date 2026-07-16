@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::Path;
 
 use rusqlite::types::ValueRef;
@@ -8,6 +7,9 @@ use serde_json::Value;
 use crate::xurl::model::{Provenance, RawTurn, Role, Tool, TurnMetadata};
 use crate::xurl::store::normalize_cwd_filter;
 use crate::xurl::{XurlError, XurlResult};
+
+mod query;
+use query::{SessionJoin, optional_text_expr, table_columns};
 
 const DEFAULT_PROFILE: &str = "default";
 
@@ -68,7 +70,7 @@ pub fn parse_hermes_db_with_options(
     )
     .map_err(|e| XurlError::Parse(format!("cannot open hermes db: {e}")))?;
 
-    let columns = table_columns(&conn, "messages")?;
+    let columns = table_columns(&conn, "messages", true)?;
     for required in ["role", "content", "timestamp"] {
         if !columns.contains(required) {
             return Err(XurlError::Parse(format!(
@@ -77,15 +79,19 @@ pub fn parse_hermes_db_with_options(
         }
     }
 
-    let meta = read_session_metadata(&conn);
-    let message_id_expr = optional_text_expr(&columns, &["message_id", "messageId", "id"]);
-    let session_id_expr = optional_text_expr(&columns, &["session_id", "sessionId"]);
-    let cwd_expr = optional_text_expr(&columns, &["cwd", "project_path", "project"]);
-    let tool_name_expr = optional_text_expr(&columns, &["tool_name", "toolName"]);
-    let tool_call_id_expr = optional_text_expr(&columns, &["tool_call_id", "toolCallId"]);
-    let title_expr = optional_text_expr(&columns, &["session_title", "title"]);
-    let source_expr = optional_text_expr(&columns, &["session_source", "source"]);
-    let id_order = if columns.contains("id") { ", id" } else { "" };
+    let meta = read_global_session_metadata(&conn);
+    let session_columns = table_columns(&conn, "sessions", false)?;
+    let SessionJoin {
+        clause: session_join,
+        cwd_expr,
+        title_expr,
+        source_expr,
+    } = SessionJoin::new(&columns, &session_columns);
+    let message_id_expr = optional_text_expr(&columns, &["message_id", "messageId", "id"], "m");
+    let session_id_expr = optional_text_expr(&columns, &["session_id", "sessionId"], "m");
+    let tool_name_expr = optional_text_expr(&columns, &["tool_name", "toolName"], "m");
+    let tool_call_id_expr = optional_text_expr(&columns, &["tool_call_id", "toolCallId"], "m");
+    let id_order = if columns.contains("id") { ", m.id" } else { "" };
 
     // Build the canonical state predicate: only import rows that are
     // active OR compacted. Rewound rows (both false) are non-canonical
@@ -99,7 +105,7 @@ pub fn parse_hermes_db_with_options(
     let has_active = columns.contains("active");
     let has_compacted = columns.contains("compacted");
     let state_predicate = match (has_active, has_compacted) {
-        (true, true) => "AND (active = 1 OR compacted = 1)",
+        (true, true) => "AND (m.active = 1 OR m.compacted = 1)",
         (false, false) => "",
         (active_only, _) => {
             let missing = if active_only { "compacted" } else { "active" };
@@ -111,11 +117,11 @@ pub fn parse_hermes_db_with_options(
     };
 
     let sql = format!(
-        "SELECT {message_id_expr}, role, content, timestamp, {session_id_expr}, \
+        "SELECT {message_id_expr}, m.role, m.content, m.timestamp, {session_id_expr}, \
          {cwd_expr}, {tool_name_expr}, {tool_call_id_expr}, {title_expr}, {source_expr} \
-         FROM messages \
-         WHERE role IN ('user', 'assistant') {state_predicate} \
-         ORDER BY timestamp{id_order}"
+         FROM messages AS m {session_join} \
+         WHERE m.role IN ('user', 'assistant') {state_predicate} \
+         ORDER BY m.timestamp{id_order}"
     );
 
     let mut stmt = conn
@@ -278,34 +284,6 @@ pub fn parse_hermes_jsonl_export(
     Ok(turns)
 }
 
-fn table_columns(conn: &Connection, table: &str) -> XurlResult<HashSet<String>> {
-    let mut stmt = conn
-        .prepare(&format!("PRAGMA table_info({table})"))
-        .map_err(XurlError::Database)?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(XurlError::Database)?;
-
-    let mut columns = HashSet::new();
-    for row in rows {
-        columns.insert(row.map_err(XurlError::Database)?);
-    }
-    if columns.is_empty() {
-        return Err(XurlError::Parse(format!(
-            "Hermes database is missing `{table}` table"
-        )));
-    }
-    Ok(columns)
-}
-
-fn optional_text_expr(columns: &HashSet<String>, candidates: &[&str]) -> String {
-    candidates
-        .iter()
-        .find(|candidate| columns.contains(**candidate))
-        .map(|column| format!("CAST({column} AS TEXT)"))
-        .unwrap_or_else(|| "NULL".to_string())
-}
-
 fn sql_text(row: &Row<'_>, idx: usize) -> XurlResult<Option<String>> {
     let value = match row.get_ref(idx).map_err(XurlError::Database)? {
         ValueRef::Null => None,
@@ -344,33 +322,25 @@ fn parse_epoch_text(value: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn read_session_metadata(conn: &Connection) -> SessionMetadata {
+fn read_global_session_metadata(conn: &Connection) -> SessionMetadata {
     SessionMetadata {
-        session_id: read_session_id(conn),
+        session_id: query_optional_text(
+            conn,
+            "SELECT value FROM metadata WHERE key = 'session_id' LIMIT 1",
+        ),
         title: query_optional_text(
             conn,
             "SELECT value FROM metadata WHERE key IN ('session_title', 'title') LIMIT 1",
-        )
-        .or_else(|| query_optional_text(conn, "SELECT title FROM sessions LIMIT 1"))
-        .or_else(|| query_optional_text(conn, "SELECT name FROM sessions LIMIT 1")),
+        ),
         source: query_optional_text(
             conn,
             "SELECT value FROM metadata WHERE key IN ('session_source', 'source') LIMIT 1",
-        )
-        .or_else(|| query_optional_text(conn, "SELECT source FROM sessions LIMIT 1")),
-        cwd: read_project_path(conn),
+        ),
+        cwd: query_optional_text(
+            conn,
+            "SELECT value FROM metadata WHERE key IN ('project_path', 'cwd', 'project') LIMIT 1",
+        ),
     }
-}
-
-/// Attempt to read a session ID from a `sessions` or `metadata` table.
-fn read_session_id(conn: &Connection) -> Option<String> {
-    query_optional_text(
-        conn,
-        "SELECT value FROM metadata WHERE key = 'session_id' LIMIT 1",
-    )
-    .or_else(|| query_optional_text(conn, "SELECT session_id FROM sessions LIMIT 1"))
-    .or_else(|| query_optional_text(conn, "SELECT id FROM sessions LIMIT 1"))
-    .or_else(|| query_optional_text(conn, "SELECT session_id FROM messages LIMIT 1"))
 }
 
 /// Attempt to read a project/cwd path from known Hermes metadata shapes.
