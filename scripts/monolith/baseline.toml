@@ -317,10 +317,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/main.rs"
 kind = "source"
-baseline_tokens = 257722
+baseline_tokens = 257734
 baseline_lines = 33347
-issue = "680"
-rationale = "Writer-lease generation fence paths recalibrated after #712 scoped deletes; no-growth ratchet."
+issue = "781"
+rationale = "Pre-existing ratchet drift reconciled for #781 to exact tokenizer and line output; no-growth ratchet."
 
 [[files]]
 path = "src/markdown_export.rs"
@@ -333,10 +333,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 173519
-baseline_lines = 21930
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt recalibrated after #680 lease-control fixes; no-growth ratchet."
+baseline_tokens = 174855
+baseline_lines = 22123
+issue = "781"
+rationale = "Pre-existing ratchet drift reconciled for #781 to exact tokenizer and line output; no-growth ratchet."
 
 [[files]]
 path = "src/mcp/tools.rs"
