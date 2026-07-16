@@ -31,6 +31,7 @@ pub mod field_taxonomy;
 pub mod hook;
 pub mod hook_diagnostics;
 pub mod hook_install;
+pub mod hook_payload;
 #[cfg(unix)]
 pub(crate) mod hook_ipc;
 pub mod hotpatch;
