@@ -50,11 +50,16 @@ impl fmt::Display for DbHolderClass {
 impl DbHolderClass {
     /// Infer the privacy-safe surface class without retaining command arguments.
     pub fn current_process() -> Self {
-        let mut args = std::env::args().skip(1).take(3);
-        match args.find(|arg| matches!(arg.as_str(), "daemon" | "serve" | "hook")) {
-            Some(command) if command == "daemon" => Self::Daemon,
-            Some(command) if command == "serve" => Self::Mcp,
-            Some(command) if command == "hook" => Self::Hook,
+        // Use args_os() to avoid panicking on non-UTF-8 argv, which is
+        // valid on Unix (e.g., non-UTF-8 file paths as CLI arguments).
+        let mut args = std::env::args_os().skip(1).take(3);
+        match args.find(|arg| {
+            arg.to_str()
+                .is_some_and(|s| matches!(s, "daemon" | "serve" | "hook"))
+        }) {
+            Some(command) if command.to_str() == Some("daemon") => Self::Daemon,
+            Some(command) if command.to_str() == Some("serve") => Self::Mcp,
+            Some(command) if command.to_str() == Some("hook") => Self::Hook,
             _ => Self::Cli,
         }
     }
