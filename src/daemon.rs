@@ -1478,12 +1478,18 @@ fn read_bounded_hook_payload_handle_from(reader: impl Read) -> Result<String> {
     reader
         .take(MAX_HOOK_HANDLE_READ_BYTES as u64)
         .read_to_string(&mut raw_payload)
-        .context("failed to read hook payload handle")?;
+        .map_err(|error| {
+            anyhow::Error::new(PayloadHandleMissing {
+                reason: format!("failed to read hook payload handle: {error}"),
+            })
+        })?;
     if raw_payload.len() > crate::hook::MAX_INLINE_PAYLOAD_BYTES {
-        anyhow::bail!(
-            "hook payload handle exceeds inline admission limit; raw body omitted (>= {} bytes)",
-            crate::hook::MAX_INLINE_PAYLOAD_BYTES
-        );
+        return Err(anyhow::Error::new(PayloadHandleMissing {
+            reason: format!(
+                "hook payload handle exceeds inline admission limit; raw body omitted (>= {} bytes)",
+                crate::hook::MAX_INLINE_PAYLOAD_BYTES
+            ),
+        }));
     }
     Ok(raw_payload)
 }
