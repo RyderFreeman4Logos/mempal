@@ -2271,7 +2271,13 @@ impl MempalMcpServer {
             .is_some();
         if let Some(peer) = peer
             && client_supports_roots
-            && let Ok(result) = peer.list_roots().await
+            // Roots is deprecated by SEP-2577; retain until rmcp ships a replacement.
+            && let Ok(result) = {
+                #[allow(deprecated)]
+                {
+                    peer.list_roots().await
+                }
+            }
             && let Some(project_id) = result
                 .roots
                 .into_iter()
