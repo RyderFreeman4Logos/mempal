@@ -1,5 +1,6 @@
 #![warn(clippy::all)]
 
+mod daemon_rest;
 mod ingest_payload;
 mod logging;
 mod resource_usage;

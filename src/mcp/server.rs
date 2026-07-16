@@ -3773,6 +3773,38 @@ struct IngestQueueAdmission {
     local_fallback_persisted_after_daemon_uncertainty: bool,
 }
 
+enum IngestAdmissionOutcome {
+    Queued(IngestQueueAdmission),
+    RestCompleted(Box<IngestResponse>),
+}
+
+enum IngestAdmissionError {
+    Queue(anyhow::Error),
+    Mcp(ErrorData),
+}
+
+impl From<anyhow::Error> for IngestAdmissionError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Queue(error)
+    }
+}
+
+fn daemon_rest_ingest_fallback_error(
+    error: &super::daemon_rest::DaemonRestIngestError,
+) -> ErrorData {
+    ErrorData::internal_error(
+        format!(
+            "SQLite writer lease `{SQLITE_WRITER_LEASE_NAME}` is held by the active mempal daemon. MCP tried the daemon hook IPC first, but it was unavailable; REST fallback failed: {error}. Restore the daemon hook socket, or install/run mempal with the `rest` feature and enable `api.enabled`."
+        ),
+        Some(serde_json::json!({
+            "kind": "writer_lease_conflict",
+            "lease": SQLITE_WRITER_LEASE_NAME,
+            "daemon_hook_ipc": "unavailable",
+            "rest_endpoint": error.endpoint(),
+        })),
+    )
+}
+
 #[doc(hidden)]
 pub struct IngestDrainWorkerHandle {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -6588,6 +6620,8 @@ impl MempalMcpServer {
         let project_id = self
             .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
             .await?;
+        let mut daemon_rest_request = request.clone();
+        daemon_rest_request.project_id = project_id.clone();
         let prepared = match tokio::time::timeout(
             self.ingest_admission_deadline,
             self.prepare_async_ingest_operation(
@@ -6613,9 +6647,18 @@ impl MempalMcpServer {
         let payload = serde_json::to_string(&prepared).map_err(|error| {
             ErrorData::internal_error(format!("failed to serialize ingest request: {error}"), None)
         })?;
-        let queue_admission = match self.enqueue_ingest_operation(payload).await {
+        let admission = match self
+            .enqueue_ingest_operation(
+                payload,
+                &daemon_rest_request,
+                &request_system_warnings,
+                matches!(worker_mode, IngestWaitWorkerMode::Background),
+            )
+            .await
+        {
             Ok(admission) => admission,
-            Err(error) => {
+            Err(IngestAdmissionError::Mcp(error)) => return Err(error),
+            Err(IngestAdmissionError::Queue(error)) => {
                 if let Some(error) = ingest_queue_byte_budget_error(&error) {
                     return Err(error);
                 }
@@ -6644,6 +6687,10 @@ impl MempalMcpServer {
                     None,
                 ));
             }
+        };
+        let queue_admission = match admission {
+            IngestAdmissionOutcome::Queued(admission) => admission,
+            IngestAdmissionOutcome::RestCompleted(response) => return Ok(Json(*response)),
         };
         let daemon_writer_lease_visible =
             if matches!(queue_admission.processor, IngestQueueProcessor::Local) {
@@ -6846,19 +6893,22 @@ impl MempalMcpServer {
     async fn enqueue_ingest_operation(
         &self,
         payload: String,
-    ) -> anyhow::Result<IngestQueueAdmission> {
+        daemon_rest_request: &IngestRequest,
+        request_system_warnings: &[SystemWarning],
+        allow_daemon_rest_fallback: bool,
+    ) -> std::result::Result<IngestAdmissionOutcome, IngestAdmissionError> {
         let idempotency_key = mcp_ingest_idempotency_key(&payload);
         let daemon_enqueue = self
             .try_enqueue_ingest_operation_via_daemon(payload.clone(), idempotency_key.clone())
             .await?;
         let daemon_enqueue_may_have_reached = match daemon_enqueue {
             DaemonIngestEnqueue::Accepted { operation_id } => {
-                return Ok(IngestQueueAdmission {
+                return Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
                     operation_id,
                     processor: IngestQueueProcessor::Daemon,
                     daemon_enqueue_may_have_reached: true,
                     local_fallback_persisted_after_daemon_uncertainty: false,
-                });
+                }));
             }
             DaemonIngestEnqueue::Fallback {
                 may_have_reached_daemon,
@@ -6871,53 +6921,79 @@ impl MempalMcpServer {
                 .daemon_admitted_operation_is_visible(&operation_id)
                 .await?
             {
-                return Ok(IngestQueueAdmission {
+                return Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
                     operation_id,
                     processor: IngestQueueProcessor::Daemon,
                     daemon_enqueue_may_have_reached,
                     local_fallback_persisted_after_daemon_uncertainty: false,
-                });
+                }));
             }
 
             return match self
                 .enqueue_ingest_operation_locally_with_retry(payload, idempotency_key)
                 .await
             {
-                Ok(operation_id) => Ok(IngestQueueAdmission {
+                Ok(operation_id) => Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
                     operation_id,
                     processor: IngestQueueProcessor::Local,
                     daemon_enqueue_may_have_reached,
                     local_fallback_persisted_after_daemon_uncertainty: true,
-                }),
+                })),
                 Err(error) if anyhow_chain_contains_sqlite_lock(&error) => {
                     if self
                         .daemon_admitted_operation_is_visible(&operation_id)
                         .await?
                     {
-                        return Ok(IngestQueueAdmission {
+                        return Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
                             operation_id,
                             processor: IngestQueueProcessor::Daemon,
                             daemon_enqueue_may_have_reached,
                             local_fallback_persisted_after_daemon_uncertainty: false,
-                        });
+                        }));
                     }
-                    Err(error.context(
+                    Err(IngestAdmissionError::Queue(error.context(
                         "SQLite queue admission remained locked and no durable daemon operation row became visible",
-                    ))
+                    )))
                 }
-                Err(error) => Err(error),
+                Err(error) => Err(IngestAdmissionError::Queue(error)),
             };
+        }
+
+        // REST is safe only after hook IPC proves the request was not delivered.
+        // The uncertain-delivery branch above must keep using its idempotent queue
+        // reconciliation path or a REST retry could create a duplicate drawer.
+        if allow_daemon_rest_fallback && self.daemon_writer_lease_visible_for_ingest_wait().await {
+            let config = self.status_config_snapshot();
+            let mut response = super::daemon_rest::ingest(
+                &config.api.addr,
+                daemon_rest_request,
+                self.ingest_admission_deadline,
+            )
+            .await
+            .map_err(|error| {
+                IngestAdmissionError::Mcp(daemon_rest_ingest_fallback_error(&error))
+            })?;
+            response.operation_id = None;
+            response.accepted_at = Some(crate::core::utils::iso_timestamp());
+            response.state = Some(IngestOperationState::Completed);
+            response.timed_out = false;
+            response.system_warnings = request_system_warnings.to_vec();
+            tracing::info!(
+                endpoint = %super::daemon_rest::ingest_endpoint(&config.api.addr),
+                "delegated MCP ingest to daemon REST after hook IPC was unavailable"
+            );
+            return Ok(IngestAdmissionOutcome::RestCompleted(Box::new(response)));
         }
 
         let operation_id = self
             .enqueue_ingest_operation_locally_with_retry(payload, idempotency_key.clone())
             .await?;
-        Ok(IngestQueueAdmission {
+        Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
             operation_id,
             processor: IngestQueueProcessor::Local,
             daemon_enqueue_may_have_reached,
             local_fallback_persisted_after_daemon_uncertainty: false,
-        })
+        }))
     }
 
     async fn enqueue_ingest_operation_locally_with_retry(
@@ -12612,6 +12688,24 @@ mod tests {
         (tempdir, db_path, server)
     }
 
+    fn setup_server_with_api_addr(api_addr: &str) -> (TempDir, PathBuf, MempalMcpServer) {
+        let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db fixture");
+        let config = Config::parse(&format!("[api]\naddr = {api_addr:?}\n"))
+            .expect("parse API endpoint config");
+        let server = MempalMcpServer::new_with_factory_and_config(
+            db_path.clone(),
+            config,
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+        .expect("create MCP server")
+        .with_async_db_for_test(async_db);
+        (tempdir, db_path, server)
+    }
+
     #[tokio::test]
     async fn test_mcp_content_mutation_rejects_takeover_after_preflight() {
         let (_tempdir, db_path, server) = setup_server();
@@ -14033,32 +14127,117 @@ quality_policy = "llm_required_for_keep"
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn test_mcp_ingest_wait_defers_local_admission_to_live_daemon_lease() {
-        let (_tempdir, db_path, server) = setup_server();
+    async fn test_mcp_ingest_falls_back_to_rest_under_live_daemon_lease() {
+        let mut rest_server = mockito::Server::new_async().await;
+        let rest_mock = rest_server
+            .mock("POST", "/api/ingest")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "content": "REST fallback under daemon writer lease",
+                "wing": "mcp",
+                "room": "busy",
+                "project_id": "project-rest-fallback"
+            })))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "drawer_id": "rest-fallback-drawer",
+                    "drawer_ids": ["rest-fallback-drawer"],
+                    "created_drawer_ids": ["rest-fallback-drawer"],
+                    "cleanup_drawer_ids": ["rest-fallback-drawer"],
+                    "chunk_count": 1,
+                    "dropped": false,
+                    "fact_check_warnings": []
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let (_tempdir, db_path, server) = setup_server_with_api_addr(&rest_server.url());
         let daemon_lease = hold_daemon_writer_lease(&db_path);
 
         let response = server
             .mempal_ingest(Parameters(IngestRequest {
-                content: "local fallback under daemon lease must not self-claim".to_string(),
+                content: "REST fallback under daemon writer lease".to_string(),
                 wing: "mcp".to_string(),
                 room: Some("busy".to_string()),
-                wait: Some(true),
-                wait_timeout_secs: Some(1),
+                project_id: Some("project-rest-fallback".to_string()),
+                wait: Some(false),
                 ..IngestRequest::default()
             }))
             .await
-            .expect("wait should return a receipt instead of locally processing under daemon lease")
+            .expect("MCP ingest should fall back to the daemon REST API")
             .0;
 
-        assert_eq!(response.state, Some(IngestOperationState::Queued));
-        assert!(response.timed_out);
-        assert!(response.created_drawer_ids.is_empty());
-        let operation_id = response.operation_id.as_deref().expect("operation id");
-        let record = PendingMessageStore::new_without_reclaim(&db_path)
-            .operation_status(operation_id)
-            .expect("query queued operation")
-            .expect("queued operation");
-        assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
+        rest_mock.assert_async().await;
+        assert_eq!(response.state, Some(IngestOperationState::Completed));
+        assert!(!response.timed_out);
+        assert_eq!(
+            response.created_drawer_ids,
+            vec!["rest-fallback-drawer".to_string()]
+        );
+        let stats = PendingMessageStore::new_without_reclaim(&db_path)
+            .stats()
+            .expect("query local queue stats");
+        assert_eq!(stats.pending, 0, "REST fallback must not strand a local op");
+        release_test_ingest_writer_lease(&db_path, &daemon_lease);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_mcp_ingest_reports_clear_error_when_daemon_rest_fallback_is_unavailable() {
+        let mut rest_server = mockito::Server::new_async().await;
+        let rest_mock = rest_server
+            .mock("POST", "/api/ingest")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"REST write service unavailable"}"#)
+            .create_async()
+            .await;
+        let (_tempdir, db_path, server) = setup_server_with_api_addr(&rest_server.url());
+        let daemon_lease = hold_daemon_writer_lease(&db_path);
+
+        let error = match server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "writer lease fallback should explain REST failure".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("busy".to_string()),
+                wait: Some(false),
+                ..IngestRequest::default()
+            }))
+            .await
+        {
+            Ok(_) => panic!("unavailable daemon REST fallback must be reported clearly"),
+            Err(error) => error,
+        };
+
+        rest_mock.assert_async().await;
+        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+        assert!(
+            error
+                .message
+                .contains("SQLite writer lease `sqlite-writer`")
+                && error.message.contains("daemon hook IPC")
+                && error.message.contains("REST fallback")
+                && error.message.contains("503"),
+            "error must identify the lease conflict and both daemon write paths: {error:?}"
+        );
+        let error_data = error
+            .data
+            .expect("machine-readable writer lease error data");
+        assert_eq!(error_data["kind"], "writer_lease_conflict");
+        assert_eq!(error_data["daemon_hook_ipc"], "unavailable");
+        assert_eq!(
+            error_data["rest_endpoint"],
+            format!("{}/api/ingest", rest_server.url())
+        );
+        let stats = PendingMessageStore::new_without_reclaim(&db_path)
+            .stats()
+            .expect("query local queue stats");
+        assert_eq!(
+            stats.pending, 0,
+            "failed fallback must not strand a local op"
+        );
         release_test_ingest_writer_lease(&db_path, &daemon_lease);
     }
 
