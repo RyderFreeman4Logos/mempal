@@ -157,10 +157,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/core/config.rs"
 kind = "source"
-baseline_tokens = 28956
-baseline_lines = 3688
+baseline_tokens = 29018
+baseline_lines = 3693
 issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+rationale = "Pre-existing tracked-text monolith debt recalibrated after #677 config growth; no-growth ratchet."
 
 [[files]]
 path = "src/core/db.rs"
@@ -245,10 +245,10 @@ rationale = "Writer-lease fenced crystallization writes; #680 correctness fix"
 [[files]]
 path = "src/daemon.rs"
 kind = "source"
-baseline_tokens = 52995
-baseline_lines = 6612
+baseline_tokens = 52563
+baseline_lines = 6651
 issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+rationale = "Pre-existing tracked-text monolith debt recalibrated after #721 payload handling; no-growth ratchet."
 
 [[files]]
 path = "src/daemon_bootstrap.rs"
@@ -317,10 +317,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/main.rs"
 kind = "source"
-baseline_tokens = 257470
-baseline_lines = 33308
+baseline_tokens = 257722
+baseline_lines = 33347
 issue = "680"
-rationale = "Writer-lease generation fence conversion of deep maintenance paths; #680 correctness fix"
+rationale = "Writer-lease generation fence paths recalibrated after #712 scoped deletes; no-growth ratchet."
 
 [[files]]
 path = "src/markdown_export.rs"
@@ -333,10 +333,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 173690
-baseline_lines = 21929
+baseline_tokens = 173519
+baseline_lines = 21930
 issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+rationale = "Pre-existing tracked-text monolith debt recalibrated after #680 lease-control fixes; no-growth ratchet."
 
 [[files]]
 path = "src/mcp/tools.rs"
@@ -397,10 +397,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/xurl/parser/hermes.rs"
 kind = "source"
-baseline_tokens = 7238
-baseline_lines = 852
+baseline_tokens = 8359
+baseline_lines = 971
 issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+rationale = "Pre-existing tracked-text monolith debt recalibrated after #741 schema validation; no-growth ratchet."
 
 [[files]]
 path = "src/xurl/store.rs"

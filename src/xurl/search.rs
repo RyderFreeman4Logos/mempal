@@ -27,6 +27,8 @@ use crate::embed::Embedder;
 use crate::xurl::store::{TurnFilter, push_filter_conditions};
 use crate::xurl::{XurlError, XurlResult};
 
+const MAX_XURL_SEARCH_CANDIDATES: usize = 500;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
     pub turn_id: String,
@@ -104,10 +106,11 @@ pub struct SearchOptions {
     pub remote_call_policy: RemoteCallPolicyConfig,
 }
 
-/// Semantic search over `conversation_turn_vectors` using brute-force cosine similarity.
+/// Semantic search over a bounded set of `conversation_turn_vectors` using brute-force cosine
+/// similarity.
 ///
-/// The query is embedded via `embedder`, then every stored vector is scored.
-/// Multi-chunk turns are deduplicated by keeping the best-scoring chunk.
+/// The query is embedded via `embedder`, then up to [`MAX_XURL_SEARCH_CANDIDATES`] matching
+/// vectors are scored. Multi-chunk turns are deduplicated by keeping the best-scoring chunk.
 /// Identical-content turns are deduplicated, keeping the highest-scored representative.
 /// Default filtering excludes CSA-delegated turns and non-human-provenance turns.
 ///
@@ -185,7 +188,8 @@ pub async fn search<E: Embedder + ?Sized>(
          ct.tool_name, ct.tool_call_id, ct.previous_message_id, ct.next_message_id \
          FROM conversation_turn_vectors ctv \
          JOIN conversation_turns ct ON ct.id = ctv.turn_id \
-         {where_clause}"
+         {where_clause} \
+         LIMIT {MAX_XURL_SEARCH_CANDIDATES}"
     );
 
     struct VectorRow {
@@ -487,4 +491,75 @@ pub fn format_hits_markdown(result: &SearchResult) -> String {
 /// Print search hits in markdown format to stdout.
 pub fn print_hits_markdown(result: &SearchResult) {
     print!("{}", format_hits_markdown(result));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xurl::model::{Provenance, RawTurn, Role, Tool, TurnMetadata};
+    use crate::xurl::store;
+
+    struct FixedEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for FixedEmbedder {
+        async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+
+        fn name(&self) -> &str {
+            "fixed"
+        }
+    }
+
+    #[tokio::test]
+    async fn xurl_search_bounds_materialized_vector_candidates() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tempdir.path().join("palace.db")).expect("open database");
+        let turns = (0..501)
+            .map(|turn_index| RawTurn {
+                session_id: "bounded-search".to_string(),
+                tool: Tool::Cc,
+                role: Role::User,
+                content: format!("unique candidate {turn_index}"),
+                timestamp_epoch: 1_748_000_000.0 + f64::from(turn_index),
+                project_path: None,
+                git_branch: None,
+                is_csa_delegated: false,
+                provenance: Provenance::Human,
+                turn_index,
+                metadata: TurnMetadata::default(),
+            })
+            .collect::<Vec<_>>();
+        store::insert_turns(db.conn(), &turns).expect("insert turns");
+
+        let mut vector = Vec::new();
+        vector.extend_from_slice(&1.0_f32.to_le_bytes());
+        vector.extend_from_slice(&0.0_f32.to_le_bytes());
+        db.conn()
+            .execute(
+                "INSERT INTO conversation_turn_vectors (turn_id, chunk_index, vector) \
+                 SELECT id, 0, ?1 FROM conversation_turns",
+                rusqlite::params![vector],
+            )
+            .expect("insert vectors");
+
+        let result = search(
+            &db,
+            &FixedEmbedder,
+            "query",
+            SearchOptions {
+                limit: 501,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+
+        assert_eq!(result.total_candidates, 500);
+    }
 }
