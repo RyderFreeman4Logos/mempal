@@ -3599,6 +3599,27 @@ impl Database {
         Ok(affected > 0)
     }
 
+    pub fn soft_delete_drawer_in_project(
+        &self,
+        drawer_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let timestamp = super::utils::current_timestamp();
+        let affected = match project_id {
+            Some(project_id) => self.conn.execute(
+                "UPDATE drawers SET deleted_at = ?1
+                 WHERE id = ?2 AND project_id = ?3 AND deleted_at IS NULL",
+                params![timestamp, drawer_id, project_id],
+            )?,
+            None => self.conn.execute(
+                "UPDATE drawers SET deleted_at = ?1
+                 WHERE id = ?2 AND project_id IS NULL AND deleted_at IS NULL",
+                params![timestamp, drawer_id],
+            )?,
+        };
+        Ok(affected > 0)
+    }
+
     pub fn soft_delete_drawers_by_ids(&self, drawer_ids: &[String]) -> Result<usize, DbError> {
         let timestamp = super::utils::current_timestamp();
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
