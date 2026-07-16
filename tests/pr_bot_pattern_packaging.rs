@@ -36,6 +36,39 @@ fn pr_bot_pattern_is_tracked_and_resolvable_from_fresh_tree() {
 }
 
 #[test]
+fn pr_bot_post_merge_records_reusable_design_insights() {
+    let body = std::fs::read_to_string(pattern_path()).expect("read PATTERN.md");
+    let merge_step = body
+        .find("**Merge**")
+        .expect("tracked PATTERN must include the merge step");
+    let insight_step = body
+        .find("**Design-opportunity pass**")
+        .expect("tracked PATTERN must include the post-merge design-opportunity pass");
+
+    assert!(
+        insight_step > merge_step,
+        "design insights must be recorded only after a successful merge"
+    );
+    for required in [
+        "dev2merge",
+        "issue-drain",
+        "mempal insight record",
+        "--source",
+        "--scope",
+        "--target",
+        "--evidence",
+        "--summary",
+        "content-free",
+        "no reusable insight",
+    ] {
+        assert!(
+            body.contains(required),
+            "post-merge insight contract is missing {required:?}"
+        );
+    }
+}
+
+#[test]
 fn pr_bot_readme_documents_canonical_path() {
     let readme = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/pr-bot/README.md");
     assert!(readme.is_file(), "missing {}", readme.display());
