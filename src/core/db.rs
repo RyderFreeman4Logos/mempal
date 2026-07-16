@@ -355,6 +355,12 @@ pub enum DbError {
         #[source]
         source: std::io::Error,
     },
+    /// Unadmitted opens (lease-control / helpers) must not follow database symlinks.
+    /// Callers should pass the canonical path from an admitted [`Database::path`].
+    #[error(
+        "symlink database path rejected for unadmitted open: {path}; use the canonical path from Database::path() after admitted open"
+    )]
+    SymlinkDatabasePath { path: PathBuf },
     #[error("failed to read database metadata for {path}")]
     Metadata {
         path: PathBuf,

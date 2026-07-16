@@ -74,6 +74,20 @@ impl Database {
                 )
             })
             .transpose()?;
+        // Admitted opens use the admission-resolved path. Unadmitted opens
+        // (lease-control) must open a non-symlink path: either a real file or
+        // the canonical path returned by Database::path() after admitted open.
+        // Reject caller-provided symlinks fail-closed before SQLite open.
+        if !admitted
+            && path
+                .symlink_metadata()
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(false)
+        {
+            return Err(DbError::SymlinkDatabasePath {
+                path: path.to_path_buf(),
+            });
+        }
         let sqlite_path = admission.as_ref().map_or_else(
             || path.to_path_buf(),
             |guard| guard.database_path().to_path_buf(),
@@ -213,9 +227,51 @@ mod tests {
         Connection::open(&target_path).expect("create target database");
         symlink(&target_path, &link_path).expect("create database symlink");
 
+        let err = match Database::open_unadmitted(&link_path) {
+            Ok(_) => panic!("unadmitted open must reject symlink"),
+            Err(error) => error,
+        };
         assert!(
-            Database::open_unadmitted(&link_path).is_err(),
-            "SQLite open must reject a caller-provided database symlink"
+            matches!(err, DbError::SymlinkDatabasePath { .. }),
+            "expected SymlinkDatabasePath, got {err}"
         );
+    }
+
+    #[test]
+    fn db_open_lease_control_rejects_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let target_path = tempdir.path().join("target.db");
+        let link_path = tempdir.path().join("link.db");
+        Connection::open(&target_path).expect("create target database");
+        symlink(&target_path, &link_path).expect("create database symlink");
+
+        let err = match Database::open_lease_control(&link_path) {
+            Ok(_) => panic!("lease-control open must reject symlink"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(err, DbError::SymlinkDatabasePath { .. }),
+            "expected SymlinkDatabasePath, got {err}"
+        );
+    }
+
+    #[test]
+    fn db_open_lease_control_accepts_canonical_path_from_admitted_open() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let target_path = tempdir.path().join("target.db");
+        let link_path = tempdir.path().join("link.db");
+        Connection::open(&target_path).expect("create target database");
+        symlink(&target_path, &link_path).expect("create database symlink");
+
+        let admitted = Database::open(&link_path).expect("admitted open via symlink");
+        let canonical = admitted.path().to_path_buf();
+        drop(admitted);
+
+        Database::open_lease_control(&canonical)
+            .expect("lease-control must accept canonical path from Database::path()");
     }
 }
