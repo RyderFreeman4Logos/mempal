@@ -35,6 +35,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **install-from-source**: use `mise x rust@stable -- cargo` when mise is
+  available, instead of raw `cargo` which requires a rustup default toolchain
+  (#740).
 - **DB admission**: enforce process-wide SQLite holder and page-cache budgets
   with cgroup-aware memory pressure diagnostics, canonical database file
   identity (symlink/hardlink rejection), PID-namespace-safe tri-state process
