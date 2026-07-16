@@ -6,7 +6,7 @@ use crate::core::{
     db::Database,
     types::{
         KnowledgeCard, KnowledgeCardEvent, KnowledgeEventType, KnowledgeEvidenceLink,
-        KnowledgeEvidenceRole, KnowledgeStatus, KnowledgeTier, MemoryKind,
+        KnowledgeEvidenceRole, KnowledgeStatus, KnowledgeTier, MemoryKind, RuntimeWriterLease,
     },
     utils::current_timestamp,
 };
@@ -96,6 +96,15 @@ pub fn evaluate_card_gate_by_id(
 }
 
 pub fn promote_card(db: &Database, request: PromoteCardRequest) -> Result<PromoteCardOutcome> {
+    promote_card_with_runtime_writer_lease(db, None, "apply knowledge card promotion", request)
+}
+
+pub fn promote_card_with_runtime_writer_lease(
+    db: &Database,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
+    operation: &'static str,
+    request: PromoteCardRequest,
+) -> Result<PromoteCardOutcome> {
     let target_status = parse_status(&request.status)?;
     if !matches!(
         target_status,
@@ -141,6 +150,8 @@ pub fn promote_card(db: &Database, request: PromoteCardRequest) -> Result<Promot
     card.updated_at = current_timestamp();
     apply_card_lifecycle(
         db,
+        runtime_writer_lease,
+        operation,
         &card,
         CardLifecycleMutation {
             old_status: old_status.clone(),
@@ -171,6 +182,15 @@ pub fn promote_card(db: &Database, request: PromoteCardRequest) -> Result<Promot
 }
 
 pub fn demote_card(db: &Database, request: DemoteCardRequest) -> Result<DemoteCardOutcome> {
+    demote_card_with_runtime_writer_lease(db, None, "apply knowledge card demotion", request)
+}
+
+pub fn demote_card_with_runtime_writer_lease(
+    db: &Database,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
+    operation: &'static str,
+    request: DemoteCardRequest,
+) -> Result<DemoteCardOutcome> {
     let target_status = parse_status(&request.status)?;
     if !matches!(
         target_status,
@@ -201,6 +221,8 @@ pub fn demote_card(db: &Database, request: DemoteCardRequest) -> Result<DemoteCa
     };
     apply_card_lifecycle(
         db,
+        runtime_writer_lease,
+        operation,
         &card,
         CardLifecycleMutation {
             old_status: old_status.clone(),
@@ -295,11 +317,12 @@ fn evaluate_card_gate(
 
 fn apply_card_lifecycle(
     db: &Database,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
+    operation: &'static str,
     card: &KnowledgeCard,
     mutation: CardLifecycleMutation,
 ) -> Result<()> {
-    db.conn().execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-    let result = (|| {
+    db.with_runtime_writer_lease_write(runtime_writer_lease, operation, || {
         for evidence_drawer_id in &mutation.new_refs {
             let link = KnowledgeEvidenceLink {
                 id: deterministic_link_id(&card.id, evidence_drawer_id, &mutation.link_role),
@@ -328,18 +351,7 @@ fn apply_card_lifecycle(
         db.append_knowledge_event(&event)
             .context("failed to append knowledge card event")?;
         Ok(())
-    })();
-
-    match result {
-        Ok(()) => {
-            db.conn().execute_batch("COMMIT")?;
-            Ok(())
-        }
-        Err(error) => {
-            let _ = db.conn().execute_batch("ROLLBACK");
-            Err(error)
-        }
-    }
+    })
 }
 
 fn evidence_counts(db: &Database, card_id: &str) -> Result<GateEvidenceCounts> {
