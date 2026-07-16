@@ -170,6 +170,7 @@ struct AdmissionState {
 
 #[derive(Debug)]
 pub struct ProfileDbAdmission {
+    database_path: PathBuf,
     state_path: PathBuf,
     lock_path: PathBuf,
     owner_identity: String,
@@ -235,6 +236,7 @@ impl ProfileDbAdmission {
         save_state(&paths.state_path, &state)?;
 
         Ok(Self {
+            database_path: paths.database_path,
             state_path: paths.state_path,
             lock_path: paths.lock_path,
             owner_identity,
@@ -278,6 +280,11 @@ impl ProfileDbAdmission {
 
     pub fn owner_identity(&self) -> &str {
         &self.owner_identity
+    }
+
+    /// The resolved database path whose identity this admission accounts for.
+    pub fn database_path(&self) -> &Path {
+        &self.database_path
     }
 
     fn release(&self) -> Result<bool, DbAdmissionError> {
@@ -352,6 +359,7 @@ fn validate_request(
 }
 
 struct AdmissionPaths {
+    database_path: PathBuf,
     state_path: PathBuf,
     lock_path: PathBuf,
 }
@@ -376,7 +384,7 @@ impl AdmissionPaths {
             ))?;
 
         let full_path = parent.join(lexical_name);
-        let (sidecar_dir, sidecar_name) = match fs::canonicalize(&full_path) {
+        let (database_path, sidecar_dir, sidecar_name) = match fs::canonicalize(&full_path) {
             Ok(canonical) => {
                 // Reject hard-linked databases: each link would get an
                 // independent admission budget, and SQLite WAL/shm files
@@ -399,13 +407,15 @@ impl AdmissionPaths {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .filter(|n| !n.is_empty())
-                    .unwrap_or(lexical_name);
-                (dir, name.to_string())
+                    .unwrap_or(lexical_name)
+                    .to_string();
+                (canonical, dir, name)
             }
-            Err(_) => (parent, lexical_name.to_string()),
+            Err(_) => (full_path, parent, lexical_name.to_string()),
         };
 
         Ok(Self {
+            database_path,
             state_path: sidecar_dir.join(format!(".{sidecar_name}.admission.json")),
             lock_path: sidecar_dir.join(format!(".{sidecar_name}.admission.lock")),
         })

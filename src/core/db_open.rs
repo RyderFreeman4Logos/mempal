@@ -74,8 +74,12 @@ impl Database {
                 )
             })
             .transpose()?;
+        let sqlite_path = admission.as_ref().map_or_else(
+            || path.to_path_buf(),
+            |guard| guard.database_path().to_path_buf(),
+        );
         if mode.allows_write() {
-            if let Some(parent) = path
+            if let Some(parent) = sqlite_path
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
             {
@@ -88,13 +92,18 @@ impl Database {
 
         register_sqlite_vec()?;
         let conn = match mode {
-            OpenMode::ReadOnly => {
-                Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?
-            }
-            OpenMode::QueryOnly => {
-                Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?
-            }
-            OpenMode::ReadWrite => Connection::open(path)?,
+            OpenMode::ReadOnly => Connection::open_with_flags(
+                &sqlite_path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?,
+            OpenMode::QueryOnly => Connection::open_with_flags(
+                &sqlite_path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?,
+            OpenMode::ReadWrite => Connection::open_with_flags(
+                &sqlite_path,
+                OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?,
         };
         conn.busy_timeout(busy_timeout)?;
         conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_DEFAULT)?;
@@ -111,7 +120,7 @@ impl Database {
         }
         Ok(Self {
             conn,
-            path: path.to_path_buf(),
+            path: sqlite_path,
             _admission: admission,
         })
     }
@@ -128,7 +137,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::db_admission::ProfileDbAdmission;
+    use crate::core::db_admission::{DbAdmissionRequest, DbHolderClass, ProfileDbAdmission};
 
     #[test]
     fn db_admission_lease_control_opens_do_not_acquire_profile_admission() {
@@ -146,5 +155,67 @@ mod tests {
         let after = ProfileDbAdmission::snapshot(&db_path).expect("snapshot after lease control");
         assert_eq!(after.active_holders, before.active_holders);
         assert_eq!(after.holders, before.holders);
+    }
+
+    #[test]
+    fn db_admission_canonical_path_survives_symbolic_link_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let first_target = tempdir.path().join("first.db");
+        let second_target = tempdir.path().join("second.db");
+        let link_path = tempdir.path().join("link.db");
+        Connection::open(&first_target).expect("create first target database");
+        Connection::open(&second_target).expect("create second target database");
+        symlink(&first_target, &link_path).expect("create first database symlink");
+        let admitted_path = first_target
+            .canonicalize()
+            .expect("canonical first target database path");
+
+        let admission = ProfileDbAdmission::acquire(
+            &link_path,
+            DbAdmissionRequest::new(DbHolderClass::Cli, 1, 1024),
+        )
+        .expect("admit first symlink target");
+        fs::remove_file(&link_path).expect("remove first database symlink");
+        symlink(&second_target, &link_path).expect("retarget database symlink");
+
+        assert_eq!(admission.database_path(), admitted_path);
+    }
+
+    #[test]
+    fn db_open_admitted_uses_canonical_path_for_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let target_path = tempdir.path().join("target.db");
+        let link_path = tempdir.path().join("link.db");
+        Connection::open(&target_path).expect("create target database");
+        symlink(&target_path, &link_path).expect("create database symlink");
+
+        let database = Database::open(&link_path).expect("open admitted canonical database path");
+
+        assert_eq!(
+            database.path(),
+            target_path
+                .canonicalize()
+                .expect("canonical target database path")
+        );
+    }
+
+    #[test]
+    fn db_open_unadmitted_rejects_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let target_path = tempdir.path().join("target.db");
+        let link_path = tempdir.path().join("link.db");
+        Connection::open(&target_path).expect("create target database");
+        symlink(&target_path, &link_path).expect("create database symlink");
+
+        assert!(
+            Database::open_unadmitted(&link_path).is_err(),
+            "SQLite open must reject a caller-provided database symlink"
+        );
     }
 }
