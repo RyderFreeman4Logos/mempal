@@ -184,6 +184,7 @@ Daemon low-memory mode:
 - After changing backend/model/dimensions, run `mempal reindex`, then `mempal daemon restart`.
 - On Linux, after starting or restarting a service, use `mempal daemon wait --timeout-secs 10` before sending writes; it verifies the singleton, current executable, and write IPC transport.
 - `mempal daemon status` and `mempal doctor` report daemon RSS/PSS, whether the daemon executable is deleted/replaced, and whether the daemon embedder cache is loaded.
+- For 24/7 operation, `[sleep] auto_interval_secs = 86400` enables daemon-owned consolidation; `0` keeps it disabled, and `phases` selects `nrem`, `rem`, and/or `salience`.
 
 ## Commands
 

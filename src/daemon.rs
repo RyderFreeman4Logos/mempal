@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::{future::Future, pin::Pin};
 
 use crate::bootstrap_events::BootstrapEvent;
@@ -52,25 +52,27 @@ use crate::session_review::{
 
 #[path = "daemon/self_heal.rs"]
 mod self_heal;
+mod sleep_scheduler;
+mod writer_lease;
 use self_heal::ClaimBackoffState;
+#[cfg(test)]
+use writer_lease::SQLITE_WRITER_LEASE_NAME;
+use writer_lease::{RuntimeWriterLeaseHandle, acquire_daemon_writer_lease};
 
 const SESSION_REVIEW_REJECTED_TOTAL_KEY: &str = "session_review.rejected.total";
 
 /// Budget given to LLM workers to finish in-flight tasks during graceful shutdown.
 /// Coupled to the orphan reaper grace period in `src/main.rs`.
 pub const DAEMON_DRAIN_BUDGET: Duration = Duration::from_secs(30);
+/// Final budget for Tokio blocking tasks after component-level drains finish.
+/// `spawn_blocking` tasks cannot be aborted, so runtime teardown must be bounded.
+const DAEMON_BLOCKING_TASK_DRAIN_BUDGET: Duration = Duration::from_secs(1);
 const DAEMON_HOOK_WORKER_LIMIT: usize = 4;
 const MAX_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const ENDPOINT_RECOVERY_REQUEUE_INTERVAL: Duration = Duration::from_secs(30);
 const AUTOMATIC_HOOK_LLM_GATE_MAX_SECS: u64 = 30;
 const MAX_AUTOMATIC_HOOK_LLM_GATE_CONTENT_BYTES: usize = 16 * 1024;
 const MAX_HOOK_HANDLE_READ_BYTES: usize = crate::hook::MAX_INLINE_PAYLOAD_BYTES + 1;
-const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
-const DAEMON_WRITER_LEASE_TTL_SECS: u64 = 120;
-const DAEMON_WRITER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
-const DAEMON_WRITER_LEASE_RENEW_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
-const DAEMON_WRITER_LEASE_RENEW_RETRY_DEADLINE: Duration = Duration::from_secs(5);
-const DAEMON_WRITER_LEASE_RENEW_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 pub fn run_command(config_path: PathBuf, foreground: bool) -> Result<()> {
     run_command_with_bootstrap_events(config_path, foreground, None)
@@ -82,7 +84,7 @@ pub fn run_command_with_bootstrap_events(
     bootstrap_events: Option<mpsc::Sender<BootstrapEvent>>,
 ) -> Result<()> {
     // harness-point: PR0
-    let context =
+    let mut context =
         match DaemonContext::bootstrap_with_events(config_path, foreground, bootstrap_events) {
             Ok(context) => context,
             // A concurrent daemon already holds the singleton lock (#496):
@@ -93,7 +95,13 @@ pub fn run_command_with_bootstrap_events(
             }
             Err(error) => return Err(error),
         };
-    context.runtime.block_on(run_loop(&context))
+    let runtime = context
+        .runtime
+        .take()
+        .context("daemon runtime was already consumed")?;
+    let result = runtime.block_on(run_loop(&context));
+    runtime.shutdown_timeout(DAEMON_BLOCKING_TASK_DRAIN_BUDGET);
+    result
 }
 
 async fn run_loop(context: &DaemonContext) -> Result<()> {
@@ -199,17 +207,34 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     } else {
         None
     };
+    let sleep_scheduler_handle = sleep_scheduler::spawn(
+        db_path.clone(),
+        Arc::clone(&context.config),
+        writer_lease.lease().clone(),
+    )
+    .context("invalid daemon embedded sleep scheduler configuration")?;
+
+    let sleep_scheduler_enabled = sleep_scheduler_handle.is_some();
 
     if !context.config.hooks.enabled {
         recovery
             .record_recovered()
             .context("failed to mark daemon recovery complete")?;
-        eprintln!("hooks not enabled; daemon running REST API only (no worker loop)");
-        // Keep the process alive for the REST server.
-        #[cfg(feature = "rest")]
-        if let Some(task) = _rest_task {
-            let _ = task.await;
+        eprintln!("hooks not enabled; daemon running configured background services only");
+        if sleep_scheduler_enabled {
+            while !shutdown_requested() {
+                wait_for_shutdown_or_sleep(Duration::from_secs(3600)).await;
+            }
+        } else {
+            // Keep the process alive for the REST server when configured.
+            #[cfg(feature = "rest")]
+            if let Some(task) = _rest_task {
+                let _ = task.await;
+                #[cfg(unix)]
+                request_shutdown_and_notify();
+            }
         }
+        sleep_scheduler::drain(sleep_scheduler_handle).await;
         return Ok(());
     }
 
@@ -401,6 +426,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     let _ = stall_watchdog_handle.await;
     hook_payload_prune_handle.abort();
     let _ = hook_payload_prune_handle.await;
+    sleep_scheduler::drain(sleep_scheduler_handle).await;
     endpoint_requeue_handle.abort();
     let _ = endpoint_requeue_handle.await;
     ingest_drain_worker.shutdown_and_drain().await;
@@ -419,196 +445,6 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     }
 
     Ok(())
-}
-
-struct RuntimeWriterLeaseHandle {
-    db_path: PathBuf,
-    lease: RuntimeWriterLease,
-    heartbeat: tokio::task::JoinHandle<()>,
-}
-
-impl RuntimeWriterLeaseHandle {
-    fn new(
-        db_path: PathBuf,
-        lease: RuntimeWriterLease,
-        recovery_faults: crate::daemon_recovery::DaemonRecoveryFaultReporter,
-    ) -> Self {
-        let heartbeat =
-            spawn_runtime_writer_lease_heartbeat(db_path.clone(), lease.clone(), recovery_faults);
-        Self {
-            db_path,
-            lease,
-            heartbeat,
-        }
-    }
-
-    fn lease(&self) -> &RuntimeWriterLease {
-        &self.lease
-    }
-}
-
-impl Drop for RuntimeWriterLeaseHandle {
-    fn drop(&mut self) {
-        self.heartbeat.abort();
-        if let Ok(db) = Database::open(&self.db_path) {
-            let _ = db.runtime_writer_lease_release(&self.lease);
-        }
-    }
-}
-
-async fn acquire_daemon_writer_lease(
-    context: &DaemonContext,
-    db_path: &Path,
-    recovery_faults: crate::daemon_recovery::DaemonRecoveryFaultReporter,
-) -> Result<RuntimeWriterLeaseHandle> {
-    let metadata = json!({
-        "command": "daemon",
-        "db_path": db_path.to_string_lossy(),
-    })
-    .to_string();
-    let lease_result = {
-        let db = context.db.lock().await;
-        db.runtime_writer_lease_acquire_for_daemon_start(
-            SQLITE_WRITER_LEASE_NAME,
-            DAEMON_WRITER_LEASE_TTL_SECS,
-            Some(&metadata),
-        )
-    };
-    let lease = match lease_result {
-        Ok(lease) => lease,
-        Err(error) => {
-            if crate::core::db::db_error_is_sqlite_lock(&error) {
-                recovery_faults
-                    .record_fault_once(crate::daemon_recovery::RecoveryFault::DatabaseLocked);
-            }
-            return Err(error).context("failed to acquire daemon writer lease");
-        }
-    };
-    match lease {
-        Some(lease) => Ok(RuntimeWriterLeaseHandle::new(
-            db_path.to_path_buf(),
-            lease,
-            recovery_faults,
-        )),
-        None => {
-            let active = {
-                let db = context.db.lock().await;
-                db.runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
-                    .unwrap_or_default()
-            };
-            Err(anyhow::anyhow!(
-                "SQLite writer lease `{}` is already held: {}",
-                SQLITE_WRITER_LEASE_NAME,
-                format_runtime_writer_leases(&active)
-            ))
-        }
-    }
-}
-
-fn spawn_runtime_writer_lease_heartbeat(
-    db_path: PathBuf,
-    lease: RuntimeWriterLease,
-    recovery_faults: crate::daemon_recovery::DaemonRecoveryFaultReporter,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(DAEMON_WRITER_LEASE_RENEW_INTERVAL);
-        loop {
-            interval.tick().await;
-            let db_path = db_path.clone();
-            let lease_for_renew = lease.clone();
-            let result = tokio::task::spawn_blocking(move || -> Result<bool> {
-                renew_daemon_writer_lease_with_retry(&db_path, &lease_for_renew)
-            })
-            .await;
-            match result {
-                Ok(Ok(true)) => {}
-                Ok(Ok(false)) => {
-                    tracing::error!(
-                        lease = %lease.name,
-                        owner = %lease.owner,
-                        "daemon writer lease was lost; requesting shutdown"
-                    );
-                    recovery_faults
-                        .record_fault_once(crate::daemon_recovery::RecoveryFault::WriterLeaseLost);
-                    #[cfg(unix)]
-                    request_shutdown_and_notify();
-                    break;
-                }
-                Ok(Err(error)) => {
-                    tracing::warn!(error = %error, "failed to renew daemon writer lease");
-                    if anyhow_error_is_sqlite_lock(&error) {
-                        recovery_faults.record_fault_once(
-                            crate::daemon_recovery::RecoveryFault::DatabaseLocked,
-                        );
-                        #[cfg(unix)]
-                        request_shutdown_and_notify();
-                        break;
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(error = %error, "writer lease heartbeat task failed");
-                }
-            }
-        }
-    })
-}
-
-fn renew_daemon_writer_lease_with_retry(
-    db_path: &Path,
-    lease: &RuntimeWriterLease,
-) -> Result<bool> {
-    let started = Instant::now();
-    loop {
-        match renew_daemon_writer_lease_once(db_path, lease) {
-            Ok(renewed) => return Ok(renewed),
-            Err(error)
-                if anyhow_error_is_sqlite_lock(&error)
-                    && started.elapsed() < DAEMON_WRITER_LEASE_RENEW_RETRY_DEADLINE =>
-            {
-                std::thread::sleep(DAEMON_WRITER_LEASE_RENEW_RETRY_DELAY);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn renew_daemon_writer_lease_once(db_path: &Path, lease: &RuntimeWriterLease) -> Result<bool> {
-    let db = Database::open_with_busy_timeout(db_path, DAEMON_WRITER_LEASE_RENEW_BUSY_TIMEOUT)
-        .context("failed to open DB for writer lease renew")?;
-    db.runtime_writer_lease_renew(lease, DAEMON_WRITER_LEASE_TTL_SECS)
-        .context("failed to renew daemon writer lease")
-}
-
-fn anyhow_error_is_sqlite_lock(error: &anyhow::Error) -> bool {
-    error.chain().any(|error| {
-        error
-            .downcast_ref::<rusqlite::Error>()
-            .is_some_and(crate::core::db::rusqlite_error_is_lock)
-            || error
-                .downcast_ref::<DbError>()
-                .is_some_and(crate::core::db::db_error_is_sqlite_lock)
-    })
-}
-
-fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
-    if leases.is_empty() {
-        return "none visible".to_string();
-    }
-    leases
-        .iter()
-        .map(|lease| {
-            format!(
-                "name={} owner={} pid={} mode={} expires_at={} heartbeat_at={}",
-                lease.name,
-                lease.owner,
-                lease.pid,
-                lease.mode,
-                lease.expires_at,
-                lease.heartbeat_at
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 #[cfg(test)]
