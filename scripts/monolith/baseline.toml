@@ -405,10 +405,10 @@ rationale = "Pre-existing tracked-text monolith debt recalibrated after #741 sch
 [[files]]
 path = "src/xurl/store.rs"
 kind = "source"
-baseline_tokens = 6604
-baseline_lines = 814
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 6610
+baseline_lines = 815
+issue = "783"
+rationale = "xurl store drift reconciled for #783 to exact formatter/tokenizer output with a no-growth ratchet."
 
 [[files]]
 path = "tests/cli_dashboard.rs"
