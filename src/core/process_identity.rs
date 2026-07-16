@@ -29,6 +29,23 @@ pub(crate) fn current_process_identity() -> &'static str {
         .as_str()
 }
 
+/// Return the kernel identity of the current process's PID namespace.
+///
+/// Callers must fail closed when procfs does not expose this identity.
+pub(crate) fn current_pid_namespace() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link("/proc/self/ns/pid")
+            .ok()
+            .and_then(|target| target.into_os_string().into_string().ok())
+            .filter(|identity| !identity.is_empty())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// Verify that a daemon owner still names the same process birth.
 pub(crate) fn daemon_owner_matches_process(owner: &str, pid: u32) -> bool {
     #[cfg(target_os = "linux")]
@@ -50,21 +67,32 @@ pub(crate) fn daemon_owner_matches_process(owner: &str, pid: u32) -> bool {
 pub(crate) enum ProcessLiveness {
     /// Identity matches — holder is alive.
     Live,
-    /// Process is confirmed dead (no `/proc` entry, zombie, or identity mismatch).
+    /// Process is confirmed dead in the holder's PID namespace.
     Dead,
     /// Cannot determine (permission denied, PID namespace isolation).
     /// Callers must retain the holder (fail-closed).
     Unverifiable,
 }
 
-/// Verify the process birth identity recorded by daemon-owned status.
+/// Verify a holder's process birth after proving its PID namespace is current.
 ///
 /// Returns [`ProcessLiveness::Live`] if the identity matches,
-/// [`ProcessLiveness::Dead`] if the process is confirmed dead or the
-/// identity doesn't match, and [`ProcessLiveness::Unverifiable`] if the
-/// process cannot be checked (PID namespace isolation, `hidepid`, etc.).
+/// [`ProcessLiveness::Dead`] if the process is confirmed dead or the identity
+/// doesn't match in the holder's PID namespace, and
+/// [`ProcessLiveness::Unverifiable`] if the namespace or process cannot be
+/// checked (`hidepid`, PID namespace isolation, etc.).
 #[cfg(target_os = "linux")]
-pub(crate) fn process_identity_liveness(pid: u32, expected: &str) -> ProcessLiveness {
+pub(crate) fn process_identity_liveness(
+    pid: u32,
+    expected: &str,
+    expected_pid_namespace: Option<&str>,
+) -> ProcessLiveness {
+    let Some(expected_pid_namespace) = expected_pid_namespace else {
+        return ProcessLiveness::Unverifiable;
+    };
+    if current_pid_namespace().as_deref() != Some(expected_pid_namespace) {
+        return ProcessLiveness::Unverifiable;
+    }
     if pid == std::process::id() {
         return if current_process_identity() == expected {
             ProcessLiveness::Live
@@ -90,7 +118,8 @@ pub(crate) fn process_identity_liveness(pid: u32, expected: &str) -> ProcessLive
 /// `None` on unverifiable.
 #[cfg(target_os = "linux")]
 pub(crate) fn process_identity_matches(pid: u32, expected: &str) -> Option<bool> {
-    match process_identity_liveness(pid, expected) {
+    let pid_namespace = current_pid_namespace();
+    match process_identity_liveness(pid, expected, pid_namespace.as_deref()) {
         ProcessLiveness::Live => Some(true),
         ProcessLiveness::Dead => Some(false),
         ProcessLiveness::Unverifiable => None,
@@ -228,6 +257,34 @@ mod tests {
         assert!(
             process_identity_matches(std::process::id(), current_process_identity())
                 .unwrap_or(false)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn holder_in_different_pid_namespace_is_unverifiable() {
+        assert_eq!(
+            process_identity_liveness(
+                std::process::id(),
+                current_process_identity(),
+                Some("pid:[foreign]"),
+            ),
+            ProcessLiveness::Unverifiable
+        );
+        assert_eq!(
+            process_identity_liveness(std::process::id(), current_process_identity(), None),
+            ProcessLiveness::Unverifiable
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_process_is_dead_in_current_pid_namespace() {
+        let pid_namespace = current_pid_namespace().expect("current PID namespace");
+
+        assert_eq!(
+            process_identity_liveness(u32::MAX, "missing-process-birth", Some(&pid_namespace)),
+            ProcessLiveness::Dead
         );
     }
 }
