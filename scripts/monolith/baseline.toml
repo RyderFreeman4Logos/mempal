@@ -13,10 +13,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "contrib/hermes-agent-plugin/test_mempal_provider.py"
 kind = "test"
-baseline_tokens = 10487
-baseline_lines = 1081
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 10495
+baseline_lines = 1080
+issue = "779"
+rationale = "Hermes provider tests grew organically; refreshed for #779 to exact formatter/tokenizer output with a no-growth ratchet."
 
 [[files]]
 path = "docs/MIND-MODEL-DESIGN.md"
