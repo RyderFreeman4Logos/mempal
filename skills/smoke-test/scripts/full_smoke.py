@@ -474,20 +474,19 @@ def record_proc_io_delta(
 
 
 def wait_exited_without_reap(pid: int, timeout: float) -> bool | None:
-    if not hasattr(os, 'waitid') or not hasattr(os, 'P_PID'):
-        return None
+    """Wait for a child process to exit without reaping it (leaves it for Popen.cleanup).
+
+    On Python 3.14+, ``os.waitid`` with ``WNOWAIT`` can deadlock when the
+    child uses tempfile redirection.  We instead poll ``/proc/<pid>`` which
+    reliably detects process exit without consuming the wait status.
+    """
     deadline = time.monotonic() + timeout
-    flags = os.WEXITED | os.WNOHANG | getattr(os, 'WNOWAIT', 0)
     while True:
-        try:
-            info = os.waitid(os.P_PID, pid, flags)
-        except ChildProcessError:
-            return None
-        if info is not None:
+        if not Path(f'/proc/{pid}').exists():
             return True
         if time.monotonic() >= deadline:
             return False
-        time.sleep(0.02)
+        time.sleep(0.05)
 
 
 def read_tempfile_bytes(handle: Any) -> bytes:
@@ -525,23 +524,16 @@ def run_child_process(
             except BrokenPipeError:
                 pass
 
-        exited = wait_exited_without_reap(proc.pid, timeout)
-        if exited is False:
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
             timed_out = True
             killed = True
             proc.kill()
-            wait_exited_without_reap(proc.pid, 5)
-        elif exited is None:
-            try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                killed = True
-                proc.kill()
-                proc.wait(timeout=5)
+            proc.wait(timeout=5)
 
         after = read_proc_io(proc.pid)
-        return_code = proc.wait(timeout=5)
+        return_code = proc.returncode
         record_proc_io_delta(io_category, before, after)
     except subprocess.TimeoutExpired:
         timed_out = True
