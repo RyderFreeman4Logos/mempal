@@ -59,6 +59,15 @@ pub enum HookCommands {
         #[arg(long, default_value_t = false)]
         skip_mcp: bool,
     },
+    /// Prune unreferenced hook-spool payload files older than retention.
+    ///
+    /// Dry-run by default (report only). Pass `--execute` to delete.
+    #[command(name = "retain-payloads")]
+    RetainPayloads {
+        /// Actually delete eligible files (default is dry-run).
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,7 +105,29 @@ pub fn run_command(command: HookCommands) -> Result<()> {
             uninstall,
             skip_mcp,
         } => hook_install::install(target, dry_run, uninstall, skip_mcp),
+        HookCommands::RetainPayloads { execute } => run_retain_payloads(execute),
     }
+}
+
+fn run_retain_payloads(execute: bool) -> Result<()> {
+    ConfigHandle::bootstrap_quiet(default_config_path()).context("failed to bootstrap config")?;
+    let config = ConfigHandle::current();
+    let db_path = expand_home_path(&config.db_path);
+    let mempal_home = mempal_home_from_db(&db_path);
+    let retention_days = config.hooks.payload_retention_days;
+    let outcome = crate::hook_payload::prune_hook_payloads_with_mode(
+        &mempal_home,
+        &db_path,
+        retention_days,
+        execute,
+    )
+    .context("hook payload retention prune failed")?;
+    let mode = if execute { "execute" } else { "dry-run" };
+    println!(
+        "hook-payload retain ({mode}): scanned={} deleted_or_eligible={} referenced={} young={} retention_days={retention_days}",
+        outcome.scanned_files, outcome.deleted_files, outcome.referenced_files, outcome.young_files,
+    );
+    Ok(())
 }
 
 fn run_capture_command(event: HookEvent) -> Result<()> {
