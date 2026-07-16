@@ -76,7 +76,8 @@ use crate::ingest::{
 use crate::knowledge_anchor::{PublishAnchorRequest as CorePublishAnchorRequest, publish_anchor};
 use crate::knowledge_card_lifecycle::{
     DemoteCardRequest as CoreDemoteCardRequest, PromoteCardRequest as CorePromoteCardRequest,
-    demote_card, evaluate_card_gate_by_id, promote_card,
+    demote_card_with_runtime_writer_lease, evaluate_card_gate_by_id,
+    promote_card_with_runtime_writer_lease,
 };
 use crate::knowledge_card_retrieval::{
     KnowledgeCardRetrievalRequest as CoreCardRetrievalRequest, retrieve_knowledge_cards_with_vector,
@@ -304,6 +305,8 @@ pub struct MempalMcpServer {
     stale_penalty_delay: Option<Duration>,
     #[cfg(test)]
     mcp_ingest_side_effect_hook: Option<Arc<dyn Fn(McpIngestSideEffectStage) + Send + Sync>>,
+    #[cfg(test)]
+    content_writer_lease_acquired_hook: Option<ContentWriterLeaseAcquiredHook>,
 }
 
 #[cfg(test)]
@@ -314,6 +317,9 @@ pub(crate) enum McpIngestSideEffectStage {
     Repair,
     Pattern,
 }
+
+#[cfg(test)]
+type ContentWriterLeaseAcquiredHook = Arc<dyn Fn(&RuntimeWriterLease) + Send + Sync>;
 
 struct McpIngestWriterLeaseGuard {
     db_path: PathBuf,
@@ -465,6 +471,35 @@ fn with_mcp_runtime_writer_lease_write<T>(
         .map_err(|error| database_write_refused_error(db.path(), operation, &error))
 }
 
+enum McpRuntimeWriterLeaseWriteError<E> {
+    Lease(crate::core::db::DbError),
+    Write(E),
+}
+
+impl<E> From<crate::core::db::DbError> for McpRuntimeWriterLeaseWriteError<E> {
+    fn from(error: crate::core::db::DbError) -> Self {
+        Self::Lease(error)
+    }
+}
+
+fn with_mcp_runtime_writer_lease_write_mapped<T, E>(
+    db: &Database,
+    lease: Option<&RuntimeWriterLease>,
+    operation: &'static str,
+    write: impl FnOnce() -> std::result::Result<T, E>,
+    map_write_error: impl FnOnce(E) -> ErrorData,
+) -> std::result::Result<T, ErrorData> {
+    match db.with_runtime_writer_lease_write(lease, operation, || {
+        write().map_err(McpRuntimeWriterLeaseWriteError::Write)
+    }) {
+        Ok(value) => Ok(value),
+        Err(McpRuntimeWriterLeaseWriteError::Lease(error)) => {
+            Err(database_write_refused_error(db.path(), operation, &error))
+        }
+        Err(McpRuntimeWriterLeaseWriteError::Write(error)) => Err(map_write_error(error)),
+    }
+}
+
 fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
     if leases.is_empty() {
         return "none visible".to_string();
@@ -561,6 +596,8 @@ impl MempalMcpServer {
             stale_penalty_delay: None,
             #[cfg(test)]
             mcp_ingest_side_effect_hook: None,
+            #[cfg(test)]
+            content_writer_lease_acquired_hook: None,
         })
     }
 
@@ -691,6 +728,15 @@ impl MempalMcpServer {
         hook: Arc<dyn Fn(McpIngestSideEffectStage) + Send + Sync>,
     ) -> Self {
         self.mcp_ingest_side_effect_hook = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_content_writer_lease_acquired_hook_for_test(
+        mut self,
+        hook: ContentWriterLeaseAcquiredHook,
+    ) -> Self {
+        self.content_writer_lease_acquired_hook = Some(hook);
         self
     }
 
@@ -1735,6 +1781,10 @@ impl MempalMcpServer {
                 ));
             }
         };
+        #[cfg(test)]
+        if let Some(hook) = &self.content_writer_lease_acquired_hook {
+            hook(&lease);
+        }
         #[cfg(any(test, feature = "db-test-seam"))]
         let ttl_secs = self.content_writer_lease_ttl_secs;
         #[cfg(not(any(test, feature = "db-test-seam")))]
@@ -5995,8 +6045,14 @@ impl MempalMcpServer {
             .next()
             .ok_or_else(|| ErrorData::internal_error("embedder returned no vector", None))?;
         let db = self.open_db()?;
-        let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_knowledge_distill")?;
-        let outcome = commit_distill(&db, *prepared, &vector).map_err(knowledge_distill_error)?;
+        let writer_lease = self.acquire_content_writer_lease(&db, "mempal_knowledge_distill")?;
+        let outcome = with_mcp_runtime_writer_lease_write_mapped(
+            &db,
+            Some(&writer_lease.lease),
+            "commit MCP knowledge distill",
+            || commit_distill(&db, *prepared, &vector),
+            knowledge_distill_error,
+        )?;
         Ok(Json(KnowledgeDistillResponse::from(outcome)))
     }
 
@@ -6204,14 +6260,16 @@ impl MempalMcpServer {
             }
             "promote" => {
                 let db = self.open_db()?;
-                let _writer_lease =
+                let writer_lease =
                     self.acquire_content_writer_lease(&db, "mempal_knowledge_cards promote")?;
                 let card_id = required_string(request.card_id.as_deref(), "card_id")?;
                 let status = required_string(request.status.as_deref(), "status")?.to_string();
                 let reason = required_string(request.reason.as_deref(), "reason")?.to_string();
                 let verification_refs = request.verification_refs.unwrap_or_default();
-                let outcome = promote_card(
+                let outcome = promote_card_with_runtime_writer_lease(
                     &db,
+                    Some(&writer_lease.lease),
+                    "promote MCP knowledge card",
                     CorePromoteCardRequest {
                         card_id: card_id.to_string(),
                         status,
@@ -6234,7 +6292,7 @@ impl MempalMcpServer {
             }
             "demote" => {
                 let db = self.open_db()?;
-                let _writer_lease =
+                let writer_lease =
                     self.acquire_content_writer_lease(&db, "mempal_knowledge_cards demote")?;
                 let card_id = required_string(request.card_id.as_deref(), "card_id")?;
                 let status = required_string(request.status.as_deref(), "status")?.to_string();
@@ -6242,8 +6300,10 @@ impl MempalMcpServer {
                 let reason_type =
                     required_string(request.reason_type.as_deref(), "reason_type")?.to_string();
                 let evidence_refs = request.evidence_refs.unwrap_or_default();
-                let outcome = demote_card(
+                let outcome = demote_card_with_runtime_writer_lease(
                     &db,
+                    Some(&writer_lease.lease),
+                    "demote MCP knowledge card",
                     CoreDemoteCardRequest {
                         card_id: card_id.to_string(),
                         status,
@@ -6280,20 +6340,27 @@ impl MempalMcpServer {
         Parameters(request): Parameters<KnowledgePromoteRequest>,
     ) -> std::result::Result<Json<KnowledgePromoteResponse>, ErrorData> {
         let db = self.open_db()?;
-        let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_knowledge_promote")?;
-        let outcome = promote_knowledge(
+        let writer_lease = self.acquire_content_writer_lease(&db, "mempal_knowledge_promote")?;
+        let outcome = with_mcp_runtime_writer_lease_write_mapped(
             &db,
-            CorePromoteRequest {
-                drawer_id: request.drawer_id,
-                status: request.status,
-                verification_refs: request.verification_refs,
-                reason: request.reason,
-                reviewer: request.reviewer,
-                allow_counterexamples: request.allow_counterexamples.unwrap_or(false),
-                enforce_gate: true,
+            Some(&writer_lease.lease),
+            "promote MCP knowledge",
+            || {
+                promote_knowledge(
+                    &db,
+                    CorePromoteRequest {
+                        drawer_id: request.drawer_id,
+                        status: request.status,
+                        verification_refs: request.verification_refs,
+                        reason: request.reason,
+                        reviewer: request.reviewer,
+                        allow_counterexamples: request.allow_counterexamples.unwrap_or(false),
+                        enforce_gate: true,
+                    },
+                )
             },
-        )
-        .map_err(knowledge_lifecycle_error)?;
+            knowledge_lifecycle_error,
+        )?;
 
         Ok(Json(KnowledgePromoteResponse::from(outcome)))
     }
@@ -6307,18 +6374,25 @@ impl MempalMcpServer {
         Parameters(request): Parameters<KnowledgeDemoteRequest>,
     ) -> std::result::Result<Json<KnowledgeDemoteResponse>, ErrorData> {
         let db = self.open_db()?;
-        let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_knowledge_demote")?;
-        let outcome = demote_knowledge(
+        let writer_lease = self.acquire_content_writer_lease(&db, "mempal_knowledge_demote")?;
+        let outcome = with_mcp_runtime_writer_lease_write_mapped(
             &db,
-            CoreDemoteRequest {
-                drawer_id: request.drawer_id,
-                status: request.status,
-                evidence_refs: request.evidence_refs,
-                reason: request.reason,
-                reason_type: request.reason_type,
+            Some(&writer_lease.lease),
+            "demote MCP knowledge",
+            || {
+                demote_knowledge(
+                    &db,
+                    CoreDemoteRequest {
+                        drawer_id: request.drawer_id,
+                        status: request.status,
+                        evidence_refs: request.evidence_refs,
+                        reason: request.reason,
+                        reason_type: request.reason_type,
+                    },
+                )
             },
-        )
-        .map_err(knowledge_lifecycle_error)?;
+            knowledge_lifecycle_error,
+        )?;
 
         Ok(Json(KnowledgeDemoteResponse::from(outcome)))
     }
@@ -6332,20 +6406,27 @@ impl MempalMcpServer {
         Parameters(request): Parameters<KnowledgePublishAnchorRequest>,
     ) -> std::result::Result<Json<KnowledgePublishAnchorResponse>, ErrorData> {
         let db = self.open_db()?;
-        let _writer_lease =
+        let writer_lease =
             self.acquire_content_writer_lease(&db, "mempal_knowledge_publish_anchor")?;
-        let outcome = publish_anchor(
+        let outcome = with_mcp_runtime_writer_lease_write_mapped(
             &db,
-            CorePublishAnchorRequest {
-                drawer_id: request.drawer_id,
-                to: request.to,
-                target_anchor_id: request.target_anchor_id,
-                cwd: request.cwd.map(PathBuf::from),
-                reason: request.reason,
-                reviewer: request.reviewer,
+            Some(&writer_lease.lease),
+            "publish MCP knowledge anchor",
+            || {
+                publish_anchor(
+                    &db,
+                    CorePublishAnchorRequest {
+                        drawer_id: request.drawer_id,
+                        to: request.to,
+                        target_anchor_id: request.target_anchor_id,
+                        cwd: request.cwd.map(PathBuf::from),
+                        reason: request.reason,
+                        reviewer: request.reviewer,
+                    },
+                )
             },
-        )
-        .map_err(knowledge_anchor_error)?;
+            knowledge_anchor_error,
+        )?;
 
         Ok(Json(KnowledgePublishAnchorResponse::from(outcome)))
     }
@@ -8275,15 +8356,20 @@ impl MempalMcpServer {
                 .map_err(db_error)?;
             (count.max(0) as usize, Vec::new())
         } else {
-            let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_rollback")?;
-            let drawer_ids = db
-                .soft_delete_drawers_since(
-                    &since,
-                    request.wing.as_deref(),
-                    request.room.as_deref(),
-                    project_id.as_deref(),
-                )
-                .map_err(db_error)?;
+            let writer_lease = self.acquire_content_writer_lease(&db, "mempal_rollback")?;
+            let drawer_ids = with_mcp_runtime_writer_lease_write(
+                &db,
+                Some(&writer_lease.lease),
+                "soft-delete MCP rollback drawers",
+                || {
+                    db.soft_delete_drawers_since(
+                        &since,
+                        request.wing.as_deref(),
+                        request.room.as_deref(),
+                        project_id.as_deref(),
+                    )
+                },
+            )?;
             (drawer_ids.len(), drawer_ids)
         };
 
@@ -8440,7 +8526,7 @@ impl MempalMcpServer {
             }
             "edit" => {
                 let db = self.open_db()?;
-                let _writer_lease =
+                let writer_lease =
                     self.acquire_content_writer_lease(&db, "mempal_taxonomy edit")?;
                 let wing = request
                     .wing
@@ -8457,7 +8543,12 @@ impl MempalMcpServer {
                     display_name: None,
                     keywords,
                 };
-                db.upsert_taxonomy_entry(&entry).map_err(db_error)?;
+                with_mcp_runtime_writer_lease_write(
+                    &db,
+                    Some(&writer_lease.lease),
+                    "upsert MCP taxonomy entry",
+                    || db.upsert_taxonomy_entry(&entry),
+                )?;
                 Ok(Json(TaxonomyResponse {
                     action: "edit".to_string(),
                     entries: vec![TaxonomyEntryDto::from(entry)],
@@ -8500,7 +8591,7 @@ impl MempalMcpServer {
                     return Err(degraded_write_error());
                 }
                 let db = self.open_db()?;
-                let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_kg add")?;
+                let writer_lease = self.acquire_content_writer_lease(&db, "mempal_kg add")?;
                 let subject = request
                     .subject
                     .ok_or_else(|| ErrorData::invalid_params("missing subject", None))?;
@@ -8521,7 +8612,12 @@ impl MempalMcpServer {
                     confidence: 1.0,
                     source_drawer: request.source_drawer,
                 };
-                db.insert_triple(&triple).map_err(db_error)?;
+                with_mcp_runtime_writer_lease_write(
+                    &db,
+                    Some(&writer_lease.lease),
+                    "insert MCP knowledge graph triple",
+                    || db.insert_triple(&triple),
+                )?;
                 Ok(Json(KgResponse {
                     action: "add".to_string(),
                     triples: vec![triple_to_dto(&triple)],
@@ -8561,12 +8657,17 @@ impl MempalMcpServer {
                     return Err(degraded_write_error());
                 }
                 let db = self.open_db()?;
-                let _writer_lease =
+                let writer_lease =
                     self.acquire_content_writer_lease(&db, "mempal_kg invalidate")?;
                 let triple_id = request
                     .triple_id
                     .ok_or_else(|| ErrorData::invalid_params("missing triple_id", None))?;
-                let invalidated = db.invalidate_triple(&triple_id).map_err(db_error)?;
+                let invalidated = with_mcp_runtime_writer_lease_write(
+                    &db,
+                    Some(&writer_lease.lease),
+                    "invalidate MCP knowledge graph triple",
+                    || db.invalidate_triple(&triple_id),
+                )?;
                 let message = if invalidated {
                     format!("triple {triple_id} invalidated")
                 } else {
@@ -8665,7 +8766,7 @@ impl MempalMcpServer {
                 }))
             }
             "add" => {
-                let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_tunnels add")?;
+                let writer_lease = self.acquire_content_writer_lease(&db, "mempal_tunnels add")?;
                 let left = request
                     .left
                     .ok_or_else(|| ErrorData::invalid_params("missing left endpoint", None))?;
@@ -8679,16 +8780,19 @@ impl MempalMcpServer {
                     .lock()
                     .map_err(|_| ErrorData::internal_error("client name lock poisoned", None))?
                     .clone();
-                let tunnel = db
-                    .create_tunnel(&left.into(), &right.into(), label, created_by.as_deref())
-                    .map_err(db_error)?;
+                let tunnel = with_mcp_runtime_writer_lease_write(
+                    &db,
+                    Some(&writer_lease.lease),
+                    "create MCP tunnel",
+                    || db.create_tunnel(&left.into(), &right.into(), label, created_by.as_deref()),
+                )?;
                 Ok(Json(TunnelsResponse {
                     tunnels: vec![explicit_tunnel_to_dto(&tunnel)],
                     system_warnings: current_system_warnings(),
                 }))
             }
             "delete" => {
-                let _writer_lease =
+                let writer_lease =
                     self.acquire_content_writer_lease(&db, "mempal_tunnels delete")?;
                 let tunnel_id = trim_to_option(request.tunnel_id.as_deref())
                     .ok_or_else(|| ErrorData::invalid_params("missing tunnel_id", None))?;
@@ -8698,7 +8802,13 @@ impl MempalMcpServer {
                         None,
                     ));
                 }
-                if !db.delete_explicit_tunnel(tunnel_id).map_err(db_error)? {
+                let deleted = with_mcp_runtime_writer_lease_write(
+                    &db,
+                    Some(&writer_lease.lease),
+                    "delete MCP tunnel",
+                    || db.delete_explicit_tunnel(tunnel_id),
+                )?;
+                if !deleted {
                     return Err(ErrorData::invalid_params(
                         format!("tunnel not found: {tunnel_id}"),
                         None,
@@ -9730,31 +9840,41 @@ impl MempalMcpServer {
                 })?;
 
                 let skill_min_sessions = config.skills.skill_min_sessions;
-                let _writer_lease =
+                let writer_lease =
                     self.acquire_content_writer_lease(&db, "mempal_skill promote")?;
-                let skill = tokio::task::block_in_place(|| {
-                    crate::core::skills::promote_pattern_to_skill(
-                        db.conn(),
-                        &crate::core::skills::PromoteArgs {
-                            pattern_id,
-                            name,
-                            trigger_description,
-                            skill_min_sessions,
-                            project_id: project_id.as_deref(),
-                        },
-                    )
-                })
-                .map_err(|e| match e {
-                    crate::core::skills::PromotionError::PatternNotFound(_)
-                    | crate::core::skills::PromotionError::PatternNotActive(_)
-                    | crate::core::skills::PromotionError::InsufficientSessions(_, _)
-                    | crate::core::skills::PromotionError::SkillAlreadyExists => {
-                        ErrorData::invalid_params(e.to_string(), None)
-                    }
-                    crate::core::skills::PromotionError::Db(db_err) => {
-                        ErrorData::internal_error(format!("promote_skill db error: {db_err}"), None)
-                    }
-                })?;
+                let skill = with_mcp_runtime_writer_lease_write_mapped(
+                    &db,
+                    Some(&writer_lease.lease),
+                    "promote MCP skill",
+                    || {
+                        tokio::task::block_in_place(|| {
+                            crate::core::skills::promote_pattern_to_skill(
+                                db.conn(),
+                                &crate::core::skills::PromoteArgs {
+                                    pattern_id,
+                                    name,
+                                    trigger_description,
+                                    skill_min_sessions,
+                                    project_id: project_id.as_deref(),
+                                },
+                            )
+                        })
+                    },
+                    |error| match error {
+                        crate::core::skills::PromotionError::PatternNotFound(_)
+                        | crate::core::skills::PromotionError::PatternNotActive(_)
+                        | crate::core::skills::PromotionError::InsufficientSessions(_, _)
+                        | crate::core::skills::PromotionError::SkillAlreadyExists => {
+                            ErrorData::invalid_params(error.to_string(), None)
+                        }
+                        crate::core::skills::PromotionError::Db(db_err) => {
+                            ErrorData::internal_error(
+                                format!("promote_skill db error: {db_err}"),
+                                None,
+                            )
+                        }
+                    },
+                )?;
 
                 Ok(Json(SkillResponse {
                     action: "promote".to_string(),
@@ -9772,11 +9892,18 @@ impl MempalMcpServer {
                     ErrorData::invalid_params("skill_id is required for adopt", None)
                 })?;
                 let active_threshold = config.skills.active_threshold;
-                let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_skill adopt")?;
-                let new_status = tokio::task::block_in_place(|| {
-                    crate::core::skills::adopt_skill(db.conn(), skill_id, active_threshold)
-                })
-                .map_err(|e| ErrorData::internal_error(format!("adopt_skill failed: {e}"), None))?
+                let writer_lease = self.acquire_content_writer_lease(&db, "mempal_skill adopt")?;
+                let new_status = with_mcp_runtime_writer_lease_write_mapped(
+                    &db,
+                    Some(&writer_lease.lease),
+                    "adopt MCP skill",
+                    || {
+                        tokio::task::block_in_place(|| {
+                            crate::core::skills::adopt_skill(db.conn(), skill_id, active_threshold)
+                        })
+                    },
+                    |error| ErrorData::internal_error(format!("adopt_skill failed: {error}"), None),
+                )?
                 .ok_or_else(|| {
                     ErrorData::invalid_params(format!("skill not found: {skill_id}"), None)
                 })?;
@@ -9800,12 +9927,20 @@ impl MempalMcpServer {
                     ErrorData::invalid_params("skill_id is required for reject", None)
                 })?;
                 let retire_threshold = config.skills.retire_threshold;
-                let _writer_lease =
-                    self.acquire_content_writer_lease(&db, "mempal_skill reject")?;
-                let new_status = tokio::task::block_in_place(|| {
-                    crate::core::skills::reject_skill(db.conn(), skill_id, retire_threshold)
-                })
-                .map_err(|e| ErrorData::internal_error(format!("reject_skill failed: {e}"), None))?
+                let writer_lease = self.acquire_content_writer_lease(&db, "mempal_skill reject")?;
+                let new_status = with_mcp_runtime_writer_lease_write_mapped(
+                    &db,
+                    Some(&writer_lease.lease),
+                    "reject MCP skill",
+                    || {
+                        tokio::task::block_in_place(|| {
+                            crate::core::skills::reject_skill(db.conn(), skill_id, retire_threshold)
+                        })
+                    },
+                    |error| {
+                        ErrorData::internal_error(format!("reject_skill failed: {error}"), None)
+                    },
+                )?
                 .ok_or_else(|| {
                     ErrorData::invalid_params(format!("skill not found: {skill_id}"), None)
                 })?;
@@ -9828,14 +9963,20 @@ impl MempalMcpServer {
                 let skill_id = request.skill_id.as_deref().ok_or_else(|| {
                     ErrorData::invalid_params("skill_id is required for retire", None)
                 })?;
-                let _writer_lease =
-                    self.acquire_content_writer_lease(&db, "mempal_skill retire")?;
-                let found = tokio::task::block_in_place(|| {
-                    crate::core::skills::retire_skill(db.conn(), skill_id)
-                })
-                .map_err(|e| {
-                    ErrorData::internal_error(format!("retire_skill failed: {e}"), None)
-                })?;
+                let writer_lease = self.acquire_content_writer_lease(&db, "mempal_skill retire")?;
+                let found = with_mcp_runtime_writer_lease_write_mapped(
+                    &db,
+                    Some(&writer_lease.lease),
+                    "retire MCP skill",
+                    || {
+                        tokio::task::block_in_place(|| {
+                            crate::core::skills::retire_skill(db.conn(), skill_id)
+                        })
+                    },
+                    |error| {
+                        ErrorData::internal_error(format!("retire_skill failed: {error}"), None)
+                    },
+                )?;
 
                 if !found {
                     return Err(ErrorData::invalid_params(
@@ -9986,12 +10127,9 @@ impl MempalMcpServer {
                         &capture.record_quality,
                         request.allow_warnings.unwrap_or(false),
                     );
-                    let _writer_lease = if should_write {
-                        Some(self.acquire_content_writer_lease(&db, "mempal_phase3 capture")?)
-                    } else {
-                        None
-                    };
                     let event = if should_write {
+                        let writer_lease =
+                            self.acquire_content_writer_lease(&db, "mempal_phase3 capture")?;
                         let event = RuntimeAdoptionEvent {
                             id: record_input.id.unwrap_or_else(|| {
                                 phase3_event_id(&track, &signal, &record_input.feature)
@@ -10008,12 +10146,12 @@ impl MempalMcpServer {
                             metadata: record_input.metadata,
                             created_at: current_timestamp(),
                         };
-                        db.insert_runtime_adoption_event(&event).map_err(|error| {
-                            ErrorData::internal_error(
-                                format!("failed to insert runtime adoption event: {error}"),
-                                None,
-                            )
-                        })?;
+                        with_mcp_runtime_writer_lease_write(
+                            &db,
+                            Some(&writer_lease.lease),
+                            "capture MCP runtime adoption event",
+                            || db.insert_runtime_adoption_event(&event),
+                        )?;
                         Some(event)
                     } else {
                         None
@@ -10264,12 +10402,9 @@ impl MempalMcpServer {
                 let quality = check_runtime_adoption_record(&input);
                 let should_write =
                     should_write_checked_record(&quality, request.allow_warnings.unwrap_or(false));
-                let _writer_lease = if should_write {
-                    Some(self.acquire_content_writer_lease(&db, "mempal_phase3 record_checked")?)
-                } else {
-                    None
-                };
                 let event = if should_write {
+                    let writer_lease =
+                        self.acquire_content_writer_lease(&db, "mempal_phase3 record_checked")?;
                     let event = RuntimeAdoptionEvent {
                         id: input
                             .id
@@ -10286,12 +10421,12 @@ impl MempalMcpServer {
                         metadata: input.metadata,
                         created_at: current_timestamp(),
                     };
-                    db.insert_runtime_adoption_event(&event).map_err(|error| {
-                        ErrorData::internal_error(
-                            format!("failed to insert runtime adoption event: {error}"),
-                            None,
-                        )
-                    })?;
+                    with_mcp_runtime_writer_lease_write(
+                        &db,
+                        Some(&writer_lease.lease),
+                        "record checked MCP runtime adoption event",
+                        || db.insert_runtime_adoption_event(&event),
+                    )?;
                     Some(event)
                 } else {
                     None
@@ -10433,7 +10568,7 @@ impl MempalMcpServer {
             }
             "record" => {
                 let db = self.open_db()?;
-                let _writer_lease =
+                let writer_lease =
                     self.acquire_content_writer_lease(&db, "mempal_phase3 record")?;
                 let track = parse_runtime_adoption_track(required_string(
                     request.track.as_deref(),
@@ -10460,12 +10595,12 @@ impl MempalMcpServer {
                     metadata: request.metadata,
                     created_at: current_timestamp(),
                 };
-                db.insert_runtime_adoption_event(&event).map_err(|error| {
-                    ErrorData::internal_error(
-                        format!("failed to insert runtime adoption event: {error}"),
-                        None,
-                    )
-                })?;
+                with_mcp_runtime_writer_lease_write(
+                    &db,
+                    Some(&writer_lease.lease),
+                    "record MCP runtime adoption event",
+                    || db.insert_runtime_adoption_event(&event),
+                )?;
                 Ok(Json(Phase3Response {
                     guidance: None,
                     instrumentation_policy: None,
@@ -12461,6 +12596,56 @@ mod tests {
         .expect("create MCP server")
         .with_async_db_for_test(async_db);
         (tempdir, db_path, server)
+    }
+
+    #[tokio::test]
+    async fn test_mcp_content_mutation_rejects_takeover_after_preflight() {
+        let (_tempdir, db_path, server) = setup_server();
+        let takeover_db_path = db_path.clone();
+        let server =
+            server.with_content_writer_lease_acquired_hook_for_test(Arc::new(move |stale_lease| {
+                let db = Database::open(&takeover_db_path).expect("open takeover database");
+                assert!(
+                    db.runtime_writer_lease_release(stale_lease)
+                        .expect("release stale writer lease")
+                );
+                let current_lease = db
+                    .runtime_writer_lease_acquire(
+                        SQLITE_WRITER_LEASE_NAME,
+                        "mcp-content-takeover-test",
+                        "daemon",
+                        300,
+                        None,
+                    )
+                    .expect("acquire replacement writer lease")
+                    .expect("replacement writer lease should be available");
+                assert!(current_lease.generation > stale_lease.generation);
+            }));
+
+        let error = match server
+            .mempal_taxonomy(Parameters(TaxonomyRequest {
+                action: "edit".to_string(),
+                wing: Some("generation-fence-test".to_string()),
+                room: Some("takeover".to_string()),
+                keywords: Some(vec!["stale-write".to_string()]),
+            }))
+            .await
+        {
+            Ok(_) => panic!("stale MCP writer generation mutated after takeover"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("generation"), "error={error:?}");
+
+        let entries = Database::open(&db_path)
+            .expect("open database after rejected write")
+            .taxonomy_entries()
+            .expect("list taxonomy entries");
+        assert!(
+            entries
+                .iter()
+                .all(|entry| { entry.wing != "generation-fence-test" || entry.room != "takeover" }),
+            "stale writer generation inserted a taxonomy entry"
+        );
     }
 
     #[test]
