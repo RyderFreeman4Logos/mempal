@@ -690,6 +690,15 @@ async fn process_hook_worker_message(
     message: ClaimedMessage,
     claim_ttl_secs: i64,
 ) {
+    process_hook_worker_message_inner(state, message, claim_ttl_secs, None).await;
+}
+
+async fn process_hook_worker_message_inner(
+    state: HookWorkerState,
+    message: ClaimedMessage,
+    claim_ttl_secs: i64,
+    heartbeat_observer: Option<tokio::sync::oneshot::Sender<()>>,
+) {
     let message_id = message.id.clone();
     let span = OperationTelemetrySpan::start(
         state.db_path.clone(),
@@ -706,6 +715,7 @@ async fn process_hook_worker_message(
         message_id.clone(),
         state.worker_id.clone(),
         hook_message_heartbeat_interval(claim_ttl_secs),
+        heartbeat_observer,
     );
     let classifier_arc = state.prototype_classifier.load_full();
     let classifier_ref = classifier_arc.as_ref().as_ref();
@@ -767,6 +777,7 @@ fn spawn_hook_message_heartbeat(
     message_id: String,
     worker_id: String,
     interval: Duration,
+    mut observer: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -778,6 +789,9 @@ fn spawn_hook_message_heartbeat(
                 break;
             }
             refresh_hook_message_heartbeat(&store, &message_id, &worker_id).await;
+            if let Some(observer) = observer.take() {
+                let _ = observer.send(());
+            }
         }
     })
 }
@@ -3298,6 +3312,12 @@ fn shutdown_notify() -> &'static Notify {
     SHUTDOWN_NOTIFY.get_or_init(Notify::new)
 }
 
+#[cfg(test)]
+pub(crate) fn global_shutdown_test_lock() -> Arc<tokio::sync::Mutex<()>> {
+    static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
+}
+
 #[cfg(unix)]
 fn request_shutdown_and_notify() {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
@@ -4704,6 +4724,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_bounded_hook_worker_continues_claiming_after_completed_batch() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let _shutdown_guard = ShutdownResetGuard::new();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
@@ -4832,6 +4853,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_main_loop_wait_wakes_on_shutdown_with_active_worker() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let _shutdown_guard = ShutdownResetGuard::new();
         let mut hook_workers = tokio::task::JoinSet::new();
         hook_workers.spawn(async {
@@ -5390,14 +5412,25 @@ mod tests {
         embed_calls: AtomicUsize,
     }
 
-    struct SlowEmbedder {
-        delay: Duration,
+    struct ControlledEmbedder {
+        db_path: PathBuf,
+        message_id: String,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
     }
 
     #[async_trait::async_trait]
-    impl Embedder for SlowEmbedder {
+    impl Embedder for ControlledEmbedder {
         async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
-            tokio::time::sleep(self.delay).await;
+            rusqlite::Connection::open(&self.db_path)
+                .expect("open sqlite to age heartbeat")
+                .execute(
+                    "UPDATE pending_messages SET claimed_at = 0, heartbeat_at = 0 WHERE id = ?1",
+                    [self.message_id.as_str()],
+                )
+                .expect("age heartbeat");
+            self.started.notify_one();
+            self.release.notified().await;
             Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
         }
 
@@ -5406,12 +5439,14 @@ mod tests {
         }
 
         fn name(&self) -> &str {
-            "slow-test"
+            "controlled-test"
         }
     }
 
     #[tokio::test]
     async fn test_hook_worker_heartbeats_long_message_processing_until_confirm() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
+        let _shutdown_guard = ShutdownResetGuard::new();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let mempal_home = tmp.path().join(".mempal");
@@ -5457,16 +5492,21 @@ mod tests {
             !config.llm.enabled,
             "test runtime config must keep LLM disabled"
         );
-        let worker = tokio::spawn(super::process_hook_worker_message(
+        let embed_started = Arc::new(Notify::new());
+        let embed_release = Arc::new(Notify::new());
+        let (heartbeat_refreshed, heartbeat_refresh) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(super::process_hook_worker_message_inner(
             HookWorkerState {
                 async_db,
                 db_path: db_path.clone(),
                 store: async_store.clone(),
                 worker_id: worker_id.to_string(),
                 embedder: Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
-                    SlowEmbedder {
-                        // Longer than claim TTL so reclaim would succeed without heartbeats.
-                        delay: Duration::from_secs(8),
+                    ControlledEmbedder {
+                        db_path: db_path.clone(),
+                        message_id: queued_id.clone(),
+                        started: Arc::clone(&embed_started),
+                        release: Arc::clone(&embed_release),
                     },
                 ))),
                 prototype_classifier: Arc::new(ArcSwap::from_pointee(None)),
@@ -5480,13 +5520,32 @@ mod tests {
             message,
             // Short claim TTL: under concurrency, heartbeats must keep renewing.
             2,
+            Some(heartbeat_refreshed),
         ));
 
-        // Wait past the claim TTL (but well under embed delay). Without heartbeats the
-        // stealing worker could reclaim; with heartbeats the claim stays held.
-        tokio::time::sleep(Duration::from_millis(4_500)).await;
+        tokio::time::timeout(Duration::from_secs(180), embed_started.notified())
+            .await
+            .expect("worker should start embedding");
+
+        tokio::time::timeout(Duration::from_secs(180), heartbeat_refresh)
+            .await
+            .expect("hook worker should refresh the aged heartbeat")
+            .expect("heartbeat observer should remain connected");
+        let heartbeat_at: Option<i64> = rusqlite::Connection::open(&db_path)
+            .expect("open sqlite to observe heartbeat")
+            .query_row(
+                "SELECT heartbeat_at FROM pending_messages WHERE id = ?1",
+                [queued_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("query heartbeat");
+        assert!(
+            heartbeat_at.unwrap_or_default() > 0,
+            "periodic heartbeat must refresh the deliberately aged claim"
+        );
+
         let duplicate = async_store
-            .claim_next("stealing-worker".to_string(), 2)
+            .claim_next("stealing-worker".to_string(), 300)
             .await
             .expect("stealing worker claim_next");
         assert!(
@@ -5494,7 +5553,8 @@ mod tests {
             "long-running hook processing must heartbeat so claim_next cannot reclaim it"
         );
 
-        tokio::time::timeout(Duration::from_secs(20), worker)
+        embed_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(180), worker)
             .await
             .expect("worker should finish")
             .expect("worker task should not panic");

@@ -26,11 +26,16 @@ impl Drop for ShutdownResetGuard {
 // These tests share test-only handler counters and the process-wide shutdown flag.
 static HOOK_IPC_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
-async fn lock_hook_ipc_tests() -> tokio::sync::MutexGuard<'static, ()> {
-    HOOK_IPC_TEST_LOCK
+async fn lock_hook_ipc_tests() -> (
+    tokio::sync::MutexGuard<'static, ()>,
+    tokio::sync::OwnedMutexGuard<()>,
+) {
+    let handler_guard = HOOK_IPC_TEST_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
-        .await
+        .await;
+    let shutdown_guard = super::super::global_shutdown_test_lock().lock_owned().await;
+    (handler_guard, shutdown_guard)
 }
 
 struct LogCapture {
