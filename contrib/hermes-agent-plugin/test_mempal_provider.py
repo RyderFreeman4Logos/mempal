@@ -600,6 +600,61 @@ class PluginBackoffTests(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertEqual(hooks._consecutive_failures, 1)
 
+    def test_hooks_session_start_warmup_and_tiered_context(self) -> None:
+        hooks_path = os.path.join(PLUGIN_DIR, "mempal-hooks", "__init__.py")
+        spec = importlib.util.spec_from_file_location("mempal_hooks_warmup_test", hooks_path)
+        if spec is None or spec.loader is None:
+            self.fail("failed to load mempal-hooks plugin module")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hooks = module._MempalHooks()
+            hooks._initialized = True
+            hooks._wing = "hermes-user/alice/work"
+            hooks._backoff = SharedPluginBackoff(path=os.path.join(tmpdir, ".plugin_backoff"))
+            hooks._get = lambda path, params=None: {
+                "markdown": "brief: project prefers atomic commits",
+            }
+            class SearchTransport:
+                def get_json(self, path: str, params: Dict[str, Any]) -> Any:
+                    del path, params
+                    return module.SearchTransportResponse(
+                        [
+                            {
+                                "content": "decision: always write RED first",
+                                "memory_kind": "decision",
+                                "importance": 4,
+                            },
+                            {
+                                "content": "note: raw log",
+                                "memory_kind": "observation",
+                                "importance": 1,
+                            },
+                        ],
+                        {},
+                    )
+
+            hooks._search_transport = SearchTransport()
+
+            hooks.on_session_start("session-warmup")
+            result = hooks.pre_llm_call("session-warmup", "how do we ship?")
+            self.assertIsInstance(result, dict)
+            assert result is not None
+            context = result["context"]
+            self.assertIn("Session warmup", context)
+            self.assertIn("brief: project prefers atomic commits", context)
+            self.assertIn("High-signal", context)
+            self.assertIn("decision: always write RED first", context)
+            # Warmup is one-shot.
+            self.assertNotIn("session-warmup", hooks._session_warmup)
+
+            # Broader tool allowlist accepts terminal observations.
+            posts: List[Tuple[str, Dict[str, Any]]] = []
+            hooks._post = lambda path, body: posts.append((path, dict(body)))
+            hooks.post_tool_call("terminal", {"command": "ls"}, "x" * 80)
+            self.assertEqual(len(posts), 1)
+
     def test_shared_breaker_allows_operation_after_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, ".plugin_backoff")

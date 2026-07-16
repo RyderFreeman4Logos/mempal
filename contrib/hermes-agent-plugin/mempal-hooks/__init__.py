@@ -57,10 +57,14 @@ _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
 _DEGRADED_RESPONSE_SECS = 8.0
 _OBSERVE_TOOL_ALLOWLIST = {
-    "bash", "shell", "run_command", "execute",
-    "web_search", "search", "browse",
-    "read_file", "write_file",
-    "python", "code_interpreter",
+    # shell / command execution
+    "bash", "shell", "run_command", "execute", "terminal", "process",
+    # web / browse
+    "web_search", "search", "browse", "web_extract", "open_page", "browser_navigate",
+    # files
+    "read_file", "write_file", "patch", "search_files",
+    # code / analysis
+    "python", "code_interpreter", "execute_code",
 }
 _OBSERVE_TOOL_DENYLIST = {
     "mempal_search", "mempal_conclude", "mempal_profile",
@@ -231,6 +235,9 @@ class _MempalHooks:
         self._search_transport = SearchTransport(self._base_url)
         self._initialized = False
         self._init_lock = threading.Lock()
+        # Session-start warmup text keyed by session_id (consumed on first inject).
+        self._session_warmup: Dict[str, str] = {}
+        self._session_warmup_lock = threading.Lock()
 
     def _ensure_init(self, **kwargs) -> None:
         if self._initialized:
@@ -395,27 +402,55 @@ class _MempalHooks:
             return None
 
         if not results:
-            return None
+            return self._consume_session_warmup(session_id)
 
-        lines: List[str] = []
+        # Tiered context: high-importance / decision-like kinds first, then the rest.
+        high: List[str] = []
+        mid: List[str] = []
+        low: List[str] = []
         for r in results:
             content = (r.get("content") or "").strip()
             if not content:
                 continue
-            kind = r.get("memory_kind", "")
+            kind = str(r.get("memory_kind") or "")
             importance = r.get("importance")
+            try:
+                imp_val = float(importance) if importance is not None else 0.0
+            except (TypeError, ValueError):
+                imp_val = 0.0
             prefix = f"[{kind}]" if kind else ""
-            suffix = f"(importance:{importance})" if importance else ""
-            lines.append(f"- {prefix} {content} {suffix}".strip())
+            suffix = f"(importance:{importance})" if importance is not None else ""
+            line = f"- {prefix} {content} {suffix}".strip()
+            kind_l = kind.lower()
+            if imp_val >= 3 or kind_l in {"decision", "conclusion", "lesson", "pattern"}:
+                high.append(line)
+            elif imp_val >= 2 or kind_l in {"evidence", "observation"}:
+                mid.append(line)
+            else:
+                low.append(line)
 
-        if not lines:
-            return None
+        sections: List[str] = []
+        if high:
+            sections.append("### High-signal\n" + "\n".join(high))
+        if mid:
+            sections.append("### Supporting\n" + "\n".join(mid))
+        if low:
+            sections.append("### Background\n" + "\n".join(low))
+        if not sections:
+            return self._consume_session_warmup(session_id)
 
-        block = (
-            "## Relevant memories (mempal)\n"
-            + "\n".join(lines)
-        )
+        block = "## Relevant memories (mempal)\n" + "\n\n".join(sections)
+        warmup = self._consume_session_warmup(session_id)
+        if warmup and warmup.get("context"):
+            block = warmup["context"] + "\n\n" + block
         return {"context": block}
+
+    def _consume_session_warmup(self, session_id: str) -> Optional[Dict[str, str]]:
+        with self._session_warmup_lock:
+            text = self._session_warmup.pop(session_id, "")
+        if not text:
+            return None
+        return {"context": text}
 
     # ── post_tool_call: capture observations ─────────────────────
 
@@ -477,6 +512,75 @@ class _MempalHooks:
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         self._ensure_init(**kwargs)
+        if self._is_breaker_open():
+            return
+        try:
+            # Prefer brief for compact session wake-up; fall back to recent search.
+            brief = self._get(
+                "/api/brief",
+                {
+                    "wing": self._wing,
+                    "limit": 8,
+                },
+            )
+            text = self._format_brief_warmup(brief)
+            if not text:
+                results, degraded = self._get_search(
+                    {
+                        "q": "recent decisions lessons patterns",
+                        "wing": self._wing,
+                        "top_k": 6,
+                        "include_raw_turns": False,
+                    },
+                )
+                if degraded:
+                    self._record_failure()
+                    return
+                text = self._format_search_warmup(results)
+            if text:
+                with self._session_warmup_lock:
+                    self._session_warmup[session_id] = text
+                self._record_success()
+        except Exception as exc:
+            self._record_failure()
+            logger.debug("mempal-hooks session start warmup failed: %s", exc)
+
+    @staticmethod
+    def _format_brief_warmup(payload: Any) -> str:
+        if payload is None:
+            return ""
+        if isinstance(payload, str) and payload.strip():
+            return "## Session warmup (mempal brief)\n" + payload.strip()[:4000]
+        if isinstance(payload, dict):
+            # Common shapes: {text/markdown/content/brief: ...} or nested sections.
+            for key in ("markdown", "text", "content", "brief", "summary"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return "## Session warmup (mempal brief)\n" + value.strip()[:4000]
+            # Fall through to JSON snippet if structured.
+            try:
+                compact = json.dumps(payload, ensure_ascii=False)[:2000]
+            except (TypeError, ValueError):
+                return ""
+            if compact and compact != "{}":
+                return "## Session warmup (mempal brief)\n" + compact
+        return ""
+
+    @staticmethod
+    def _format_search_warmup(results: List[Dict[str, Any]]) -> str:
+        lines: List[str] = []
+        for r in results:
+            content = (r.get("content") or "").strip()
+            if not content:
+                continue
+            kind = r.get("memory_kind") or ""
+            prefix = f"[{kind}] " if kind else ""
+            lines.append(f"- {prefix}{content[:400]}")
+            if len(lines) >= 6:
+                break
+        if not lines:
+            return ""
+        return "## Session warmup (mempal recent)\n" + "\n".join(lines)
 
 
 def register(ctx):

@@ -185,7 +185,7 @@ alongside the MemoryProvider — they complement each other:
 |------|------|-------------|
 | `pre_llm_call` | Before each LLM turn | Searches mempal for relevant memories matching the user message, injects them as turn context |
 | `post_tool_call` | After each tool returns | Captures interesting tool results (shell, web search, code) as observation drawers in mempal |
-| `on_session_start` | Session begins | Warms up mempal connection |
+| `on_session_start` | Session begins | Fetches mempal brief (or recent search) and caches session warmup injected on the next pre_llm_call |
 
 ### Context injection
 
