@@ -334,7 +334,7 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertNotIn("SECRET_LOCAL_CONCLUSION", serialized)
         self.assertNotIn("SECRET_LOCAL_SPOOL_BODY", serialized)
 
-    def test_open_breaker_admits_conclude_locally_without_transport(self) -> None:
+    def test_open_breaker_returns_local_admission_success_without_transport(self) -> None:
         provider = RecordingProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
         for _ in range(5):
@@ -342,10 +342,20 @@ class DurableConcludeTests(unittest.TestCase):
 
         result = self._conclude(provider, "SECRET_BREAKER_CONCLUSION")
 
-        details = result["error_details"]
-        self.assertEqual(details["kind"], "durable_replay_deferred")
-        self.assertEqual(details["error_class"], "breaker_open")
-        self.assertTrue(details["operation_key"])
+        self.assertEqual(result["result"], "Fact admitted locally; durable storage pending.")
+        self.assertEqual(result["state"], "local_admitted")
+        self.assertTrue(result["operation_key"])
+        self.assertEqual(result["retry_operation_id"], result["operation_key"])
+        self.assertTrue(result["retry_safe"])
+        self.assertEqual(
+            result["durability"],
+            {
+                "state": "pending",
+                "kind": "durable_replay_deferred",
+                "deferred_reason": "breaker_open",
+            },
+        )
+        self.assertNotIn("error", result)
         self.assertEqual(provider.posts, [])
         self.assertEqual(provider._write_spool.count(), 1)
         self.assertNotIn("SECRET_BREAKER_CONCLUSION", json.dumps(result))

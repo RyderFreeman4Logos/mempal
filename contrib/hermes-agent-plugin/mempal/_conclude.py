@@ -69,13 +69,18 @@ def submit_conclusion(
         ))
 
     if not transport_allowed:
-        return ConcludeResult(False, _retry_payload(
-            "durable_replay_deferred",
-            None,
-            key,
-            "local_admitted",
-            "breaker_open",
-        ))
+        return ConcludeResult(False, {
+            "result": "Fact admitted locally; durable storage pending.",
+            "operation_key": key,
+            "retry_operation_id": key,
+            "state": "local_admitted",
+            "retry_safe": True,
+            "durability": {
+                "state": "pending",
+                "kind": "durable_replay_deferred",
+                "deferred_reason": "breaker_open",
+            },
+        })
 
     deadline = time.monotonic() + max(0.0, wait_timeout)
     operation_id: Optional[str] = None
