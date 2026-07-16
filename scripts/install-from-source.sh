@@ -16,7 +16,16 @@ cd "$(dirname "$0")/.."
 
 git pull --ff-only origin main
 install_root="${CARGO_INSTALL_ROOT:-/usr/local}"
-cargo install --path . --force --locked --features rest --root "$install_root"
+
+# Use mise-pinned Rust toolchain when available (same resolution as `just install`).
+# Falls back to raw cargo for environments without mise.
+if command -v mise >/dev/null 2>&1; then
+    cargo=(mise x rust@stable -- cargo)
+else
+    cargo=(cargo)
+fi
+
+"${cargo[@]}" install --path . --force --locked --features rest --root "$install_root"
 
 echo "--- verifying schema match ---"
 "$install_root/bin/mempal" status | grep -E "schema_version|fork_ext_version"
