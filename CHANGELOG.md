@@ -40,6 +40,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   identity (symlink/hardlink rejection), PID-namespace-safe tri-state process
   liveness, writer-lease fenced mutations, and `args_os()` for panic-free
   non-UTF-8 argv handling (#680).
+- **xurl/Hermes parser**: filter rewound messages by enforcing `active = 1 OR
+  compacted = 1` state predicate when Hermes `state.db` exposes those columns,
+  preventing ghost recall of non-canonical content. Legacy schemas without
+  state columns preserve existing import-all behavior (#741).
 - **Hermes/REST search**: end-to-end query deadline defaults to ~4 minutes
   (`api.search_query_deadline_secs = 240`), is hot-reloadable without a hard
   ceiling, is snapshotted at query admission, and is shared as remaining budget
