@@ -4,6 +4,7 @@ mod ingest_payload;
 mod logging;
 mod resource_usage;
 mod server;
+mod smoke_vectors;
 mod stale_daemon;
 mod timeline;
 mod tools;
