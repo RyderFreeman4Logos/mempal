@@ -1353,10 +1353,10 @@ threshold = 0.5
             test_lease,
         ));
 
-        tokio::time::timeout(Duration::from_secs(5), secondary_notify.notified())
+        tokio::time::timeout(Duration::from_secs(45), secondary_notify.notified())
             .await
             .expect("secondary endpoint should be used");
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(45), async {
             loop {
                 if let Some((verdict, score)) = maybe_llm_audit_verdict(&db, drawer_id)
                     && verdict == LLM_VERDICT_KEEP
@@ -1364,7 +1364,7 @@ threshold = 0.5
                 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await

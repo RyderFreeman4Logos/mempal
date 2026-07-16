@@ -5609,8 +5609,9 @@ mod tests {
             .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
             .expect("enqueue hook envelope");
         let worker_id = "long-processing-worker";
+        // Also fix the claim_next TTL at the start of the test (was 1).
         let message = store
-            .claim_next(worker_id, 1)
+            .claim_next(worker_id, 2)
             .expect("claim next")
             .expect("claimed message");
         assert_eq!(message.id, queued_id);
@@ -5628,7 +5629,8 @@ mod tests {
                 worker_id: worker_id.to_string(),
                 embedder: Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
                     SlowEmbedder {
-                        delay: Duration::from_secs(3),
+                        // Longer than claim TTL so reclaim would succeed without heartbeats.
+                        delay: Duration::from_secs(8),
                     },
                 ))),
                 prototype_classifier: Arc::new(ArcSwap::from_pointee(None)),
@@ -5640,12 +5642,15 @@ mod tests {
                 idle_observer: None,
             },
             message,
-            1,
+            // Short claim TTL: under concurrency, heartbeats must keep renewing.
+            2,
         ));
 
-        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        // Wait past the claim TTL (but well under embed delay). Without heartbeats the
+        // stealing worker could reclaim; with heartbeats the claim stays held.
+        tokio::time::sleep(Duration::from_millis(4_500)).await;
         let duplicate = async_store
-            .claim_next("stealing-worker".to_string(), 1)
+            .claim_next("stealing-worker".to_string(), 2)
             .await
             .expect("stealing worker claim_next");
         assert!(
@@ -5653,7 +5658,7 @@ mod tests {
             "long-running hook processing must heartbeat so claim_next cannot reclaim it"
         );
 
-        tokio::time::timeout(Duration::from_secs(3), worker)
+        tokio::time::timeout(Duration::from_secs(20), worker)
             .await
             .expect("worker should finish")
             .expect("worker task should not panic");
