@@ -60,7 +60,7 @@ struct DaemonStallDiagnostic {
 }
 
 pub struct DaemonContext {
-    pub runtime: tokio::runtime::Runtime,
+    pub runtime: Option<tokio::runtime::Runtime>,
     pub db: SharedDatabase,
     pub async_db: AsyncDb,
     pub store: AsyncPendingMessageStore,
@@ -317,7 +317,7 @@ fn bootstrap_inner(
     emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::Ready);
 
     Ok(DaemonContext {
-        runtime,
+        runtime: Some(runtime),
         db,
         async_db,
         store,

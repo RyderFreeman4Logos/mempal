@@ -97,13 +97,7 @@ const DEFAULT_CONSOLIDATION_STRATEGY: &str = "richest_content";
 const DEFAULT_CRYSTALLIZE_MIN_CLUSTER_SIZE: usize = 5;
 const DEFAULT_CRYSTALLIZE_READINESS_THRESHOLD: f64 = 5.0;
 const DEFAULT_CRYSTALLIZE_MAX_CANDIDATES_PER_RUN: usize = 20;
-const DEFAULT_SLEEP_NREM_PRUNE_MIN_AGE_DAYS: u64 = 30;
-const DEFAULT_SLEEP_NREM_PRUNE_MAX_IMPORTANCE: i32 = 1;
-const DEFAULT_SLEEP_NREM_COMPACTION_THRESHOLD: f64 = 0.85;
-const DEFAULT_SLEEP_SALIENCE_IDLE_MINUTES: u64 = 30;
-const DEFAULT_SLEEP_SCHEDULE: &str = "0 3 * * *";
 static DEFAULT_SENSITIVE_SCRUBBER: OnceLock<Option<CompiledPrivacyConfig>> = OnceLock::new();
-
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -3195,19 +3189,21 @@ pub struct SleepConfig {
     pub nrem_compaction_threshold: f64,
     pub rem_auto_resolve: bool,
     pub salience_idle_minutes: u64,
-    pub schedule: String,
+    pub auto_interval_secs: u64,
+    pub phases: Vec<String>,
 }
 
 impl Default for SleepConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            nrem_prune_min_age_days: DEFAULT_SLEEP_NREM_PRUNE_MIN_AGE_DAYS,
-            nrem_prune_max_importance: DEFAULT_SLEEP_NREM_PRUNE_MAX_IMPORTANCE,
-            nrem_compaction_threshold: DEFAULT_SLEEP_NREM_COMPACTION_THRESHOLD,
+            nrem_prune_min_age_days: 30,
+            nrem_prune_max_importance: 1,
+            nrem_compaction_threshold: 0.85,
             rem_auto_resolve: true,
-            salience_idle_minutes: DEFAULT_SLEEP_SALIENCE_IDLE_MINUTES,
-            schedule: DEFAULT_SLEEP_SCHEDULE.to_string(),
+            salience_idle_minutes: 30,
+            auto_interval_secs: 0,
+            phases: vec!["nrem".into(), "rem".into(), "salience".into()],
         }
     }
 }
