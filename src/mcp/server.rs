@@ -1729,18 +1729,24 @@ impl MempalMcpServer {
                     db_path.display()
                 )
             })?;
-            db.runtime_writer_lease_acquire_preserving_live_holders(
-                SQLITE_WRITER_LEASE_NAME,
-                &owner,
-                "mcp-ingest-worker",
-                MCP_INGEST_WRITER_LEASE_TTL_SECS,
-                Some(&metadata_json),
-            )
-            .context("failed to acquire MCP ingest writer lease")
+            // Lease-control heartbeats must use the admitted/open identity path,
+            // not the configured path which may be a symlink.
+            let admitted_path = db.path().to_path_buf();
+            let lease = db
+                .runtime_writer_lease_acquire_preserving_live_holders(
+                    SQLITE_WRITER_LEASE_NAME,
+                    &owner,
+                    "mcp-ingest-worker",
+                    MCP_INGEST_WRITER_LEASE_TTL_SECS,
+                    Some(&metadata_json),
+                )
+                .context("failed to acquire MCP ingest writer lease")?;
+            Ok::<_, anyhow::Error>((admitted_path, lease))
         })
         .await
         .context("MCP ingest writer lease task failed")??;
-        Ok(lease.map(|lease| McpIngestWriterLeaseGuard::new(self.db_path.clone(), lease)))
+        let (admitted_path, lease) = lease;
+        Ok(lease.map(|lease| McpIngestWriterLeaseGuard::new(admitted_path, lease)))
     }
 
     fn acquire_content_writer_lease(
