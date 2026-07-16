@@ -10,6 +10,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use super::evidence_config::EvidenceWorkflowConfig;
 use super::types::IntelligenceMode;
 
 const DEFAULT_DB_PATH: &str = "~/.mempal/palace.db";
@@ -111,6 +112,7 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     pub config_hot_reload: ConfigHotReloadConfig,
     pub search: SearchConfig,
+    pub evidence_workflow: EvidenceWorkflowConfig,
     pub turns: TurnsConfig,
     pub hotpatch: HotpatchConfig,
     #[serde(alias = "gating")]
@@ -141,6 +143,7 @@ impl Default for Config {
             privacy: PrivacyConfig::default(),
             config_hot_reload: ConfigHotReloadConfig::default(),
             search: SearchConfig::default(),
+            evidence_workflow: EvidenceWorkflowConfig::default(),
             turns: TurnsConfig::default(),
             hotpatch: HotpatchConfig::default(),
             ingest_gating: IngestGatingConfig::default(),
@@ -349,6 +352,7 @@ impl Config {
                 "search.tunnel_penalty must be a finite value in 0.0..=1.0".to_string(),
             ));
         }
+        self.evidence_workflow.validate()?;
         if self.search.reranker.timeout_secs == 0 {
             return Err(ConfigError::InvalidConfig(
                 "search.reranker.timeout_secs must be greater than 0".to_string(),

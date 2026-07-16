@@ -16,6 +16,7 @@ Next session (any agent) → mempal search → finds the decision with source ci
 - **Configurable embeddings**: prefer an explicit OpenAI-compatible local/LAN provider for production; model2vec is an opt-in feature/backend
 - **Single file**: everything lives in `~/.mempal/palace.db` (SQLite + sqlite-vec)
 - **No cloud by default**: remote embeddings, LLM gating, and rerankers are disabled until configured explicitly
+- **Optional cited evidence packs**: an [ADK-Rust post-retrieval workflow](docs/evidence-workflow.md) quality-gates exact source excerpts
 
 ## Quick Start
 
