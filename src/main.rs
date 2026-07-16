@@ -215,6 +215,13 @@ struct SearchCommandOptions<'a> {
     include_expired: bool,
 }
 
+struct DeleteCommandOptions<'a> {
+    drawer_id: &'a str,
+    project: Option<&'a str>,
+    include_global: bool,
+    all_projects: bool,
+}
+
 struct IngestCommandOptions<'a> {
     dir: Option<&'a Path>,
     stdin: bool,
@@ -608,7 +615,18 @@ enum Commands {
         command: BenchCommands,
     },
     /// Soft-delete a drawer by ID.
-    Delete { drawer_id: String },
+    Delete {
+        drawer_id: String,
+        /// Delete the drawer in an explicit project scope.
+        #[arg(long)]
+        project: Option<String>,
+        /// With --project/current project, also allow legacy global drawers.
+        #[arg(long, default_value_t = false)]
+        include_global: bool,
+        /// Allow deleting a drawer across all project scopes.
+        #[arg(long, default_value_t = false)]
+        all_projects: bool,
+    },
     /// Pin a drawer by ID.
     Pin { drawer_id: String },
     /// Unpin a drawer by ID.
@@ -4049,7 +4067,21 @@ fn run() -> Result<()> {
         }
         Commands::Project { command } => project_command(&db, command),
         Commands::Config { .. } => unreachable!(),
-        Commands::Delete { drawer_id } => delete_command(&db, &drawer_id),
+        Commands::Delete {
+            drawer_id,
+            project,
+            include_global,
+            all_projects,
+        } => delete_command(
+            &db,
+            config.as_ref(),
+            DeleteCommandOptions {
+                drawer_id: &drawer_id,
+                project: project.as_deref(),
+                include_global,
+                all_projects,
+            },
+        ),
         Commands::Pin { drawer_id } => pin_command(&db, &drawer_id),
         Commands::Unpin { drawer_id } => unpin_command(&db, &drawer_id),
         Commands::Pinned {
@@ -12515,34 +12547,55 @@ fn print_promotion_policy(policy: &[PromotionPolicyEntry]) {
     }
 }
 
-fn delete_command(db: &Database, drawer_id: &str) -> Result<()> {
-    let drawer = db
-        .get_drawer(drawer_id)
-        .context("failed to look up drawer")?;
-    match drawer {
-        Some(drawer) => {
-            let deleted = classify_cli_content_write_result(
-                db,
-                "delete",
-                db.soft_delete_drawer(drawer_id)
-                    .context("failed to soft-delete drawer"),
-            )?;
-            if !deleted {
-                bail!("drawer not found: {drawer_id}");
-            }
-            append_audit_entry(db, "delete", &serde_json::json!({ "drawer_id": drawer_id }))
-                .context("failed to append audit log")?;
-            println!("soft-deleted {}", drawer_id);
-            println!(
-                "  wing={} room={} source={}",
-                drawer.wing,
-                drawer.room.as_deref().unwrap_or("default"),
-                drawer.source_file.as_deref().unwrap_or("(none)")
-            );
-            println!("  (use `mempal purge` to permanently remove)");
-        }
-        None => bail!("drawer not found: {drawer_id}"),
+fn delete_command(db: &Database, config: &Config, options: DeleteCommandOptions<'_>) -> Result<()> {
+    let current_dir = env::current_dir().ok();
+    let project_id = resolve_project_id(options.project, config, current_dir.as_deref())
+        .context("failed to resolve delete project scope")?;
+    let scope = ProjectSearchScope::from_request(
+        project_id,
+        options.include_global,
+        options.all_projects,
+        config.search.strict_project_isolation,
+    );
+    let details = db
+        .get_drawer_details(options.drawer_id)
+        .context("failed to look up drawer")?
+        .ok_or_else(|| anyhow::anyhow!("drawer not found: {}", options.drawer_id))?;
+    if !scope.allows_row(details.project_id.as_deref()) {
+        bail!(
+            "drawer {} is outside the current project scope",
+            options.drawer_id
+        );
     }
+
+    let drawer_project_id = details.project_id;
+    let drawer = details.drawer;
+    let deleted = classify_cli_content_write_result(
+        db,
+        "delete",
+        db.soft_delete_drawer_in_project(options.drawer_id, drawer_project_id.as_deref())
+            .context("failed to soft-delete drawer"),
+    )?;
+    if !deleted {
+        bail!("drawer not found: {}", options.drawer_id);
+    }
+    append_audit_entry(
+        db,
+        "delete",
+        &serde_json::json!({
+            "drawer_id": options.drawer_id,
+            "project_id": drawer_project_id,
+        }),
+    )
+    .context("failed to append audit log")?;
+    println!("soft-deleted {}", options.drawer_id);
+    println!(
+        "  wing={} room={} source={}",
+        drawer.wing,
+        drawer.room.as_deref().unwrap_or("default"),
+        drawer.source_file.as_deref().unwrap_or("(none)")
+    );
+    println!("  (use `mempal purge` to permanently remove)");
     Ok(())
 }
 

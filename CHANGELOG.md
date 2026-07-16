@@ -35,6 +35,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+
+- **CLI/Delete**: scope exact-ID deletes to the resolved current project by default,
+  add explicit `--project`, `--include-global`, and `--all-projects` selectors,
+  and retain the project predicate in the soft-delete update itself (#712).
 - **Daemon/hooks**: missing or unreadable hook payload handles are now
   dead-lettered as Terminal instead of retrying forever as
   `invalid_queue_payload` (#721).
