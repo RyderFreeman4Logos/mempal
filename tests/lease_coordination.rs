@@ -132,6 +132,7 @@ fn runtime_writer_lease_acquire_renew_release() {
 
     assert_eq!(lease.name, "sqlite-writer");
     assert_eq!(lease.owner, "daemon-owner");
+    assert_eq!(lease.generation, 1);
     assert_eq!(lease.mode, "daemon");
     assert_eq!(lease.pid, std::process::id());
     assert!(lease.remaining_secs > 0);
@@ -140,25 +141,46 @@ fn runtime_writer_lease_acquire_renew_release() {
         Some(r#"{"command":"daemon"}"#)
     );
 
-    assert!(
-        db.runtime_writer_lease_renew(&lease.name, &lease.owner, &lease.session_id, 600)
-            .unwrap()
-    );
+    assert!(db.runtime_writer_lease_renew(&lease, 600).unwrap());
     let renewed = db
         .runtime_writer_lease_status(Some("sqlite-writer"))
         .unwrap();
     assert_eq!(renewed.len(), 1);
     assert!(renewed[0].remaining_secs > 0);
 
-    assert!(
-        db.runtime_writer_lease_release(&lease.name, &lease.owner, &lease.session_id)
-            .unwrap()
-    );
+    assert!(db.runtime_writer_lease_release(&lease).unwrap());
     assert!(
         db.runtime_writer_lease_status(Some("sqlite-writer"))
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn runtime_writer_read_only_status_filters_expired_without_cleanup_write() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("test.db");
+    let db = Database::open(&path).expect("open writer");
+    db.runtime_writer_lease_acquire("sqlite-writer", "owner", "maintenance", 1, None)
+        .expect("acquire lease")
+        .expect("writer lease");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let reader = Database::open_query_only(&path).expect("open query-only reader");
+    assert!(
+        reader
+            .runtime_writer_lease_status_read_only(Some("sqlite-writer"))
+            .expect("read-only lease status")
+            .is_empty()
+    );
+
+    let raw = rusqlite::Connection::open(&path).expect("open raw verifier");
+    let row_count: i64 = raw
+        .query_row("SELECT COUNT(*) FROM runtime_writer_leases", [], |row| {
+            row.get(0)
+        })
+        .expect("count retained lease row");
+    assert_eq!(row_count, 1, "query-only status must not clean up rows");
 }
 
 #[test]
@@ -183,8 +205,13 @@ fn runtime_writer_lease_conflicts_until_expiry() {
         "maintenance writer must not acquire while daemon writer lease is active"
     );
     assert!(
-        !db.runtime_writer_lease_release("sqlite-writer", "maintenance-owner", &daemon.session_id)
-            .unwrap(),
+        !db.runtime_writer_lease_release_fenced(
+            "sqlite-writer",
+            "maintenance-owner",
+            &daemon.session_id,
+            daemon.generation,
+        )
+        .unwrap(),
         "wrong owner/session must not release another writer lease"
     );
 
@@ -201,6 +228,36 @@ fn runtime_writer_lease_conflicts_until_expiry() {
         .unwrap()
         .expect("expired daemon lease should be recoverable");
     assert_eq!(maintenance.mode, "maintenance");
+    assert!(maintenance.generation > daemon.generation);
+}
+
+#[test]
+fn runtime_writer_lease_generation_fences_stale_owner_after_takeover() {
+    let db = open_test_db();
+    let first = db
+        .runtime_writer_lease_acquire("sqlite-writer", "owner", "maintenance", 1, None)
+        .unwrap()
+        .expect("first lease");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let second = db
+        .runtime_writer_lease_acquire("sqlite-writer", "owner", "maintenance", 300, None)
+        .unwrap()
+        .expect("take over expired lease");
+
+    assert!(second.generation > first.generation);
+    assert!(!db.runtime_writer_lease_renew(&first, 300).unwrap());
+    assert!(!db.runtime_writer_lease_release(&first).unwrap());
+    assert!(
+        !db.runtime_writer_lease_restore_if_unheld(&first, 300)
+            .unwrap()
+    );
+    assert!(db.runtime_writer_lease_is_active(&second).unwrap());
+    assert_eq!(
+        db.runtime_writer_lease_status(Some("sqlite-writer"))
+            .unwrap(),
+        vec![second]
+    );
 }
 
 #[test]

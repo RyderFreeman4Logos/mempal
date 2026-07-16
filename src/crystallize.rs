@@ -11,6 +11,7 @@ use crate::core::decay::parse_temporal_timestamp_secs;
 use crate::core::types::{
     Drawer, DrawerDetails, KnowledgeCard, KnowledgeCardEvent, KnowledgeEventType,
     KnowledgeEvidenceLink, KnowledgeEvidenceRole, KnowledgeStatus, KnowledgeTier,
+    RuntimeWriterLease,
 };
 use crate::core::utils::current_timestamp;
 use crate::intelligence::global_intelligence_status;
@@ -101,7 +102,16 @@ pub async fn run_crystallization(
     config: &Config,
     options: CrystallizeOptions,
 ) -> Result<CrystallizeSummary> {
-    run_crystallization_inner(db, config, options, true).await
+    run_crystallization_with_writer_lease(db, config, options, None).await
+}
+
+pub async fn run_crystallization_with_writer_lease(
+    db: &Database,
+    config: &Config,
+    options: CrystallizeOptions,
+    writer_lease: Option<&RuntimeWriterLease>,
+) -> Result<CrystallizeSummary> {
+    run_crystallization_inner(db, config, options, true, writer_lease).await
 }
 
 pub fn run_crystallization_deterministic(
@@ -109,8 +119,23 @@ pub fn run_crystallization_deterministic(
     config: &Config,
     options: CrystallizeOptions,
 ) -> Result<CrystallizeSummary> {
+    run_crystallization_deterministic_with_writer_lease(db, config, options, None)
+}
+
+pub fn run_crystallization_deterministic_with_writer_lease(
+    db: &Database,
+    config: &Config,
+    options: CrystallizeOptions,
+    writer_lease: Option<&RuntimeWriterLease>,
+) -> Result<CrystallizeSummary> {
     let runtime = tokio::runtime::Runtime::new().expect("create crystallize runtime");
-    runtime.block_on(run_crystallization_inner(db, config, options, false))
+    runtime.block_on(run_crystallization_inner(
+        db,
+        config,
+        options,
+        false,
+        writer_lease,
+    ))
 }
 
 async fn run_crystallization_inner(
@@ -118,6 +143,7 @@ async fn run_crystallization_inner(
     config: &Config,
     options: CrystallizeOptions,
     allow_llm: bool,
+    writer_lease: Option<&RuntimeWriterLease>,
 ) -> Result<CrystallizeSummary> {
     if !config.crystallize.enabled {
         return Ok(CrystallizeSummary {
@@ -171,11 +197,20 @@ async fn run_crystallization_inner(
         if options.dry_run {
             continue;
         }
-        if db.get_knowledge_card(&candidate.card.id)?.is_some() {
-            continue;
+        let inserted = db.with_runtime_writer_lease_write(
+            writer_lease,
+            "insert crystallization candidate",
+            || -> Result<bool> {
+                if db.get_knowledge_card(&candidate.card.id)?.is_some() {
+                    return Ok(false);
+                }
+                insert_candidate(db, candidate)?;
+                Ok(true)
+            },
+        )?;
+        if inserted {
+            cards_created += 1;
         }
-        insert_candidate(db, candidate)?;
-        cards_created += 1;
     }
 
     Ok(CrystallizeSummary {

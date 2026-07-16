@@ -526,7 +526,7 @@ struct StatusResponse {
     embedder_circuit: EmbedderCircuitStatus,
     queue_stats: ApiQueueStats,
     hook_admission: crate::hook_diagnostics::HookAdmissionStats,
-    resource_usage: ResourceUsageStatus,
+    resource_usage: super::resource_status::ResourceUsageStatus,
     io_burst: crate::observability::IoBurstSnapshot,
     write_queue: WriteQueueStats,
     feature_flags: FeatureFlags,
@@ -555,86 +555,6 @@ struct SearchPolicyStatus {
     embed_deadline_secs: u64,
     /// Stage cap for reranker HTTP (still limited by remaining E2E budget).
     reranker_timeout_secs: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct ResourceUsageStatus {
-    process: ProcessResourceUsageStatus,
-    sqlite: SqliteResourceUsageStatus,
-    counters: ResourceCounterStatus,
-}
-
-#[derive(Debug, Serialize)]
-struct ProcessResourceUsageStatus {
-    pid: i32,
-    rss_bytes: Option<u64>,
-    pss_bytes: Option<u64>,
-    private_dirty_bytes: Option<u64>,
-    anonymous_bytes: Option<u64>,
-    swap_bytes: Option<u64>,
-    io_read_bytes: Option<u64>,
-    io_write_bytes: Option<u64>,
-    io_cancelled_write_bytes: Option<u64>,
-}
-
-impl From<crate::process_diagnostics::ProcessMemoryReport> for ProcessResourceUsageStatus {
-    fn from(value: crate::process_diagnostics::ProcessMemoryReport) -> Self {
-        Self {
-            pid: value.pid,
-            rss_bytes: value.rss_bytes,
-            pss_bytes: value.pss_bytes,
-            private_dirty_bytes: value.private_dirty_bytes,
-            anonymous_bytes: value.anonymous_bytes,
-            swap_bytes: value.swap_bytes,
-            io_read_bytes: value.io_read_bytes,
-            io_write_bytes: value.io_write_bytes,
-            io_cancelled_write_bytes: value.io_cancelled_write_bytes,
-        }
-    }
-}
-
-#[derive(Debug, Default, Serialize)]
-struct SqliteResourceUsageStatus {
-    async_pool_loaded: bool,
-    async_reader_connections: usize,
-    async_writer_connections: usize,
-    async_total_connections: usize,
-    per_connection_cache_kib: i64,
-    per_connection_cache_bytes: u64,
-    configured_page_cache_bytes: u64,
-    page_cache_budget_bytes: u64,
-}
-
-impl From<crate::core::async_db::AsyncDbResourceSnapshot> for SqliteResourceUsageStatus {
-    fn from(value: crate::core::async_db::AsyncDbResourceSnapshot) -> Self {
-        Self {
-            async_pool_loaded: true,
-            async_reader_connections: value.reader_connections,
-            async_writer_connections: value.writer_connections,
-            async_total_connections: value.total_connections,
-            per_connection_cache_kib: value.per_connection_cache_kib,
-            per_connection_cache_bytes: value.per_connection_cache_bytes,
-            configured_page_cache_bytes: value.configured_page_cache_bytes,
-            page_cache_budget_bytes: value.page_cache_budget_bytes,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct ResourceCounterStatus {
-    access_writeback_scheduled_total: u64,
-    access_writeback_skipped_total: u64,
-    access_writeback_failed_total: u64,
-}
-
-impl From<crate::observability::ResourceCounterSnapshot> for ResourceCounterStatus {
-    fn from(value: crate::observability::ResourceCounterSnapshot) -> Self {
-        Self {
-            access_writeback_scheduled_total: value.access_writeback_scheduled_total,
-            access_writeback_skipped_total: value.access_writeback_skipped_total,
-            access_writeback_failed_total: value.access_writeback_failed_total,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -972,6 +892,7 @@ async fn process_ingest_request(
                 &drawer_id,
                 chunk,
                 &db,
+                None,
                 project_id.as_deref(),
                 &config.ingest_gating.fact_check,
                 validated.confidence,
@@ -1288,20 +1209,16 @@ async fn status_handler(
                 .to_string(),
         );
     }
-    let process_report =
-        crate::process_diagnostics::inspect_process_memory(std::process::id() as i32);
-    let sqlite_resource = state
-        .async_db_resource_snapshot()
-        .map(SqliteResourceUsageStatus::from)
-        .unwrap_or_else(|| SqliteResourceUsageStatus {
-            async_pool_loaded: false,
-            ..SqliteResourceUsageStatus::default()
-        });
-    let resource_usage = ResourceUsageStatus {
-        process: ProcessResourceUsageStatus::from(process_report),
-        sqlite: sqlite_resource,
-        counters: ResourceCounterStatus::from(crate::observability::resource_counters()),
-    };
+    let resource_usage = tokio::task::spawn_blocking({
+        let db_path = state.db_path.clone();
+        let snapshot = state.async_db_resource_snapshot();
+        move || super::resource_status::build_resource_usage(&db_path, snapshot)
+    })
+    .await
+    .unwrap_or_else(|err| {
+        tracing::warn!(?err, "resource status spawn_blocking failed");
+        super::resource_status::build_resource_usage_degraded()
+    });
     let embed_endpoints = daemon_embed_config
         .embed
         .effective_endpoints()

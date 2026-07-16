@@ -487,7 +487,7 @@ fn release_runtime_writer_lease(
 ) -> Result<()> {
     let db = Database::open(db_path)?;
     assert!(
-        db.runtime_writer_lease_release(&lease.name, &lease.owner, &lease.session_id)?,
+        db.runtime_writer_lease_release(lease)?,
         "writer lease should be active before release"
     );
     Ok(())
@@ -573,6 +573,7 @@ log_path = "{}"
     assert_eq!(
         seen,
         vec![
+            BootstrapEvent::RecoveryAdmitted,
             BootstrapEvent::Daemonize,
             BootstrapEvent::RuntimeInit,
             BootstrapEvent::ConfigHandleBootstrap,

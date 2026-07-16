@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use thiserror::Error;
 
-use super::db::SQLITE_CACHE_SIZE_KIB_256_MIB;
+use super::db_connection::AdmittedSqliteConnection;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReindexProgressRow {
@@ -20,6 +20,8 @@ pub struct ReindexProgressRow {
 pub enum ReindexProgressError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Database(#[from] super::db::DbError),
 }
 
 pub type Result<T> = std::result::Result<T, ReindexProgressError>;
@@ -43,6 +45,22 @@ impl ReindexProgressStore {
         embedder_name: &str,
     ) -> Result<()> {
         self.upsert(
+            source_path,
+            last_processed_chunk_id,
+            embedder_name,
+            "running",
+        )
+    }
+
+    pub fn upsert_running_on_connection(
+        &self,
+        conn: &rusqlite::Connection,
+        source_path: &str,
+        last_processed_chunk_id: Option<i64>,
+        embedder_name: &str,
+    ) -> Result<()> {
+        Self::upsert_on_connection(
+            conn,
             source_path,
             last_processed_chunk_id,
             embedder_name,
@@ -87,6 +105,22 @@ impl ReindexProgressStore {
         )
     }
 
+    pub fn mark_failed_on_connection(
+        &self,
+        conn: &rusqlite::Connection,
+        source_path: &str,
+        last_processed_chunk_id: Option<i64>,
+        embedder_name: &str,
+    ) -> Result<()> {
+        Self::upsert_on_connection(
+            conn,
+            source_path,
+            last_processed_chunk_id,
+            embedder_name,
+            "failed",
+        )
+    }
+
     /// Finalize orphan `running` rows whose source drawers are already fully
     /// current for the active vector index.
     ///
@@ -98,8 +132,21 @@ impl ReindexProgressStore {
         current_index_version: &str,
         target_fingerprint: &str,
     ) -> Result<usize> {
-        let now = now_secs();
         let conn = self.open_connection()?;
+        self.finalize_completed_running_rows_on_connection(
+            conn.connection(),
+            current_index_version,
+            target_fingerprint,
+        )
+    }
+
+    pub fn finalize_completed_running_rows_on_connection(
+        &self,
+        conn: &rusqlite::Connection,
+        current_index_version: &str,
+        target_fingerprint: &str,
+    ) -> Result<usize> {
+        let now = now_secs();
         let updated = conn.execute(
             FINALIZE_COMPLETED_RUNNING_ROWS_SQL,
             params![current_index_version, target_fingerprint, now],
@@ -134,8 +181,11 @@ impl ReindexProgressStore {
         };
 
         let row = match embedder_name {
-            Some(name) => conn.query_row(sql, [name], map_row).optional()?,
-            None => conn.query_row(sql, [], map_row).optional()?,
+            Some(name) => conn
+                .connection()
+                .query_row(sql, [name], map_row)
+                .optional()?,
+            None => conn.connection().query_row(sql, [], map_row).optional()?,
         };
         Ok(row)
     }
@@ -147,8 +197,24 @@ impl ReindexProgressStore {
         embedder_name: &str,
         status: &str,
     ) -> Result<()> {
-        let now = now_secs();
         let conn = self.open_connection()?;
+        Self::upsert_on_connection(
+            conn.connection(),
+            source_path,
+            last_processed_chunk_id,
+            embedder_name,
+            status,
+        )
+    }
+
+    fn upsert_on_connection(
+        conn: &rusqlite::Connection,
+        source_path: &str,
+        last_processed_chunk_id: Option<i64>,
+        embedder_name: &str,
+        status: &str,
+    ) -> Result<()> {
+        let now = now_secs();
         conn.execute(
             r#"
             INSERT INTO reindex_progress (
@@ -177,10 +243,8 @@ impl ReindexProgressStore {
         Ok(())
     }
 
-    fn open_connection(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.db_path)?;
-        conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_256_MIB)?;
-        Ok(conn)
+    fn open_connection(&self) -> Result<AdmittedSqliteConnection> {
+        AdmittedSqliteConnection::open_default(&self.db_path).map_err(ReindexProgressError::from)
     }
 }
 

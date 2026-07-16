@@ -1,6 +1,6 @@
 use crate::core::{
     db::Database,
-    types::{AnchorKind, Drawer, MemoryDomain, Provenance, SourceType},
+    types::{AnchorKind, Drawer, MemoryDomain, Provenance, RuntimeWriterLease, SourceType},
     utils::current_timestamp,
 };
 use crate::embed::Embedder;
@@ -113,6 +113,7 @@ pub fn prepare_diary_rollup(
 
 pub fn commit_prepared_diary_rollup(
     db: &Database,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
     prepared: PreparedDiaryRollup,
     vector: &[f32],
 ) -> Result<DiaryRollupOutcome, IngestError> {
@@ -155,7 +156,7 @@ pub fn commit_prepared_diary_rollup(
         compacted_into: None,
     };
 
-    db.upsert_drawer_and_replace_vector(&drawer, vector)
+    db.upsert_drawer_and_replace_vector_fenced(runtime_writer_lease, &drawer, vector)
         .map_err(|source| IngestError::InsertDrawer {
             drawer_id: prepared.drawer_id.clone(),
             source,
@@ -169,6 +170,17 @@ pub fn commit_prepared_diary_rollup(
 
 pub async fn ingest_diary_rollup<E: Embedder + ?Sized>(
     db: &Database,
+    embedder: &E,
+    content: &str,
+    wing: &str,
+    options: DiaryRollupOptions<'_>,
+) -> Result<DiaryRollupOutcome, IngestError> {
+    ingest_diary_rollup_fenced(db, None, embedder, content, wing, options).await
+}
+
+pub async fn ingest_diary_rollup_fenced<E: Embedder + ?Sized>(
+    db: &Database,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
     embedder: &E,
     content: &str,
     wing: &str,
@@ -215,7 +227,7 @@ pub async fn ingest_diary_rollup<E: Embedder + ?Sized>(
             drawer_id: prepared.drawer_id.clone(),
         })?;
 
-    commit_prepared_diary_rollup(db, prepared, &vector)
+    commit_prepared_diary_rollup(db, runtime_writer_lease, prepared, &vector)
 }
 
 fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {

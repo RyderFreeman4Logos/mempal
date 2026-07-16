@@ -2,11 +2,16 @@
 
 mod ingest_payload;
 mod logging;
+mod resource_usage;
 mod server;
 mod stale_daemon;
 mod timeline;
 mod tools;
 
+pub use resource_usage::{
+    DaemonRecoveryDto, MemoryPressureDto, ProcessResourceUsageDto, ProfileDbAdmissionDto,
+    ProfileDbHolderDto, ResourceCounterDto, ResourceUsageDto, SqliteResourceUsageDto,
+};
 pub use server::{IngestDrainWorkerHandle, MempalMcpServer, daemon_ingest_ipc_available_for_path};
 pub use timeline::{TimelineRequest, TimelineResponse};
 pub use tools::{

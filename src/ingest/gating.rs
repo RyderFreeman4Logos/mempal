@@ -4,13 +4,17 @@ use crate::core::config::{
     AutoFactCheckConfig, Config, EmbeddingClassifierConfig, GatingQualityPolicy, GatingRuleConfig,
     IngestGatingConfig,
 };
-use crate::core::db::{Database, DbError};
 use crate::embed::{EmbedError, Embedder, EmbedderFactory, build_backend_from_name};
-use crate::factcheck::{self, FactIssue};
+use crate::factcheck::FactIssue;
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{sync::OnceCell, task::JoinHandle};
+
+#[path = "gating_fact_check.rs"]
+mod gating_fact_check;
+
+pub use gating_fact_check::evaluate_fact_check_gate;
 
 const MIN_SIGNAL_BYTES: usize = 12;
 const MAX_PROTOTYPE_COUNT: usize = 64;
@@ -470,56 +474,6 @@ pub async fn evaluate_tier2<E: Embedder + ?Sized>(
             }
         }
     }
-}
-
-pub fn evaluate_fact_check_gate(
-    candidate_hash: &str,
-    chunk_text: &str,
-    db: &Database,
-    project_id: Option<&str>,
-    config: &AutoFactCheckConfig,
-    new_confidence: f64,
-) -> Result<Option<FactCheckGateOutcome>, DbError> {
-    if !config.enabled {
-        return Ok(None);
-    }
-
-    let now = match factcheck::resolve_now(None) {
-        Ok(now) => now,
-        Err(error) => {
-            let outcome = fact_check_fail_open_outcome(error.to_string());
-            db.record_gating_audit(
-                candidate_hash,
-                &outcome.decision,
-                project_id,
-                Some(chunk_text),
-            )?;
-            return Ok(Some(outcome));
-        }
-    };
-
-    let report = match factcheck::check_with_confidence(chunk_text, db, now, None, new_confidence) {
-        Ok(report) => report,
-        Err(error) => {
-            let outcome = fact_check_fail_open_outcome(error.to_string());
-            db.record_gating_audit(
-                candidate_hash,
-                &outcome.decision,
-                project_id,
-                Some(chunk_text),
-            )?;
-            return Ok(Some(outcome));
-        }
-    };
-
-    let warnings = report
-        .issues
-        .iter()
-        .map(format_fact_issue_warning)
-        .collect::<Vec<_>>();
-    let decision = fact_check_decision(&report.issues, config);
-    db.record_gating_audit(candidate_hash, &decision, project_id, Some(chunk_text))?;
-    Ok(Some(FactCheckGateOutcome { decision, warnings }))
 }
 
 fn fact_check_decision(issues: &[FactIssue], config: &AutoFactCheckConfig) -> GatingDecision {

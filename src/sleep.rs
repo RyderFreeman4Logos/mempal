@@ -19,10 +19,10 @@ use crate::core::{
     config::Config,
     db::{Database, DbError, find_similar_clusters},
     decay::parse_temporal_timestamp_secs,
-    types::CompactionStrategy,
+    types::{CompactionStrategy, RuntimeWriterLease},
     utils::{current_timestamp, iso_timestamp},
 };
-use crate::crystallize::{CrystallizeOptions, run_crystallization_deterministic};
+use crate::crystallize::{CrystallizeOptions, run_crystallization_deterministic_with_writer_lease};
 use crate::factcheck::{self, FactCheckError, FactIssue};
 
 #[derive(Debug, Error)]
@@ -203,6 +203,15 @@ pub fn run_sleep_cycle(
     config: &Config,
     options: SleepRunOptions,
 ) -> Result<SleepCycleSummary, SleepError> {
+    run_sleep_cycle_with_writer_lease(db, config, options, None)
+}
+
+pub fn run_sleep_cycle_with_writer_lease(
+    db: &Database,
+    config: &Config,
+    options: SleepRunOptions,
+    writer_lease: Option<&RuntimeWriterLease>,
+) -> Result<SleepCycleSummary, SleepError> {
     let phases = options.phases.selected_or_all();
     let project_ids = sleep_project_ids(db, options.project_id.as_deref())?;
     let mut summary = SleepCycleSummary {
@@ -214,10 +223,16 @@ pub fn run_sleep_cycle(
     for phase in phases {
         match phase {
             SleepPhase::Nrem => {
-                summary.nrem = Some(run_nrem(db, config, &project_ids, options.dry_run)?);
+                summary.nrem = Some(run_nrem(
+                    db,
+                    config,
+                    &project_ids,
+                    options.dry_run,
+                    writer_lease,
+                )?);
                 if config.crystallize.enabled {
                     for project_id in &project_ids {
-                        let crystallize = run_crystallization_deterministic(
+                        let crystallize = run_crystallization_deterministic_with_writer_lease(
                             db,
                             config,
                             CrystallizeOptions {
@@ -225,6 +240,7 @@ pub fn run_sleep_cycle(
                                 project_id: project_id.clone(),
                                 use_llm: false,
                             },
+                            writer_lease,
                         )?;
                         summary.crystallize_candidates += crystallize.candidates_found;
                         summary.crystallized_cards += crystallize.cards_created;
@@ -232,16 +248,29 @@ pub fn run_sleep_cycle(
                 }
             }
             SleepPhase::Rem => {
-                summary.rem = Some(run_rem(db, config, &project_ids, options.dry_run)?);
+                summary.rem = Some(run_rem(
+                    db,
+                    config,
+                    &project_ids,
+                    options.dry_run,
+                    writer_lease,
+                )?);
             }
             SleepPhase::Salience => {
-                summary.salience = Some(run_salience(db, &project_ids, options.dry_run)?);
+                summary.salience = Some(run_salience(
+                    db,
+                    &project_ids,
+                    options.dry_run,
+                    writer_lease,
+                )?);
             }
         }
     }
 
     if !options.dry_run {
-        insert_sleep_log(db, options.phases.label(), &summary)?;
+        db.with_runtime_writer_lease_write(writer_lease, "insert sleep log", || {
+            insert_sleep_log(db, options.phases.label(), &summary)
+        })?;
     }
 
     Ok(summary)
@@ -252,6 +281,7 @@ fn run_nrem(
     config: &Config,
     project_ids: &[Option<String>],
     dry_run: bool,
+    writer_lease: Option<&RuntimeWriterLease>,
 ) -> Result<NremSummary, SleepError> {
     let now_secs = unix_now_secs();
     let sleep_at = iso_timestamp();
@@ -276,7 +306,9 @@ fn run_nrem(
 
         summary.pruned_drawers += old_ids.len();
         if !dry_run && !old_ids.is_empty() {
-            soft_delete_drawers_for_sleep(db, &old_ids, &sleep_at)?;
+            db.with_runtime_writer_lease_write(writer_lease, "prune sleep drawers", || {
+                soft_delete_drawers_for_sleep(db, &old_ids, &sleep_at)
+            })?;
         }
         let pruned_ids = old_ids.into_iter().collect::<HashSet<_>>();
 
@@ -316,12 +348,30 @@ fn run_nrem(
                 if drawer_ids.is_empty() {
                     continue;
                 }
-                let result =
-                    merge_cluster(db, &drawer_ids, CompactionStrategy::RichestContent, dry_run)?;
+                let result = if dry_run {
+                    merge_cluster(db, &drawer_ids, CompactionStrategy::RichestContent, true)?
+                } else {
+                    db.with_runtime_writer_lease_write(
+                        writer_lease,
+                        "compact sleep cluster",
+                        || {
+                            merge_cluster(
+                                db,
+                                &drawer_ids,
+                                CompactionStrategy::RichestContent,
+                                false,
+                            )
+                        },
+                    )?
+                };
                 summary.clusters_compacted += 1;
                 summary.compacted_drawers += result.source_ids.len().saturating_sub(1);
                 if !dry_run {
-                    mark_last_sleep_at(db, &result.source_ids, &sleep_at)?;
+                    db.with_runtime_writer_lease_write(
+                        writer_lease,
+                        "mark compacted sleep drawers",
+                        || mark_last_sleep_at(db, &result.source_ids, &sleep_at),
+                    )?;
                 }
             }
         }
@@ -335,6 +385,7 @@ fn run_rem(
     config: &Config,
     project_ids: &[Option<String>],
     dry_run: bool,
+    writer_lease: Option<&RuntimeWriterLease>,
 ) -> Result<RemSummary, SleepError> {
     let now_secs = unix_now_secs() as u64;
     let sleep_at = iso_timestamp();
@@ -371,16 +422,22 @@ fn run_rem(
 
                 summary.conflicts_resolved += 1;
                 if !dry_run {
-                    db.invalidate_triple(&triple_id)?;
-                    insert_resolution_log(
-                        db,
-                        &sleep_at,
-                        &drawer,
-                        &triple_id,
-                        source_drawer.as_deref(),
-                        existing_confidence,
+                    db.with_runtime_writer_lease_write(
+                        writer_lease,
+                        "resolve sleep conflict",
+                        || {
+                            db.invalidate_triple(&triple_id)?;
+                            insert_resolution_log(
+                                db,
+                                &sleep_at,
+                                &drawer,
+                                &triple_id,
+                                source_drawer.as_deref(),
+                                existing_confidence,
+                            )?;
+                            mark_last_sleep_at(db, std::slice::from_ref(&drawer.id), &sleep_at)
+                        },
                     )?;
-                    mark_last_sleep_at(db, std::slice::from_ref(&drawer.id), &sleep_at)?;
                 }
             }
         }
@@ -393,6 +450,7 @@ fn run_salience(
     db: &Database,
     project_ids: &[Option<String>],
     dry_run: bool,
+    writer_lease: Option<&RuntimeWriterLease>,
 ) -> Result<SalienceSummary, SleepError> {
     let now_secs = unix_now_secs();
     let sleep_at = iso_timestamp();
@@ -419,7 +477,11 @@ fn run_salience(
 
         summary.scored_drawers += updates.len();
         if !dry_run && !updates.is_empty() {
-            update_salience_scores(db, &updates, &sleep_at)?;
+            db.with_runtime_writer_lease_write(
+                writer_lease,
+                "update sleep salience scores",
+                || update_salience_scores(db, &updates, &sleep_at),
+            )?;
         }
     }
 
@@ -640,7 +702,10 @@ fn soft_delete_drawers_for_sleep(
     sleep_at: &str,
 ) -> Result<(), DbError> {
     let deleted_at = current_timestamp();
-    db.conn().execute_batch("BEGIN IMMEDIATE")?;
+    let owns_transaction = db.conn().is_autocommit();
+    if owns_transaction {
+        db.conn().execute_batch("BEGIN IMMEDIATE")?;
+    }
     let result = (|| -> Result<(), DbError> {
         for drawer_id in drawer_ids {
             db.conn().execute(
@@ -656,11 +721,14 @@ fn soft_delete_drawers_for_sleep(
         }
         Ok(())
     })();
-    commit_or_rollback(db, result)
+    commit_or_rollback(db, owns_transaction, result)
 }
 
 fn mark_last_sleep_at(db: &Database, drawer_ids: &[String], sleep_at: &str) -> Result<(), DbError> {
-    db.conn().execute_batch("BEGIN IMMEDIATE")?;
+    let owns_transaction = db.conn().is_autocommit();
+    if owns_transaction {
+        db.conn().execute_batch("BEGIN IMMEDIATE")?;
+    }
     let result = (|| -> Result<(), DbError> {
         for drawer_id in drawer_ids {
             db.conn().execute(
@@ -670,7 +738,7 @@ fn mark_last_sleep_at(db: &Database, drawer_ids: &[String], sleep_at: &str) -> R
         }
         Ok(())
     })();
-    commit_or_rollback(db, result)
+    commit_or_rollback(db, owns_transaction, result)
 }
 
 fn update_salience_scores(
@@ -678,7 +746,10 @@ fn update_salience_scores(
     updates: &[(String, f64)],
     sleep_at: &str,
 ) -> Result<(), DbError> {
-    db.conn().execute_batch("BEGIN IMMEDIATE")?;
+    let owns_transaction = db.conn().is_autocommit();
+    if owns_transaction {
+        db.conn().execute_batch("BEGIN IMMEDIATE")?;
+    }
     let result = (|| -> Result<(), DbError> {
         for (drawer_id, score) in updates {
             db.conn().execute(
@@ -693,10 +764,17 @@ fn update_salience_scores(
         }
         Ok(())
     })();
-    commit_or_rollback(db, result)
+    commit_or_rollback(db, owns_transaction, result)
 }
 
-fn commit_or_rollback(db: &Database, result: Result<(), DbError>) -> Result<(), DbError> {
+fn commit_or_rollback(
+    db: &Database,
+    owns_transaction: bool,
+    result: Result<(), DbError>,
+) -> Result<(), DbError> {
+    if !owns_transaction {
+        return result;
+    }
     match result {
         Ok(()) => {
             db.conn().execute_batch("COMMIT")?;

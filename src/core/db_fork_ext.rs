@@ -1,5 +1,9 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
+#[path = "db_fork_ext_v26.rs"]
+mod v26;
+use v26::{apply_v24, apply_v25, apply_v26};
+
 /// Hook injected into the migration runner between `up()` and `COMMIT`.
 /// Returning Err triggers a ROLLBACK, leaving `fork_ext_version` unchanged.
 /// // harness-point: PR0
@@ -14,7 +18,7 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 25;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 26;
 
 // Partial indexes on the most expensive GROUP BY + COUNT(*) paths used by `mempal status`.
 // idx_drawers_project_id_active is a partial replacement for the non-partial
@@ -153,16 +157,6 @@ CREATE INDEX IF NOT EXISTS idx_operation_telemetry_source_operation
     ON operation_telemetry(source, operation, started_at_unix_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_operation_telemetry_call_site
     ON operation_telemetry(call_site, started_at_unix_ms DESC);
-"#;
-
-pub const FORK_EXT_V24_SCHEMA_SQL: &str = r#"
-CREATE INDEX IF NOT EXISTS idx_pending_status_heartbeat_at
-    ON pending_messages(status, heartbeat_at);
-"#;
-
-pub const FORK_EXT_V25_SCHEMA_SQL: &str = r#"
-CREATE INDEX IF NOT EXISTS idx_pending_completions_op_state_rejected_reason
-    ON pending_message_completions(op_state, rejected_reason);
 "#;
 
 pub const FORK_EXT_V15_SCHEMA_SQL: &str = r#"
@@ -507,6 +501,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 25,
             up: apply_v25,
         },
+        Migration {
+            version: 26,
+            up: apply_v26,
+        },
     ]
 }
 
@@ -757,14 +755,6 @@ fn apply_v22(conn: &Connection) -> rusqlite::Result<()> {
 
 fn apply_v23(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(FORK_EXT_V23_SCHEMA_SQL)
-}
-
-fn apply_v24(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(FORK_EXT_V24_SCHEMA_SQL)
-}
-
-fn apply_v25(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(FORK_EXT_V25_SCHEMA_SQL)
 }
 
 fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {

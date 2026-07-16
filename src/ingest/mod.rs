@@ -213,40 +213,6 @@ pub enum IngestError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to verify runtime SQLite writer lease before {operation}")]
-    RuntimeWriterLeaseCheck {
-        operation: &'static str,
-        #[source]
-        source: crate::core::db::DbError,
-    },
-    #[error("runtime SQLite writer lease `{lease_name}` for {owner} was lost before {operation}")]
-    RuntimeWriterLeaseLost {
-        lease_name: String,
-        owner: String,
-        operation: &'static str,
-    },
-}
-
-fn ensure_runtime_writer_lease_active(
-    db: &Database,
-    lease: Option<&RuntimeWriterLease>,
-    operation: &'static str,
-) -> Result<()> {
-    let Some(lease) = lease else {
-        return Ok(());
-    };
-    let active = db
-        .runtime_writer_lease_is_active(&lease.name, &lease.owner, &lease.session_id)
-        .map_err(|source| IngestError::RuntimeWriterLeaseCheck { operation, source })?;
-    if active {
-        Ok(())
-    } else {
-        Err(IngestError::RuntimeWriterLeaseLost {
-            lease_name: lease.name.clone(),
-            owner: lease.owner.clone(),
-            operation,
-        })
-    }
 }
 
 /// Chunk content for embedding using the token-aware chunker.
@@ -375,11 +341,9 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
 
     // Stage 3: Diary rollup early-return (upstream)
     if options.diary_rollup {
-        if !options.dry_run {
-            ensure_runtime_writer_lease_active(db, runtime_writer_lease, "diary rollup")?;
-        }
-        let mut outcome = diary::ingest_diary_rollup(
+        let mut outcome = diary::ingest_diary_rollup_fenced(
             db,
+            runtime_writer_lease,
             embedder,
             &scrubbed,
             wing,
@@ -497,16 +461,17 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
         .confidence
         .unwrap_or_else(|| default_confidence(source_type));
     if options.replace_existing_source && !options.dry_run {
-        ensure_runtime_writer_lease_active(db, runtime_writer_lease, "source replacement")?;
         let replace_result = if options.replace_across_rooms {
-            db.replace_active_source_drawers_across_rooms(
+            db.replace_active_source_drawers_across_rooms_fenced(
+                runtime_writer_lease,
                 &source_file,
                 wing,
                 options.project_id,
                 persisted_source_root.as_deref(),
             )
         } else {
-            db.replace_active_source_drawers(
+            db.replace_active_source_drawers_fenced(
+                runtime_writer_lease,
                 &source_file,
                 wing,
                 Some(resolved_room.as_str()),
@@ -554,12 +519,7 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
             .find(|summary| Some(summary.id.as_str()) != replacement_target_id);
         if let Some(existing) = exact_duplicate {
             if options.is_pinned {
-                ensure_runtime_writer_lease_active(
-                    db,
-                    runtime_writer_lease,
-                    "pin duplicate drawer",
-                )?;
-                db.pin_drawer(&existing.id, None)
+                db.pin_drawer_fenced(runtime_writer_lease, &existing.id, None)
                     .map_err(|source| IngestError::InsertDrawer {
                         drawer_id: existing.id.clone(),
                         source,
@@ -620,16 +580,18 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
                 gating_decision = Some(tier2.decision);
             }
             if let Some(decision) = gating_decision.as_ref() {
-                ensure_runtime_writer_lease_active(
-                    db,
+                db.record_gating_audit_fenced(
                     runtime_writer_lease,
+                    &drawer_id,
+                    decision,
+                    options.project_id,
+                    Some(chunk),
                     "record gating audit",
-                )?;
-                db.record_gating_audit(&drawer_id, decision, options.project_id, Some(chunk))
-                    .map_err(|source| IngestError::InsertDrawer {
-                        drawer_id: drawer_id.clone(),
-                        source,
-                    })?;
+                )
+                .map_err(|source| IngestError::InsertDrawer {
+                    drawer_id: drawer_id.clone(),
+                    source,
+                })?;
                 if decision.is_rejected() {
                     stats.dropped_by_gate += 1;
                     continue;
@@ -637,18 +599,11 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
             }
 
             if !raw_turn
-                && {
-                    ensure_runtime_writer_lease_active(
-                        db,
-                        runtime_writer_lease,
-                        "record fact-check audit",
-                    )?;
-                    true
-                }
                 && let Some(outcome) = evaluate_fact_check_gate(
                     &drawer_id,
                     chunk,
                     db,
+                    runtime_writer_lease,
                     options.project_id,
                     &gating.fact_check,
                     confidence,
@@ -671,12 +626,12 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
 
     if options.dry_run || pending.is_empty() {
         if !options.dry_run {
-            ensure_runtime_writer_lease_active(
+            supersede_after_successful_replacement(
                 db,
                 runtime_writer_lease,
-                "supersede replacement target",
+                replacement_target_id,
+                &mut stats,
             )?;
-            supersede_after_successful_replacement(db, replacement_target_id, &mut stats)?;
         }
         return Ok(stats);
     }
@@ -724,7 +679,6 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
 
     // Stage 7: Storage with all fields from both sides
     for ((chunk_index, chunk, drawer_id), vector) in pending.into_iter().zip(vectors) {
-        ensure_runtime_writer_lease_active(db, runtime_writer_lease, "insert drawer")?;
         let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
             id: drawer_id.clone(),
             content: chunk.to_string(),
@@ -756,54 +710,59 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
             link_superseded_drawer(&mut drawer, old_id);
         }
 
-        db.insert_drawer_with_project_validity(
-            &drawer,
-            options.project_id,
-            persisted_source_root.as_deref(),
-            options.valid_from,
-            options.valid_until,
-        )
+        db.with_runtime_writer_lease_write(runtime_writer_lease, "insert drawer", || {
+            db.insert_drawer_with_project_validity(
+                &drawer,
+                options.project_id,
+                persisted_source_root.as_deref(),
+                options.valid_from,
+                options.valid_until,
+            )
+        })
         .map_err(|source| IngestError::InsertDrawer {
             drawer_id: drawer.id.clone(),
             source,
         })?;
-        ensure_runtime_writer_lease_active(db, runtime_writer_lease, "insert vector")?;
-        db.insert_vector_with_project(&drawer_id, &vector, options.project_id)
-            .map_err(|source| IngestError::InsertVector {
-                drawer_id: drawer.id.clone(),
-                source,
-            })?;
+        db.with_runtime_writer_lease_write(runtime_writer_lease, "insert vector", || {
+            db.insert_vector_with_project(&drawer_id, &vector, options.project_id)
+        })
+        .map_err(|source| IngestError::InsertVector {
+            drawer_id: drawer.id.clone(),
+            source,
+        })?;
 
         // Failure detection (P14) — synchronous, lightweight DB write.
         {
             let config_snap = ConfigHandle::current();
             if config_snap.repair.enabled {
-                ensure_runtime_writer_lease_active(
-                    db,
+                db.with_runtime_writer_lease_write(
                     runtime_writer_lease,
                     "record repair signal",
-                )?;
-                crate::repair::try_record_failure(
-                    db.path(),
-                    &drawer_id,
-                    chunk,
-                    wing,
-                    Some(resolved_room.as_str()),
-                    options.project_id,
-                    &config_snap.repair,
-                );
+                    || {
+                        crate::repair::try_record_failure_on_connection(
+                            db.conn(),
+                            &drawer_id,
+                            chunk,
+                            wing,
+                            Some(resolved_room.as_str()),
+                            options.project_id,
+                            &config_snap.repair,
+                        )
+                        .map_err(crate::core::db::DbError::from)
+                    },
+                )
+                .map_err(|source| IngestError::InsertDrawer {
+                    drawer_id: drawer_id.clone(),
+                    source,
+                })?;
             }
         }
 
-        // Pattern detection (P13) — fire-and-forget, never blocks or fails ingest.
+        // Pattern detection (P13) is best-effort, but lease loss still aborts
+        // ingest so a replaced writer generation cannot mutate the database.
         {
             let config_snap = ConfigHandle::current();
             if config_snap.patterns.enabled {
-                ensure_runtime_writer_lease_active(
-                    db,
-                    runtime_writer_lease,
-                    "record pattern signal",
-                )?;
                 let model_id = config_snap.embed.model.clone().unwrap_or_else(|| {
                     if config_snap.embed.backend == "model2vec" {
                         "model2vec/potion-multilingual-128M".to_string()
@@ -812,21 +771,32 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
                     }
                 });
                 let session_id = source_file.as_str();
-                crate::core::patterns::run_pattern_detection(
-                    db.conn(),
-                    &crate::core::patterns::PatternDetectionArgs {
-                        new_drawer_id: &drawer_id,
-                        session_id,
-                        embedding: &vector,
-                        project_id: options.project_id,
-                        model_id: &model_id,
-                        similarity_threshold: config_snap.patterns.similarity_threshold,
-                        min_sessions: config_snap.patterns.min_sessions,
-                        min_exemplars: config_snap.patterns.min_exemplars,
-                        promote_threshold: config_snap.patterns.promote_threshold,
-                        top_tags: 5,
+                db.with_runtime_writer_lease_write(
+                    runtime_writer_lease,
+                    "record pattern signal",
+                    || {
+                        crate::core::patterns::run_pattern_detection(
+                            db.conn(),
+                            &crate::core::patterns::PatternDetectionArgs {
+                                new_drawer_id: &drawer_id,
+                                session_id,
+                                embedding: &vector,
+                                project_id: options.project_id,
+                                model_id: &model_id,
+                                similarity_threshold: config_snap.patterns.similarity_threshold,
+                                min_sessions: config_snap.patterns.min_sessions,
+                                min_exemplars: config_snap.patterns.min_exemplars,
+                                promote_threshold: config_snap.patterns.promote_threshold,
+                                top_tags: 5,
+                            },
+                        );
+                        Ok(())
                     },
-                );
+                )
+                .map_err(|source| IngestError::InsertDrawer {
+                    drawer_id: drawer_id.clone(),
+                    source,
+                })?;
             }
         }
 
@@ -834,8 +804,12 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
         stats.chunks += 1;
     }
 
-    ensure_runtime_writer_lease_active(db, runtime_writer_lease, "supersede replacement target")?;
-    supersede_after_successful_replacement(db, replacement_target_id, &mut stats)?;
+    supersede_after_successful_replacement(
+        db,
+        runtime_writer_lease,
+        replacement_target_id,
+        &mut stats,
+    )?;
 
     Ok(stats)
 }
@@ -957,24 +931,27 @@ fn merge_optional_sum(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     }
 }
 
-fn supersede_target(db: &Database, old_id: &str, new_id: &str) -> Result<()> {
-    db.supersede_drawer(old_id, &format!("replaced by {new_id}"))
-        .map_err(|source| IngestError::SupersedeDrawer {
-            drawer_id: old_id.to_string(),
-            source,
-        })?;
-    Ok(())
-}
-
 fn supersede_after_successful_replacement(
     db: &Database,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
     replacement_target_id: Option<&str>,
     stats: &mut IngestStats,
 ) -> Result<()> {
     if let Some(target_id) = replacement_target_id
         && let Some(replacement_id) = stats.drawer_ids.first()
     {
-        supersede_target(db, target_id, replacement_id)?;
+        db.with_runtime_writer_lease_write(
+            runtime_writer_lease,
+            "supersede replacement target",
+            || {
+                db.supersede_drawer(target_id, &format!("replaced by {replacement_id}"))
+                    .map(|_| ())
+            },
+        )
+        .map_err(|source| IngestError::SupersedeDrawer {
+            drawer_id: target_id.to_string(),
+            source,
+        })?;
         stats.superseded_drawer_id = Some(target_id.to_string());
     }
     Ok(())

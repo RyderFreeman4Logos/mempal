@@ -35,6 +35,11 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **DB admission**: enforce process-wide SQLite holder and page-cache budgets
+  with cgroup-aware memory pressure diagnostics, canonical database file
+  identity (symlink/hardlink rejection), PID-namespace-safe tri-state process
+  liveness, writer-lease fenced mutations, and `args_os()` for panic-free
+  non-UTF-8 argv handling (#680).
 - **Hermes/REST search**: end-to-end query deadline defaults to ~4 minutes
   (`api.search_query_deadline_secs = 240`), is hot-reloadable without a hard
   ceiling, is snapshotted at query admission, and is shared as remaining budget

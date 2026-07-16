@@ -76,13 +76,6 @@ pub enum BusError {
     MissingCaptureDatabase,
     #[error("capture execute requires an active SQLite writer lease")]
     MissingCaptureWriterLease,
-    #[error("failed to verify SQLite writer lease `{lease_name}` before {operation}")]
-    CaptureWriterLeaseVerify {
-        operation: &'static str,
-        lease_name: String,
-        #[source]
-        source: DbError,
-    },
     #[error("SQLite writer lease `{lease_name}` for {owner} was lost before {operation}")]
     CaptureWriterLeaseLost {
         operation: &'static str,
@@ -1089,7 +1082,6 @@ pub fn capture_handoff_to_memory(
         let db = db.ok_or(BusError::MissingCaptureDatabase)?;
         let runtime_writer_lease =
             runtime_writer_lease.ok_or(BusError::MissingCaptureWriterLease)?;
-        ensure_capture_writer_lease_active(db, runtime_writer_lease, "capture cowork handoff")?;
         let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
             id: drawer_id.clone(),
             content: content.clone(),
@@ -1101,7 +1093,24 @@ pub fn capture_handoff_to_memory(
             chunk_index: Some(0),
             importance: 3,
         });
-        db.insert_drawer(&drawer)?;
+        db.with_runtime_writer_lease_write(
+            Some(runtime_writer_lease),
+            "capture cowork handoff",
+            || db.insert_drawer(&drawer),
+        )
+        .map_err(|error| match error {
+            DbError::RuntimeWriterLeaseLost {
+                lease_name,
+                owner,
+                operation,
+                ..
+            } => BusError::CaptureWriterLeaseLost {
+                operation,
+                lease_name,
+                owner,
+            },
+            error => BusError::Db(error),
+        })?;
     }
 
     Ok(CoworkCaptureReport {
@@ -1112,29 +1121,6 @@ pub fn capture_handoff_to_memory(
         source: "handoff".to_string(),
         content,
     })
-}
-
-fn ensure_capture_writer_lease_active(
-    db: &Database,
-    lease: &RuntimeWriterLease,
-    operation: &'static str,
-) -> Result<(), BusError> {
-    let active = db
-        .runtime_writer_lease_is_active(&lease.name, &lease.owner, &lease.session_id)
-        .map_err(|source| BusError::CaptureWriterLeaseVerify {
-            operation,
-            lease_name: lease.name.clone(),
-            source,
-        })?;
-    if active {
-        Ok(())
-    } else {
-        Err(BusError::CaptureWriterLeaseLost {
-            operation,
-            lease_name: lease.name.clone(),
-            owner: lease.owner.clone(),
-        })
-    }
 }
 
 pub fn send(mempal_home: &Path, cwd: &Path, request: SendRequest) -> Result<SendReport, BusError> {

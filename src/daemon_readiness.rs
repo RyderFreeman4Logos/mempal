@@ -23,6 +23,13 @@ enum DaemonReadinessState {
     RegistrationPending,
     ExecutableUnavailable,
     ExecutableNotCurrent,
+    RecoveryStateUnavailable,
+    RecoveryActive,
+    RestartBudgetExhausted,
+    WriterLeaseUnavailable,
+    WriterLeaseMissing,
+    WriterLeaseAmbiguous,
+    WriterLeaseMismatch,
     WriteTransportUnavailable,
     Ready(i32),
 }
@@ -36,6 +43,13 @@ impl fmt::Display for DaemonReadinessState {
             Self::RegistrationPending => write!(f, "singleton daemon registration pending"),
             Self::ExecutableUnavailable => write!(f, "daemon executable identity unavailable"),
             Self::ExecutableNotCurrent => write!(f, "daemon executable is not current"),
+            Self::RecoveryStateUnavailable => write!(f, "daemon recovery state unavailable"),
+            Self::RecoveryActive => write!(f, "daemon recovery is active"),
+            Self::RestartBudgetExhausted => write!(f, "daemon restart budget exhausted"),
+            Self::WriterLeaseUnavailable => write!(f, "daemon writer lease unavailable"),
+            Self::WriterLeaseMissing => write!(f, "daemon writer lease missing"),
+            Self::WriterLeaseAmbiguous => write!(f, "multiple daemon writer leases detected"),
+            Self::WriterLeaseMismatch => write!(f, "daemon writer lease identity mismatch"),
             Self::WriteTransportUnavailable => write!(f, "daemon write transport unavailable"),
             Self::Ready(_) => write!(f, "ready"),
         }
@@ -158,6 +172,30 @@ fn probe(db_path: &Path, transport_timeout: Duration) -> DaemonReadinessState {
     }
 
     let mempal_home = db_path.parent().unwrap_or(db_path);
+    match crate::daemon_recovery::DaemonRecovery::new(mempal_home).snapshot() {
+        Ok(snapshot) if snapshot.phase == crate::daemon_recovery::RecoveryPhase::Healthy => {}
+        Ok(snapshot) if snapshot.phase == crate::daemon_recovery::RecoveryPhase::Cooldown => {
+            return DaemonReadinessState::RestartBudgetExhausted;
+        }
+        Ok(_) => return DaemonReadinessState::RecoveryActive,
+        Err(_) => return DaemonReadinessState::RecoveryStateUnavailable,
+    }
+    let leases = match crate::core::db::Database::open_query_only_with_busy_timeout(
+        db_path,
+        transport_timeout,
+    )
+    .and_then(|db| db.runtime_writer_lease_status_read_only(Some("sqlite-writer")))
+    {
+        Ok(leases) => leases,
+        Err(_) => return DaemonReadinessState::WriterLeaseUnavailable,
+    };
+    let lease_state = classify_writer_leases(&leases, daemon_pid, |owner, pid| {
+        crate::core::process_identity::daemon_owner_matches_process(owner, pid)
+    });
+    if lease_state != DaemonReadinessState::Ready(daemon_pid) {
+        return lease_state;
+    }
+
     match crate::hook_ipc::probe_readiness(mempal_home, transport_timeout) {
         Some(response)
             if readiness_response_matches(
@@ -170,6 +208,29 @@ fn probe(db_path: &Path, transport_timeout: Duration) -> DaemonReadinessState {
         }
         _ => DaemonReadinessState::WriteTransportUnavailable,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_writer_leases(
+    leases: &[crate::core::types::RuntimeWriterLease],
+    daemon_pid: i32,
+    owner_matches: impl Fn(&str, u32) -> bool,
+) -> DaemonReadinessState {
+    let lease = match leases {
+        [] => return DaemonReadinessState::WriterLeaseMissing,
+        [lease] => lease,
+        _ => return DaemonReadinessState::WriterLeaseAmbiguous,
+    };
+    let pid_matches = u32::try_from(daemon_pid).ok() == Some(lease.pid);
+    if lease.mode != "daemon"
+        || lease.generation == 0
+        || lease.session_id.is_empty()
+        || !pid_matches
+        || !owner_matches(&lease.owner, lease.pid)
+    {
+        return DaemonReadinessState::WriterLeaseMismatch;
+    }
+    DaemonReadinessState::Ready(daemon_pid)
 }
 
 #[cfg(target_os = "linux")]
@@ -219,6 +280,13 @@ mod tests {
             DaemonReadinessState::RegistrationPending,
             DaemonReadinessState::ExecutableUnavailable,
             DaemonReadinessState::ExecutableNotCurrent,
+            DaemonReadinessState::RecoveryStateUnavailable,
+            DaemonReadinessState::RecoveryActive,
+            DaemonReadinessState::RestartBudgetExhausted,
+            DaemonReadinessState::WriterLeaseUnavailable,
+            DaemonReadinessState::WriterLeaseMissing,
+            DaemonReadinessState::WriterLeaseAmbiguous,
+            DaemonReadinessState::WriterLeaseMismatch,
             DaemonReadinessState::WriteTransportUnavailable,
         ];
         for state in states {
@@ -294,5 +362,49 @@ mod tests {
         };
 
         assert!(!readiness_response_matches(&daemon, &response, true));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_writer_lease_readiness_requires_one_matching_daemon_holder() {
+        let matching = synthetic_lease(42, "daemon");
+        assert_eq!(
+            classify_writer_leases(&[], 42, |_, _| true),
+            DaemonReadinessState::WriterLeaseMissing
+        );
+        assert_eq!(
+            classify_writer_leases(&[matching.clone(), matching.clone()], 42, |_, _| true),
+            DaemonReadinessState::WriterLeaseAmbiguous
+        );
+        assert_eq!(
+            classify_writer_leases(&[synthetic_lease(99, "daemon")], 42, |_, _| true),
+            DaemonReadinessState::WriterLeaseMismatch
+        );
+        assert_eq!(
+            classify_writer_leases(&[synthetic_lease(42, "maintenance")], 42, |_, _| true),
+            DaemonReadinessState::WriterLeaseMismatch
+        );
+        assert_eq!(
+            classify_writer_leases(&[matching], 42, |_, _| true),
+            DaemonReadinessState::Ready(42)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn synthetic_lease(pid: u32, mode: &str) -> crate::core::types::RuntimeWriterLease {
+        crate::core::types::RuntimeWriterLease {
+            name: "sqlite-writer".to_string(),
+            owner: format!("synthetic-{pid}"),
+            generation: 1,
+            pid,
+            boot_id: Some("synthetic-boot".to_string()),
+            session_id: "synthetic-session".to_string(),
+            acquired_at: "1970-01-01T00:00:00Z".to_string(),
+            expires_at: "2999-01-01T00:00:00Z".to_string(),
+            heartbeat_at: "1970-01-01T00:00:00Z".to_string(),
+            mode: mode.to_string(),
+            metadata_json: None,
+            remaining_secs: 60,
+        }
     }
 }

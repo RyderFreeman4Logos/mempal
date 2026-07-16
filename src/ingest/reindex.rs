@@ -2,11 +2,15 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::core::{db::Database, types::ReindexSource};
+use crate::core::{
+    db::Database,
+    types::{ReindexSource, RuntimeWriterLease},
+};
 use crate::embed::Embedder;
 
 use super::{
-    IngestError, IngestOptions, ingest_file_with_options, normalize::CURRENT_NORMALIZE_VERSION,
+    IngestError, IngestOptions, ingest_file_with_options_and_writer_lease,
+    normalize::CURRENT_NORMALIZE_VERSION,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +61,15 @@ pub async fn reindex_sources<E: Embedder + ?Sized>(
     embedder: &E,
     options: ReindexOptions,
 ) -> Result<ReindexReport, ReindexError> {
+    reindex_sources_with_writer_lease(db, embedder, options, None).await
+}
+
+pub async fn reindex_sources_with_writer_lease<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    options: ReindexOptions,
+    writer_lease: Option<&RuntimeWriterLease>,
+) -> Result<ReindexReport, ReindexError> {
     let project_scoped = match options.mode {
         ReindexMode::Stale => db.project_scoped_reindex_sources_stale(CURRENT_NORMALIZE_VERSION)?,
         ReindexMode::Force => db.project_scoped_reindex_sources_force()?,
@@ -99,7 +112,15 @@ pub async fn reindex_sources<E: Embedder + ?Sized>(
             continue;
         }
 
-        let stats = reindex_one_source(db, embedder, &source, source_file, source_path).await?;
+        let stats = reindex_one_source(
+            db,
+            embedder,
+            &source,
+            source_file,
+            source_path,
+            writer_lease,
+        )
+        .await?;
         report.processed_sources += 1;
         report.reingested_files += stats.files;
         report.reingested_chunks += stats.chunks;
@@ -115,8 +136,9 @@ async fn reindex_one_source<E: Embedder + ?Sized>(
     source: &ReindexSource,
     source_file: &str,
     source_path: PathBuf,
+    writer_lease: Option<&RuntimeWriterLease>,
 ) -> Result<super::IngestStats, ReindexError> {
-    ingest_file_with_options(
+    ingest_file_with_options_and_writer_lease(
         db,
         embedder,
         &source_path,
@@ -132,6 +154,7 @@ async fn reindex_one_source<E: Embedder + ?Sized>(
             no_strip_noise: false,
             ..IngestOptions::default()
         },
+        writer_lease,
     )
     .await
     .map_err(|source| ReindexError::Ingest {

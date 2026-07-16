@@ -11,6 +11,7 @@ use crate::core::db::Database;
 use crate::core::queue::{
     AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore, QueueFailureDisposition,
 };
+use crate::core::types::RuntimeWriterLease;
 use crate::daemon_bootstrap::DaemonWriteObserver;
 
 use super::client::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse};
@@ -218,6 +219,7 @@ pub async fn run_llm_worker(
     status: Arc<LlmStatus>,
     db: AsyncDb,
     write_observer: DaemonWriteObserver,
+    lease: RuntimeWriterLease,
 ) -> Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static WORKER_INDEX: AtomicUsize = AtomicUsize::new(0);
@@ -339,6 +341,7 @@ pub async fn run_llm_worker(
                 &message.payload,
                 config.as_ref(),
                 Some(heartbeat.as_ref()),
+                &lease,
             ) => Some(result),
             _ = llm_gen_rx.changed() => None,
         };
@@ -440,12 +443,13 @@ async fn process_llm_task_shared(
     payload: &str,
     config: &crate::core::config::Config,
     heartbeat: Option<&HeartbeatCallback>,
+    lease: &RuntimeWriterLease,
 ) -> Result<()> {
     let task: LlmTaskPayload =
         serde_json::from_str(payload).context("failed to decode LLM task payload")?;
 
     match task.task_type.as_str() {
-        "gating" => process_gating_task(router, status, db, &task, config, heartbeat).await,
+        "gating" => process_gating_task(router, status, db, &task, config, heartbeat, lease).await,
         other => anyhow::bail!("unknown LLM task type: {other}"),
     }
 }
@@ -457,6 +461,7 @@ async fn process_gating_task(
     task: &LlmTaskPayload,
     config: &crate::core::config::Config,
     heartbeat: Option<&HeartbeatCallback>,
+    lease: &RuntimeWriterLease,
 ) -> Result<()> {
     let outcome = request_effective_gating_verdict(router, status, task, config, heartbeat).await?;
     apply_gating_verdict_async(
@@ -465,6 +470,7 @@ async fn process_gating_task(
         config.clone(),
         outcome.verdict.as_str().to_string(),
         outcome.score,
+        lease,
     )
     .await
 }
@@ -475,9 +481,15 @@ async fn apply_gating_verdict_async(
     config: crate::core::config::Config,
     verdict: String,
     score: f64,
+    lease: &RuntimeWriterLease,
 ) -> Result<()> {
-    db.run_write_anyhow(move |db| apply_gating_verdict(db, &task, &config, &verdict, score))
-        .await
+    let lease = lease.clone();
+    db.run_write_anyhow(move |db| {
+        db.with_runtime_writer_lease_write(Some(&lease), "llm gating verdict", || {
+            apply_gating_verdict(db, &task, &config, &verdict, score)
+        })
+    })
+    .await
 }
 
 pub async fn process_llm_task(
@@ -1242,12 +1254,17 @@ threshold = 0.5
         let client_runtime = Arc::new(Mutex::new(LlmClientRuntime::new(
             &ConfigHandle::current().llm,
         )));
+        let test_lease = db
+            .runtime_writer_lease_acquire("sqlite-writer", "test", "llm-worker-test", 300, None)
+            .expect("acquire test lease")
+            .expect("test lease available");
         let worker = tokio::spawn(run_llm_worker(
             Arc::new(async_store),
             client_runtime,
             Arc::new(LlmStatus::new(5)),
             async_db,
             DaemonWriteObserver::for_test(),
+            test_lease,
         ));
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1323,12 +1340,17 @@ threshold = 0.5
         let client_runtime = Arc::new(Mutex::new(LlmClientRuntime::new(
             &ConfigHandle::current().llm,
         )));
+        let test_lease = db
+            .runtime_writer_lease_acquire("sqlite-writer", "test", "llm-worker-test", 300, None)
+            .expect("acquire test lease")
+            .expect("test lease available");
         let worker = tokio::spawn(run_llm_worker(
             Arc::new(async_store),
             client_runtime,
             Arc::new(LlmStatus::new(5)),
             async_db,
             DaemonWriteObserver::for_test(),
+            test_lease,
         ));
 
         tokio::time::timeout(Duration::from_secs(5), secondary_notify.notified())
@@ -1436,12 +1458,17 @@ threshold = 0.5
         };
         let (ticks, ticker) = spawn_runtime_ticker();
 
+        let test_lease = db
+            .runtime_writer_lease_acquire("sqlite-writer", "test", "llm-verdict-test", 300, None)
+            .expect("acquire test lease")
+            .expect("test lease available");
         apply_gating_verdict_async(
             &async_db,
             task,
             Config::default(),
             "reject".to_string(),
             0.1,
+            &test_lease,
         )
         .await
         .expect("apply verdict");

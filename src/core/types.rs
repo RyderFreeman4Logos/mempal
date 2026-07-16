@@ -4,6 +4,10 @@ use std::str::FromStr;
 use super::anchor;
 use serde::{Deserialize, Serialize};
 
+#[path = "types_writer_lease.rs"]
+mod writer_lease;
+pub use writer_lease::RuntimeWriterLease;
+
 use crate::core::project::SearchResultSource;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -838,22 +842,6 @@ pub struct LeaseInfo {
     pub expires_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<String>,
-    pub remaining_secs: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RuntimeWriterLease {
-    pub name: String,
-    pub owner: String,
-    pub pid: u32,
-    pub boot_id: Option<String>,
-    pub session_id: String,
-    pub acquired_at: String,
-    pub expires_at: String,
-    pub heartbeat_at: String,
-    pub mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata_json: Option<String>,
     pub remaining_secs: i64,
 }
 

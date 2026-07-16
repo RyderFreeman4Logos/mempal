@@ -205,10 +205,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/core/queue.rs"
 kind = "source"
-baseline_tokens = 23869
-baseline_lines = 3140
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 23930
+baseline_lines = 3148
+issue = "680"
+rationale = "Transaction-aware queue helpers for writer-lease fenced writes; #680 correctness fix"
 
 [[files]]
 path = "src/core/types.rs"
@@ -237,10 +237,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/crystallize.rs"
 kind = "source"
-baseline_tokens = 6364
-baseline_lines = 861
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 6610
+baseline_lines = 896
+issue = "680"
+rationale = "Writer-lease fenced crystallization writes; #680 correctness fix"
 
 [[files]]
 path = "src/daemon.rs"
@@ -301,10 +301,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/llm/worker.rs"
 kind = "source"
-baseline_tokens = 12037
-baseline_lines = 1453
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 12300
+baseline_lines = 1480
+issue = "680"
+rationale = "Writer-lease generation fence threaded through run_llm_worker; #680 review F1 correctness fix"
 
 [[files]]
 path = "src/longmemeval.rs"
@@ -317,10 +317,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/main.rs"
 kind = "source"
-baseline_tokens = 256004
-baseline_lines = 33133
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 257470
+baseline_lines = 33308
+issue = "680"
+rationale = "Writer-lease generation fence conversion of deep maintenance paths; #680 correctness fix"
 
 [[files]]
 path = "src/markdown_export.rs"
@@ -334,7 +334,7 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 path = "src/mcp/server.rs"
 kind = "source"
 baseline_tokens = 173690
-baseline_lines = 21926
+baseline_lines = 21929
 issue = "695"
 rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
 
@@ -381,10 +381,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/sleep.rs"
 kind = "source"
-baseline_tokens = 7899
-baseline_lines = 1072
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 8345
+baseline_lines = 1150
+issue = "680"
+rationale = "Transaction-aware sleep helpers for writer-lease fenced writes; #680 correctness fix"
 
 [[files]]
 path = "src/wiki.rs"

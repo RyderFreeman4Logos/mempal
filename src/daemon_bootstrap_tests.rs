@@ -24,6 +24,11 @@ async fn write_observer_reports_stall_when_queue_has_work_and_no_recent_writes()
     assert_eq!(diagnostic.queued_count, 1);
     assert!(diagnostic.seconds_since_successful_write >= DAEMON_STALL_SECONDS);
     assert_eq!(diagnostic.last_error, "failed to merge drawer");
+    assert!(observer.maybe_log_stall(&store).await);
+    assert!(
+        !observer.maybe_log_stall(&store).await,
+        "one stalled generation must emit only one recovery signal per throttle window"
+    );
 }
 
 #[tokio::test]
