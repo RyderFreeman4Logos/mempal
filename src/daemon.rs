@@ -1457,13 +1457,19 @@ fn validated_hook_payload_path(payload_path: &str, mempal_home: &Path) -> Result
         })
     })?;
     if !canonical_path.starts_with(&spool_root) {
-        anyhow::bail!("hook payload handle escapes hook spool root");
+        return Err(anyhow::Error::new(PayloadHandleMissing {
+            reason: "hook payload handle escapes hook spool root".to_string(),
+        }));
     }
     Ok(canonical_path)
 }
 
 fn read_bounded_hook_payload_handle(path: &Path) -> Result<String> {
-    let file = fs::File::open(path).context("failed to open hook payload handle")?;
+    let file = fs::File::open(path).map_err(|error| {
+        anyhow::Error::new(PayloadHandleMissing {
+            reason: format!("failed to open hook payload handle: {error}"),
+        })
+    })?;
     read_bounded_hook_payload_handle_from(file)
 }
 
@@ -3892,6 +3898,31 @@ mod tests {
     }
 
     #[test]
+    fn queue_failure_disposition_dead_letters_missing_validated_payload_path() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mempal_home = tmp.path().join(".mempal");
+        let spool_root = mempal_home.join(crate::hook::HOOK_SPOOL_DIR);
+        std::fs::create_dir_all(&spool_root).expect("create hook spool");
+        let missing_path = spool_root.join("missing.json");
+
+        let error = super::validated_hook_payload_path(
+            missing_path.to_str().expect("UTF-8 test path"),
+            &mempal_home,
+        )
+        .expect_err("missing payload path must fail validation");
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<PayloadHandleMissing>().is_some())
+        );
+        assert_eq!(
+            queue_failure_disposition(&error),
+            QueueFailureDisposition::Terminal
+        );
+    }
+
+    #[test]
     fn queue_failure_disposition_dead_letters_automatic_hook_llm_gate_deadline() {
         let timeout_error = anyhow::Error::new(AutomaticHookLlmGateTerminalFailure {
             reason: "timed out after 30s".to_string(),
@@ -3938,6 +3969,22 @@ mod tests {
     }
 
     #[test]
+    fn read_bounded_hook_payload_handle_classifies_open_and_read_failures_as_terminal() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let open_error = super::read_bounded_hook_payload_handle(&tmp.path().join("missing.json"))
+            .expect_err("missing handle must fail to open");
+        let read_error = super::read_bounded_hook_payload_handle_from(&[0xff][..])
+            .expect_err("invalid UTF-8 handle must fail to read");
+
+        for error in [open_error, read_error] {
+            assert_eq!(
+                queue_failure_disposition(&error),
+                QueueFailureDisposition::Terminal
+            );
+        }
+    }
+
+    #[test]
     fn read_bounded_hook_payload_handle_stops_at_inline_limit_sentinel() {
         let read_bytes = Rc::new(Cell::new(0));
         let reader = CountingHookPayloadReader {
@@ -3950,6 +3997,10 @@ mod tests {
         let message = format!("{error:#}");
 
         assert_eq!(read_bytes.get(), super::MAX_HOOK_HANDLE_READ_BYTES);
+        assert_eq!(
+            queue_failure_disposition(&error),
+            QueueFailureDisposition::Terminal
+        );
         assert!(message.contains("exceeds inline admission limit"));
         assert!(message.contains(&format!(
             ">= {} bytes",
@@ -4023,6 +4074,10 @@ mod tests {
         let message = format!("{error:#}");
 
         assert!(message.contains("escapes hook spool root"));
+        assert_eq!(
+            queue_failure_disposition(&error),
+            QueueFailureDisposition::Terminal
+        );
         assert!(
             !message.contains("outside spool"),
             "diagnostic must not include rejected payload body"
