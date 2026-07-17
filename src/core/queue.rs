@@ -18,7 +18,7 @@ use super::queue_connection_admission as queue_admission;
 #[path = "queue_writer_lease_fence.rs"]
 mod queue_writer_lease_fence;
 
-pub use super::queue_connection_admission::queue_stats_readonly;
+pub use super::queue_connection_admission::{queue_stats, queue_stats_readonly};
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 const STARTUP_RECLAIM_STALE_SECS: i64 = 60;

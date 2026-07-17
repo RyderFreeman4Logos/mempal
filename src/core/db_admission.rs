@@ -4,8 +4,9 @@
 //! when daemon, MCP, REST, CLI, and hook processes each open independent pools.
 //! This module places a small file contract beside the database and serializes
 //! registration with `flock`, so budget admission happens before an expensive
-//! SQLite holder is created. A process-birth identity makes stale PID records
-//! reclaimable without treating PID reuse as ownership.
+//! SQLite holder is created. Each registration owns a kernel-backed lease for
+//! namespace-independent crash recovery; process birth metadata remains for
+//! legacy fail-closed diagnostics without treating PID reuse as ownership.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -21,6 +22,7 @@ const ADMISSION_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const ADMISSION_LOCK_RETRY: Duration = Duration::from_millis(2);
 const ADMISSION_RELEASE_MAX_ATTEMPTS: u8 = 3;
 const ADMISSION_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(50);
+const HOLDER_LEASE_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -150,12 +152,17 @@ pub struct DbAdmissionHolder {
     process_identity: String,
     #[serde(default)]
     pid_namespace: Option<String>,
+    #[serde(default)]
+    lease_version: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbAdmissionSnapshot {
     pub holders: Vec<DbAdmissionHolder>,
     pub active_holders: usize,
+    pub reaped_stale_holders: usize,
+    pub unknown_holders: usize,
+    pub unknown_holder_generations: Vec<u64>,
     pub configured_holder_limit: usize,
     pub configured_cache_bytes: u64,
     pub active_cache_bytes: u64,
@@ -176,6 +183,8 @@ pub struct ProfileDbAdmission {
     owner_identity: String,
     token: String,
     generation: u64,
+    lease_path: PathBuf,
+    _lease: File,
 }
 
 impl ProfileDbAdmission {
@@ -192,7 +201,8 @@ impl ProfileDbAdmission {
         let paths = AdmissionPaths::new(db_path)?;
         let _lock = lock_state(&paths.lock_path)?;
         let mut state = load_state(&paths.state_path)?;
-        state.holders.retain(holder_is_live);
+        let reaped = reap_stale_holders(&paths, &mut state);
+        persist_reaped_holders(&paths, &state, &reaped)?;
 
         let active_cache_bytes = state.holders.iter().fold(0_u64, |total, holder| {
             total.saturating_add(holder.configured_cache_bytes)
@@ -218,6 +228,8 @@ impl ProfileDbAdmission {
         let owner_identity = format!("mempal-{}-{pid}-{process_identity}", request.holder_class);
         let acquired_at_unix_secs = unix_secs_now();
         let token = admission_token(&owner_identity, generation, acquired_at_unix_secs);
+        let lease_path = paths.holder_lease_path(&token);
+        let lease = create_holder_lease(&lease_path)?;
         state.holders.push(DbAdmissionHolder {
             holder_class: request.holder_class,
             owner_identity: owner_identity.clone(),
@@ -229,11 +241,16 @@ impl ProfileDbAdmission {
             token: token.clone(),
             process_identity,
             pid_namespace,
+            lease_version: HOLDER_LEASE_VERSION,
         });
         state
             .holders
             .sort_by_key(|holder| (holder.generation, holder.pid));
-        save_state(&paths.state_path, &state)?;
+        if let Err(error) = save_state(&paths.state_path, &state) {
+            drop(lease);
+            remove_holder_lease(&lease_path);
+            return Err(error);
+        }
 
         Ok(Self {
             database_path: paths.database_path,
@@ -242,6 +259,8 @@ impl ProfileDbAdmission {
             owner_identity,
             token,
             generation,
+            lease_path,
+            _lease: lease,
         })
     }
 
@@ -256,22 +275,26 @@ impl ProfileDbAdmission {
         let paths = AdmissionPaths::new(db_path)?;
         let _lock = lock_state(&paths.lock_path)?;
         let mut state = load_state(&paths.state_path)?;
-        let previous_len = state.holders.len();
-        state.holders.retain(holder_is_live);
-        if state.holders.len() != previous_len {
-            save_state(&paths.state_path, &state)?;
-        }
+        let reaped = reap_stale_holders(&paths, &mut state);
+        persist_reaped_holders(&paths, &state, &reaped)?;
         let active_cache_bytes = state.holders.iter().fold(0_u64, |total, holder| {
             total.saturating_add(holder.configured_cache_bytes)
         });
         Ok(DbAdmissionSnapshot {
             active_holders: state.holders.len(),
             holders: state.holders,
+            reaped_stale_holders: reaped.reaped_stale_holders,
+            unknown_holders: reaped.unknown_holder_generations.len(),
+            unknown_holder_generations: reaped.unknown_holder_generations,
             configured_holder_limit: config.max_holders,
             configured_cache_bytes: config.max_cache_bytes,
             active_cache_bytes,
             available_cache_bytes: config.max_cache_bytes.saturating_sub(active_cache_bytes),
         })
+    }
+
+    pub(crate) fn resolve_database_path(db_path: &Path) -> Result<PathBuf, DbAdmissionError> {
+        AdmissionPaths::new(db_path).map(|paths| paths.database_path)
     }
 
     pub const fn generation(&self) -> u64 {
@@ -299,6 +322,7 @@ impl ProfileDbAdmission {
         let released = state.holders.len() != before;
         if released {
             save_state(&self.state_path, &state)?;
+            remove_holder_lease(&self.lease_path);
         }
         Ok(released)
     }
@@ -422,6 +446,63 @@ impl AdmissionPaths {
             lock_path: sidecar_dir.join(format!(".{sidecar_name}.admission.lock")),
         })
     }
+
+    fn holder_lease_path(&self, token: &str) -> PathBuf {
+        let state_name = self
+            .state_path
+            .file_name()
+            .expect("validated admission state path has a file name")
+            .to_string_lossy();
+        // Never place serialized token text into a path: the state file is a
+        // trust boundary, while a fixed hash keeps the lease beside its state.
+        let lease_id = blake3::hash(token.as_bytes()).to_hex();
+        self.state_path
+            .with_file_name(format!("{state_name}.{}.lease", &lease_id[..24]))
+    }
+}
+
+fn create_holder_lease(path: &Path) -> Result<File, DbAdmissionError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| DbAdmissionError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    match imp::try_lock_exclusive(&file) {
+        Ok(true) => Ok(file),
+        Ok(false) => {
+            remove_holder_lease(path);
+            Err(DbAdmissionError::Io {
+                path: path.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "new database holder lease is unexpectedly locked",
+                ),
+            })
+        }
+        Err(source) => {
+            remove_holder_lease(path);
+            Err(DbAdmissionError::Io {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    }
+}
+
+fn remove_holder_lease(path: &Path) {
+    if let Err(error) = fs::remove_file(path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            %error,
+            lease_path = %path.display(),
+            "failed to remove database holder lease sidecar"
+        );
+    }
 }
 
 fn lock_state(path: &Path) -> Result<File, DbAdmissionError> {
@@ -502,31 +583,123 @@ fn save_state(path: &Path, state: &AdmissionState) -> Result<(), DbAdmissionErro
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HolderLiveness {
+    Live,
+    Dead,
+    Unknown,
+}
+
+#[derive(Debug, Default)]
+struct ReapedHolders {
+    reaped_stale_holders: usize,
+    stale_lease_paths: Vec<PathBuf>,
+    unknown_holder_generations: Vec<u64>,
+}
+
+fn reap_stale_holders(paths: &AdmissionPaths, state: &mut AdmissionState) -> ReapedHolders {
+    let mut result = ReapedHolders::default();
+    state
+        .holders
+        .retain(|holder| match holder_liveness(paths, holder) {
+            HolderLiveness::Live => true,
+            HolderLiveness::Unknown => {
+                result.unknown_holder_generations.push(holder.generation);
+                true
+            }
+            HolderLiveness::Dead => {
+                result.reaped_stale_holders = result.reaped_stale_holders.saturating_add(1);
+                if holder.lease_version == HOLDER_LEASE_VERSION {
+                    result
+                        .stale_lease_paths
+                        .push(paths.holder_lease_path(&holder.token));
+                }
+                false
+            }
+        });
+    result
+}
+
+fn persist_reaped_holders(
+    paths: &AdmissionPaths,
+    state: &AdmissionState,
+    reaped: &ReapedHolders,
+) -> Result<(), DbAdmissionError> {
+    if reaped.reaped_stale_holders == 0 {
+        return Ok(());
+    }
+    save_state(&paths.state_path, state)?;
+    for lease_path in &reaped.stale_lease_paths {
+        remove_holder_lease(lease_path);
+    }
+    Ok(())
+}
+
+fn holder_liveness(paths: &AdmissionPaths, holder: &DbAdmissionHolder) -> HolderLiveness {
+    match holder.lease_version {
+        HOLDER_LEASE_VERSION => holder_lease_liveness(&paths.holder_lease_path(&holder.token)),
+        0 => legacy_holder_liveness(holder),
+        _ => HolderLiveness::Unknown,
+    }
+}
+
+fn holder_lease_liveness(path: &Path) -> HolderLiveness {
+    let file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return HolderLiveness::Dead,
+        Err(_) => return HolderLiveness::Unknown,
+    };
+    match imp::try_lock_exclusive(&file) {
+        Ok(true) => HolderLiveness::Dead,
+        Ok(false) => HolderLiveness::Live,
+        Err(_) => HolderLiveness::Unknown,
+    }
+}
+
+#[cfg(test)]
 fn holder_is_live(holder: &DbAdmissionHolder) -> bool {
+    !matches!(legacy_holder_liveness(holder), HolderLiveness::Dead)
+}
+
+fn legacy_holder_liveness(holder: &DbAdmissionHolder) -> HolderLiveness {
     #[cfg(target_os = "linux")]
     {
-        !matches!(
-            super::process_identity::process_identity_liveness(
-                holder.pid,
-                &holder.process_identity,
-                holder.pid_namespace.as_deref(),
-            ),
-            super::process_identity::ProcessLiveness::Dead
-        )
+        match super::process_identity::process_identity_liveness(
+            holder.pid,
+            &holder.process_identity,
+            holder.pid_namespace.as_deref(),
+        ) {
+            super::process_identity::ProcessLiveness::Live => HolderLiveness::Live,
+            super::process_identity::ProcessLiveness::Dead => HolderLiveness::Dead,
+            super::process_identity::ProcessLiveness::Unverifiable => HolderLiveness::Unknown,
+        }
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
         if holder.pid == std::process::id() {
-            return holder.process_identity == super::process_identity::current_process_identity();
+            return if holder.process_identity == super::process_identity::current_process_identity()
+            {
+                HolderLiveness::Live
+            } else {
+                HolderLiveness::Dead
+            };
         }
-        retain_holder_for_liveness(imp::foreign_process_liveness(holder.pid))
+        match imp::foreign_process_liveness(holder.pid) {
+            ProcessLiveness::Dead => HolderLiveness::Dead,
+            ProcessLiveness::Unverifiable => HolderLiveness::Unknown,
+        }
     }
     #[cfg(not(unix))]
     {
         if holder.pid == std::process::id() {
-            return holder.process_identity == super::process_identity::current_process_identity();
+            return if holder.process_identity == super::process_identity::current_process_identity()
+            {
+                HolderLiveness::Live
+            } else {
+                HolderLiveness::Dead
+            };
         }
-        retain_holder_for_liveness(ProcessLiveness::Unverifiable)
+        HolderLiveness::Unknown
     }
 }
 

@@ -3848,8 +3848,10 @@ fn run() -> Result<()> {
 
     let db = match if let Some(path) = empty_read_only_db_path.as_ref() {
         Database::open(path).context("failed to open empty read-only database")
+    } else if matches!(&cli.command, Commands::Status { .. }) {
+        Database::open_diagnostic_read_only(&db_path).context("failed to open status database")
     } else if read_only_database {
-        open_read_only_database(&db_path).context("failed to open read-only database")
+        Database::open_read_only(&db_path).context("failed to open read-only database")
     } else if command_retries_stdin_ingest_startup_open(&cli.command) {
         open_stdin_ingest_database_with_retry(&db_path)
     } else if let Some(operation) = cli_content_write_operation(&cli.command) {
@@ -5154,14 +5156,6 @@ fn validate_read_only_command_args(command: &Commands) -> Result<()> {
     Ok(())
 }
 
-fn open_read_only_database(path: &Path) -> Result<Database> {
-    let db = Database::open_read_only(path)?;
-    db.conn()
-        .execute_batch("PRAGMA query_only = ON;")
-        .context("failed to enable query_only for read-only connection")?;
-    Ok(db)
-}
-
 fn display_path_for_user(path: &Path) -> String {
     if let Some(home) = env::var_os("HOME").map(PathBuf::from)
         && let Ok(stripped) = path.strip_prefix(&home)
@@ -5717,7 +5711,7 @@ fn prime_command(config_path: &Path, args: PrimeArgs) -> Result<()> {
         eprintln!("mempal: palace.db not found; skipping priming");
         return Ok(());
     }
-    let db = open_read_only_database(&db_path).context("failed to open priming database")?;
+    let db = Database::open_read_only(&db_path).context("failed to open priming database")?;
     let current_dir = env::current_dir().ok();
     let project_id =
         resolve_project_id(args.project_id.as_deref(), &config, current_dir.as_deref())
@@ -7712,7 +7706,7 @@ fn run_cli_route_bounded(
     deadline: std::time::Duration,
 ) -> Result<Option<Result<mempal::core::types::RouteDecision>>> {
     run_cli_search_read_bounded("route", deadline, move || {
-        let db = open_read_only_database(&db_path)?;
+        let db = Database::open_read_only(&db_path)?;
         resolve_route(&db, &query, wing.as_deref(), room.as_deref())
             .context("failed to resolve search route")
     })
@@ -7738,7 +7732,7 @@ fn run_cli_hybrid_search_bounded(
     request: CliHybridSearchRequest,
 ) -> Result<Option<Result<Vec<mempal::core::types::SearchResult>>>> {
     run_cli_search_read_bounded("hybrid", request.db.deadline, move || {
-        let db = open_read_only_database(&request.db.db_path)?;
+        let db = Database::open_read_only(&request.db.db_path)?;
         if let Some(current_dim) =
             search_current_vector_dim(&db).map_err(SearchError::KeywordSearch)?
             && current_dim != request.query_vector.len()
@@ -7766,7 +7760,7 @@ fn run_cli_bm25_search_bounded(
     request: CliSearchDbRequest,
 ) -> Result<Option<Result<Vec<mempal::core::types::SearchResult>>>> {
     run_cli_search_read_bounded("bm25", request.deadline, move || {
-        let db = open_read_only_database(&request.db_path)?;
+        let db = Database::open_read_only(&request.db_path)?;
         search_bm25_only_with_options(
             &db,
             &request.query,
@@ -13268,7 +13262,7 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     };
     let embed_status = global_embed_status().snapshot();
     let intelligence_status = mempal::intelligence::global_intelligence_status().snapshot();
-    let queue_stats = mempal::core::queue::queue_stats_readonly(db.path())
+    let queue_stats = mempal::core::queue::queue_stats(db.conn())
         .context("failed to query pending message stats")?;
     let schema_version = db
         .schema_version()

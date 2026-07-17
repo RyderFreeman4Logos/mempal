@@ -16,6 +16,13 @@ impl Database {
         Self::open_with_mode(path, OpenMode::ReadOnly, true)
     }
 
+    /// Open a strictly read-only diagnostic connection without consuming a
+    /// profile holder slot. Callers must keep this connection short-lived.
+    pub fn open_diagnostic_read_only(path: &Path) -> Result<Self, DbError> {
+        let path = super::super::db_admission::ProfileDbAdmission::resolve_database_path(path)?;
+        Self::open_with_mode(&path, OpenMode::ReadOnly, false)
+    }
+
     /// Open a non-mutating connection without startup writes or migrations.
     pub fn open_query_only(path: &Path) -> Result<Self, DbError> {
         Self::open_with_mode(path, OpenMode::QueryOnly, true)
@@ -122,7 +129,7 @@ impl Database {
         conn.busy_timeout(busy_timeout)?;
         conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_DEFAULT)?;
         register_math_functions(&conn)?;
-        if matches!(mode, OpenMode::QueryOnly) {
+        if !mode.allows_write() {
             conn.pragma_update(None, "query_only", "ON")?;
         }
         if mode.allows_write() {

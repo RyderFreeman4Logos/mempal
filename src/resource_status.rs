@@ -67,6 +67,24 @@ pub fn print_profile_resource_status(db_path: &Path, indent: &str) {
                 snapshot.configured_cache_bytes,
                 snapshot.available_cache_bytes
             );
+            println!(
+                "{indent}reaped_stale_holders: {}",
+                snapshot.reaped_stale_holders
+            );
+            println!("{indent}unknown_holders: {}", snapshot.unknown_holders);
+            if snapshot.unknown_holder_generations.is_empty() {
+                println!("{indent}unknown_holder_generations: none");
+            } else {
+                println!(
+                    "{indent}unknown_holder_generations: {}",
+                    snapshot
+                        .unknown_holder_generations
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
             for holder in snapshot.holders {
                 println!(
                     "{indent}- class={} owner={} pid={} generation={} connections={} cache_bytes={}",

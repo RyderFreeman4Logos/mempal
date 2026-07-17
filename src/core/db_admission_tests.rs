@@ -1,9 +1,13 @@
 #[cfg(target_os = "linux")]
 use super::{
     AdmissionPaths, DbAdmissionError, DbAdmissionHolder, DbAdmissionRequest, DbHolderClass,
-    ProfileDbAdmission, holder_is_live,
+    ProfileDbAdmission, holder_is_live, imp,
 };
 use super::{ProcessLiveness, retain_holder_for_liveness};
+#[cfg(target_os = "linux")]
+use std::fs::{File, OpenOptions};
+#[cfg(target_os = "linux")]
+use std::path::Path;
 
 #[cfg(target_os = "linux")]
 fn holder(pid: u32, process_identity: &str, pid_namespace: Option<String>) -> DbAdmissionHolder {
@@ -18,7 +22,56 @@ fn holder(pid: u32, process_identity: &str, pid_namespace: Option<String>) -> Db
         token: "test-token".to_string(),
         process_identity: process_identity.to_string(),
         pid_namespace,
+        lease_version: 0,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn raw_leased_holder(token: &str, pid: u32, pid_namespace: &str) -> serde_json::Value {
+    serde_json::json!({
+        "holder_class": "mcp",
+        "owner_identity": format!("test-holder-{token}"),
+        "pid": pid,
+        "generation": 1,
+        "acquired_at_unix_secs": 1,
+        "connection_count": 1,
+        "configured_cache_bytes": 1024,
+        "token": token,
+        "process_identity": "foreign-process-birth",
+        "pid_namespace": pid_namespace,
+        "lease_version": 1
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn write_raw_state(path: &Path, holders: Vec<serde_json::Value>) {
+    std::fs::write(
+        path,
+        serde_json::to_vec(&serde_json::json!({
+            "next_generation": holders.len(),
+            "holders": holders
+        }))
+        .expect("serialize admission state"),
+    )
+    .expect("write admission state");
+}
+
+#[cfg(target_os = "linux")]
+fn create_lease(paths: &AdmissionPaths, token: &str, lock: bool) -> File {
+    let lease_path = paths.holder_lease_path(token);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&lease_path)
+        .expect("create holder lease");
+    if lock {
+        assert!(
+            imp::try_lock_exclusive(&file).expect("lock holder lease"),
+            "new holder lease must be lockable"
+        );
+    }
+    file
 }
 
 #[cfg(target_os = "linux")]
@@ -62,6 +115,101 @@ fn cross_pid_namespace_holders_are_retained_when_pid_conflicts_or_is_missing() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn crashed_holder_in_nested_pid_namespace_is_reaped_from_lease() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("palace.db");
+    let paths = AdmissionPaths::new(&db_path).expect("admission paths");
+    let token = "nested-crashed";
+    drop(create_lease(&paths, token, false));
+    write_raw_state(
+        &paths.state_path,
+        vec![raw_leased_holder(token, 7, "pid:[nested-child]")],
+    );
+
+    let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("reap crashed holder");
+
+    assert_eq!(snapshot.active_holders, 0);
+    assert_eq!(snapshot.reaped_stale_holders, 1);
+    assert_eq!(snapshot.unknown_holders, 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unrelated_host_pid_alias_does_not_keep_dead_namespaced_holder() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("palace.db");
+    let paths = AdmissionPaths::new(&db_path).expect("admission paths");
+    let token = "host-pid-alias";
+    drop(create_lease(&paths, token, false));
+    write_raw_state(
+        &paths.state_path,
+        vec![raw_leased_holder(
+            token,
+            std::process::id(),
+            "pid:[unrelated-namespace]",
+        )],
+    );
+
+    let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("reap aliased holder");
+
+    assert_eq!(snapshot.active_holders, 0);
+    assert_eq!(snapshot.reaped_stale_holders, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_foreign_namespace_owner_keeps_multiple_registrations() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("palace.db");
+    let paths = AdmissionPaths::new(&db_path).expect("admission paths");
+    let first_token = "live-registration-one";
+    let second_token = "live-registration-two";
+    let _first_lease = create_lease(&paths, first_token, true);
+    let _second_lease = create_lease(&paths, second_token, true);
+    write_raw_state(
+        &paths.state_path,
+        vec![
+            raw_leased_holder(first_token, 19, "pid:[live-foreign]"),
+            raw_leased_holder(second_token, 19, "pid:[live-foreign]"),
+        ],
+    );
+
+    let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("retain live holder leases");
+
+    assert_eq!(snapshot.active_holders, 2);
+    assert_eq!(snapshot.holders.len(), 2);
+    assert_eq!(snapshot.unknown_holders, 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repeated_smoke_style_crash_reap_cycles_do_not_grow_holder_state() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("palace.db");
+    let paths = AdmissionPaths::new(&db_path).expect("admission paths");
+
+    for cycle in 0..32 {
+        let token = format!("smoke-crash-{cycle}");
+        drop(create_lease(&paths, &token, false));
+        write_raw_state(
+            &paths.state_path,
+            vec![raw_leased_holder(
+                &token,
+                100 + cycle,
+                &format!("pid:[smoke-{cycle}]"),
+            )],
+        );
+
+        let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("reap smoke holder");
+        assert_eq!(
+            snapshot.active_holders, 0,
+            "stale holder survived cycle {cycle}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn missing_process_in_current_pid_namespace_is_reclaimed() {
     let pid_namespace = std::fs::read_link("/proc/self/ns/pid")
         .expect("read current PID namespace")
@@ -90,6 +238,26 @@ fn legacy_holder_without_pid_namespace_is_retained_fail_closed() {
 
     assert_eq!(legacy_holder.pid_namespace, None);
     assert!(holder_is_live(&legacy_holder));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn snapshot_reports_unverifiable_legacy_holder() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("palace.db");
+    let paths = AdmissionPaths::new(&db_path).expect("admission paths");
+    let mut legacy = raw_leased_holder("legacy-unknown", 23, "pid:[foreign-legacy]");
+    legacy
+        .as_object_mut()
+        .expect("holder object")
+        .remove("lease_version");
+    write_raw_state(&paths.state_path, vec![legacy]);
+
+    let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("snapshot legacy holder");
+
+    assert_eq!(snapshot.active_holders, 1);
+    assert_eq!(snapshot.unknown_holders, 1);
+    assert_eq!(snapshot.unknown_holder_generations, vec![1]);
 }
 
 #[cfg(target_os = "linux")]

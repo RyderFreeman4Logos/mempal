@@ -136,6 +136,9 @@ impl From<AsyncDbResourceSnapshot> for SqliteResourceUsageStatus {
 #[derive(Debug, Default, Serialize)]
 struct ProfileAdmissionStatus {
     active_holders: usize,
+    reaped_stale_holders: usize,
+    unknown_holders: usize,
+    unknown_holder_generations: Vec<u64>,
     configured_holder_limit: usize,
     configured_cache_bytes: u64,
     active_cache_bytes: u64,
@@ -161,6 +164,9 @@ impl ProfileAdmissionStatus {
             .unwrap_or(0);
         Self {
             active_holders: snapshot.active_holders,
+            reaped_stale_holders: snapshot.reaped_stale_holders,
+            unknown_holders: snapshot.unknown_holders,
+            unknown_holder_generations: snapshot.unknown_holder_generations,
             configured_holder_limit: snapshot.configured_holder_limit,
             configured_cache_bytes: snapshot.configured_cache_bytes,
             active_cache_bytes: snapshot.active_cache_bytes,

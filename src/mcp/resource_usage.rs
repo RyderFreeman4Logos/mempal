@@ -84,6 +84,9 @@ impl DaemonRecoveryDto {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ProfileDbAdmissionDto {
     pub active_holders: usize,
+    pub reaped_stale_holders: usize,
+    pub unknown_holders: usize,
+    pub unknown_holder_generations: Vec<u64>,
     pub configured_holder_limit: usize,
     pub configured_cache_bytes: u64,
     pub active_cache_bytes: u64,
@@ -112,6 +115,9 @@ impl From<crate::core::db_admission::DbAdmissionSnapshot> for ProfileDbAdmission
             .unwrap_or(0);
         Self {
             active_holders: value.active_holders,
+            reaped_stale_holders: value.reaped_stale_holders,
+            unknown_holders: value.unknown_holders,
+            unknown_holder_generations: value.unknown_holder_generations,
             configured_holder_limit: value.configured_holder_limit,
             configured_cache_bytes: value.configured_cache_bytes,
             active_cache_bytes: value.active_cache_bytes,
