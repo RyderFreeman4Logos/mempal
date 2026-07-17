@@ -258,10 +258,8 @@ async fn run_llm_worker_inner(
         }
     }
 
-    // Subscribe to LLM config generation changes. When a hot-reloadable LLM
-    // field changes (endpoint, credentials, model, etc.), the receiver value
-    // is bumped and any in-flight task is cancelled so the worker restarts
-    // with the new config.
+    // Restart with fresh config whenever hot-reloadable LLM settings change,
+    // cancelling any in-flight task through the generation receiver.
     let mut llm_gen_rx = ConfigHandle::subscribe_llm_gen();
     let mut idle_count = 0_u32;
 
@@ -271,9 +269,8 @@ async fn run_llm_worker_inner(
             break;
         }
 
-        // Re-read config at the start of each claim cycle so runtime-disabled
-        // subsystems stop claiming promptly. The LLM client itself is prepared
-        // only after a task is claimed, using the then-current LLM generation.
+        // Re-read config each claim cycle so runtime-disabled subsystems stop promptly;
+        // prepare the client only after a claim using that generation.
         let config = ConfigHandle::current();
         if !crate::daemon::llm_worker_claim_enabled(config.as_ref()) {
             idle_count = 0;
