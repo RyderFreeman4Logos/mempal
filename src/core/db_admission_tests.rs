@@ -129,7 +129,7 @@ fn crashed_holder_in_nested_pid_namespace_is_reaped_from_lease() {
     let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("reap crashed holder");
 
     assert_eq!(snapshot.active_holders, 0);
-    assert_eq!(snapshot.reaped_stale_holders, 1);
+    assert_eq!(snapshot.reaped_stale_holders_this_snapshot, 1);
     assert_eq!(snapshot.unknown_holders, 0);
 }
 
@@ -153,7 +153,7 @@ fn unrelated_host_pid_alias_does_not_keep_dead_namespaced_holder() {
     let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("reap aliased holder");
 
     assert_eq!(snapshot.active_holders, 0);
-    assert_eq!(snapshot.reaped_stale_holders, 1);
+    assert_eq!(snapshot.reaped_stale_holders_this_snapshot, 1);
 }
 
 #[cfg(target_os = "linux")]
@@ -210,6 +210,149 @@ fn repeated_smoke_style_crash_reap_cycles_do_not_grow_holder_state() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn unreferenced_current_database_lease_is_reclaimed_on_next_snapshot() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("palace.db");
+    let paths = AdmissionPaths::new(&db_path).expect("admission paths");
+    let token = "orphaned-before-state-publication";
+    let lease_path = paths.holder_lease_path(token);
+    drop(create_lease(&paths, token, false));
+    write_raw_state(&paths.state_path, Vec::new());
+
+    let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("recover orphaned lease");
+
+    assert_eq!(snapshot.active_holders, 0);
+    assert!(
+        !lease_path.exists(),
+        "an unreferenced current-format lease must be reclaimed before admission writes"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn old_writer_stripped_lease_version_still_uses_current_lease_as_liveness_anchor() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("palace.db");
+    let paths = AdmissionPaths::new(&db_path).expect("admission paths");
+    let token = "old-writer-stripped-version";
+    drop(create_lease(&paths, token, false));
+    let mut holder = raw_leased_holder(token, 7, "pid:[foreign-old-writer]");
+    holder
+        .as_object_mut()
+        .expect("holder object")
+        .remove("lease_version");
+    write_raw_state(&paths.state_path, vec![holder]);
+
+    let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("recover old-writer holder");
+
+    assert_eq!(
+        snapshot.active_holders, 0,
+        "an unlocked deterministic lease proves this legacy-shaped holder is dead"
+    );
+    assert_eq!(snapshot.unknown_holders, 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn orphan_sweep_retries_after_a_later_verifiable_pass() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("palace.db");
+    let paths = AdmissionPaths::new(&db_path).expect("admission paths");
+    let token = "retry-after-unlink-verification";
+    let lease_path = paths.holder_lease_path(token);
+    let alias_path = temp.path().join("lease-hard-link");
+    drop(create_lease(&paths, token, false));
+    std::fs::hard_link(&lease_path, &alias_path).expect("make lease temporarily unverifiable");
+    write_raw_state(&paths.state_path, Vec::new());
+
+    let first = ProfileDbAdmission::snapshot(&db_path).expect("first recovery pass");
+    assert_eq!(first.active_holders, 0);
+    assert!(
+        lease_path.exists(),
+        "a multi-link lease must be retained fail-closed on the first pass"
+    );
+
+    std::fs::remove_file(&alias_path).expect("restore single-link lease");
+    let second = ProfileDbAdmission::snapshot(&db_path).expect("second recovery pass");
+    assert_eq!(second.active_holders, 0);
+    assert!(
+        !lease_path.exists(),
+        "a later verifiable pass must recover the previously retained orphan"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repeated_orphan_recovery_does_not_grow_current_lease_entries() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("palace.db");
+    let paths = AdmissionPaths::new(&db_path).expect("admission paths");
+    write_raw_state(&paths.state_path, Vec::new());
+
+    for cycle in 0..32 {
+        let token = format!("orphan-cycle-{cycle}");
+        let lease_path = paths.holder_lease_path(&token);
+        drop(create_lease(&paths, &token, false));
+        let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("recover orphaned lease");
+        assert_eq!(snapshot.active_holders, 0);
+        assert!(
+            !lease_path.exists(),
+            "orphan lease survived recovery cycle {cycle}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unknown_version_holder_protects_its_deterministic_lease_from_orphan_sweep() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("palace.db");
+    let paths = AdmissionPaths::new(&db_path).expect("admission paths");
+    let token = "unknown-version-protected";
+    let lease_path = paths.holder_lease_path(token);
+    drop(create_lease(&paths, token, false));
+    let mut holder = raw_leased_holder(token, 7, "pid:[unknown-version]");
+    holder["lease_version"] = serde_json::json!(u8::MAX);
+    write_raw_state(&paths.state_path, vec![holder]);
+
+    let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("inspect unknown holder");
+
+    assert!(
+        lease_path.exists(),
+        "unknown-version holder must retain its lease"
+    );
+    assert_eq!(snapshot.unknown_holders, 1);
+    assert_eq!(
+        snapshot.unknown_holder_diagnostics,
+        vec![super::UnknownHolderDiagnostic {
+            generation: 1,
+            reason: super::UnknownHolderReason::UnknownLeaseVersion,
+        }]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn stale_reap_count_is_limited_to_the_snapshot_that_performed_recovery() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("palace.db");
+    let paths = AdmissionPaths::new(&db_path).expect("admission paths");
+    let token = "snapshot-reap-count";
+    drop(create_lease(&paths, token, false));
+    write_raw_state(
+        &paths.state_path,
+        vec![raw_leased_holder(token, 7, "pid:[snapshot-reap]")],
+    );
+
+    let first = ProfileDbAdmission::snapshot(&db_path).expect("first snapshot");
+    let second = ProfileDbAdmission::snapshot(&db_path).expect("second snapshot");
+
+    assert_eq!(first.reaped_stale_holders_this_snapshot, 1);
+    assert_eq!(second.reaped_stale_holders_this_snapshot, 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn missing_process_in_current_pid_namespace_is_reclaimed() {
     let pid_namespace = std::fs::read_link("/proc/self/ns/pid")
         .expect("read current PID namespace")
@@ -258,6 +401,47 @@ fn snapshot_reports_unverifiable_legacy_holder() {
     assert_eq!(snapshot.active_holders, 1);
     assert_eq!(snapshot.unknown_holders, 1);
     assert_eq!(snapshot.unknown_holder_generations, vec![1]);
+    assert_eq!(
+        snapshot.unknown_holder_diagnostics,
+        vec![super::UnknownHolderDiagnostic {
+            generation: 1,
+            reason: super::UnknownHolderReason::LegacyProcessIdentityUnverifiable,
+        }]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn nofollow_lease_open_failure_is_reported_as_a_typed_unknown_reason() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("palace.db");
+    let paths = AdmissionPaths::new(&db_path).expect("admission paths");
+    let token = "nofollow-open-failure";
+    let lease_path = paths.holder_lease_path(token);
+    let target = temp.path().join("not-a-lease");
+    std::fs::write(&target, b"not a lease").expect("write symlink target");
+    symlink(&target, &lease_path).expect("create lease-path symlink");
+    write_raw_state(
+        &paths.state_path,
+        vec![raw_leased_holder(token, 7, "pid:[nofollow-open-failure]")],
+    );
+
+    let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("inspect protected lease");
+
+    assert_eq!(snapshot.active_holders, 1);
+    assert_eq!(
+        snapshot.unknown_holder_diagnostics,
+        vec![super::UnknownHolderDiagnostic {
+            generation: 1,
+            reason: super::UnknownHolderReason::LeaseOpenUnavailable,
+        }]
+    );
+    assert!(
+        lease_path.is_symlink(),
+        "unknown holder lease must remain protected"
+    );
 }
 
 #[cfg(target_os = "linux")]

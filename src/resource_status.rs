@@ -68,8 +68,8 @@ pub fn print_profile_resource_status(db_path: &Path, indent: &str) {
                 snapshot.available_cache_bytes
             );
             println!(
-                "{indent}reaped_stale_holders: {}",
-                snapshot.reaped_stale_holders
+                "{indent}reaped_stale_holders_this_snapshot: {}",
+                snapshot.reaped_stale_holders_this_snapshot
             );
             println!("{indent}unknown_holders: {}", snapshot.unknown_holders);
             if snapshot.unknown_holder_generations.is_empty() {
@@ -84,6 +84,17 @@ pub fn print_profile_resource_status(db_path: &Path, indent: &str) {
                         .collect::<Vec<_>>()
                         .join(",")
                 );
+            }
+            if snapshot.unknown_holder_diagnostics.is_empty() {
+                println!("{indent}unknown_holder_diagnostics: none");
+            } else {
+                println!("{indent}unknown_holder_diagnostics:");
+                for diagnostic in &snapshot.unknown_holder_diagnostics {
+                    println!(
+                        "{indent}  - generation={} reason={}",
+                        diagnostic.generation, diagnostic.reason
+                    );
+                }
             }
             for holder in snapshot.holders {
                 println!(

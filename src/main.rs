@@ -3845,11 +3845,15 @@ fn run() -> Result<()> {
             display_path_for_user(&db_path)
         );
     }
+    if let Commands::Status { full } = &cli.command {
+        return Database::with_diagnostic_read_only(&db_path, |db| {
+            status_command(db, config.as_ref(), *full)
+        })
+        .context("failed to open status database")?;
+    }
 
     let db = match if let Some(path) = empty_read_only_db_path.as_ref() {
         Database::open(path).context("failed to open empty read-only database")
-    } else if matches!(&cli.command, Commands::Status { .. }) {
-        Database::open_diagnostic_read_only(&db_path).context("failed to open status database")
     } else if read_only_database {
         Database::open_read_only(&db_path).context("failed to open read-only database")
     } else if command_retries_stdin_ingest_startup_open(&cli.command) {

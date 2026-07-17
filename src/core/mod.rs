@@ -7,6 +7,8 @@ pub mod compaction;
 pub mod config;
 pub mod db;
 pub mod db_admission;
+mod db_admission_diagnostics;
+mod db_admission_lease;
 pub(crate) mod db_connection;
 pub(crate) mod deadline;
 pub use async_db::{AsyncDb, QueryOnlyAsyncDb};

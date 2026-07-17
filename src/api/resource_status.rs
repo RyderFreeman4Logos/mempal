@@ -40,7 +40,7 @@ pub(super) fn build_resource_usage_degraded() -> ResourceUsageStatus {
     ResourceUsageStatus {
         process: ProcessResourceUsageStatus::default(),
         sqlite: SqliteResourceUsageStatus::default(),
-        profile_admission: ProfileAdmissionStatus::default(),
+        profile_admission: ProfileAdmissionStatus::unavailable(),
         memory_pressure: crate::system_memory::MemoryPressureSnapshot::default(),
         daemon_recovery: DaemonRecoveryStatus::default(),
         counters: ResourceCounterStatus::from(crate::observability::resource_counters()),
@@ -136,9 +136,10 @@ impl From<AsyncDbResourceSnapshot> for SqliteResourceUsageStatus {
 #[derive(Debug, Default, Serialize)]
 struct ProfileAdmissionStatus {
     active_holders: usize,
-    reaped_stale_holders: usize,
+    reaped_stale_holders_this_snapshot: usize,
     unknown_holders: usize,
     unknown_holder_generations: Vec<u64>,
+    unknown_holder_diagnostics: Vec<UnknownHolderDiagnosticStatus>,
     configured_holder_limit: usize,
     configured_cache_bytes: u64,
     active_cache_bytes: u64,
@@ -148,6 +149,13 @@ struct ProfileAdmissionStatus {
 }
 
 impl ProfileAdmissionStatus {
+    fn unavailable() -> Self {
+        Self {
+            error: Some("profile admission diagnostics unavailable".to_string()),
+            ..Self::default()
+        }
+    }
+
     fn inspect(db_path: &Path) -> Self {
         let snapshot = match ProfileDbAdmission::snapshot(db_path) {
             Ok(snapshot) => snapshot,
@@ -164,9 +172,17 @@ impl ProfileAdmissionStatus {
             .unwrap_or(0);
         Self {
             active_holders: snapshot.active_holders,
-            reaped_stale_holders: snapshot.reaped_stale_holders,
+            reaped_stale_holders_this_snapshot: snapshot.reaped_stale_holders_this_snapshot,
             unknown_holders: snapshot.unknown_holders,
             unknown_holder_generations: snapshot.unknown_holder_generations,
+            unknown_holder_diagnostics: snapshot
+                .unknown_holder_diagnostics
+                .into_iter()
+                .map(|diagnostic| UnknownHolderDiagnosticStatus {
+                    generation: diagnostic.generation,
+                    reason: diagnostic.reason.to_string(),
+                })
+                .collect(),
             configured_holder_limit: snapshot.configured_holder_limit,
             configured_cache_bytes: snapshot.configured_cache_bytes,
             active_cache_bytes: snapshot.active_cache_bytes,
@@ -187,6 +203,12 @@ impl ProfileAdmissionStatus {
             error: None,
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct UnknownHolderDiagnosticStatus {
+    generation: u64,
+    reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -242,5 +264,15 @@ mod tests {
         );
         assert!(value["memory_pressure"].is_object());
         assert_eq!(value["daemon_recovery"]["phase"], "healthy");
+    }
+
+    #[test]
+    fn degraded_resource_usage_marks_admission_diagnostics_unavailable() {
+        let status = build_resource_usage_degraded();
+
+        assert!(
+            status.profile_admission.error.is_some(),
+            "degraded status must not serialize admission diagnostics as healthy zeroes"
+        );
     }
 }

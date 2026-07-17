@@ -16,11 +16,15 @@ impl Database {
         Self::open_with_mode(path, OpenMode::ReadOnly, true)
     }
 
-    /// Open a strictly read-only diagnostic connection without consuming a
-    /// profile holder slot. Callers must keep this connection short-lived.
-    pub fn open_diagnostic_read_only(path: &Path) -> Result<Self, DbError> {
+    /// Run a strictly read-only diagnostic operation without consuming a
+    /// profile holder slot. The connection closes before this method returns.
+    pub fn with_diagnostic_read_only<T>(
+        path: &Path,
+        operation: impl FnOnce(&Self) -> T,
+    ) -> Result<T, DbError> {
         let path = super::super::db_admission::ProfileDbAdmission::resolve_database_path(path)?;
-        Self::open_with_mode(&path, OpenMode::ReadOnly, false)
+        let database = Self::open_with_mode(&path, OpenMode::ReadOnly, false)?;
+        Ok(operation(&database))
     }
 
     /// Open a non-mutating connection without startup writes or migrations.
@@ -174,6 +178,29 @@ mod tests {
                 .expect("open lease-control database with timeout");
 
         let after = ProfileDbAdmission::snapshot(&db_path).expect("snapshot after lease control");
+        assert_eq!(after.active_holders, before.active_holders);
+        assert_eq!(after.holders, before.holders);
+    }
+
+    #[test]
+    fn diagnostic_operation_closes_without_consuming_an_admission_slot() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let _admitted = Database::open(&db_path).expect("open admitted database");
+        let before = ProfileDbAdmission::snapshot(&db_path).expect("snapshot before diagnostic");
+
+        let table_count = Database::with_diagnostic_read_only(&db_path, |database| {
+            database
+                .conn()
+                .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+        })
+        .expect("open diagnostic operation")
+        .expect("run diagnostic query");
+
+        let after = ProfileDbAdmission::snapshot(&db_path).expect("snapshot after diagnostic");
+        assert!(table_count >= 0);
         assert_eq!(after.active_holders, before.active_holders);
         assert_eq!(after.holders, before.holders);
     }

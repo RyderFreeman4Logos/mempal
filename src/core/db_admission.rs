@@ -16,13 +16,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use super::db_admission_lease::{
+    HolderLiveness, create_holder_lease, holder_lease_liveness, remove_holder_lease,
+    sweep_unreferenced_holder_leases,
+};
+
 const DEFAULT_MAX_HOLDERS: usize = 16;
 const DEFAULT_MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const ADMISSION_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const ADMISSION_LOCK_RETRY: Duration = Duration::from_millis(2);
 const ADMISSION_RELEASE_MAX_ATTEMPTS: u8 = 3;
 const ADMISSION_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(50);
-const HOLDER_LEASE_VERSION: u8 = 1;
+pub(super) const HOLDER_LEASE_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -148,21 +153,39 @@ pub struct DbAdmissionHolder {
     pub acquired_at_unix_secs: u64,
     pub connection_count: usize,
     pub configured_cache_bytes: u64,
-    token: String,
+    pub(super) token: String,
     process_identity: String,
     #[serde(default)]
     pid_namespace: Option<String>,
     #[serde(default)]
-    lease_version: u8,
+    pub(super) lease_version: u8,
+}
+
+/// Why a holder remains fail-closed when its liveness cannot be established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownHolderReason {
+    UnknownLeaseVersion,
+    LeaseOpenUnavailable,
+    LeaseLockUnavailable,
+    LegacyProcessIdentityUnverifiable,
+}
+
+/// Privacy-safe liveness evidence for an unreaped holder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnknownHolderDiagnostic {
+    pub generation: u64,
+    pub reason: UnknownHolderReason,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbAdmissionSnapshot {
     pub holders: Vec<DbAdmissionHolder>,
     pub active_holders: usize,
-    pub reaped_stale_holders: usize,
+    pub reaped_stale_holders_this_snapshot: usize,
     pub unknown_holders: usize,
     pub unknown_holder_generations: Vec<u64>,
+    pub unknown_holder_diagnostics: Vec<UnknownHolderDiagnostic>,
     pub configured_holder_limit: usize,
     pub configured_cache_bytes: u64,
     pub active_cache_bytes: u64,
@@ -201,6 +224,7 @@ impl ProfileDbAdmission {
         let paths = AdmissionPaths::new(db_path)?;
         let _lock = lock_state(&paths.lock_path)?;
         let mut state = load_state(&paths.state_path)?;
+        sweep_unreferenced_holder_leases(&paths, &state.holders)?;
         let reaped = reap_stale_holders(&paths, &mut state);
         persist_reaped_holders(&paths, &state, &reaped)?;
 
@@ -275,6 +299,7 @@ impl ProfileDbAdmission {
         let paths = AdmissionPaths::new(db_path)?;
         let _lock = lock_state(&paths.lock_path)?;
         let mut state = load_state(&paths.state_path)?;
+        sweep_unreferenced_holder_leases(&paths, &state.holders)?;
         let reaped = reap_stale_holders(&paths, &mut state);
         persist_reaped_holders(&paths, &state, &reaped)?;
         let active_cache_bytes = state.holders.iter().fold(0_u64, |total, holder| {
@@ -283,9 +308,14 @@ impl ProfileDbAdmission {
         Ok(DbAdmissionSnapshot {
             active_holders: state.holders.len(),
             holders: state.holders,
-            reaped_stale_holders: reaped.reaped_stale_holders,
-            unknown_holders: reaped.unknown_holder_generations.len(),
-            unknown_holder_generations: reaped.unknown_holder_generations,
+            reaped_stale_holders_this_snapshot: reaped.reaped_stale_holders_this_snapshot,
+            unknown_holders: reaped.unknown_holder_diagnostics.len(),
+            unknown_holder_generations: reaped
+                .unknown_holder_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.generation)
+                .collect(),
+            unknown_holder_diagnostics: reaped.unknown_holder_diagnostics,
             configured_holder_limit: config.max_holders,
             configured_cache_bytes: config.max_cache_bytes,
             active_cache_bytes,
@@ -313,6 +343,12 @@ impl ProfileDbAdmission {
     fn release(&self) -> Result<bool, DbAdmissionError> {
         let _lock = lock_state(&self.lock_path)?;
         let mut state = load_state(&self.state_path)?;
+        let paths = AdmissionPaths {
+            database_path: self.database_path.clone(),
+            state_path: self.state_path.clone(),
+            lock_path: self.lock_path.clone(),
+        };
+        sweep_unreferenced_holder_leases(&paths, &state.holders)?;
         let before = state.holders.len();
         state.holders.retain(|holder| {
             holder.token != self.token
@@ -382,7 +418,7 @@ fn validate_request(
     Ok(())
 }
 
-struct AdmissionPaths {
+pub(super) struct AdmissionPaths {
     database_path: PathBuf,
     state_path: PathBuf,
     lock_path: PathBuf,
@@ -447,7 +483,7 @@ impl AdmissionPaths {
         })
     }
 
-    fn holder_lease_path(&self, token: &str) -> PathBuf {
+    pub(super) fn holder_lease_path(&self, token: &str) -> PathBuf {
         let state_name = self
             .state_path
             .file_name()
@@ -459,49 +495,28 @@ impl AdmissionPaths {
         self.state_path
             .with_file_name(format!("{state_name}.{}.lease", &lease_id[..24]))
     }
-}
 
-fn create_holder_lease(path: &Path) -> Result<File, DbAdmissionError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|source| DbAdmissionError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    match imp::try_lock_exclusive(&file) {
-        Ok(true) => Ok(file),
-        Ok(false) => {
-            remove_holder_lease(path);
-            Err(DbAdmissionError::Io {
-                path: path.to_path_buf(),
-                source: io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "new database holder lease is unexpectedly locked",
-                ),
-            })
-        }
-        Err(source) => {
-            remove_holder_lease(path);
-            Err(DbAdmissionError::Io {
-                path: path.to_path_buf(),
-                source,
-            })
-        }
+    pub(super) fn state_parent(&self) -> &Path {
+        self.state_path.parent().unwrap_or_else(|| Path::new("."))
     }
-}
 
-fn remove_holder_lease(path: &Path) {
-    if let Err(error) = fs::remove_file(path)
-        && error.kind() != io::ErrorKind::NotFound
-    {
-        tracing::warn!(
-            %error,
-            lease_path = %path.display(),
-            "failed to remove database holder lease sidecar"
-        );
+    pub(super) fn is_current_lease_path(&self, path: &Path) -> bool {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let state_name = self
+            .state_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let Some(lease_id) = name
+            .strip_prefix(state_name)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .and_then(|rest| rest.strip_suffix(".lease"))
+        else {
+            return false;
+        };
+        lease_id.len() == 24 && lease_id.bytes().all(|byte| byte.is_ascii_hexdigit())
     }
 }
 
@@ -583,18 +598,10 @@ fn save_state(path: &Path, state: &AdmissionState) -> Result<(), DbAdmissionErro
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HolderLiveness {
-    Live,
-    Dead,
-    Unknown,
-}
-
 #[derive(Debug, Default)]
 struct ReapedHolders {
-    reaped_stale_holders: usize,
-    stale_lease_paths: Vec<PathBuf>,
-    unknown_holder_generations: Vec<u64>,
+    reaped_stale_holders_this_snapshot: usize,
+    unknown_holder_diagnostics: Vec<UnknownHolderDiagnostic>,
 }
 
 fn reap_stale_holders(paths: &AdmissionPaths, state: &mut AdmissionState) -> ReapedHolders {
@@ -603,17 +610,18 @@ fn reap_stale_holders(paths: &AdmissionPaths, state: &mut AdmissionState) -> Rea
         .holders
         .retain(|holder| match holder_liveness(paths, holder) {
             HolderLiveness::Live => true,
-            HolderLiveness::Unknown => {
-                result.unknown_holder_generations.push(holder.generation);
+            HolderLiveness::Unknown(reason) => {
+                result
+                    .unknown_holder_diagnostics
+                    .push(UnknownHolderDiagnostic {
+                        generation: holder.generation,
+                        reason,
+                    });
                 true
             }
             HolderLiveness::Dead => {
-                result.reaped_stale_holders = result.reaped_stale_holders.saturating_add(1);
-                if holder.lease_version == HOLDER_LEASE_VERSION {
-                    result
-                        .stale_lease_paths
-                        .push(paths.holder_lease_path(&holder.token));
-                }
+                result.reaped_stale_holders_this_snapshot =
+                    result.reaped_stale_holders_this_snapshot.saturating_add(1);
                 false
             }
         });
@@ -625,34 +633,22 @@ fn persist_reaped_holders(
     state: &AdmissionState,
     reaped: &ReapedHolders,
 ) -> Result<(), DbAdmissionError> {
-    if reaped.reaped_stale_holders == 0 {
+    if reaped.reaped_stale_holders_this_snapshot == 0 {
         return Ok(());
     }
     save_state(&paths.state_path, state)?;
-    for lease_path in &reaped.stale_lease_paths {
-        remove_holder_lease(lease_path);
-    }
+    sweep_unreferenced_holder_leases(paths, &state.holders)?;
     Ok(())
 }
 
 fn holder_liveness(paths: &AdmissionPaths, holder: &DbAdmissionHolder) -> HolderLiveness {
     match holder.lease_version {
         HOLDER_LEASE_VERSION => holder_lease_liveness(&paths.holder_lease_path(&holder.token)),
+        0 if paths.holder_lease_path(&holder.token).exists() => {
+            holder_lease_liveness(&paths.holder_lease_path(&holder.token))
+        }
         0 => legacy_holder_liveness(holder),
-        _ => HolderLiveness::Unknown,
-    }
-}
-
-fn holder_lease_liveness(path: &Path) -> HolderLiveness {
-    let file = match OpenOptions::new().read(true).write(true).open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return HolderLiveness::Dead,
-        Err(_) => return HolderLiveness::Unknown,
-    };
-    match imp::try_lock_exclusive(&file) {
-        Ok(true) => HolderLiveness::Dead,
-        Ok(false) => HolderLiveness::Live,
-        Err(_) => HolderLiveness::Unknown,
+        _ => HolderLiveness::Unknown(UnknownHolderReason::UnknownLeaseVersion),
     }
 }
 
@@ -671,7 +667,9 @@ fn legacy_holder_liveness(holder: &DbAdmissionHolder) -> HolderLiveness {
         ) {
             super::process_identity::ProcessLiveness::Live => HolderLiveness::Live,
             super::process_identity::ProcessLiveness::Dead => HolderLiveness::Dead,
-            super::process_identity::ProcessLiveness::Unverifiable => HolderLiveness::Unknown,
+            super::process_identity::ProcessLiveness::Unverifiable => {
+                HolderLiveness::Unknown(UnknownHolderReason::LegacyProcessIdentityUnverifiable)
+            }
         }
     }
     #[cfg(all(unix, not(target_os = "linux")))]
@@ -686,7 +684,9 @@ fn legacy_holder_liveness(holder: &DbAdmissionHolder) -> HolderLiveness {
         }
         match imp::foreign_process_liveness(holder.pid) {
             ProcessLiveness::Dead => HolderLiveness::Dead,
-            ProcessLiveness::Unverifiable => HolderLiveness::Unknown,
+            ProcessLiveness::Unverifiable => {
+                HolderLiveness::Unknown(UnknownHolderReason::LegacyProcessIdentityUnverifiable)
+            }
         }
     }
     #[cfg(not(unix))]
@@ -699,7 +699,7 @@ fn legacy_holder_liveness(holder: &DbAdmissionHolder) -> HolderLiveness {
                 HolderLiveness::Dead
             };
         }
-        HolderLiveness::Unknown
+        HolderLiveness::Unknown(UnknownHolderReason::LegacyProcessIdentityUnverifiable)
     }
 }
 
@@ -733,7 +733,7 @@ fn unix_secs_now() -> u64 {
 }
 
 #[cfg(unix)]
-mod imp {
+pub(super) mod imp {
     use std::fs::File;
     use std::io;
     use std::os::fd::AsRawFd;
@@ -775,7 +775,7 @@ mod imp {
 }
 
 #[cfg(not(unix))]
-mod imp {
+pub(super) mod imp {
     use std::fs::File;
     use std::io;
 
