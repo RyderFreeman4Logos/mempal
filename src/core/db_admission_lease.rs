@@ -13,6 +13,53 @@ use super::db_admission::{
     AdmissionPaths, DbAdmissionError, DbAdmissionHolder, UnknownHolderReason, imp,
 };
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_UNLINK: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) struct UnlinkFaultGuard {
+    previous: Option<std::path::PathBuf>,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_holder_lease_unlink(path: &Path) -> UnlinkFaultGuard {
+    let previous = FAIL_NEXT_UNLINK.with(|slot| slot.replace(Some(path.to_path_buf())));
+    assert!(
+        previous.is_none(),
+        "holder-lease unlink fault already armed"
+    );
+    UnlinkFaultGuard {
+        previous,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+#[cfg(test)]
+fn take_unlink_failure(path: &Path) -> bool {
+    FAIL_NEXT_UNLINK.with(|slot| {
+        let mut armed = slot.borrow_mut();
+        if armed.as_deref() == Some(path) {
+            armed.take();
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+impl Drop for UnlinkFaultGuard {
+    fn drop(&mut self) {
+        FAIL_NEXT_UNLINK.with(|slot| {
+            slot.replace(self.previous.take());
+        });
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HolderLiveness {
     Live,
@@ -33,7 +80,9 @@ pub(super) fn create_holder_lease(path: &Path) -> Result<File, DbAdmissionError>
     match imp::try_lock_exclusive(&file) {
         Ok(true) => Ok(file),
         Ok(false) => {
-            remove_holder_lease(path);
+            if let Err(error) = remove_holder_lease(path) {
+                tracing::warn!(%error, "failed to clean up unexpectedly locked holder lease");
+            }
             Err(DbAdmissionError::Io {
                 path: path.to_path_buf(),
                 source: io::Error::new(
@@ -43,7 +92,9 @@ pub(super) fn create_holder_lease(path: &Path) -> Result<File, DbAdmissionError>
             })
         }
         Err(source) => {
-            remove_holder_lease(path);
+            if let Err(error) = remove_holder_lease(path) {
+                tracing::warn!(%error, "failed to clean up holder lease after lock error");
+            }
             Err(DbAdmissionError::Io {
                 path: path.to_path_buf(),
                 source,
@@ -52,11 +103,21 @@ pub(super) fn create_holder_lease(path: &Path) -> Result<File, DbAdmissionError>
     }
 }
 
-pub(super) fn remove_holder_lease(path: &Path) {
-    if let Err(error) = fs::remove_file(path)
-        && error.kind() != io::ErrorKind::NotFound
-    {
-        tracing::warn!(%error, "failed to remove database holder lease sidecar");
+pub(super) fn remove_holder_lease(path: &Path) -> Result<(), DbAdmissionError> {
+    #[cfg(test)]
+    if take_unlink_failure(path) {
+        return Err(DbAdmissionError::Io {
+            path: path.to_path_buf(),
+            source: io::Error::other("injected one-time holder lease unlink failure"),
+        });
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DbAdmissionError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 

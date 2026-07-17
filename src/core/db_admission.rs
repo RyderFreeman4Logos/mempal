@@ -16,6 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use super::db_admission_fault_injection::{self as fault_injection, CrashPoint};
 use super::db_admission_lease::{
     HolderLiveness, create_holder_lease, holder_lease_liveness, remove_holder_lease,
     sweep_unreferenced_holder_leases,
@@ -25,8 +27,8 @@ const DEFAULT_MAX_HOLDERS: usize = 16;
 const DEFAULT_MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const ADMISSION_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const ADMISSION_LOCK_RETRY: Duration = Duration::from_millis(2);
-const ADMISSION_RELEASE_MAX_ATTEMPTS: u8 = 3;
-const ADMISSION_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(50);
+pub(super) const ADMISSION_RELEASE_MAX_ATTEMPTS: u8 = 3;
+pub(super) const ADMISSION_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(50);
 pub(super) const HOLDER_LEASE_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,6 +256,8 @@ impl ProfileDbAdmission {
         let token = admission_token(&owner_identity, generation, acquired_at_unix_secs);
         let lease_path = paths.holder_lease_path(&token);
         let lease = create_holder_lease(&lease_path)?;
+        #[cfg(test)]
+        fault_injection::exit_if(CrashPoint::LeaseCreatedBeforeStatePublish);
         state.holders.push(DbAdmissionHolder {
             holder_class: request.holder_class,
             owner_identity: owner_identity.clone(),
@@ -272,10 +276,11 @@ impl ProfileDbAdmission {
             .sort_by_key(|holder| (holder.generation, holder.pid));
         if let Err(error) = save_state(&paths.state_path, &state) {
             drop(lease);
-            remove_holder_lease(&lease_path);
+            if let Err(cleanup_error) = remove_holder_lease(&lease_path) {
+                tracing::warn!(%cleanup_error, "failed to clean up unpublished holder lease");
+            }
             return Err(error);
         }
-
         Ok(Self {
             database_path: paths.database_path,
             state_path: paths.state_path,
@@ -340,7 +345,7 @@ impl ProfileDbAdmission {
         &self.database_path
     }
 
-    fn release(&self) -> Result<bool, DbAdmissionError> {
+    pub(super) fn release(&self) -> Result<bool, DbAdmissionError> {
         let _lock = lock_state(&self.lock_path)?;
         let mut state = load_state(&self.state_path)?;
         let paths = AdmissionPaths {
@@ -358,41 +363,17 @@ impl ProfileDbAdmission {
         let released = state.holders.len() != before;
         if released {
             save_state(&self.state_path, &state)?;
-            remove_holder_lease(&self.lease_path);
+            #[cfg(test)]
+            fault_injection::exit_if(CrashPoint::ReleaseStateSavedBeforeLeaseUnlink);
+        }
+        if state
+            .holders
+            .iter()
+            .all(|holder| holder.token != self.token)
+        {
+            remove_holder_lease(&self.lease_path)?;
         }
         Ok(released)
-    }
-}
-
-impl Drop for ProfileDbAdmission {
-    fn drop(&mut self) {
-        // Bounded retry: transient lock contention or I/O errors should not
-        // permanently leak the admission slot. Retry a few times before
-        // giving up and logging the leak.
-        for attempt in 1..=ADMISSION_RELEASE_MAX_ATTEMPTS {
-            match self.release() {
-                Ok(_) => return,
-                Err(error) => {
-                    if attempt < ADMISSION_RELEASE_MAX_ATTEMPTS {
-                        tracing::warn!(
-                            %error,
-                            admission_owner = %self.owner_identity,
-                            attempt,
-                            "failed to release DB admission holder; will retry"
-                        );
-                        std::thread::sleep(ADMISSION_RELEASE_RETRY_DELAY);
-                    } else {
-                        tracing::error!(
-                            %error,
-                            admission_owner = %self.owner_identity,
-                            "failed to release DB admission holder after {} attempts; \
-                             budget slot may leak until process exit",
-                            ADMISSION_RELEASE_MAX_ATTEMPTS
-                        );
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -420,12 +401,12 @@ fn validate_request(
 
 pub(super) struct AdmissionPaths {
     database_path: PathBuf,
-    state_path: PathBuf,
+    pub(super) state_path: PathBuf,
     lock_path: PathBuf,
 }
 
 impl AdmissionPaths {
-    fn new(db_path: &Path) -> Result<Self, DbAdmissionError> {
+    pub(super) fn new(db_path: &Path) -> Result<Self, DbAdmissionError> {
         // Canonicalize the full database path to prevent symlink aliases
         // from bypassing the profile-wide admission budget.
         let raw_parent = db_path.parent().unwrap_or_else(|| Path::new("."));
@@ -637,6 +618,8 @@ fn persist_reaped_holders(
         return Ok(());
     }
     save_state(&paths.state_path, state)?;
+    #[cfg(test)]
+    fault_injection::exit_if(CrashPoint::ReapStateSavedBeforeOrphanSweep);
     sweep_unreferenced_holder_leases(paths, &state.holders)?;
     Ok(())
 }

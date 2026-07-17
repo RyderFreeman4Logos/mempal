@@ -7,8 +7,15 @@ pub mod compaction;
 pub mod config;
 pub mod db;
 pub mod db_admission;
+#[cfg(all(test, target_os = "linux"))]
+mod db_admission_crash_tests;
 mod db_admission_diagnostics;
+#[cfg(test)]
+mod db_admission_fault_injection;
 mod db_admission_lease;
+mod db_admission_release;
+#[cfg(all(test, target_os = "linux"))]
+pub mod db_admission_test_process;
 pub(crate) mod db_connection;
 pub(crate) mod deadline;
 pub use async_db::{AsyncDb, QueryOnlyAsyncDb};

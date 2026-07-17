@@ -3,11 +3,10 @@ mod admission_supervisor;
 mod common;
 
 use std::fs;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use admission_supervisor::DeadlineChild;
+use admission_supervisor::{DeadlineChild, LeaderResourceState, SpawnSpec, StdioMode};
 
 use mempal::core::AsyncDb;
 use mempal::core::db::Database;
@@ -160,7 +159,7 @@ fn async_pool_holds_admission_for_its_full_lifetime() {
 #[test]
 fn deadline_child_bounds_non_exiting_fixture_with_inherited_pipes() {
     let started = Instant::now();
-    let mut command = Command::new("sh");
+    let mut command = SpawnSpec::new("/bin/sh").expect("absolute shell");
     command.args([
         "-c",
         "trap '' TERM; printf ready; while :; do sleep 60; done",
@@ -175,7 +174,7 @@ fn deadline_child_bounds_non_exiting_fixture_with_inherited_pipes() {
         "{:#?}",
         output.cleanup.errors
     );
-    assert!(!output.cleanup.transferred_to_background_reaper);
+    assert!(output.cleanup.kill_fence_sent);
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "subprocess cleanup exceeded its deadline"
@@ -185,7 +184,7 @@ fn deadline_child_bounds_non_exiting_fixture_with_inherited_pipes() {
 #[cfg(target_os = "linux")]
 #[test]
 fn deadline_child_retains_tail_diagnostics_after_capture_limit() {
-    let mut command = Command::new("sh");
+    let mut command = SpawnSpec::new("/bin/sh").expect("absolute shell");
     command.args([
         "-c",
         "head -c 1100000 /dev/zero | tr '\\0' x; printf '\\nTAIL_MARKER\\n'",
@@ -209,7 +208,7 @@ fn deadline_child_retains_tail_diagnostics_after_capture_limit() {
         "{:#?}",
         output.cleanup.errors
     );
-    assert!(!output.cleanup.transferred_to_background_reaper);
+    assert!(output.cleanup.kill_fence_sent);
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("TAIL_MARKER"),
         "bounded capture must retain a tail diagnostic marker"
@@ -231,8 +230,10 @@ fn status_remains_available_when_holder_budget_is_exhausted() {
         })
         .collect::<Vec<_>>();
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mempal"));
-    command.arg("status").env("HOME", &home).current_dir(&home);
+    let mut command =
+        SpawnSpec::new(env!("CARGO_BIN_EXE_mempal")).expect("absolute mempal executable");
+    command.arg("status").env("HOME", &home);
+    command.current_dir(&home).expect("absolute home directory");
     let output =
         DeadlineChild::output(command, Duration::from_secs(5)).expect("run status at holder cap");
 
@@ -259,7 +260,10 @@ fn status_remains_available_when_holder_budget_is_exhausted() {
 #[cfg(target_os = "linux")]
 #[test]
 fn pid_namespace_mcp_holder_is_reaped_after_forced_exit_when_supported() {
-    let mut support_command = Command::new("unshare");
+    let Ok(mut support_command) = SpawnSpec::resolve("unshare") else {
+        eprintln!("skipping PID namespace integration probe: unshare is unavailable");
+        return;
+    };
     support_command.args([
         "--user",
         "--map-root-user",
@@ -302,7 +306,7 @@ fn pid_namespace_mcp_holder_is_reaped_after_forced_exit_when_supported() {
     let db_path = mempal_home.join("palace.db");
     drop(Database::open(&db_path).expect("initialize database"));
 
-    let mut command = Command::new("unshare");
+    let mut command = SpawnSpec::resolve("unshare").expect("resolved unshare executable");
     command
         .args([
             "--user",
@@ -315,10 +319,8 @@ fn pid_namespace_mcp_holder_is_reaped_after_forced_exit_when_supported() {
         .arg(env!("CARGO_BIN_EXE_mempal"))
         .args(["serve", "--mcp"])
         .env("HOME", &home)
-        .current_dir(&home)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdio(StdioMode::PipedInput);
+    command.current_dir(&home).expect("absolute home directory");
     let mut child = DeadlineChild::spawn(command, Duration::from_secs(5))
         .expect("spawn namespaced MCP fixture");
     child
@@ -327,12 +329,13 @@ fn pid_namespace_mcp_holder_is_reaped_after_forced_exit_when_supported() {
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mempal_status","arguments":{}}}
 "#,
-        Instant::now() + Duration::from_secs(5),
+        Duration::from_secs(5),
     )
     .expect("write namespaced child stdin");
     let live_deadline = Instant::now() + Duration::from_secs(10);
     let live_snapshot = loop {
-        if let Some(diagnostic) = child.exit_diagnostic() {
+        let diagnostic = child.exit_diagnostic().expect("inspect namespaced fixture");
+        if child.resources().leader != LeaderResourceState::Running {
             panic!("namespaced MCP fixture exited before registration: {diagnostic}");
         }
         if let Ok(snapshot) = ProfileDbAdmission::snapshot(&db_path)
@@ -344,17 +347,16 @@ fn pid_namespace_mcp_holder_is_reaped_after_forced_exit_when_supported() {
             Instant::now() < live_deadline,
             "namespaced MCP fixture did not register before deadline"
         );
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::yield_now();
     };
     assert_eq!(live_snapshot.reaped_stale_holders_this_snapshot, 0);
     assert_eq!(live_snapshot.unknown_holders, 0);
 
-    let cleanup = child.force_kill();
+    let cleanup = child
+        .force_kill()
+        .expect_complete("kill namespaced MCP fixture");
     assert!(cleanup.errors.is_empty(), "cleanup errors: {cleanup:?}");
-    assert!(
-        !cleanup.transferred_to_background_reaper,
-        "fixture cleanup must reap the direct child synchronously"
-    );
+    assert!(cleanup.kill_fence_sent);
 
     let reap_deadline = Instant::now() + Duration::from_secs(10);
     let mut reaped_total = 0usize;
@@ -369,7 +371,7 @@ fn pid_namespace_mcp_holder_is_reaped_after_forced_exit_when_supported() {
             Instant::now() < reap_deadline,
             "namespaced MCP holder was not reaped before deadline"
         );
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::yield_now();
     }
     assert!(
         reaped_total > 0,
