@@ -17,6 +17,7 @@ enum FaultKind {
     Status,
     GitDir,
     GitCommonDir,
+    CheckIgnore,
 }
 
 impl FaultKind {
@@ -25,6 +26,7 @@ impl FaultKind {
             Self::Status => "status",
             Self::GitDir => "git-dir",
             Self::GitCommonDir => "git-common-dir",
+            Self::CheckIgnore => "check-ignore",
         }
     }
 
@@ -33,6 +35,7 @@ impl FaultKind {
             Self::Status => &["status", "--porcelain=v1", "--untracked-files=no"],
             Self::GitDir => &["rev-parse", "--git-dir"],
             Self::GitCommonDir => &["rev-parse", "--git-common-dir"],
+            Self::CheckIgnore => &["check-ignore", "-q", "--", "target"],
         }
     }
 }
@@ -86,6 +89,11 @@ fi
 if [ "${1:-}" = "rev-parse" ] && [ "${LOCAL_GATE_RECEIPT_FAULT_KIND:?}" = "git-common-dir" ] && [ "${2:-}" = "--git-common-dir" ]; then
     "${LOCAL_GATE_RECEIPT_REAL_GIT:?}" "$@"
     printf '%s\n' 'faulted-git-common-dir' >>"${LOCAL_GATE_RECEIPT_FAULT_LOG:?}"
+    exit 42
+fi
+
+if [ "${1:-}" = "check-ignore" ] && [ "${LOCAL_GATE_RECEIPT_FAULT_KIND:?}" = "check-ignore" ]; then
+    printf '%s\n' 'faulted-check-ignore' >>"${LOCAL_GATE_RECEIPT_FAULT_LOG:?}"
     exit 42
 fi
 
@@ -228,6 +236,37 @@ fn producer_rejects_post_aggregate_status_command_uncertainty() {
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains("PASS local gate receipt:"),
         "uncertainty printed PASS"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn producer_rejects_check_ignore_uncertainty_for_a_symlinked_target() {
+    let fixture = fixture(successful_aggregate());
+    let linked_target = tempfile::tempdir().expect("create linked target directory");
+    std::os::unix::fs::symlink(linked_target.path(), fixture.root.join("target"))
+        .expect("link fixture target directory");
+    let shim = fault_shim(&fixture, FaultKind::CheckIgnore, false);
+    assert_fault_shim_is_selective(&fixture, &shim);
+    fs::remove_file(&shim.log).expect("clear check-ignore fault proof log");
+
+    let output = run_fixture_with_fault(&fixture, "produce", &shim);
+    assert!(
+        !output.status.success(),
+        "producer accepted uncertain check-ignore result: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&shim.log).expect("read check-ignore fault log"),
+        "faulted-check-ignore\n"
+    );
+    assert!(
+        !fixture.aggregate_log.exists(),
+        "aggregate ran after check-ignore uncertainty"
+    );
+    assert!(
+        receipt_artifacts(&fixture).is_empty(),
+        "check-ignore uncertainty minted PASS"
     );
 }
 
