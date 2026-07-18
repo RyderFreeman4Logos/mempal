@@ -18,14 +18,34 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> io::Result<Output> 
         if Instant::now() >= deadline {
             let _ = child.kill();
             let output = child.wait_with_output()?;
-            panic!(
-                "child did not exit within {timeout:?}; stdout={}, stderr={}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "child did not exit within {timeout:?}; stdout={}, stderr={}",
+                    bounded_diagnostic(&output.stdout),
+                    bounded_diagnostic(&output.stderr)
+                ),
+            ));
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn bounded_diagnostic(output: &[u8]) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
+
+    String::from_utf8_lossy(&output[..output.len().min(MAX_DIAGNOSTIC_BYTES)]).into_owned()
+}
+
+fn configure_fixture_git_environment(command: &mut Command, working_dir: &Path) {
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_1", working_dir.join(".fixture-git-hooks"));
 }
 
 #[cfg(unix)]
@@ -46,30 +66,182 @@ fn run_bash_script(
     action: &str,
     aggregate_log: &Path,
 ) -> Output {
-    let child = Command::new("bash")
+    let mut command = Command::new("bash");
+    command
         .arg(script)
         .arg(action)
         .current_dir(working_dir)
         .env("LOCAL_GATE_FIXTURE_LOG", aggregate_log)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn fixture gate script");
+        .stderr(Stdio::piped());
+    configure_fixture_git_environment(&mut command, working_dir);
+    let child = command.spawn().expect("spawn fixture gate script");
     wait_with_timeout(child, Duration::from_secs(5)).expect("wait for fixture gate script")
 }
 
-fn run_git(working_dir: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(working_dir)
-        .output()
-        .expect("run fixture git command");
+fn fixture_git_command(working_dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command.args(args).current_dir(working_dir);
+    configure_fixture_git_environment(&mut command, working_dir);
+    command
+}
+
+fn run_fixture_git_with_timeout(working_dir: &Path, args: &[&str]) -> io::Result<Output> {
+    let child = fixture_git_command(working_dir, args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    wait_with_timeout(child, Duration::from_secs(5))
+}
+
+fn fixture_git_output(working_dir: &Path, args: &[&str]) -> Output {
+    let output = run_fixture_git_with_timeout(working_dir, args)
+        .unwrap_or_else(|error| panic!("git {args:?} failed: {error}"));
     assert!(
         output.status.success(),
         "git {args:?} failed: stdout={}, stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    output
+}
+
+fn run_git(working_dir: &Path, args: &[&str]) {
+    let _ = fixture_git_output(working_dir, args);
+}
+
+const STALLED_GIT_CHILD_ENV: &str = "LOCAL_GATE_RECEIPT_STALLED_GIT_CHILD";
+const STALLED_GIT_PID_FILE_ENV: &str = "LOCAL_GATE_RECEIPT_STALLED_GIT_PID_FILE";
+
+fn stalled_fixture_git(working_dir: &Path) -> io::Result<Output> {
+    run_fixture_git_with_timeout(working_dir, &["rev-parse", "HEAD"])
+}
+
+fn wait_for_test_child(mut child: Child, timeout: Duration) -> (Output, bool) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("poll bounded test child").is_some() {
+            return (
+                child
+                    .wait_with_output()
+                    .expect("collect bounded test child output"),
+                false,
+            );
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill bounded test child");
+            return (
+                child.wait_with_output().expect("reap bounded test child"),
+                true,
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: i32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(") ")?
+        .1
+        .split_ascii_whitespace()
+        .nth(19)
+        .map(str::to_owned)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_process_exit(pid: i32, start_time: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if process_start_time(pid).as_deref() != Some(start_time) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_matching_process(pid: i32, start_time: &str) {
+    if process_start_time(pid).as_deref() == Some(start_time) {
+        // SAFETY: the PID's Linux start-time identity was revalidated immediately before signal.
+        unsafe {
+            let _ = libc::kill(pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_git_commands_time_out_and_reap_stalled_direct_children() {
+    if std::env::var_os(STALLED_GIT_CHILD_ENV).is_some() {
+        let error = stalled_fixture_git(&repo_root())
+            .expect_err("stalled fixture git command must reach its internal timeout");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        return;
+    }
+
+    let tempdir = tempfile::tempdir().expect("create stalled git fixture directory");
+    let fake_bin_dir = tempdir.path().join("bin");
+    fs::create_dir(&fake_bin_dir).expect("create stalled fake binary directory");
+    let pid_file = tempdir.path().join("stalled-git.pid");
+    write_executable(
+        &fake_bin_dir.join("git"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nstart_time=\"$(awk '{print $22}' /proc/$$/stat)\"\nprintf '%s %s\\n' \"$$\" \"${start_time}\" >\"${LOCAL_GATE_RECEIPT_STALLED_GIT_PID_FILE:?}\"\nexec /bin/sleep 60\n",
+    );
+
+    let inherited_path = std::env::var_os("PATH").expect("PATH is set for fixture");
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin_dir).chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("construct stalled fixture PATH");
+    let child = Command::new(std::env::current_exe().expect("current test executable"))
+        .args([
+            "--exact",
+            "fixture_git_commands_time_out_and_reap_stalled_direct_children",
+            "--nocapture",
+        ])
+        .env(STALLED_GIT_CHILD_ENV, "1")
+        .env(STALLED_GIT_PID_FILE_ENV, &pid_file)
+        .env("PATH", path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bounded stalled-git test child");
+    let started = Instant::now();
+    let (output, outer_timed_out) = wait_for_test_child(child, Duration::from_secs(7));
+    let elapsed = started.elapsed();
+
+    let pid_record = fs::read_to_string(&pid_file).expect("read stalled git PID record");
+    let (pid, start_time) = pid_record
+        .split_once(' ')
+        .expect("parse stalled git PID record");
+    let pid = pid.trim().parse::<i32>().expect("parse stalled git PID");
+    let start_time = start_time.trim();
+    let reaped = wait_for_process_exit(pid, start_time, Duration::from_secs(1));
+    if !reaped {
+        terminate_matching_process(pid, start_time);
+    }
+
+    assert!(
+        !outer_timed_out,
+        "outer RED bound killed the test child after {elapsed:?}; fixture git did not self-timeout; stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "stalled-git test child failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "timeout exceeded headroom: {elapsed:?}"
+    );
+    assert!(reaped, "stalled direct git child was not reaped");
 }
 
 fn run_review_check(fake_bin_dir: &Path, log: &Path, csa_context: (&str, &str)) -> Output {
@@ -148,6 +320,7 @@ fn fixture(aggregate: &str) -> GateFixture {
     let root = tempdir.path().to_path_buf();
     let script_dir = root.join("scripts/gates");
     fs::create_dir_all(&script_dir).expect("create fixture script directory");
+    fs::create_dir(root.join(".fixture-git-hooks")).expect("create fixture hook directory");
     let source = fs::read_to_string(repo_root().join("scripts/gates/local-gate-receipt.sh"))
         .expect("read local gate receipt script");
     let script = script_dir.join("local-gate-receipt.sh");
@@ -159,12 +332,13 @@ fn fixture(aggregate: &str) -> GateFixture {
     .expect("write fixture justfile");
     fs::write(root.join("lefthook.yml"), "pre-push:\n  commands: {}\n")
         .expect("write fixture lefthook config");
-    fs::write(root.join(".gitignore"), "/target\n").expect("write fixture ignore rules");
+    fs::write(root.join(".gitignore"), "/target\n/.fixture-git-hooks\n")
+        .expect("write fixture ignore rules");
     run_git(&root, &["init", "--quiet"]);
     run_git(&root, &["config", "user.email", "gates@example.test"]);
     run_git(&root, &["config", "user.name", "Gate Fixture"]);
     write_executable(
-        &root.join(".git/hooks/pre-push"),
+        &root.join(".fixture-git-hooks/pre-push"),
         "#!/usr/bin/env bash\nexit 0\n",
     );
     run_git(
@@ -262,41 +436,23 @@ fn producer_publishes_a_clean_exact_tree_pass_receipt() {
     let receipt = fs::read_to_string(&receipts[0]).expect("read receipt");
     assert!(receipt.contains("schema=local-gate-receipt-v1"));
     assert!(receipt.contains("status=PASS"));
+    let head = fixture_git_output(&fixture.root, &["rev-parse", "HEAD"]);
     assert!(receipt.contains(&format!(
         "head={}",
-        String::from_utf8_lossy(
-            &Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(&fixture.root)
-                .output()
-                .expect("read fixture HEAD")
-                .stdout
-        )
-        .trim()
+        String::from_utf8_lossy(&head.stdout).trim()
     )));
+    let tree = fixture_git_output(&fixture.root, &["rev-parse", "HEAD^{tree}"]);
     assert!(receipt.contains(&format!(
         "tree={}",
-        String::from_utf8_lossy(
-            &Command::new("git")
-                .args(["rev-parse", "HEAD^{tree}"])
-                .current_dir(&fixture.root)
-                .output()
-                .expect("read fixture tree")
-                .stdout
-        )
-        .trim()
+        String::from_utf8_lossy(&tree.stdout).trim()
     )));
     let receipt_relative = receipts[0]
         .strip_prefix(&fixture.root)
         .expect("receipt is inside fixture")
         .to_str()
         .expect("UTF-8 receipt path");
-    let ignored = Command::new("git")
-        .args(["check-ignore", "-q", receipt_relative])
-        .current_dir(&fixture.root)
-        .status()
-        .expect("check ignore rule");
-    assert!(ignored.success(), "receipt must be ignored");
+    let ignored = fixture_git_output(&fixture.root, &["check-ignore", "-q", receipt_relative]);
+    assert!(ignored.status.success(), "receipt must be ignored");
 }
 
 #[test]
