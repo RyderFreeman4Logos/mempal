@@ -75,6 +75,20 @@ receipt_path() {
 }
 
 ensure_receipt_location_is_ignored() {
+    local component ancestor
+    local -a components
+
+    IFS=/ read -r -a components <<<"$RECEIPT_ROOT"
+    ancestor=""
+    for component in "${components[@]}"; do
+        ancestor="${ancestor:+${ancestor}/}${component}"
+        if [ -L "$ancestor" ]; then
+            git check-ignore -q -- "$ancestor" \
+                || die "receipt directory must be ignored: ${RECEIPT_ROOT}"
+            return
+        fi
+    done
+
     git check-ignore -q -- "$RECEIPT_ROOT" \
         || die "receipt directory must be ignored: ${RECEIPT_ROOT}"
 }

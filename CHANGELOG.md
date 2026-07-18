@@ -42,6 +42,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **Development gates**: accept receipt roots below an ignored, untracked
+  checkout-local symlink without weakening Git tracking checks (#802).
 - **DB admission**: preserve actionable SQLite diagnostics when a configured
   database path resolves to a directory, while retaining hard-link alias
   rejection (#791).

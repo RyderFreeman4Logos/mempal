@@ -472,6 +472,116 @@ fn producer_publishes_a_clean_exact_tree_pass_receipt() {
     assert!(ignored.status.success(), "receipt must be ignored");
 }
 
+#[cfg(unix)]
+#[test]
+fn producer_and_validator_reuse_receipts_through_an_ignored_symlinked_target() {
+    let fixture = fixture(successful_aggregate());
+    let linked_target = tempfile::tempdir().expect("create linked target directory");
+    let target_link = fixture.root.join("target");
+    std::os::unix::fs::symlink(linked_target.path(), &target_link)
+        .expect("link fixture target directory");
+
+    let produced = run_fixture(&fixture, "produce");
+    assert!(
+        produced.status.success(),
+        "producer rejected ignored symlinked target: stderr={}",
+        String::from_utf8_lossy(&produced.stderr)
+    );
+
+    let receipt_dir = linked_target.path().join("local-gates/receipts");
+    let linked_receipts = fs::read_dir(&receipt_dir)
+        .expect("receipt directory was created through linked target")
+        .map(|entry| entry.expect("read linked receipt").path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        linked_receipts.len(),
+        1,
+        "linked receipts={linked_receipts:?}"
+    );
+    let linked_receipt = linked_receipts
+        .into_iter()
+        .next()
+        .expect("linked receipt exists");
+    let receipt_relative = Path::new("target/local-gates/receipts").join(
+        linked_receipt
+            .file_name()
+            .expect("linked receipt has file name"),
+    );
+    let receipt_relative = receipt_relative
+        .to_str()
+        .expect("UTF-8 linked receipt path")
+        .to_owned();
+
+    let reused = run_fixture(&fixture, "validate");
+    assert!(
+        reused.status.success(),
+        "validator rejected receipt through ignored symlinked target: stderr={}",
+        String::from_utf8_lossy(&reused.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.aggregate_log).expect("read aggregate log"),
+        "aggregate\n",
+        "receipt validation must reuse the linked receipt without rerunning the aggregate"
+    );
+
+    let target_is_ignored = fixture_git_output(&fixture.root, &["check-ignore", "-q", "target"]);
+    assert!(
+        target_is_ignored.status.success(),
+        "target symlink must be ignored"
+    );
+    for untracked_path in ["target".to_owned(), receipt_relative] {
+        let output = run_fixture_git_with_timeout(
+            &fixture.root,
+            &["ls-files", "--error-unmatch", "--", &untracked_path],
+        )
+        .expect("run git ls-files for linked receipt");
+        assert!(
+            !output.status.success(),
+            "Git unexpectedly tracks {untracked_path}: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn producer_rejects_an_unignored_symlinked_target() {
+    let fixture = fixture(successful_aggregate());
+    fs::write(fixture.root.join(".gitignore"), "/.fixture-git-hooks\n")
+        .expect("remove target ignore rule");
+    run_git(&fixture.root, &["add", ".gitignore"]);
+    run_git(
+        &fixture.root,
+        &["commit", "--quiet", "-m", "unignore fixture target"],
+    );
+
+    let linked_target = tempfile::tempdir().expect("create unignored linked target directory");
+    std::os::unix::fs::symlink(linked_target.path(), fixture.root.join("target"))
+        .expect("link unignored fixture target directory");
+
+    let output = run_fixture(&fixture, "produce");
+    assert!(
+        !output.status.success(),
+        "producer accepted an unignored symlinked target: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("receipt directory must be ignored: target/local-gates/receipts"),
+        "unignored symlink rejection lost its diagnostic: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !fixture.aggregate_log.exists(),
+        "aggregate ran after unignored symlink rejection"
+    );
+    assert!(
+        !linked_target.path().join("local-gates/receipts").exists(),
+        "unignored symlink minted a receipt"
+    );
+}
+
 #[test]
 fn producer_never_publishes_pass_after_failure_or_identity_drift() {
     for aggregate in [
