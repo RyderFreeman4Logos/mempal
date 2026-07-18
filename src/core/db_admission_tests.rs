@@ -1,7 +1,7 @@
 #[cfg(target_os = "linux")]
 use super::{
-    AdmissionPaths, DbAdmissionHolder, DbAdmissionRequest, DbHolderClass, ProfileDbAdmission,
-    holder_is_live,
+    AdmissionPaths, DbAdmissionError, DbAdmissionHolder, DbAdmissionRequest, DbHolderClass,
+    ProfileDbAdmission, holder_is_live,
 };
 use super::{ProcessLiveness, retain_holder_for_liveness};
 
@@ -90,6 +90,43 @@ fn legacy_holder_without_pid_namespace_is_retained_fail_closed() {
 
     assert_eq!(legacy_holder.pid_namespace, None);
     assert!(holder_is_live(&legacy_holder));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn admission_paths_allow_directory_for_sqlite_diagnostics() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("palace.db");
+    std::fs::create_dir(&db_path).expect("create directory at database path");
+
+    let paths = AdmissionPaths::new(&db_path).expect("admission must defer non-regular paths");
+
+    assert_eq!(
+        paths.database_path,
+        std::fs::canonicalize(db_path).expect("canonical database directory")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn admission_paths_reject_regular_file_with_multiple_hard_links() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("palace.db");
+    let alias_path = temp.path().join("palace-alias.db");
+    std::fs::write(&db_path, b"sqlite fixture").expect("create database file");
+    std::fs::hard_link(&db_path, alias_path).expect("create database hard link");
+
+    let error = match AdmissionPaths::new(&db_path) {
+        Ok(_) => panic!("hard-linked regular database must be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        DbAdmissionError::InvalidRequest(
+            "database file has multiple hard links; admission identity cannot be established safely"
+        )
+    ));
 }
 
 #[test]

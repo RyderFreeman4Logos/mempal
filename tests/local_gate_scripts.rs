@@ -34,7 +34,7 @@ fn run_bash_script(
     envs: &[(&str, &str)],
     timeout: Duration,
 ) -> Output {
-    let mut command = Command::new("bash");
+    let mut command = Command::new("/bin/bash");
     command
         .arg(script)
         .args(args)
@@ -224,7 +224,6 @@ fn rest_gate_reports_missing_flock_dependency() {
     let fixture = tempfile::tempdir().expect("create missing-flock fixture");
     let bin_dir = fixture.path().join("bin");
     fs::create_dir(&bin_dir).expect("create fixture bin directory");
-    write_executable(&bin_dir.join("bash"), "#!/bin/sh\nexec /bin/bash \"$@\"\n");
     let fixture_path = bin_dir.to_str().expect("UTF-8 fixture bin path");
 
     let output = run_bash_script(

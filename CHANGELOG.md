@@ -42,6 +42,13 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **DB admission**: preserve actionable SQLite diagnostics when a configured
+  database path resolves to a directory, while retaining hard-link alias
+  rejection (#791).
+- **Development gates**: use fast read-only pre-commit checks, content-addressed
+  exact-tree full-gate receipts, and exact-HEAD review validation before push;
+  `push-reviewed` reuses receipts instead of rerunning expensive gates and
+  reviews.
 - **CLI/Delete**: scope exact-ID deletes to the resolved current project by default,
   add explicit `--project`, `--include-global`, and `--all-projects` selectors,
   and retain the project predicate in the soft-delete update itself (#712).

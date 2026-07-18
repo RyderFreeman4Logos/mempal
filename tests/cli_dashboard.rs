@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -195,12 +195,9 @@ fn write_config_atomic(path: &Path, contents: &str) {
     fs::rename(&tmp, path).expect("rename config");
 }
 
-fn run_mempal(home: &Path, cwd: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(mempal_bin())
-        .args(args)
-        .env("HOME", home)
-        .current_dir(cwd)
-        .output()
+fn run_mempal(home: &Path, cwd: &Path, args: &[&str]) -> Output {
+    spawn_mempal(home, cwd, args)
+        .wait_with_output()
         .expect("run mempal")
 }
 
@@ -208,6 +205,7 @@ fn spawn_mempal(home: &Path, cwd: &Path, args: &[&str]) -> Child {
     Command::new(mempal_bin())
         .args(args)
         .env("HOME", home)
+        .env_remove("MEMPAL_PROJECT_ID")
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -5480,9 +5480,9 @@ mod tests {
             .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
             .expect("enqueue hook envelope");
         let worker_id = "long-processing-worker";
-        // Also fix the claim_next TTL at the start of the test (was 1).
+        let claim_ttl_secs = 2;
         let message = store
-            .claim_next(worker_id, 2)
+            .claim_next(worker_id, claim_ttl_secs)
             .expect("claim next")
             .expect("claimed message");
         assert_eq!(message.id, queued_id);
@@ -5518,8 +5518,7 @@ mod tests {
                 idle_observer: None,
             },
             message,
-            // Short claim TTL: under concurrency, heartbeats must keep renewing.
-            2,
+            claim_ttl_secs,
             Some(heartbeat_refreshed),
         ));
 

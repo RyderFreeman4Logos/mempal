@@ -13,11 +13,11 @@ pre-commit:
       run: scripts/hooks/branch-protection.sh
     quick-format-check:
       run: just fmt-check
-    quality-gates:
+    fast-gates:
       files: git diff --cached --name-only --diff-filter=ACMR | grep -E '(^|/)(Cargo\.toml|Cargo\.lock)$|\.rs$' || true
       env:
         CARGO_BUILD_JOBS: "2"
-      run: just quality-gates
+      run: just pre-commit-fast
 
 pre-push:
   commands:
@@ -40,9 +40,7 @@ pre-push:
             exit 1
           fi
         fi
-    local-gates:
-      env:
-        CARGO_BUILD_JOBS: "2"
-      run: just local-gates
+    local-gate-receipt:
+      run: bash scripts/gates/local-gate-receipt.sh validate
     review-check:
       run: scripts/hooks/review-check.sh

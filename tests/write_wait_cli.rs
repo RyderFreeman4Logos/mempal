@@ -420,6 +420,15 @@ fn print_lines(output: &Output) -> (String, String) {
     )
 }
 
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn cleanup_ids_from_ingest_json(json: &Value) -> Vec<String> {
     let cleanup_key = if json.get("cleanup_drawer_ids").is_some() {
         "cleanup_drawer_ids"
@@ -460,11 +469,13 @@ fn cleanup_ids_from_operation_stdout(stdout: &str) -> Vec<String> {
         .into_iter()
         .collect()
 }
-
-fn delete_cleanup_ids(home: &Path, drawer_ids: &[String]) {
+fn delete_cleanup_ids(home: &Path, drawer_ids: &[String], project_id: Option<&str>) {
     assert!(!drawer_ids.is_empty(), "cleanup ids must not be empty");
     for drawer_id in drawer_ids {
-        let delete_output = run_cli(home, &["delete", drawer_id]);
+        let mut delete = Command::new(mempal_bin());
+        delete.args(["delete", drawer_id]).env("HOME", home);
+        delete.envs(project_id.map(|project_id| ("MEMPAL_PROJECT_ID", project_id)));
+        let delete_output = delete.output().expect("run mempal");
         assert!(
             delete_output.status.success(),
             "delete {drawer_id} must succeed, stdout={}, stderr={}",
@@ -473,7 +484,6 @@ fn delete_cleanup_ids(home: &Path, drawer_ids: &[String]) {
         );
     }
 }
-
 fn hold_daemon_writer_lease(home: &Path) -> mempal::core::types::RuntimeWriterLease {
     let db = Database::open(&home.join(".mempal/palace.db")).expect("open db");
     db.runtime_writer_lease_acquire("sqlite-writer", "daemon-owner", "daemon", 300, None)
@@ -625,12 +635,7 @@ fn insert_fact_check_contradiction(home: &Path) {
 }
 
 fn assert_completed_status(output: &Output) {
-    assert!(
-        output.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_success(output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("state=completed"), "{stdout}");
     assert!(stdout.contains("timed_out=false"), "{stdout}");
@@ -644,12 +649,7 @@ fn assert_completed_status(output: &Output) {
 }
 
 fn assert_queued_status(output: &Output) {
-    assert!(
-        output.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_success(output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("state=queued"), "{stdout}");
     assert!(stdout.contains("timed_out=false"), "{stdout}");
@@ -702,18 +702,8 @@ async fn test_ingest_wait_matches_non_wait_plain_output() {
     );
     handle.shutdown().await;
 
-    assert!(
-        direct_output.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&direct_output.stdout),
-        String::from_utf8_lossy(&direct_output.stderr)
-    );
-    assert!(
-        wait_output.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&wait_output.stdout),
-        String::from_utf8_lossy(&wait_output.stderr)
-    );
+    assert_success(&direct_output);
+    assert_success(&wait_output);
 
     let direct_stdout = String::from_utf8_lossy(&direct_output.stdout);
     let wait_stdout = String::from_utf8_lossy(&wait_output.stdout);
@@ -781,18 +771,8 @@ async fn test_ingest_wait_json_matches_non_wait_json_output() {
     );
     handle.shutdown().await;
 
-    assert!(
-        direct_output.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&direct_output.stdout),
-        String::from_utf8_lossy(&direct_output.stderr)
-    );
-    assert!(
-        wait_output.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&wait_output.stdout),
-        String::from_utf8_lossy(&wait_output.stderr)
-    );
+    assert_success(&direct_output);
+    assert_success(&wait_output);
 
     let direct_json: Value =
         serde_json::from_slice(&direct_output.stdout).expect("parse direct ingest JSON");
@@ -864,12 +844,7 @@ async fn test_ingest_wait_json_cleanup_ids_delete_exact_drawers() {
     );
     handle.shutdown().await;
 
-    assert!(
-        output.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_success(&output);
     let stdout: Value = serde_json::from_slice(&output.stdout).expect("parse wait JSON");
     assert_eq!(stdout["stats"]["chunks"], 1);
     assert_eq!(
@@ -902,9 +877,7 @@ async fn test_ingest_wait_json_cleanup_ids_delete_exact_drawers() {
         );
     }
     drop(db);
-
-    delete_cleanup_ids(home.path(), &cleanup_ids);
-
+    delete_cleanup_ids(home.path(), &cleanup_ids, None);
     let db = Database::open(&db_path).expect("reopen db");
     for drawer_id in &cleanup_ids {
         assert!(
@@ -1137,6 +1110,7 @@ fn test_ingest_wait_new_content_under_mcp_ingest_worker_lease_times_out_as_recei
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued() {
     let home = setup_home();
+    let project_id = "mempal";
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
     let _config_path = write_config(home.path(), &format!("http://{addr}/v1"));
     let db_path = home.path().join(".mempal/palace.db");
@@ -1153,7 +1127,7 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
             "ingest",
             "--stdin",
             "--project",
-            "mempal",
+            project_id,
             "--source-type",
             "agent_observation",
             "--no-gate",
@@ -1246,12 +1220,7 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
         ],
     );
 
-    assert!(
-        recovery.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&recovery.stdout),
-        String::from_utf8_lossy(&recovery.stderr)
-    );
+    assert_success(&recovery);
     let (recovery_stdout, recovery_stderr) = print_lines(&recovery);
     let recovery_json: Value =
         serde_json::from_str(&recovery_stdout).expect("parse operation wait recovery JSON");
@@ -1287,12 +1256,7 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
     );
     handle.shutdown().await;
 
-    assert!(
-        status.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&status.stdout),
-        String::from_utf8_lossy(&status.stderr)
-    );
+    assert_success(&status);
     let status_json: Value =
         serde_json::from_slice(&status.stdout).expect("parse operation status JSON");
     assert_eq!(status_json["state"], "completed");
@@ -1309,7 +1273,7 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
     assert_eq!(db.drawer_count().expect("drawer count"), 1);
     drop(db);
 
-    delete_cleanup_ids(home.path(), &recovery_ids);
+    delete_cleanup_ids(home.path(), &recovery_ids, Some(project_id));
     let db = Database::open(&db_path).expect("reopen db");
     for drawer_id in &recovery_ids {
         assert!(
@@ -1355,18 +1319,8 @@ async fn test_ingest_wait_matches_non_wait_when_novelty_is_enabled() {
     ];
     let seed_wait_output = run_cli_with_stdin(wait_home.path(), &seed_args, seed_payload);
     let seed_direct_output = run_cli_with_stdin(direct_home.path(), &seed_args, seed_payload);
-    assert!(
-        seed_wait_output.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&seed_wait_output.stdout),
-        String::from_utf8_lossy(&seed_wait_output.stderr)
-    );
-    assert!(
-        seed_direct_output.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&seed_direct_output.stdout),
-        String::from_utf8_lossy(&seed_direct_output.stderr)
-    );
+    assert_success(&seed_wait_output);
+    assert_success(&seed_direct_output);
 
     let wait_timeout = u64::MAX.to_string();
     let payload = br#"{"content":"novelty candidate content"}"#;
@@ -1404,18 +1358,8 @@ async fn test_ingest_wait_matches_non_wait_when_novelty_is_enabled() {
     );
     handle.shutdown().await;
 
-    assert!(
-        direct_output.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&direct_output.stdout),
-        String::from_utf8_lossy(&direct_output.stderr)
-    );
-    assert!(
-        wait_output.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&wait_output.stdout),
-        String::from_utf8_lossy(&wait_output.stderr)
-    );
+    assert_success(&direct_output);
+    assert_success(&wait_output);
 
     let direct_json: Value =
         serde_json::from_slice(&direct_output.stdout).expect("parse direct ingest JSON");
@@ -1484,12 +1428,7 @@ async fn test_ingest_wait_preserves_stdin_semantics_and_audit() {
     );
     handle.shutdown().await;
 
-    assert!(
-        output.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("dry_run=false"), "{stdout}");
     assert!(stdout.contains("files=1"), "{stdout}");
@@ -1601,18 +1540,8 @@ async fn test_ingest_wait_exact_duplicate_matches_non_wait_plain_and_json_output
             run_cli_with_stdin(direct_home.path(), &direct_args, payload.as_bytes());
         let wait_output = run_cli_with_stdin(wait_home.path(), &wait_args, payload.as_bytes());
 
-        assert!(
-            direct_output.status.success(),
-            "stdout={}, stderr={}",
-            String::from_utf8_lossy(&direct_output.stdout),
-            String::from_utf8_lossy(&direct_output.stderr)
-        );
-        assert!(
-            wait_output.status.success(),
-            "stdout={}, stderr={}",
-            String::from_utf8_lossy(&wait_output.stdout),
-            String::from_utf8_lossy(&wait_output.stderr)
-        );
+        assert_success(&direct_output);
+        assert_success(&wait_output);
         assert_bootstrap_stderr(&direct_output);
         assert_bootstrap_stderr(&wait_output);
 
@@ -1747,18 +1676,8 @@ async fn test_ingest_wait_rejected_matches_non_wait_output_and_audit() {
         payload.as_bytes(),
     );
 
-    assert!(
-        direct_output.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&direct_output.stdout),
-        String::from_utf8_lossy(&direct_output.stderr)
-    );
-    assert!(
-        wait_output.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&wait_output.stdout),
-        String::from_utf8_lossy(&wait_output.stderr)
-    );
+    assert_success(&direct_output);
+    assert_success(&wait_output);
     assert_bootstrap_stderr(&direct_output);
     assert_bootstrap_stderr(&wait_output);
 
@@ -1866,12 +1785,7 @@ async fn test_operation_wait_exits_zero_and_prints_progress() {
     let output = child.wait_with_output().expect("wait operation child");
     handle.shutdown().await;
 
-    assert!(
-        output.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_success(&output);
     let (stdout, stderr) = print_lines(&output);
     assert!(stdout.contains("state=completed"), "{stdout}");
     assert!(
@@ -1942,12 +1856,7 @@ async fn test_operation_wait_timeout_returns_receipt_and_leaves_finite_budget_qu
     );
     handle.shutdown().await;
 
-    assert!(
-        recovery.status.success(),
-        "stdout={}, stderr={}",
-        String::from_utf8_lossy(&recovery.stdout),
-        String::from_utf8_lossy(&recovery.stderr)
-    );
+    assert_success(&recovery);
     let (recovery_stdout, recovery_stderr) = print_lines(&recovery);
     assert!(
         recovery_stdout.contains("state=completed"),

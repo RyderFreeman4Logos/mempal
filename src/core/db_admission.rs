@@ -386,14 +386,16 @@ impl AdmissionPaths {
         let full_path = parent.join(lexical_name);
         let (database_path, sidecar_dir, sidecar_name) = match fs::canonicalize(&full_path) {
             Ok(canonical) => {
-                // Reject hard-linked databases: each link would get an
-                // independent admission budget, and SQLite WAL/shm files
-                // are not designed for multi-link access.
+                // Reject hard-linked regular databases: each link would get
+                // an independent admission budget, and SQLite WAL/shm files
+                // are not designed for multi-link access. Non-regular paths
+                // must reach SQLite so its existing diagnostics classify the
+                // underlying path/open failure.
                 #[cfg(unix)]
                 if let Ok(metadata) = fs::metadata(&canonical) {
                     use std::os::unix::fs::MetadataExt;
                     let nlink = metadata.nlink();
-                    if nlink > 1 {
+                    if metadata.is_file() && nlink > 1 {
                         return Err(DbAdmissionError::InvalidRequest(
                             "database file has multiple hard links; admission identity cannot be established safely",
                         ));

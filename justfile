@@ -17,11 +17,9 @@ default: local-gates
 # Aggregate local gate for humans and agents before push/merge.
 local-gates:
     # This is the project/agent gate; do not poll GitHub Actions unless branch
-    # protection or the user explicitly requires it.
-    just fmt-check
-    just quality-gates
-    just test-rest
-    just release-gate
+    # protection or the user explicitly requires it. The receipt producer runs
+    # this literal aggregate once and publishes PASS only for its exact tree.
+    bash scripts/gates/local-gate-receipt.sh produce
 
 # Short alias for the aggregate gate.
 gate: local-gates
@@ -30,6 +28,13 @@ gate: local-gates
 pre-commit:
     just fmt
     just quality-gates
+
+# Fast read-only commit hook gate. Focused behavioral tests remain the writer's
+# obligation; the full acceptance matrix runs once on a clean committed tree.
+pre-commit-fast:
+    just fmt-check
+    just find-monolith-files
+    just clippy-fast
 
 # Read-only format check for fast hook paths.
 fmt-check:
@@ -206,6 +211,10 @@ fmt:
 clippy:
     {{cargo}} clippy --all-features --all-targets -- -D warnings
 
+# Bounded default-feature lint for the fast commit hook.
+clippy-fast:
+    {{cargo}} clippy -- -D warnings
+
 # Fast test tier for pre-commit. Slow endpoint and long-running migration tests
 # are behind the `integration` feature.
 # CARGO_BUILD_JOBS=2 limits parallel LLVM codegen to avoid OOM on this host.
@@ -258,20 +267,20 @@ install-hooks:
     lefthook install
     @echo "Lefthook hooks installed."
 
-# Reviewed push: run csa review first, then push + create PR.
-# Usage: just push-reviewed [base=main]
-push-reviewed base="main":
+# Reviewed push: validate existing local-gate and review receipts, then push + create PR.
+# Usage: just push-reviewed
+push-reviewed:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "=== Local gate: just local-gates ==="
-    just local-gates
-    echo "=== Pre-push review: csa review --sa-mode false --range {{base}}...HEAD ==="
-    csa review --sa-mode false --range "{{base}}...HEAD"
-    echo "=== Review passed. Pushing... ==="
+    echo "=== Validating local-gate receipt ==="
+    bash scripts/gates/local-gate-receipt.sh validate
+    echo "=== Validating review receipt ==="
+    scripts/hooks/review-check.sh
+    echo "=== Receipts valid. Pushing... ==="
     git push -u origin HEAD
-    echo "=== Creating or reusing PR targeting {{base}}... ==="
+    echo "=== Creating or reusing PR targeting main... ==="
     set +e
-    CREATE_OUTPUT="$(gh pr create --base "{{base}}" 2>&1)"
+    CREATE_OUTPUT="$(gh pr create --base main 2>&1)"
     CREATE_RC=$?
     set -e
     if [ "${CREATE_RC}" -ne 0 ]; then
