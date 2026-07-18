@@ -308,6 +308,8 @@ pub struct MempalMcpServer {
     mcp_ingest_side_effect_hook: Option<Arc<dyn Fn(McpIngestSideEffectStage) + Send + Sync>>,
     #[cfg(test)]
     content_writer_lease_acquired_hook: Option<ContentWriterLeaseAcquiredHook>,
+    #[cfg(test)]
+    operation_status_json_within_probe_attempts: Arc<AtomicUsize>,
 }
 
 #[cfg(test)]
@@ -599,6 +601,8 @@ impl MempalMcpServer {
             mcp_ingest_side_effect_hook: None,
             #[cfg(test)]
             content_writer_lease_acquired_hook: None,
+            #[cfg(test)]
+            operation_status_json_within_probe_attempts: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -2389,6 +2393,9 @@ impl MempalMcpServer {
         if timeout.is_zero() {
             return Ok(None);
         }
+        #[cfg(test)]
+        self.operation_status_json_within_probe_attempts
+            .fetch_add(1, Ordering::Relaxed);
         let started_at = Instant::now();
 
         #[cfg(any(test, feature = "db-test-seam"))]
@@ -15542,7 +15549,6 @@ pattern_boost = 0.2
         let (_tempdir, _db_path, server) = setup_server();
         let server = server.with_operation_status_probe_delay_for_test(Duration::from_millis(500));
 
-        let started = tokio::time::Instant::now();
         let response = tokio::time::timeout(
             Duration::from_millis(250),
             server.mempal_ingest_with_controls_scoped_worker(
@@ -15565,11 +15571,31 @@ pattern_boost = 0.2
 
         assert_eq!(response.state, Some(IngestOperationState::Queued));
         assert!(response.timed_out);
-        assert!(response.operation_id.is_some());
+        let operation_id = response
+            .operation_id
+            .as_deref()
+            .expect("zero-wait receipt must include operation id")
+            .to_string();
         assert!(response.created_drawer_ids.is_empty());
-        assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "scoped ingest performed an unbudgeted status refresh after wait budget exhaustion"
+        assert_eq!(
+            server
+                .operation_status_json_within_probe_attempts
+                .load(Ordering::Relaxed),
+            0,
+            "zero wait must not begin a bounded status probe"
+        );
+
+        let status = server
+            .operation_status_json_within(&operation_id, Duration::from_millis(1))
+            .await
+            .expect("positive-budget status probe must time out cleanly");
+        assert!(status.is_none());
+        assert_eq!(
+            server
+                .operation_status_json_within_probe_attempts
+                .load(Ordering::Relaxed),
+            1,
+            "positive-budget status probe must increment its observer"
         );
     }
 
