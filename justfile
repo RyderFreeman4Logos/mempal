@@ -267,16 +267,16 @@ install-hooks:
     lefthook install
     @echo "Lefthook hooks installed."
 
-# Reviewed push: run csa review first, then push + create PR.
+# Reviewed push: validate existing local-gate and review receipts, then push + create PR.
 # Usage: just push-reviewed [base=main]
 push-reviewed base="main":
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "=== Local gate: just local-gates ==="
-    just local-gates
-    echo "=== Pre-push review: csa review --sa-mode false --range {{base}}...HEAD ==="
-    csa review --sa-mode false --range "{{base}}...HEAD"
-    echo "=== Review passed. Pushing... ==="
+    echo "=== Validating local-gate receipt ==="
+    bash scripts/gates/local-gate-receipt.sh validate
+    echo "=== Validating review receipt ==="
+    scripts/hooks/review-check.sh
+    echo "=== Receipts valid. Pushing... ==="
     git push -u origin HEAD
     echo "=== Creating or reusing PR targeting {{base}}... ==="
     set +e

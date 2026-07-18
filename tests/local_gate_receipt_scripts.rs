@@ -332,28 +332,54 @@ fn validator_rejects_dirty_changed_missing_and_malformed_receipts() {
 }
 
 #[test]
-fn push_reviewed_orders_gate_review_push_and_preserves_pre_push_controls() {
+fn push_reviewed_validates_existing_receipts_without_rerunning_expensive_gates() {
     let justfile = fs::read_to_string(repo_root().join("justfile")).expect("read justfile");
+    let push_workflow = &justfile[justfile
+        .find("push-reviewed base=\"main\":")
+        .expect("push-reviewed recipe exists")..];
+    assert!(
+        !push_workflow.contains("just local-gates"),
+        "push-reviewed must reuse the existing local-gate receipt"
+    );
+    for forbidden in ["csa review --sa-mode", "csa review --range"] {
+        assert!(
+            !push_workflow.contains(forbidden),
+            "push-reviewed must not launch {forbidden}"
+        );
+    }
+    let local_gate_validation = push_workflow
+        .find("bash scripts/gates/local-gate-receipt.sh validate")
+        .expect("local-gate receipt validation exists");
+    let review_validation = push_workflow
+        .find("scripts/hooks/review-check.sh")
+        .expect("review receipt validation exists");
+    let push = push_workflow
+        .find("git push -u origin HEAD")
+        .expect("push command exists");
+
+    assert!(
+        local_gate_validation < push && review_validation < push,
+        "receipt validation must precede push"
+    );
+    for preserved_tail in [
+        "git push -u origin HEAD",
+        "gh pr create --base \"{{base}}\"",
+        "CREATE_RC=$?",
+        "PR already exists. Continuing.",
+    ] {
+        assert!(
+            push_workflow.contains(preserved_tail),
+            "push-reviewed lost its PR creation/reuse tail: {preserved_tail}"
+        );
+    }
+}
+
+#[test]
+fn push_reviewed_preserves_pre_push_controls() {
     let lefthook = fs::read_to_string(repo_root().join("lefthook.yml")).expect("read lefthook");
     let review_check = fs::read_to_string(repo_root().join("scripts/hooks/review-check.sh"))
         .expect("read review hook");
 
-    let push_workflow = &justfile[justfile
-        .find("push-reviewed base=\"main\":")
-        .expect("push-reviewed recipe exists")..];
-    let gate = push_workflow
-        .find("just local-gates")
-        .expect("gate command exists");
-    let review = push_workflow
-        .find("csa review --sa-mode false")
-        .expect("review command exists");
-    let push = push_workflow
-        .find("git push -u origin HEAD")
-        .expect("push command exists");
-    assert!(
-        gate < review && review < push,
-        "push-reviewed order changed"
-    );
     for control in ["branch-protection:", "changelog-check:", "review-check:"] {
         assert!(lefthook.contains(control), "missing pre-push {control}");
     }
