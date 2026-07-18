@@ -26,9 +26,9 @@ if [ "${CSA_SKIP_REVIEW_CHECK:-0}" = "1" ]; then
   exit 0
 fi
 
-# Skip if csa is not installed in this repo
 if ! command -v csa >/dev/null 2>&1; then
-  exit 0
+  echo "ERROR: review-check requires 'csa' in PATH." >&2
+  exit 1
 fi
 
 CURRENT_HEAD="$(git rev-parse HEAD)"

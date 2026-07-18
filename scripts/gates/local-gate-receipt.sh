@@ -22,8 +22,12 @@ require_command() {
 }
 
 ensure_clean_tracked_tree() {
-    [ -z "$(git status --porcelain=v1 --untracked-files=no)" ] \
-        || return 1
+    local status_output
+    if ! status_output="$(git status --porcelain=v1 --untracked-files=no 2>/dev/null)"; then
+        printf 'ERROR: cannot determine tracked index and worktree cleanliness.\n' >&2
+        return 1
+    fi
+    [ -z "$status_output" ] || return 1
 }
 
 hash_record() {
@@ -34,11 +38,13 @@ snapshot_identity() {
     SNAPSHOT_HEAD="$(git rev-parse --verify HEAD^{commit})" || die "cannot resolve committed HEAD"
     SNAPSHOT_TREE="$(git rev-parse --verify HEAD^{tree})" || die "cannot resolve HEAD tree"
 
-    local repo_root git_dir common_dir contract_blobs path blob
+    local repo_root git_dir_output git_dir common_dir_output common_dir contract_blobs path blob
     repo_root="$(git rev-parse --show-toplevel)" || die "cannot resolve repository root"
     repo_root="$(realpath -e "$repo_root")" || die "cannot canonicalize repository root"
-    git_dir="$(realpath -e "$(git rev-parse --git-dir)")" || die "cannot canonicalize Git directory"
-    common_dir="$(realpath -e "$(git rev-parse --git-common-dir)")" || die "cannot canonicalize Git common directory"
+    git_dir_output="$(git rev-parse --git-dir 2>/dev/null)" || die "cannot resolve Git directory"
+    git_dir="$(realpath -e "$git_dir_output" 2>/dev/null)" || die "cannot canonicalize Git directory"
+    common_dir_output="$(git rev-parse --git-common-dir 2>/dev/null)" || die "cannot resolve Git common directory"
+    common_dir="$(realpath -e "$common_dir_output" 2>/dev/null)" || die "cannot canonicalize Git common directory"
 
     SNAPSHOT_REPOSITORY="$(printf '%s\0' "$common_dir" | hash_record)" \
         || die "cannot hash repository identity"

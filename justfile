@@ -268,8 +268,8 @@ install-hooks:
     @echo "Lefthook hooks installed."
 
 # Reviewed push: validate existing local-gate and review receipts, then push + create PR.
-# Usage: just push-reviewed [base=main]
-push-reviewed base="main":
+# Usage: just push-reviewed
+push-reviewed:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "=== Validating local-gate receipt ==="
@@ -278,9 +278,9 @@ push-reviewed base="main":
     scripts/hooks/review-check.sh
     echo "=== Receipts valid. Pushing... ==="
     git push -u origin HEAD
-    echo "=== Creating or reusing PR targeting {{base}}... ==="
+    echo "=== Creating or reusing PR targeting main... ==="
     set +e
-    CREATE_OUTPUT="$(gh pr create --base "{{base}}" 2>&1)"
+    CREATE_OUTPUT="$(gh pr create --base main 2>&1)"
     CREATE_RC=$?
     set -e
     if [ "${CREATE_RC}" -ne 0 ]; then

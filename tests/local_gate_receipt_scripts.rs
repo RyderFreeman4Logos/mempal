@@ -5,6 +5,9 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "local_gate_receipt_scripts/failure_modes.rs"]
+mod failure_modes;
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -140,37 +143,47 @@ fn wait_for_test_child(mut child: Child, timeout: Duration) -> (Output, bool) {
 }
 
 #[cfg(target_os = "linux")]
-fn process_start_time(pid: i32) -> Option<String> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit_once(") ")?
+fn process_start_time(pid: i32) -> io::Result<Option<String>> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let start_time = stat
+        .rsplit_once(") ")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed /proc stat"))?
         .1
         .split_ascii_whitespace()
         .nth(19)
-        .map(str::to_owned)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing /proc start time"))?;
+    Ok(Some(start_time.to_owned()))
 }
 
 #[cfg(target_os = "linux")]
-fn wait_for_process_exit(pid: i32, start_time: &str, timeout: Duration) -> bool {
+fn wait_for_process_exit(pid: i32, start_time: &str, timeout: Duration) -> io::Result<bool> {
     let deadline = Instant::now() + timeout;
     loop {
-        if process_start_time(pid).as_deref() != Some(start_time) {
-            return true;
+        match process_start_time(pid)? {
+            None => return Ok(true),
+            Some(current) if current != start_time => return Ok(true),
+            Some(_) => {}
         }
         if Instant::now() >= deadline {
-            return false;
+            return Ok(false);
         }
         thread::sleep(Duration::from_millis(25));
     }
 }
 
 #[cfg(target_os = "linux")]
-fn terminate_matching_process(pid: i32, start_time: &str) {
-    if process_start_time(pid).as_deref() == Some(start_time) {
+fn terminate_matching_process(pid: i32, start_time: &str) -> io::Result<()> {
+    if process_start_time(pid)?.as_deref() == Some(start_time) {
         // SAFETY: the PID's Linux start-time identity was revalidated immediately before signal.
         unsafe {
             let _ = libc::kill(pid, libc::SIGKILL);
         }
     }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -220,9 +233,10 @@ fn fixture_git_commands_time_out_and_reap_stalled_direct_children() {
         .expect("parse stalled git PID record");
     let pid = pid.trim().parse::<i32>().expect("parse stalled git PID");
     let start_time = start_time.trim();
-    let reaped = wait_for_process_exit(pid, start_time, Duration::from_secs(1));
+    let reaped = wait_for_process_exit(pid, start_time, Duration::from_secs(1))
+        .expect("verify stalled git child identity");
     if !reaped {
-        terminate_matching_process(pid, start_time);
+        terminate_matching_process(pid, start_time).expect("terminate matching stalled git child");
     }
 
     assert!(
@@ -370,15 +384,18 @@ fn run_fixture(fixture: &GateFixture, action: &str) -> Output {
     )
 }
 
-fn receipt_files(fixture: &GateFixture) -> Vec<PathBuf> {
+fn receipt_files(fixture: &GateFixture) -> io::Result<Vec<PathBuf>> {
     let receipt_dir = fixture.root.join("target/local-gates/receipts");
-    let mut receipts = fs::read_dir(receipt_dir)
-        .into_iter()
-        .flatten()
-        .map(|entry| entry.expect("read receipt entry").path())
-        .collect::<Vec<_>>();
+    let entries = match fs::read_dir(receipt_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut receipts = entries
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<io::Result<Vec<_>>>()?;
     receipts.sort();
-    receipts
+    Ok(receipts)
 }
 
 fn successful_aggregate() -> &'static str {
@@ -431,7 +448,7 @@ fn producer_publishes_a_clean_exact_tree_pass_receipt() {
         fs::read_to_string(&fixture.aggregate_log).expect("read aggregate log"),
         "aggregate\n"
     );
-    let receipts = receipt_files(&fixture);
+    let receipts = receipt_files(&fixture).expect("list receipts");
     assert_eq!(receipts.len(), 1, "receipts={receipts:?}");
     let receipt = fs::read_to_string(&receipts[0]).expect("read receipt");
     assert!(receipt.contains("schema=local-gate-receipt-v1"));
@@ -467,7 +484,10 @@ fn producer_never_publishes_pass_after_failure_or_identity_drift() {
             fs::read_to_string(&fixture.aggregate_log).expect("read aggregate log"),
             "aggregate\n"
         );
-        assert!(receipt_files(&fixture).is_empty(), "failure minted PASS");
+        assert!(
+            receipt_files(&fixture).expect("list receipts").is_empty(),
+            "failure minted PASS"
+        );
     }
 }
 
@@ -491,7 +511,7 @@ fn producer_stops_at_an_early_aggregate_failure_without_publishing_pass() {
         "aggregate continued after its failed command"
     );
     assert!(
-        receipt_files(&fixture).is_empty(),
+        receipt_files(&fixture).expect("list receipts").is_empty(),
         "early aggregate failure minted PASS"
     );
 }
@@ -527,6 +547,7 @@ fn validator_rejects_dirty_changed_missing_and_malformed_receipts() {
     assert!(run_fixture(&malformed, "produce").status.success());
     fs::write(
         receipt_files(&malformed)
+            .expect("list receipts")
             .into_iter()
             .next()
             .expect("receipt exists"),
@@ -543,7 +564,7 @@ fn validator_rejects_dirty_changed_missing_and_malformed_receipts() {
 fn push_reviewed_validates_existing_receipts_without_rerunning_expensive_gates() {
     let justfile = fs::read_to_string(repo_root().join("justfile")).expect("read justfile");
     let push_workflow = &justfile[justfile
-        .find("push-reviewed base=\"main\":")
+        .find("push-reviewed:")
         .expect("push-reviewed recipe exists")..];
     assert!(
         !push_workflow.contains("just local-gates"),
@@ -571,7 +592,7 @@ fn push_reviewed_validates_existing_receipts_without_rerunning_expensive_gates()
     );
     for preserved_tail in [
         "git push -u origin HEAD",
-        "gh pr create --base \"{{base}}\"",
+        "gh pr create --base main",
         "CREATE_RC=$?",
         "PR already exists. Continuing.",
     ] {
