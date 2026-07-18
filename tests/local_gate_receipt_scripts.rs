@@ -72,6 +72,58 @@ fn run_git(working_dir: &Path, args: &[&str]) {
     );
 }
 
+fn run_review_check(fake_bin_dir: &Path, log: &Path, csa_context: (&str, &str)) -> Output {
+    let inherited_path = std::env::var_os("PATH").expect("PATH is set for fixture");
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin_dir.to_path_buf()).chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("construct fixture PATH");
+    let mut command = Command::new("bash");
+    command
+        .arg(repo_root().join("scripts/hooks/review-check.sh"))
+        .current_dir(repo_root())
+        .env("PATH", path)
+        .env("REVIEW_CHECK_FIXTURE_LOG", log)
+        .env_remove("CSA_SESSION_ID")
+        .env_remove("CSA_DEPTH")
+        .env_remove("CSA_SKIP_REVIEW_CHECK")
+        .env(csa_context.0, csa_context.1)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().expect("spawn review-check fixture");
+    wait_with_timeout(child, Duration::from_secs(5)).expect("wait for review-check fixture")
+}
+
+#[test]
+fn review_check_validates_missing_receipts_inside_automatic_csa_contexts() {
+    let tempdir = tempfile::tempdir().expect("create review-check fixture directory");
+    let fake_bin_dir = tempdir.path().join("bin");
+    fs::create_dir(&fake_bin_dir).expect("create fake binary directory");
+    write_executable(
+        &fake_bin_dir.join("csa"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >>\"${REVIEW_CHECK_FIXTURE_LOG:?}\"\nexit 42\n",
+    );
+
+    for (case, context) in [
+        ("session", ("CSA_SESSION_ID", "synthetic-review-gate-probe")),
+        ("depth", ("CSA_DEPTH", "1")),
+    ] {
+        let log = tempdir.path().join(format!("{case}.log"));
+        let output = run_review_check(&fake_bin_dir, &log, context);
+        assert!(
+            !output.status.success(),
+            "{case} CSA context bypassed review validation: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&log).expect("read fake csa invocation log"),
+            "review --check-verdict\n",
+            "{case} CSA context did not run exactly one receipt validation"
+        );
+    }
+}
+
 struct GateFixture {
     _tempdir: tempfile::TempDir,
     root: PathBuf,
