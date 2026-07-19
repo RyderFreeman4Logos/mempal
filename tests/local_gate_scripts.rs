@@ -72,15 +72,32 @@ fn kill_pids(pids: &[String]) {
 }
 
 #[cfg(unix)]
-fn write_executable(path: &Path, contents: &str) {
-    use std::os::unix::fs::PermissionsExt;
+fn assert_path_command_is_stable_proxy(command: &Path) {
+    assert!(
+        fs::symlink_metadata(command)
+            .expect("read fixture PATH command metadata")
+            .file_type()
+            .is_symlink(),
+        "fixture PATH command must be a symlink: {}",
+        command.display()
+    );
+    assert_eq!(
+        fs::canonicalize(command).expect("canonical fixture PATH command"),
+        fs::canonicalize(repo_root().join("tests/fixtures/local-gate-command-proxy.sh"))
+            .expect("canonical committed command proxy"),
+        "fixture PATH command must target the committed proxy"
+    );
+}
 
-    fs::write(path, contents).expect("write executable fixture");
-    let mut permissions = fs::metadata(path)
-        .expect("read executable fixture metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("set executable fixture permissions");
+#[cfg(unix)]
+fn symlink_path_command_to_stable_proxy(bin_dir: &Path, command_name: &str) {
+    let command = bin_dir.join(command_name);
+    std::os::unix::fs::symlink(
+        repo_root().join("tests/fixtures/local-gate-command-proxy.sh"),
+        &command,
+    )
+    .expect("link fixture PATH command to committed proxy");
+    assert_path_command_is_stable_proxy(&command);
 }
 
 #[test]
@@ -89,7 +106,7 @@ fn cargo_test_wrapper_times_out_and_reports_process_context() {
 
     let output = run_bash_script(
         &script,
-        &["bash", "-c", "sleep 5"],
+        &["/bin/bash", "-c", "sleep 5"],
         &[
             ("MEMPAL_CARGO_TEST_TIMEOUT_SECS", "1"),
             ("MEMPAL_CARGO_TEST_KILL_GRACE_SECS", "1"),
@@ -114,9 +131,9 @@ fn cargo_test_wrapper_success_does_not_leave_timeout_sleeper() {
 
     let status = Command::new("timeout")
         .arg("3s")
-        .arg("bash")
+        .arg("/bin/bash")
         .arg(&script)
-        .args(["bash", "-c", "true"])
+        .args(["/bin/bash", "-c", "true"])
         .current_dir(repo_root())
         .env("MEMPAL_CARGO_TEST_TIMEOUT_SECS", "313")
         .stdout(Stdio::null())
@@ -248,37 +265,8 @@ fn rest_gate_children_cannot_retain_the_parent_lock() {
     let fixture = tempfile::tempdir().expect("create inherited-lock fixture");
     let bin_dir = fixture.path().join("bin");
     fs::create_dir(&bin_dir).expect("create fixture bin directory");
-    write_executable(
-        &bin_dir.join("mise"),
-        r#"#!/usr/bin/env bash
-set -euo pipefail
-if [[ "$#" -lt 4 || "$1" != "x" || "$3" != "--" || "$4" != "cargo" ]]; then
-    exit 64
-fi
-shift 4
-exec cargo "$@"
-"#,
-    );
-    write_executable(
-        &bin_dir.join("cargo"),
-        r#"#!/usr/bin/env bash
-set -euo pipefail
-if [[ "${1:-}" == "test" && ! -e "${FAKE_CARGO_TRIGGERED}" ]]; then
-    : >"${FAKE_CARGO_TRIGGERED}"
-    (
-        trap '' HUP
-        printf '%s\n' "${BASHPID}" >"${HOLDER_PID_FILE}"
-        : >"${HOLDER_READY_FILE}"
-        exec sleep 30
-    ) </dev/null >/dev/null 2>&1 &
-    while [[ ! -s "${HOLDER_PID_FILE}" || ! -e "${HOLDER_READY_FILE}" ]]; do
-        sleep 0.01
-    done
-    kill -TERM "$$"
-fi
-exit 0
-"#,
-    );
+    symlink_path_command_to_stable_proxy(&bin_dir, "mise");
+    symlink_path_command_to_stable_proxy(&bin_dir, "cargo");
 
     let target = fixture.path().join("target");
     let triggered_file = fixture.path().join("cargo-triggered");
@@ -360,7 +348,7 @@ fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
     let ready_file = fixture.path().join("lock-ready");
     let lock_holder = Command::new("flock")
         .arg(&lock_file)
-        .args(["bash", "-c", "touch \"$LOCK_READY\"; sleep 1"])
+        .args(["/bin/bash", "-c", "touch \"$LOCK_READY\"; sleep 1"])
         .env("LOCK_READY", &ready_file)
         .spawn()
         .expect("spawn lock holder");
@@ -423,7 +411,7 @@ fn rest_gate_fails_with_a_bounded_lock_timeout() {
     let ready_file = fixture.path().join("lock-ready");
     let lock_holder = Command::new("flock")
         .arg(&lock_file)
-        .args(["bash", "-c", "touch \"$LOCK_READY\"; sleep 3"])
+        .args(["/bin/bash", "-c", "touch \"$LOCK_READY\"; sleep 3"])
         .env("LOCK_READY", &ready_file)
         .spawn()
         .expect("spawn lock holder");

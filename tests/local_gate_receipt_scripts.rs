@@ -63,13 +63,42 @@ fn write_executable(path: &Path, contents: &str) {
     fs::set_permissions(path, permissions).expect("set executable fixture permissions");
 }
 
+#[cfg(unix)]
+fn assert_path_command_is_stable_proxy(command: &Path) {
+    assert!(
+        fs::symlink_metadata(command)
+            .expect("read fixture PATH command metadata")
+            .file_type()
+            .is_symlink(),
+        "fixture PATH command must be a symlink: {}",
+        command.display()
+    );
+    assert_eq!(
+        fs::canonicalize(command).expect("canonical fixture PATH command"),
+        fs::canonicalize(repo_root().join("tests/fixtures/local-gate-command-proxy.sh"))
+            .expect("canonical committed command proxy"),
+        "fixture PATH command must target the committed proxy"
+    );
+}
+
+#[cfg(unix)]
+fn symlink_path_command_to_stable_proxy(bin_dir: &Path, command_name: &str) {
+    let command = bin_dir.join(command_name);
+    std::os::unix::fs::symlink(
+        repo_root().join("tests/fixtures/local-gate-command-proxy.sh"),
+        &command,
+    )
+    .expect("link fixture PATH command to committed proxy");
+    assert_path_command_is_stable_proxy(&command);
+}
+
 fn run_bash_script(
     working_dir: &Path,
     script: &Path,
     action: &str,
     aggregate_log: &Path,
 ) -> Output {
-    let mut command = Command::new("bash");
+    let mut command = Command::new("/bin/bash");
     command
         .arg(script)
         .arg(action)
@@ -200,10 +229,7 @@ fn fixture_git_commands_time_out_and_reap_stalled_direct_children() {
     let fake_bin_dir = tempdir.path().join("bin");
     fs::create_dir(&fake_bin_dir).expect("create stalled fake binary directory");
     let pid_file = tempdir.path().join("stalled-git.pid");
-    write_executable(
-        &fake_bin_dir.join("git"),
-        "#!/usr/bin/env bash\nset -euo pipefail\nstart_time=\"$(awk '{print $22}' /proc/$$/stat)\"\nprintf '%s %s\\n' \"$$\" \"${start_time}\" >\"${LOCAL_GATE_RECEIPT_STALLED_GIT_PID_FILE:?}\"\nexec /bin/sleep 60\n",
-    );
+    symlink_path_command_to_stable_proxy(&fake_bin_dir, "git");
 
     let inherited_path = std::env::var_os("PATH").expect("PATH is set for fixture");
     let path = std::env::join_paths(
@@ -264,7 +290,7 @@ fn run_review_check(fake_bin_dir: &Path, log: &Path, csa_context: (&str, &str)) 
         std::iter::once(fake_bin_dir.to_path_buf()).chain(std::env::split_paths(&inherited_path)),
     )
     .expect("construct fixture PATH");
-    let mut command = Command::new("bash");
+    let mut command = Command::new("/bin/bash");
     command
         .arg(repo_root().join("scripts/hooks/review-check.sh"))
         .current_dir(repo_root())
@@ -285,10 +311,7 @@ fn review_check_validates_missing_receipts_inside_automatic_csa_contexts() {
     let tempdir = tempfile::tempdir().expect("create review-check fixture directory");
     let fake_bin_dir = tempdir.path().join("bin");
     fs::create_dir(&fake_bin_dir).expect("create fake binary directory");
-    write_executable(
-        &fake_bin_dir.join("csa"),
-        "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >>\"${REVIEW_CHECK_FIXTURE_LOG:?}\"\nexit 42\n",
-    );
+    symlink_path_command_to_stable_proxy(&fake_bin_dir, "csa");
 
     for (case, context) in [
         ("session", ("CSA_SESSION_ID", "synthetic-review-gate-probe")),
