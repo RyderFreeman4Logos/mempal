@@ -1,5 +1,4 @@
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -16,33 +15,15 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn wait_with_timeout(mut child: Child, timeout: Duration) -> io::Result<Output> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output();
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child.wait_with_output()?;
-            panic!(
-                "child did not exit within {timeout:?}; stdout={}, stderr={}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
 fn run_bash_script(
     script: &Path,
     args: &[&str],
     envs: &[(&str, &str)],
     timeout: Duration,
 ) -> Output {
-    let child = spawn_bash_script(script, args, envs);
-    wait_with_timeout(child, timeout).expect("wait for bash script")
+    let mut gate = GateChild::new(spawn_bash_script(script, args, envs));
+    gate.wait_with_timeout(timeout)
+        .expect("wait for bash script")
 }
 
 fn spawn_bash_script(script: &Path, args: &[&str], envs: &[(&str, &str)]) -> Child {
