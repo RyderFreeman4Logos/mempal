@@ -1,10 +1,13 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::fs;
+    use std::os::fd::AsFd;
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::sync::mpsc;
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -76,6 +79,60 @@ mod tests {
         spawn_in_own_session(&mut command).expect("spawn isolated fixture")
     }
 
+    fn spawn_setsid_escape_after_release(
+        release_file: &Path,
+        ready_file: &Path,
+        pid_file: &Path,
+    ) -> Child {
+        let mut command = Command::new("/bin/bash");
+        command
+            .args([
+                "-c",
+                r#"
+                    while [[ ! -e "${RELEASE_FILE:?}" ]]; do /bin/sleep 0.01; done
+                    setsid /bin/bash -c '
+                        trap "" TERM
+                        pid="${BASHPID}"
+                        start_time="$(awk "{print \$22}" "/proc/${pid}/stat")"
+                        printf "%s %s\n" "${pid}" "${start_time}" >"${PID_FILE:?}"
+                        : >"${READY_FILE:?}"
+                        while true; do
+                            printf "escaped stdout\n"
+                            printf "escaped stderr\n" >&2
+                            /bin/sleep 60
+                        done
+                    ' &
+                    while [[ ! -e "${READY_FILE:?}" ]]; do /bin/sleep 0.01; done
+                    exit 0
+                "#,
+            ])
+            .env("RELEASE_FILE", release_file)
+            .env("READY_FILE", ready_file)
+            .env("PID_FILE", pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        spawn_in_own_session(&mut command).expect("spawn release-coordinated fixture")
+    }
+
+    fn spawn_non_utf8_comm_process(ready_file: &Path) -> Child {
+        let mut command = Command::new("/bin/bash");
+        command
+            .args([
+                "-c",
+                r#"
+                    printf '\377' > /proc/self/comm
+                    : >"${READY_FILE:?}"
+                    while true; do /bin/sleep 60; done
+                "#,
+            ])
+            .env("READY_FILE", ready_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        spawn_in_own_session(&mut command).expect("spawn non-UTF-8 comm fixture")
+    }
+
     fn process_identity_from_pid_file(pid_file: &Path) -> ProcessIdentity {
         let pid_file = fs::read_to_string(pid_file).expect("read escaped process identity");
         let mut fields = pid_file.split_whitespace();
@@ -106,6 +163,18 @@ mod tests {
                 .expect("inspect escaped process identity"),
             "escaped process remained alive: {identity:?}"
         );
+    }
+
+    fn assert_process_identity_gone_within(identity: ProcessIdentity, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while identity
+            .is_running()
+            .expect("inspect escaped process identity")
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_process_identity_gone(identity);
     }
 
     #[test]
@@ -170,6 +239,214 @@ mod tests {
         process
             .send_signal(0)
             .expect("pidfd signal zero checks the captured process without signaling it");
+    }
+
+    #[test]
+    fn pipe_reader_sibling_is_never_tracked_or_signaled_as_a_writer() {
+        let fixture = tempfile::tempdir().expect("create pipe-endpoint fixture");
+        let sibling_ready = fixture.path().join("sibling-ready");
+        let term_file = fixture.path().join("sibling-term");
+        let mut writer_command = Command::new("/bin/sleep");
+        writer_command
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let writer = spawn_in_own_session(&mut writer_command).expect("spawn pipe writer");
+        let stdout = writer.stdout.as_ref().expect("writer stdout is piped");
+        let reader = File::from(
+            stdout
+                .as_fd()
+                .try_clone_to_owned()
+                .expect("clone pipe read endpoint"),
+        );
+
+        let mut sibling_command = Command::new("/bin/bash");
+        sibling_command
+            .args([
+                "-c",
+                r#"
+                    trap ': >"${TERM_FILE:?}"; exit 0' TERM
+                    : >"${READY_FILE:?}"
+                    while true; do /bin/sleep 60; done
+                "#,
+            ])
+            .env("READY_FILE", &sibling_ready)
+            .env("TERM_FILE", &term_file)
+            .stdin(Stdio::from(reader))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let sibling = spawn_in_own_session(&mut sibling_command).expect("spawn pipe reader");
+        let sibling_handle = capture_owned_child(&sibling).expect("capture pipe reader identity");
+        wait_for_file(&sibling_ready, Duration::from_secs(2), "pipe reader sibling");
+
+        let mut gate = GateChild::new(writer).expect("capture pipe writer identity");
+        gate.refresh_tracked_processes()
+            .expect("discover pipe writers without aborting");
+        let pipe_targets = output_pipe_targets(
+            gate.child
+                .as_ref()
+                .expect("gate writer remains owned for recheck"),
+        )
+        .expect("read gate pipe targets");
+        let fallback = TrackedProcess::pipe_fallback(
+            ProcessHandle::capture(sibling_handle.identity.pid)
+                .expect("recapture pipe reader for fallback recheck")
+                .expect("pipe reader remains visible for fallback recheck"),
+            pipe_targets,
+        );
+        signal_tracked_processes(&[fallback], libc::SIGTERM)
+            .expect("recheck a pipe fallback before signaling");
+        let reader_was_tracked = gate
+            .tracked_processes
+            .iter()
+            .any(|tracked| tracked.identity() == sibling_handle.identity);
+
+        drop(gate);
+        thread::sleep(Duration::from_millis(50));
+        let reader_survived_cleanup = sibling_handle
+            .is_running()
+            .expect("inspect pipe reader after gate cleanup");
+        let reader_received_term = term_file.exists();
+        let _ = reap_owned_child(sibling);
+
+        assert!(
+            !reader_was_tracked,
+            "a sibling holding only the pipe read end must not become a fallback handle"
+        );
+        assert!(
+            reader_survived_cleanup && !reader_received_term,
+            "a read-end-only sibling must not be signaled by pipe fallback cleanup"
+        );
+    }
+
+    #[test]
+    fn reaped_leader_performs_a_final_pipe_descendant_discovery() {
+        let fixture = tempfile::tempdir().expect("create post-reap escape fixture");
+        let release_file = fixture.path().join("release");
+        let ready_file = fixture.path().join("ready");
+        let pid_file = fixture.path().join("pid");
+        let mut child =
+            spawn_setsid_escape_after_release(&release_file, &ready_file, &pid_file);
+        let root = capture_owned_child(&child).expect("capture release-coordinated root");
+        let mut tracked_processes = Vec::new();
+        refresh_owned_processes(&child, &root, &mut tracked_processes)
+            .expect("initial discovery before escape creation");
+
+        fs::write(&release_file, "release\n").expect("release escaped descendant creation");
+        wait_for_file(
+            &ready_file,
+            Duration::from_secs(2),
+            "post-reap escaped descendant",
+        );
+        let escaped = process_identity_from_pid_file(&pid_file);
+        assert!(
+            wait_for_child_exit(&mut child, Duration::from_secs(2))
+                .expect("wait for leader exit"),
+            "leader did not exit after creating its escaped descendant"
+        );
+
+        refresh_after_leader_reap(&mut child, &root, &mut tracked_processes)
+            .expect("rediscover pipe descendants after leader reaping");
+        let escaped_was_rediscovered = tracked_processes
+            .iter()
+            .any(|tracked| tracked.identity() == escaped);
+        let output = terminate_and_collect(child, &root, &mut tracked_processes)
+            .expect("terminate rediscovered escaped descendant");
+
+        assert!(output.status.success(), "leader status: {}", output.status);
+        assert!(
+            escaped_was_rediscovered,
+            "the final post-reap scan must retain the escaped pipe holder"
+        );
+        assert_process_identity_gone_within(escaped, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn discovers_children_created_by_non_leader_threads() {
+        let parent_pid = i32::try_from(std::process::id()).expect("test process PID fits i32");
+        let parent = ProcessHandle::capture(parent_pid)
+            .expect("capture test process")
+            .expect("test process remains visible in procfs");
+        let (child_pid_sender, child_pid_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut child = Command::new("/bin/sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn child from worker thread");
+            child_pid_sender
+                .send(child.id())
+                .expect("report worker-thread child PID");
+            release_receiver
+                .recv()
+                .expect("receive worker-thread child cleanup signal");
+            child.kill().expect("terminate worker-thread child");
+            child.wait().expect("reap worker-thread child");
+        });
+        let child_pid = i32::try_from(
+            child_pid_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("receive worker-thread child PID"),
+        )
+        .expect("worker-thread child PID fits i32");
+
+        let descendants = capture_live_children(parent.identity)
+            .expect("enumerate children across every parent task");
+        release_sender
+            .send(())
+            .expect("release worker-thread child cleanup");
+        worker.join().expect("join child-spawning worker thread");
+
+        assert!(
+            descendants
+                .iter()
+                .any(|descendant| descendant.identity.pid == child_pid),
+            "the child created by a non-leader thread must be discovered"
+        );
+    }
+
+    #[test]
+    fn unrelated_non_utf8_comm_does_not_abort_pipe_cleanup() {
+        let fixture = tempfile::tempdir().expect("create non-UTF-8 comm fixture");
+        let unrelated_ready = fixture.path().join("unrelated-ready");
+        let unrelated = spawn_non_utf8_comm_process(&unrelated_ready);
+        wait_for_file(
+            &unrelated_ready,
+            Duration::from_secs(2),
+            "non-UTF-8 comm process",
+        );
+
+        let mut writer_command = Command::new("/bin/sleep");
+        writer_command
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let writer = spawn_in_own_session(&mut writer_command).expect("spawn pipe writer");
+        let mut gate = GateChild::new(writer).expect("capture pipe writer identity");
+        let scan_result = gate.refresh_tracked_processes();
+        let cleanup_result = if scan_result.is_ok() {
+            terminate_and_collect(
+                gate.child.take().expect("take pipe writer for cleanup"),
+                &gate.root,
+                &mut gate.tracked_processes,
+            )
+            .map(|_| ())
+        } else {
+            let mut writer = gate.child.take().expect("take pipe writer after failed scan");
+            writer.kill().expect("terminate writer after failed scan");
+            writer.wait().expect("reap writer after failed scan");
+            Ok(())
+        };
+        let unrelated_cleanup = reap_owned_child(unrelated);
+
+        scan_result.expect("unrelated non-UTF-8 comm must be skipped during global scan");
+        cleanup_result.expect("pipe cleanup must complete after scanning unrelated processes");
+        unrelated_cleanup.expect("clean up non-UTF-8 comm fixture");
     }
 
     #[test]

@@ -41,6 +41,52 @@ struct ProcessHandle {
     pidfd: Option<OwnedFd>,
 }
 
+enum TrackedProcessSource {
+    Descendant,
+    PipeFallback { pipe_targets: Vec<PathBuf> },
+}
+
+struct TrackedProcess {
+    process: ProcessHandle,
+    source: TrackedProcessSource,
+}
+
+impl TrackedProcess {
+    fn descendant(process: ProcessHandle) -> Self {
+        Self {
+            process,
+            source: TrackedProcessSource::Descendant,
+        }
+    }
+
+    fn pipe_fallback(process: ProcessHandle, pipe_targets: Vec<PathBuf>) -> Self {
+        Self {
+            process,
+            source: TrackedProcessSource::PipeFallback { pipe_targets },
+        }
+    }
+
+    fn identity(&self) -> ProcessIdentity {
+        self.process.identity
+    }
+
+    fn requires_cleanup(&self) -> io::Result<bool> {
+        match &self.source {
+            TrackedProcessSource::Descendant => self.process.is_running(),
+            TrackedProcessSource::PipeFallback { pipe_targets } => {
+                process_holds_writable_pipe(&self.process, pipe_targets)
+            }
+        }
+    }
+
+    fn send_signal(&self, signal: i32) -> io::Result<()> {
+        if self.requires_cleanup()? {
+            self.process.send_signal(signal)?;
+        }
+        Ok(())
+    }
+}
+
 impl ProcessHandle {
     fn capture(pid: i32) -> io::Result<Option<Self>> {
         Self::capture_with_parent(pid, None)
@@ -57,16 +103,16 @@ impl ProcessHandle {
         let Some(initial) = inspect_process(pid)? else {
             return Ok(None);
         };
-        if !matches_expected_parent(&initial, expected_parent)? {
-            return Ok(None);
+        if let Some(parent) = expected_parent {
+            if !parent.is_running()? || initial.parent_pid != parent.pid {
+                return Ok(None);
+            }
         }
         let pidfd = open_pidfd(pid)?;
         let Some(confirmed) = inspect_process(pid)? else {
             return Ok(None);
         };
-        if confirmed.identity != initial.identity
-            || !matches_expected_parent(&confirmed, expected_parent)?
-        {
+        if confirmed.identity != initial.identity {
             return Ok(None);
         }
 
@@ -98,20 +144,10 @@ impl ProcessHandle {
     }
 }
 
-fn matches_expected_parent(
-    process: &ProcessSnapshot,
-    expected_parent: Option<ProcessIdentity>,
-) -> io::Result<bool> {
-    match expected_parent {
-        Some(parent) => Ok(parent.is_running()? && process.parent_pid == parent.pid),
-        None => Ok(true),
-    }
-}
-
 pub(crate) struct GateChild {
     child: Option<Child>,
     root: ProcessHandle,
-    tracked_processes: Vec<ProcessHandle>,
+    tracked_processes: Vec<TrackedProcess>,
 }
 
 pub(crate) fn spawn_in_own_session(command: &mut Command) -> io::Result<Child> {
@@ -208,7 +244,7 @@ fn timeout_error(timeout: Duration, cleanup: io::Result<Output>) -> io::Result<O
 fn terminate_and_collect(
     mut child: Child,
     root: &ProcessHandle,
-    tracked_processes: &mut Vec<ProcessHandle>,
+    tracked_processes: &mut Vec<TrackedProcess>,
 ) -> io::Result<Output> {
     terminate_owned_process_tree(&mut child, root, tracked_processes)?;
     collect_bounded_output(&mut child)
@@ -217,16 +253,19 @@ fn terminate_and_collect(
 fn terminate_owned_process_tree(
     child: &mut Child,
     root: &ProcessHandle,
-    tracked_processes: &mut Vec<ProcessHandle>,
+    tracked_processes: &mut Vec<TrackedProcess>,
 ) -> io::Result<()> {
     refresh_owned_processes(child, root, tracked_processes)?;
-    let mut child_exited = child.try_wait()?.is_some();
+    let mut child_exited = refresh_after_leader_reap(child, root, tracked_processes)?;
     if !child_exited {
         signal_root_process_tree(root, libc::SIGTERM)?;
     }
     signal_tracked_processes(tracked_processes, libc::SIGTERM)?;
     if !child_exited {
         child_exited = wait_for_child_exit(child, PROCESS_GROUP_TERM_TIMEOUT)?;
+        if child_exited {
+            refresh_owned_processes(child, root, tracked_processes)?;
+        }
     }
     if child_exited
         && wait_for_tracked_processes_exit(tracked_processes, PROCESS_GROUP_TERM_TIMEOUT)?
@@ -241,6 +280,9 @@ fn terminate_owned_process_tree(
     signal_tracked_processes(tracked_processes, libc::SIGKILL)?;
     if !child_exited {
         child_exited = wait_for_child_exit(child, PROCESS_GROUP_KILL_TIMEOUT)?;
+        if child_exited {
+            refresh_owned_processes(child, root, tracked_processes)?;
+        }
     }
     if child_exited
         && wait_for_tracked_processes_exit(tracked_processes, PROCESS_GROUP_KILL_TIMEOUT)?
@@ -295,7 +337,7 @@ fn signal_root_process_tree(root: &ProcessHandle, signal: i32) -> io::Result<()>
     signal_process_group(root.identity.pid, signal)
 }
 
-fn signal_tracked_processes(processes: &[ProcessHandle], signal: i32) -> io::Result<()> {
+fn signal_tracked_processes(processes: &[TrackedProcess], signal: i32) -> io::Result<()> {
     for process in processes {
         process.send_signal(signal)?;
     }
@@ -303,14 +345,14 @@ fn signal_tracked_processes(processes: &[ProcessHandle], signal: i32) -> io::Res
 }
 
 fn wait_for_tracked_processes_exit(
-    processes: &[ProcessHandle],
+    processes: &[TrackedProcess],
     timeout: Duration,
 ) -> io::Result<bool> {
     let deadline = Instant::now() + timeout;
     loop {
         let mut any_running = false;
         for process in processes {
-            if process.is_running()? {
+            if process.requires_cleanup()? {
                 any_running = true;
                 break;
             }
@@ -338,16 +380,28 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> io::Result<bool>
     }
 }
 
+fn refresh_after_leader_reap(
+    child: &mut Child,
+    root: &ProcessHandle,
+    tracked_processes: &mut Vec<TrackedProcess>,
+) -> io::Result<bool> {
+    let reaped = child.try_wait()?.is_some();
+    if reaped {
+        refresh_owned_processes(child, root, tracked_processes)?;
+    }
+    Ok(reaped)
+}
+
 fn refresh_owned_processes(
     child: &Child,
     root: &ProcessHandle,
-    tracked_processes: &mut Vec<ProcessHandle>,
+    tracked_processes: &mut Vec<TrackedProcess>,
 ) -> io::Result<()> {
     track_output_pipe_holders(child, tracked_processes)?;
     let mut pending = Vec::new();
     for process in tracked_processes.iter() {
-        if process.is_running()? {
-            pending.push(process.identity);
+        if process.requires_cleanup()? {
+            pending.push(process.identity());
         }
     }
     if root.is_running()? {
@@ -362,10 +416,10 @@ fn refresh_owned_processes(
         for descendant in capture_live_children(identity)? {
             if !tracked_processes
                 .iter()
-                .any(|tracked| tracked.identity == descendant.identity)
+                .any(|tracked| tracked.identity() == descendant.identity)
             {
                 pending.push(descendant.identity);
-                tracked_processes.push(descendant);
+                tracked_processes.push(TrackedProcess::descendant(descendant));
             }
         }
     }
@@ -374,15 +428,9 @@ fn refresh_owned_processes(
 
 fn track_output_pipe_holders(
     child: &Child,
-    tracked_processes: &mut Vec<ProcessHandle>,
+    tracked_processes: &mut Vec<TrackedProcess>,
 ) -> io::Result<()> {
-    let mut pipe_targets = Vec::new();
-    if let Some(stdout) = child.stdout.as_ref() {
-        pipe_targets.push(pipe_target(stdout.as_raw_fd())?);
-    }
-    if let Some(stderr) = child.stderr.as_ref() {
-        pipe_targets.push(pipe_target(stderr.as_raw_fd())?);
-    }
+    let pipe_targets = output_pipe_targets(child)?;
     if pipe_targets.is_empty() {
         return Ok(());
     }
@@ -407,14 +455,19 @@ fn track_output_pipe_holders(
             Err(error) if process_scan_error(&error) => continue,
             Err(error) => return Err(error),
         };
-        if !process_holds_pipe(&process, &pipe_targets)? {
+        let holds_pipe = match process_holds_writable_pipe(&process, &pipe_targets) {
+            Ok(holds_pipe) => holds_pipe,
+            Err(error) if process_scan_error(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if !holds_pipe {
             continue;
         }
         if !tracked_processes
             .iter()
-            .any(|tracked| tracked.identity == process.identity)
+            .any(|tracked| tracked.identity() == process.identity)
         {
-            tracked_processes.push(process);
+            tracked_processes.push(TrackedProcess::pipe_fallback(process, pipe_targets.clone()));
         }
     }
     Ok(())
@@ -424,7 +477,21 @@ fn pipe_target(fd: i32) -> io::Result<PathBuf> {
     fs::read_link(format!("/proc/self/fd/{fd}"))
 }
 
-fn process_holds_pipe(process: &ProcessHandle, pipe_targets: &[PathBuf]) -> io::Result<bool> {
+fn output_pipe_targets(child: &Child) -> io::Result<Vec<PathBuf>> {
+    let mut pipe_targets = Vec::new();
+    if let Some(stdout) = child.stdout.as_ref() {
+        pipe_targets.push(pipe_target(stdout.as_raw_fd())?);
+    }
+    if let Some(stderr) = child.stderr.as_ref() {
+        pipe_targets.push(pipe_target(stderr.as_raw_fd())?);
+    }
+    Ok(pipe_targets)
+}
+
+fn process_holds_writable_pipe(
+    process: &ProcessHandle,
+    pipe_targets: &[PathBuf],
+) -> io::Result<bool> {
     if !process.is_running()? {
         return Ok(false);
     }
@@ -446,10 +513,43 @@ fn process_holds_pipe(process: &ProcessHandle, pipe_targets: &[PathBuf]) -> io::
             Err(error) => return Err(error),
         };
         if pipe_targets.contains(&target) {
-            return process.is_running();
+            let writable = match fd_is_writable(process, &entry) {
+                Ok(writable) => writable,
+                Err(error) if process_scan_error(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            if writable {
+                return process.is_running();
+            }
         }
     }
     Ok(false)
+}
+
+fn fd_is_writable(process: &ProcessHandle, entry: &fs::DirEntry) -> io::Result<bool> {
+    let fd_name = entry.file_name();
+    let fdinfo = fs::read_to_string(format!(
+        "/proc/{}/fdinfo/{}",
+        process.identity.pid,
+        fd_name.to_string_lossy()
+    ))?;
+    let flags = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("flags:"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Linux proc fdinfo missing flags",
+            )
+        })?
+        .trim();
+    let flags = u32::from_str_radix(flags, 8).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Linux proc fdinfo flags were not octal",
+        )
+    })?;
+    Ok(flags & libc::O_ACCMODE as u32 != libc::O_RDONLY as u32)
 }
 
 fn capture_live_children(parent: ProcessIdentity) -> io::Result<Vec<ProcessHandle>> {
@@ -457,9 +557,6 @@ fn capture_live_children(parent: ProcessIdentity) -> io::Result<Vec<ProcessHandl
         return Ok(Vec::new());
     }
     let child_pids = child_pids(parent.pid)?;
-    if !parent.is_running()? {
-        return Ok(Vec::new());
-    }
 
     let mut children = Vec::new();
     for child_pid in child_pids {
@@ -469,81 +566,101 @@ fn capture_live_children(parent: ProcessIdentity) -> io::Result<Vec<ProcessHandl
             children.push(child);
         }
     }
-    if !parent.is_running()? {
-        return Ok(Vec::new());
-    }
     Ok(children)
 }
 
 fn child_pids(parent_pid: i32) -> io::Result<Vec<i32>> {
-    let path = format!("/proc/{parent_pid}/task/{parent_pid}/children");
-    let children = match fs::read_to_string(path) {
-        Ok(children) => children,
+    let task_directory = format!("/proc/{parent_pid}/task");
+    let tasks = match fs::read_dir(task_directory) {
+        Ok(tasks) => tasks,
         Err(error) if process_is_gone(&error) => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    children
-        .split_whitespace()
-        .map(|pid| {
-            pid.parse().map_err(|_| {
+    let mut child_pids = HashSet::new();
+    for task in tasks {
+        let task = match task {
+            Ok(task) => task,
+            Err(error) if process_is_gone(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let children = match fs::read_to_string(task.path().join("children")) {
+            Ok(children) => children,
+            Err(error) if process_is_gone(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        for pid in children.split_whitespace() {
+            let pid = pid.parse().map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Linux proc children entry was not a PID",
                 )
-            })
-        })
-        .collect()
+            })?;
+            child_pids.insert(pid);
+        }
+    }
+    Ok(child_pids.into_iter().collect())
 }
 
 fn inspect_process(pid: i32) -> io::Result<Option<ProcessSnapshot>> {
-    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+    let stat = match fs::read(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
         Err(error) if process_is_gone(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let (_, fields) = stat.rsplit_once(')').ok_or_else(|| {
+    let fields = stat.rsplit(|byte| *byte == b')').next().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "Linux proc stat was missing the command name terminator",
         )
     })?;
-    let mut fields = fields.split_whitespace();
+    let mut fields = fields
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty());
     let state = fields
         .next()
-        .and_then(|state| state.chars().next())
+        .and_then(|state| state.first().copied())
+        .map(char::from)
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "Linux proc stat missing state")
         })?;
-    let parent_pid = fields
-        .next()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Linux proc stat missing parent PID",
-            )
-        })?
-        .parse()
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Linux proc parent PID was not numeric",
-            )
-        })?;
-    let start_time_ticks = fields
-        .nth(17)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Linux proc stat missing start time",
-            )
-        })?
-        .parse()
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Linux proc start time was not numeric",
-            )
-        })?;
+    let parent_pid = std::str::from_utf8(fields.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Linux proc stat missing parent PID",
+        )
+    })?)
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Linux proc parent PID was not numeric",
+        )
+    })?
+    .parse()
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Linux proc parent PID was not numeric",
+        )
+    })?;
+    let start_time_ticks = std::str::from_utf8(fields.nth(17).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Linux proc stat missing start time",
+        )
+    })?)
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Linux proc start time was not numeric",
+        )
+    })?
+    .parse()
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Linux proc start time was not numeric",
+        )
+    })?;
     Ok(Some(ProcessSnapshot {
         identity: ProcessIdentity {
             pid,
@@ -601,7 +718,9 @@ fn process_is_gone(error: &io::Error) -> bool {
 }
 
 fn process_scan_error(error: &io::Error) -> bool {
-    process_is_gone(error) || error.kind() == io::ErrorKind::PermissionDenied
+    process_is_gone(error)
+        || error.kind() == io::ErrorKind::PermissionDenied
+        || error.kind() == io::ErrorKind::InvalidData
 }
 
 fn collect_bounded_output(child: &mut Child) -> io::Result<Output> {
