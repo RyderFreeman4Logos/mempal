@@ -7,23 +7,39 @@ use std::time::Instant;
 
 use super::*;
 
+const READS_PER_PUMP: usize = 1;
+
+impl ProcessIdentity {
+    pub fn still_refers_to_original_process(self) -> bool {
+        let Some(expected) = self.start_time_ticks else {
+            // SAFETY: signal 0 does not deliver a signal; it only queries the kernel about this
+            // PID when no start-time identity was available for the test fixture.
+            return unsafe { libc::kill(self.pid, 0) } == 0;
+        };
+        read_process_start_time(self.pid).is_ok_and(|actual| actual == expected)
+    }
+}
+
 impl DeadlineChild {
-    pub(super) fn pump(&mut self) -> io::Result<()> {
-        self.drain_setup()?;
-        self.drain_output(true)?;
-        self.drain_output(false)?;
+    pub(super) fn pump(&mut self, deadline: Instant) -> io::Result<()> {
+        self.drain_setup(deadline)?;
+        self.drain_output(true, deadline)?;
+        self.drain_output(false, deadline)?;
         self.observe_leader()?;
         self.try_reap()
     }
 
-    fn drain_setup(&mut self) -> io::Result<()> {
+    fn drain_setup(&mut self, deadline: Instant) -> io::Result<()> {
         let Some(active) = self.active_mut() else {
             return Ok(());
         };
         let Some(fd) = active.setup_status.as_ref().map(AsRawFd::as_raw_fd) else {
             return Ok(());
         };
-        loop {
+        for _ in 0..READS_PER_PUMP {
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
             let target = &mut active.setup_bytes[active.setup_filled..];
             if target.is_empty() {
                 let record = active.setup_bytes;
@@ -32,6 +48,9 @@ impl DeadlineChild {
                 active.setup_status.take();
                 return Ok(());
             }
+            // SAFETY: `fd` is borrowed from `active.setup_status`, which remains owned and
+            // open throughout this call; `target` is a mutable, initialized byte slice whose
+            // pointer and length describe writable storage for the nonblocking read.
             let result = unsafe { libc::read(fd, target.as_mut_ptr().cast(), target.len()) };
             if result > 0 {
                 active.setup_filled += result as usize;
@@ -61,9 +80,10 @@ impl DeadlineChild {
             }
             return Err(error);
         }
+        Ok(())
     }
 
-    fn drain_output(&mut self, stdout: bool) -> io::Result<()> {
+    fn drain_output(&mut self, stdout: bool, deadline: Instant) -> io::Result<()> {
         let fd = self.active().and_then(|active| {
             if stdout {
                 active.stdout.as_ref()
@@ -76,7 +96,13 @@ impl DeadlineChild {
             return Ok(());
         };
         let mut buffer = [0u8; 16 * 1024];
-        loop {
+        for _ in 0..READS_PER_PUMP {
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            // SAFETY: `fd` is borrowed from the selected OwnedFd and remains open for this
+            // call; `buffer` is initialized writable storage, and its exact capacity is passed
+            // to the nonblocking read before any bytes are appended to a capture.
             let result = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
             if result > 0 {
                 if stdout {
@@ -105,6 +131,7 @@ impl DeadlineChild {
             }
             return Err(error);
         }
+        Ok(())
     }
 
     fn observe_leader(&mut self) -> io::Result<()> {
@@ -114,7 +141,11 @@ impl DeadlineChild {
         if matches!(active.leader, LeaderState::ExitedUnreaped(_)) {
             return Ok(());
         }
+        // SAFETY: `siginfo_t` is a C output record with a valid all-zero representation; waitid
+        // initializes it before any accessor is used.
         let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        // SAFETY: `active.identity.pid` names the direct, still-unreaped child owned by this
+        // supervisor, and `info` is a writable initialized output buffer for WNOWAIT observation.
         let result = unsafe {
             libc::waitid(
                 libc::P_PID,
@@ -126,9 +157,13 @@ impl DeadlineChild {
         if result != 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: a successful waitid call initialized `info`; si_pid is read only to determine
+        // whether an exit record was reported.
         if unsafe { info.si_pid() } != 0 {
             active.leader = LeaderState::ExitedUnreaped(ExitFacts {
                 code: info.si_code,
+                // SAFETY: this branch follows successful waitid with a nonzero si_pid, so the
+                // exit status field belongs to the reported direct child event.
                 status: unsafe { info.si_status() },
             });
         }
@@ -144,6 +179,8 @@ impl DeadlineChild {
         let Some(active) = self.active_mut() else {
             return;
         };
+        // SAFETY: the direct child remains unreaped while it anchors ownership, preventing PID
+        // reuse; querying its PGID is therefore an identity check before using a negative PGID.
         if !active.group_ready
             && unsafe { libc::getpgid(active.identity.pid) } == active.identity.pid
         {
@@ -155,6 +192,8 @@ impl DeadlineChild {
         } else {
             active.identity.pid
         };
+        // SAFETY: a negative target is used only after the owned child verified itself as the
+        // process-group leader; otherwise the still-owned direct child PID is signaled directly.
         if unsafe { libc::kill(target, signal) } == 0 {
             active.group = next_state;
             return;
@@ -199,6 +238,8 @@ impl DeadlineChild {
         };
         let mut raw_status = 0;
         let waited = loop {
+            // SAFETY: this supervisor owns the direct child and retains it unreaped until the
+            // final group fence; `raw_status` is valid writable storage for WNOHANG wait status.
             let result =
                 unsafe { libc::waitpid(active.identity.pid, &mut raw_status, libc::WNOHANG) };
             if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
@@ -295,6 +336,9 @@ impl Drop for DeadlineChild {
         } else {
             active.identity.pid
         };
+        // SAFETY: Drop only reaches this fail-closed path while the owned direct child remains
+        // unreaped, so the target is either its verified PGID or its PID; _exit prevents the test
+        // process from continuing after cleanup ownership was abandoned.
         unsafe {
             libc::kill(target, libc::SIGKILL);
             libc::_exit(DROP_EXIT_CODE);

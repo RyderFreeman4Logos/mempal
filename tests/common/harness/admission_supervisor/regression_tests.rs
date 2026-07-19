@@ -12,6 +12,7 @@ const READY_PATH_ENV: &str = "MEMPAL_SUPERVISOR_READY_PATH";
 const FIXTURE_TEST: &str = "admission_supervisor::regression_tests::supervisor_fixture";
 const DESCENDANT_TEST: &str =
     "admission_supervisor::regression_tests::supervisor_descendant_fixture";
+const SUSTAINED_STDOUT_WRITER_COUNT: usize = 8;
 
 #[derive(Debug)]
 struct ExactProcessGuard {
@@ -44,6 +45,8 @@ impl ExactProcessGuard {
 impl Drop for ExactProcessGuard {
     fn drop(&mut self) {
         if self.armed && self.identity.still_refers_to_original_process() {
+            // SAFETY: the start-time identity check rules out PID reuse before this test-only
+            // fallback sends SIGKILL to the exact fixture process.
             unsafe {
                 libc::kill(self.identity.pid, libc::SIGKILL);
             }
@@ -136,10 +139,30 @@ fn parse_identities(bytes: &[u8]) -> Vec<ProcessIdentity> {
 }
 
 fn ignore_term_and_pause() -> ! {
+    // SAFETY: this is an exec'd, test-only fixture; it changes only its own SIGTERM disposition
+    // and then blocks in pause until the supervisor's process-group SIGKILL terminates it.
     unsafe {
         libc::signal(libc::SIGTERM, libc::SIG_IGN);
         loop {
             libc::pause();
+        }
+    }
+}
+
+fn ignore_term_and_emit_sustained_output(write_stdout: bool, write_stderr: bool) -> ! {
+    let stdout = [b'o'; 16 * 1024];
+    let stderr = [b'e'; 16 * 1024];
+    // SAFETY: this exec'd fixture owns its signal disposition; both byte arrays remain live and
+    // initialized for each selected write, and STDOUT/STDERR are inherited capture-pipe FDs.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        loop {
+            if write_stdout {
+                libc::write(libc::STDOUT_FILENO, stdout.as_ptr().cast(), stdout.len());
+            }
+            if write_stderr {
+                libc::write(libc::STDERR_FILENO, stderr.as_ptr().cast(), stderr.len());
+            }
         }
     }
 }
@@ -150,7 +173,11 @@ fn supervisor_fixture() {
         return;
     };
     match case.as_str() {
-        "exit-42" => unsafe { libc::_exit(42) },
+        "exit-42" => {
+            // SAFETY: this isolated fixture must terminate immediately with its asserted status
+            // without running inherited test-harness destructors.
+            unsafe { libc::_exit(42) }
+        }
         "pipe-descendant" | "silent-descendant" => {
             let mut command = fixture_command("pause");
             if case == "silent-descendant" {
@@ -167,10 +194,14 @@ fn supervisor_fixture() {
                 .flush()
                 .expect("flush descendant identity");
             std::mem::forget(child);
+            // SAFETY: the fixture intentionally leaves the descendant in the owned process
+            // group, then exits without running test-harness cleanup so pipe inheritance persists.
             unsafe { libc::_exit(0) }
         }
         "term-resistant" => {
             let ready = PathBuf::from(std::env::var_os(READY_PATH_ENV).expect("ready path"));
+            // SAFETY: this exec'd fixture changes only its own SIGTERM disposition to exercise
+            // the supervisor's mandatory KILL escalation.
             unsafe {
                 libc::signal(libc::SIGTERM, libc::SIG_IGN);
             }
@@ -183,6 +214,8 @@ fn supervisor_fixture() {
         }
         "term-resistant-tree" => {
             let ready = PathBuf::from(std::env::var_os(READY_PATH_ENV).expect("ready path"));
+            // SAFETY: this exec'd fixture changes only its own SIGTERM disposition to exercise
+            // KILL fencing of the entire owned descendant group.
             unsafe {
                 libc::signal(libc::SIGTERM, libc::SIG_IGN);
             }
@@ -197,6 +230,27 @@ fn supervisor_fixture() {
             std::mem::forget(child);
             ignore_term_and_pause();
         }
+        "sustained-output-tree" => {
+            let ready = PathBuf::from(std::env::var_os(READY_PATH_ENV).expect("ready path"));
+            append_identity(
+                &ready,
+                process_identity(std::process::id() as libc::pid_t),
+                false,
+            );
+            for _ in 0..SUSTAINED_STDOUT_WRITER_COUNT {
+                let mut command = fixture_command("sustained-stdout");
+                command.env(READY_PATH_ENV, &ready);
+                let child = command.spawn().expect("spawn sustained stdout descendant");
+                append_identity(&ready, process_identity(child.id() as libc::pid_t), true);
+                std::mem::forget(child);
+            }
+            let mut command = fixture_command("sustained-stderr");
+            command.env(READY_PATH_ENV, &ready);
+            let child = command.spawn().expect("spawn sustained stderr descendant");
+            append_identity(&ready, process_identity(child.id() as libc::pid_t), true);
+            std::mem::forget(child);
+            ignore_term_and_emit_sustained_output(true, false);
+        }
         other => panic!("unknown supervisor fixture case {other}"),
     }
 }
@@ -206,6 +260,8 @@ fn supervisor_descendant_fixture() {
     let Ok(case) = std::env::var(DESCENDANT_CASE_ENV) else {
         return;
     };
+    // SAFETY: this exec'd descendant changes only its own SIGTERM disposition, allowing the
+    // parent test to verify that the supervisor eventually uses a process-group SIGKILL.
     unsafe {
         libc::signal(libc::SIGTERM, libc::SIG_IGN);
     }
@@ -225,6 +281,8 @@ fn supervisor_descendant_fixture() {
             std::mem::forget(child);
             ignore_term_and_pause();
         }
+        "sustained-stdout" => ignore_term_and_emit_sustained_output(true, false),
+        "sustained-stderr" => ignore_term_and_emit_sustained_output(false, true),
         other => panic!("unknown descendant fixture case {other}"),
     }
 }
@@ -251,6 +309,8 @@ fn blocked_setup_is_owned_after_group_ready_and_reaped_before_return() {
         assert!(output.cleanup.errors.is_empty(), "{:#?}", output.cleanup);
         ExactProcessGuard::new(output.identity).assert_gone("blocked setup child");
         let mut status = 0;
+        // SAFETY: output returned only after the supervisor claimed to reap its direct child;
+        // this WNOHANG query uses valid status storage to verify ECHILD rather than reaping it.
         assert_eq!(
             unsafe { libc::waitpid(ready_pid, &mut status, libc::WNOHANG) },
             -1
@@ -392,6 +452,56 @@ fn term_resistant_process_tree_reaches_kill_and_disappears() {
     for identity in identities {
         ExactProcessGuard::new(identity).assert_gone("TERM-resistant process tree");
     }
+}
+
+#[test]
+fn sustained_output_obeys_deadline_and_reaps_the_owned_process_group() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let ready = temp.path().join("sustained-output-ready");
+    let mut spec = current_test_spec("sustained-output-tree");
+    spec.env(READY_PATH_ENV, &ready);
+    let timeout = Duration::from_secs(2);
+    let started = Instant::now();
+    let output = DeadlineChild::output(spec, timeout).expect("supervise sustained output");
+    let elapsed = started.elapsed();
+    let identities = wait_for_ready_file(&ready);
+
+    assert!(output.timed_out, "sustained output must hit the deadline");
+    assert!(
+        elapsed <= timeout,
+        "supervisor exceeded its configured deadline: {elapsed:?} > {timeout:?}"
+    );
+    assert!(output.cleanup.kill_fence_sent);
+    assert!(output.cleanup.errors.is_empty(), "{:#?}", output.cleanup);
+    assert!(
+        output.stdout_total_bytes > 0,
+        "stdout received no bounded service"
+    );
+    assert!(
+        output.stderr_total_bytes > 0,
+        "stderr was starved by stdout"
+    );
+    assert_eq!(
+        identities.len(),
+        SUSTAINED_STDOUT_WRITER_COUNT + 2,
+        "expected leader plus stdout and stderr writer identities"
+    );
+    for identity in identities {
+        ExactProcessGuard::new(identity).assert_gone("sustained-output process group member");
+    }
+
+    let mut status = 0;
+    // SAFETY: output returned only after the supervisor claimed to reap its direct child; this
+    // WNOHANG query uses valid status storage to verify ECHILD rather than reaping it.
+    assert_eq!(
+        unsafe { libc::waitpid(output.identity.pid, &mut status, libc::WNOHANG) },
+        -1,
+        "the direct child must be reaped before output returns"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
 }
 
 #[test]

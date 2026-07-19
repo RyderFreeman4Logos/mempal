@@ -141,6 +141,8 @@ impl TestSetupGate {
         let mut bytes = [0u8; std::mem::size_of::<libc::pid_t>()];
         let mut filled = 0usize;
         while filled < bytes.len() {
+            // SAFETY: the gate retains ownership of ready_read for this method, and the suffix
+            // of `bytes` is initialized writable storage with the exact remaining capacity.
             let result = unsafe {
                 libc::read(
                     self.ready_read.as_raw_fd(),
@@ -223,17 +225,23 @@ struct SetupFailureRecord {
 pub(super) const SETUP_RECORD_BYTES: usize = std::mem::size_of::<SetupFailureRecord>();
 
 pub(super) fn decode_setup_record(bytes: [u8; SETUP_RECORD_BYTES]) -> (SetupStage, i32) {
+    // SAFETY: the byte array is exactly the repr(C) record size and may lack natural alignment;
+    // read_unaligned copies its initialized bytes without creating a misaligned reference.
     let record = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<SetupFailureRecord>()) };
     (SetupStage::from_wire(record.stage), record.errno)
 }
 
 pub(super) fn spawn_owned(spec: SpawnSpec) -> io::Result<RawSpawn> {
     let prepared = PreparedSpawn::new(spec)?;
+    // SAFETY: the child branch immediately delegates to child_exec, whose post-fork path uses
+    // only async-signal-safe libc operations until execve or _exit; the parent retains `prepared`.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
+        // SAFETY: this is the fork child and `prepared` remains valid in its copied address
+        // space until child_exec replaces it with execve or terminates with _exit.
         unsafe { child_exec(&prepared) }
     }
 
@@ -411,103 +419,110 @@ impl Pipe {
     }
 }
 
+// SAFETY: call only in the fork child; `prepared` must remain valid and the implementation may
+// perform only async-signal-safe operations until it reaches execve or _exit.
 unsafe fn child_exec(prepared: &PreparedSpawn) -> ! {
-    if unsafe { libc::setpgid(0, 0) } != 0 {
-        unsafe { child_fail(prepared, SetupStage::SetProcessGroup) }
-    }
+    // SAFETY: this entire branch executes only in the child after fork; all raw FDs, C strings,
+    // pointer arrays, and SetupFailureRecord storage were prepared before fork and stay valid;
+    // every libc call here is async-signal-safe until execve or _exit.
+    unsafe {
+        if libc::setpgid(0, 0) != 0 {
+            child_fail(prepared, SetupStage::SetProcessGroup)
+        }
 
-    if let Some(gate) = &prepared.setup_gate {
-        unsafe {
+        if let Some(gate) = &prepared.setup_gate {
             libc::close(gate.inherited_parent_fds[0]);
             libc::close(gate.inherited_parent_fds[1]);
-        }
-        let pid = unsafe { libc::getpid() };
-        let pid_bytes = unsafe {
-            std::slice::from_raw_parts(
+            let pid = libc::getpid();
+            let pid_bytes = std::slice::from_raw_parts(
                 (&pid as *const libc::pid_t).cast::<u8>(),
                 std::mem::size_of::<libc::pid_t>(),
-            )
-        };
-        if !unsafe { child_write_all(gate.ready_write.as_raw_fd(), pid_bytes) } {
-            unsafe { child_fail(prepared, SetupStage::ReadyHandshake) }
-        }
-        let mut release = 0u8;
-        loop {
-            let result = unsafe {
-                libc::read(
+            );
+            if !child_write_all(gate.ready_write.as_raw_fd(), pid_bytes) {
+                child_fail(prepared, SetupStage::ReadyHandshake)
+            }
+            let mut release = 0u8;
+            loop {
+                let result = libc::read(
                     gate.release_read.as_raw_fd(),
                     (&mut release as *mut u8).cast(),
                     1,
-                )
-            };
-            if result == 1 {
-                break;
+                );
+                if result == 1 {
+                    break;
+                }
+                if result == 0 {
+                    child_fail_with_errno(prepared, SetupStage::SetupGate, libc::EPIPE)
+                }
+                if *libc::__errno_location() != libc::EINTR {
+                    child_fail(prepared, SetupStage::SetupGate)
+                }
             }
-            if result == 0 {
-                unsafe { child_fail_with_errno(prepared, SetupStage::SetupGate, libc::EPIPE) }
-            }
-            if unsafe { *libc::__errno_location() } != libc::EINTR {
-                unsafe { child_fail(prepared, SetupStage::SetupGate) }
-            }
-        }
-        unsafe {
             libc::close(gate.ready_write.as_raw_fd());
             libc::close(gate.release_read.as_raw_fd());
         }
-    }
 
-    if unsafe { libc::chdir(prepared.current_dir.as_ptr()) } != 0 {
-        unsafe { child_fail(prepared, SetupStage::ChangeDirectory) }
-    }
-    if unsafe { libc::dup2(prepared.child_stdin, libc::STDIN_FILENO) } < 0 {
-        unsafe { child_fail(prepared, SetupStage::StandardInput) }
-    }
-    if unsafe { libc::dup2(prepared.child_stdout, libc::STDOUT_FILENO) } < 0 {
-        unsafe { child_fail(prepared, SetupStage::StandardOutput) }
-    }
-    if unsafe { libc::dup2(prepared.child_stderr, libc::STDERR_FILENO) } < 0 {
-        unsafe { child_fail(prepared, SetupStage::StandardError) }
-    }
-
-    let close_pointer = prepared.close_fds.as_ptr();
-    let close_len = prepared.close_fds.len();
-    let setup_write = prepared.setup_pipe.write.as_raw_fd();
-    let mut index = 0usize;
-    while index < close_len {
-        let fd = unsafe { *close_pointer.add(index) };
-        if fd != setup_write && fd > libc::STDERR_FILENO {
-            unsafe { libc::close(fd) };
+        if libc::chdir(prepared.current_dir.as_ptr()) != 0 {
+            child_fail(prepared, SetupStage::ChangeDirectory)
         }
-        index += 1;
-    }
+        if libc::dup2(prepared.child_stdin, libc::STDIN_FILENO) < 0 {
+            child_fail(prepared, SetupStage::StandardInput)
+        }
+        if libc::dup2(prepared.child_stdout, libc::STDOUT_FILENO) < 0 {
+            child_fail(prepared, SetupStage::StandardOutput)
+        }
+        if libc::dup2(prepared.child_stderr, libc::STDERR_FILENO) < 0 {
+            child_fail(prepared, SetupStage::StandardError)
+        }
 
-    unsafe {
+        let close_pointer = prepared.close_fds.as_ptr();
+        let close_len = prepared.close_fds.len();
+        let setup_write = prepared.setup_pipe.write.as_raw_fd();
+        let mut index = 0usize;
+        while index < close_len {
+            let fd = *close_pointer.add(index);
+            if fd != setup_write && fd > libc::STDERR_FILENO {
+                libc::close(fd);
+            }
+            index += 1;
+        }
+
         libc::execve(
             prepared.executable.as_ptr(),
             prepared.argv_pointers.as_ptr(),
             prepared.environment_pointers.as_ptr(),
-        )
-    };
-    unsafe { child_fail(prepared, SetupStage::Exec) }
+        );
+        child_fail(prepared, SetupStage::Exec)
+    }
 }
 
+// SAFETY: call only from the post-fork child with a valid pre-fork `prepared` allocation; it
+// reports a fixed-size failure record using async-signal-safe operations and then terminates.
 unsafe fn child_fail(prepared: &PreparedSpawn, stage: SetupStage) -> ! {
-    let errno = unsafe { *libc::__errno_location() };
-    unsafe { child_fail_with_errno(prepared, stage, errno) }
+    // SAFETY: the function runs only in the post-fork child, where reading thread-local errno
+    // and delegating to the _exit failure path preserves the async-signal-safe contract.
+    unsafe {
+        let errno = *libc::__errno_location();
+        child_fail_with_errno(prepared, stage, errno)
+    }
 }
 
+// SAFETY: call only from the post-fork child with a valid setup write FD in `prepared`; this
+// function writes the fixed record with async-signal-safe operations and always calls _exit.
 unsafe fn child_fail_with_errno(prepared: &PreparedSpawn, stage: SetupStage, errno: i32) -> ! {
-    let mut record = prepared.failure_record;
-    record.stage = stage.to_wire();
-    record.errno = errno;
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
+    // SAFETY: `prepared` and its record/FD storage were initialized before fork and remain valid
+    // in the child copy; the record byte slice has exactly SETUP_RECORD_BYTES before _exit.
+    unsafe {
+        let mut record = prepared.failure_record;
+        record.stage = stage.to_wire();
+        record.errno = errno;
+        let bytes = std::slice::from_raw_parts(
             (&record as *const SetupFailureRecord).cast::<u8>(),
             SETUP_RECORD_BYTES,
-        )
-    };
-    let _ = unsafe { child_write_all(prepared.setup_pipe.write.as_raw_fd(), bytes) };
-    unsafe { libc::_exit(127) }
+        );
+        let _ = child_write_all(prepared.setup_pipe.write.as_raw_fd(), bytes);
+        libc::_exit(127)
+    }
 }
 
 fn path_cstring(path: &Path) -> io::Result<CString> {
@@ -525,15 +540,26 @@ fn os_cstring(value: &OsStr, field: &str) -> io::Result<CString> {
 
 fn pipe_cloexec() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [-1; 2];
+    // SAFETY: `fds` is writable storage for exactly two descriptor integers as required by
+    // pipe2; O_CLOEXEC does not affect Rust memory validity.
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: successful pipe2 initialized two distinct nonnegative FDs whose ownership has not
+    // yet been wrapped; each is transferred exactly once into its OwnedFd.
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: callers pass an open descriptor they retain for both fcntl calls; F_GETFL does not
+    // dereference Rust memory and returns the descriptor's current flag word.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` remains open and `flags` came from its successful F_GETFL call, so OR-ing
+    // O_NONBLOCK preserves all existing file-status flags while updating the same descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -541,6 +567,8 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 
 fn establish_process_group(pid: libc::pid_t) -> io::Result<()> {
     loop {
+        // SAFETY: `pid` is the just-forked direct child owned by this supervisor; using it for
+        // both pid and pgid establishes an isolated group before the child can be reaped.
         if unsafe { libc::setpgid(pid, pid) } == 0 {
             return Ok(());
         }
@@ -548,6 +576,8 @@ fn establish_process_group(pid: libc::pid_t) -> io::Result<()> {
         if error.kind() == io::ErrorKind::Interrupted {
             continue;
         }
+        // SAFETY: this checks only the still-owned child PID after setpgid reported the race
+        // errno; it verifies the child already became the expected group leader.
         if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
             && unsafe { libc::getpgid(pid) } == pid
         {
@@ -558,10 +588,13 @@ fn establish_process_group(pid: libc::pid_t) -> io::Result<()> {
 }
 
 fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
+    // SAFETY: pid is the just-forked direct child, and SYS_pidfd_open is invoked with flags 0;
+    // the returned integer is checked before it is treated as an owned descriptor.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as RawFd;
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: successful pidfd_open returned a fresh nonnegative FD that has not been wrapped.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -590,6 +623,8 @@ fn poll_fd(fd: RawFd, events: libc::c_short, deadline: Instant) -> io::Result<()
             events,
             revents: 0,
         };
+        // SAFETY: `pollfd` is initialized stack storage and its address stays valid for this
+        // synchronous single-entry poll call.
         let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
         if result > 0 {
             return Ok(());
@@ -607,6 +642,8 @@ fn poll_fd(fd: RawFd, events: libc::c_short, deadline: Instant) -> io::Result<()
 fn write_all(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
     let mut written = 0usize;
     while written < bytes.len() {
+        // SAFETY: callers retain the open destination FD; the slice is live and the offset is
+        // bounded by bytes.len(), so its pointer and remaining length are valid for write.
         let result = unsafe {
             libc::write(
                 fd,
@@ -626,24 +663,28 @@ fn write_all(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+// SAFETY: call only in the post-fork child with an open FD and a live byte slice prepared before
+// fork; it performs only async-signal-safe write/errno operations and never allocates.
 unsafe fn child_write_all(fd: RawFd, bytes: &[u8]) -> bool {
-    let mut written = 0usize;
-    while written < bytes.len() {
-        let result = unsafe {
-            libc::write(
+    // SAFETY: the post-fork caller guarantees that `fd` is open and `bytes` remains valid; each
+    // offset stays within the slice, and the loop uses only write and errno before execve/_exit.
+    unsafe {
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let result = libc::write(
                 fd,
                 bytes.as_ptr().add(written).cast(),
                 bytes.len() - written,
-            )
-        };
-        if result > 0 {
-            written += result as usize;
-            continue;
+            );
+            if result > 0 {
+                written += result as usize;
+                continue;
+            }
+            if result < 0 && *libc::__errno_location() == libc::EINTR {
+                continue;
+            }
+            return false;
         }
-        if result < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
-            continue;
-        }
-        return false;
+        true
     }
-    true
 }

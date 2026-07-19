@@ -31,15 +31,6 @@ pub struct ProcessIdentity {
     pub start_time_ticks: Option<u64>,
 }
 
-impl ProcessIdentity {
-    pub fn still_refers_to_original_process(self) -> bool {
-        let Some(expected) = self.start_time_ticks else {
-            return unsafe { libc::kill(self.pid, 0) } == 0;
-        };
-        read_process_start_time(self.pid).is_ok_and(|actual| actual == expected)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SetupStage {
     SetProcessGroup,
@@ -513,7 +504,7 @@ impl DeadlineChild {
     }
 
     pub fn exit_diagnostic(&mut self) -> io::Result<String> {
-        self.pump()?;
+        self.pump(Instant::now())?;
         Ok(match &self.state {
             Lifecycle::Active(active) => match active.leader {
                 LeaderState::Running => format!("child {} is still running", active.identity.pid),
@@ -562,6 +553,8 @@ impl DeadlineChild {
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "child exited"));
                 }
             };
+            // SAFETY: `fd` is borrowed from the active stdin OwnedFd for the duration of this
+            // iteration, and the slice pointer/remaining length describe readable bytes.
             let result =
                 unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
             if result > 0 {
@@ -596,7 +589,7 @@ impl DeadlineChild {
 
     fn wait_for_setup(&mut self, deadline: Instant) -> io::Result<SetupWait> {
         loop {
-            self.pump()?;
+            self.pump(deadline)?;
             let outcome = match &self.state {
                 Lifecycle::Active(active) => active.setup_outcome,
                 Lifecycle::Complete(_) => SetupOutcome::ExecSucceeded,
@@ -616,7 +609,7 @@ impl DeadlineChild {
 
     fn wait_for_leader_exit(&mut self, deadline: Instant) -> io::Result<bool> {
         loop {
-            self.pump()?;
+            self.pump(deadline)?;
             if self.resources().leader != LeaderResourceState::Running {
                 return Ok(true);
             }
@@ -635,7 +628,7 @@ impl DeadlineChild {
             self.signal_group(libc::SIGTERM, GroupFenceState::TermSent, &mut report);
             let grace_deadline = (Instant::now() + TERM_GRACE).min(deadline);
             while Instant::now() < grace_deadline {
-                if let Err(error) = self.pump() {
+                if let Err(error) = self.pump(deadline) {
                     report.errors.push(CleanupError {
                         operation: "observe during TERM grace",
                         error,
@@ -666,7 +659,7 @@ impl DeadlineChild {
             .is_none_or(|active| active.group == GroupFenceState::KillFenceSent);
 
         while Instant::now() < deadline {
-            if let Err(error) = self.pump() {
+            if let Err(error) = self.pump(deadline) {
                 report.errors.push(CleanupError {
                     operation: "drain/observe/reap after KILL fence",
                     error,
@@ -688,7 +681,7 @@ impl DeadlineChild {
             }
         }
         if had_cleanup_budget {
-            let _ = self.pump().map_err(|error| {
+            let _ = self.pump(deadline).map_err(|error| {
                 report.errors.push(CleanupError {
                     operation: "final cleanup observation",
                     error,
@@ -758,6 +751,8 @@ fn poll_many(pollfds: &mut [libc::pollfd], deadline: Instant) -> io::Result<()> 
         }
         let timeout = remaining.min(POLL_SLICE);
         let timeout_ms = timeout.as_millis().max(1).min(i32::MAX as u128) as i32;
+        // SAFETY: `pollfds` is a live mutable slice of initialized pollfd records, and its
+        // pointer/count remain valid for the synchronous poll call.
         let result = unsafe {
             libc::poll(
                 pollfds.as_mut_ptr(),
