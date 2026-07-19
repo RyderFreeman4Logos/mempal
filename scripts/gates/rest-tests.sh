@@ -54,10 +54,19 @@ if ! flock -n "${rest_lock_fd}"; then
         $(monotonic_centiseconds) + REST_GATE_LOCK_TIMEOUT_SECS * 100
     ))
     echo "rest gate waiting for lock: ${rest_lock_file} (pid=$$)" >&2
-    if command -v fuser >/dev/null 2>&1; then
+    rest_lock_wait_remaining_centiseconds=$((
+        rest_lock_wait_deadline_centiseconds - $(monotonic_centiseconds)
+    ))
+    if ((rest_lock_wait_remaining_centiseconds > 0)) \
+        && command -v fuser >/dev/null 2>&1 \
+        && command -v timeout >/dev/null 2>&1; then
+        rest_lock_wait_remaining="$(printf '%d.%02d' \
+            "$((rest_lock_wait_remaining_centiseconds / 100))" \
+            "$((rest_lock_wait_remaining_centiseconds % 100))")"
         (
             exec {rest_lock_fd}>&-
-            fuser -v "${rest_lock_file}" >&2
+            timeout --signal=KILL "${rest_lock_wait_remaining}s" \
+                fuser -v "${rest_lock_file}" >&2
         ) || true
     fi
     rest_lock_wait_remaining_centiseconds=$((

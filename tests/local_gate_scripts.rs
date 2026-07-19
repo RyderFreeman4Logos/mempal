@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 mod local_gate_child;
 
 #[cfg(unix)]
-use local_gate_child::{GateChild, reap_owned_child};
+use local_gate_child::{GateChild, reap_owned_child, spawn_in_own_session};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -56,7 +56,7 @@ fn spawn_bash_script(script: &Path, args: &[&str], envs: &[(&str, &str)]) -> Chi
     for (key, value) in envs {
         command.env(key, value);
     }
-    command.spawn().expect("spawn bash script")
+    spawn_in_own_session(&mut command).expect("spawn isolated bash script")
 }
 
 fn wait_for_file(path: &Path, timeout: Duration, description: &str) {
@@ -78,7 +78,8 @@ impl LockHolder {
     fn spawn(lock_file: &Path, fixture_root: &Path) -> Self {
         let ready_file = fixture_root.join("lock-holder-ready");
         let release_file = fixture_root.join("lock-holder-release");
-        let child = Command::new("/bin/bash")
+        let mut command = Command::new("/bin/bash");
+        command
             .args([
                 "-c",
                 r#"
@@ -95,9 +96,8 @@ impl LockHolder {
             .env("LOCK_RELEASE_FILE", &release_file)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn coordinated lock holder");
+            .stderr(Stdio::null());
+        let child = spawn_in_own_session(&mut command).expect("spawn coordinated lock holder");
         let holder = Self {
             child: Some(child),
             release_file,
@@ -646,6 +646,7 @@ fn rest_gate_fails_with_a_bounded_lock_timeout() {
                     .to_str()
                     .expect("UTF-8 lock holder release path"),
             ),
+            ("REST_GATE_FUSER_STALL_AFTER_RELEASE", "1"),
         ],
     ));
     wait_for_file(
@@ -655,7 +656,7 @@ fn rest_gate_fails_with_a_bounded_lock_timeout() {
     );
 
     let budget_probe = Command::new("flock")
-        .args(["-w", "1"])
+        .args(["-w", "0.5"])
         .arg(&lock_file)
         .arg("true")
         .status()
@@ -663,7 +664,7 @@ fn rest_gate_fails_with_a_bounded_lock_timeout() {
     assert_eq!(
         budget_probe.code(),
         Some(1),
-        "the holder must outlive a full advertised lock budget"
+        "the holder must remain locked until the diagnostic releases it"
     );
     fs::write(&fuser_release_file, "release\n").expect("release blocked REST lock diagnostic");
     let output = gate
