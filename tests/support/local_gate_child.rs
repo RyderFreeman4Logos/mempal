@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::io::Read;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output};
@@ -22,19 +22,96 @@ struct ProcessIdentity {
 
 impl ProcessIdentity {
     fn is_running(self) -> io::Result<bool> {
-        Ok(inspect_process(self.pid)?
-            .is_some_and(|process| process.identity == self && process.state != 'Z'))
+        Ok(self.matches_running_snapshot(inspect_process(self.pid)?.as_ref()))
+    }
+
+    fn matches_running_snapshot(self, snapshot: Option<&ProcessSnapshot>) -> bool {
+        snapshot.is_some_and(|process| process.identity == self && process.state != 'Z')
     }
 }
 
 struct ProcessSnapshot {
     identity: ProcessIdentity,
+    parent_pid: i32,
     state: char,
+}
+
+struct ProcessHandle {
+    identity: ProcessIdentity,
+    pidfd: Option<OwnedFd>,
+}
+
+impl ProcessHandle {
+    fn capture(pid: i32) -> io::Result<Option<Self>> {
+        Self::capture_with_parent(pid, None)
+    }
+
+    fn capture_child(parent: ProcessIdentity, pid: i32) -> io::Result<Option<Self>> {
+        Self::capture_with_parent(pid, Some(parent))
+    }
+
+    fn capture_with_parent(
+        pid: i32,
+        expected_parent: Option<ProcessIdentity>,
+    ) -> io::Result<Option<Self>> {
+        let Some(initial) = inspect_process(pid)? else {
+            return Ok(None);
+        };
+        if !matches_expected_parent(&initial, expected_parent)? {
+            return Ok(None);
+        }
+        let pidfd = open_pidfd(pid)?;
+        let Some(confirmed) = inspect_process(pid)? else {
+            return Ok(None);
+        };
+        if confirmed.identity != initial.identity
+            || !matches_expected_parent(&confirmed, expected_parent)?
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            identity: initial.identity,
+            pidfd,
+        }))
+    }
+
+    fn is_running(&self) -> io::Result<bool> {
+        self.identity.is_running()
+    }
+
+    fn has_pidfd(&self) -> bool {
+        self.pidfd.is_some()
+    }
+
+    fn send_signal(&self, signal: i32) -> io::Result<()> {
+        if !self.is_running()? {
+            return Ok(());
+        }
+        let Some(pidfd) = self.pidfd.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "pidfd is required to signal a tracked gate process safely",
+            ));
+        };
+        send_pidfd_signal(pidfd, signal)
+    }
+}
+
+fn matches_expected_parent(
+    process: &ProcessSnapshot,
+    expected_parent: Option<ProcessIdentity>,
+) -> io::Result<bool> {
+    match expected_parent {
+        Some(parent) => Ok(parent.is_running()? && process.parent_pid == parent.pid),
+        None => Ok(true),
+    }
 }
 
 pub(crate) struct GateChild {
     child: Option<Child>,
-    tracked_processes: Vec<ProcessIdentity>,
+    root: ProcessHandle,
+    tracked_processes: Vec<ProcessHandle>,
 }
 
 pub(crate) fn spawn_in_own_session(command: &mut Command) -> io::Result<Child> {
@@ -51,11 +128,13 @@ pub(crate) fn spawn_in_own_session(command: &mut Command) -> io::Result<Child> {
 }
 
 impl GateChild {
-    pub(crate) fn new(child: Child) -> Self {
-        Self {
+    pub(crate) fn new(child: Child) -> io::Result<Self> {
+        let root = capture_owned_child(&child)?;
+        Ok(Self {
             child: Some(child),
+            root,
             tracked_processes: Vec::new(),
-        }
+        })
     }
 
     pub(crate) fn wait_with_timeout(&mut self, timeout: Duration) -> io::Result<Output> {
@@ -71,6 +150,7 @@ impl GateChild {
             if exited {
                 return terminate_and_collect(
                     self.child.take().expect("gate child already reaped"),
+                    &self.root,
                     &mut self.tracked_processes,
                 );
             }
@@ -79,6 +159,7 @@ impl GateChild {
                     timeout,
                     terminate_and_collect(
                         self.child.take().expect("gate child already reaped"),
+                        &self.root,
                         &mut self.tracked_processes,
                     ),
                 );
@@ -89,21 +170,22 @@ impl GateChild {
 
     fn refresh_tracked_processes(&mut self) -> io::Result<()> {
         let child = self.child.as_ref().expect("gate child already reaped");
-        refresh_owned_processes(child, &mut self.tracked_processes)
+        refresh_owned_processes(child, &self.root, &mut self.tracked_processes)
     }
 }
 
 impl Drop for GateChild {
     fn drop(&mut self) {
         if let Some(child) = self.child.take() {
-            let _ = terminate_and_collect(child, &mut self.tracked_processes);
+            let _ = terminate_and_collect(child, &self.root, &mut self.tracked_processes);
         }
     }
 }
 
 pub(crate) fn reap_owned_child(child: Child) -> io::Result<()> {
+    let root = capture_owned_child(&child)?;
     let mut tracked_processes = Vec::new();
-    terminate_and_collect(child, &mut tracked_processes).map(|_| ())
+    terminate_and_collect(child, &root, &mut tracked_processes).map(|_| ())
 }
 
 fn timeout_error(timeout: Duration, cleanup: io::Result<Output>) -> io::Result<Output> {
@@ -125,21 +207,22 @@ fn timeout_error(timeout: Duration, cleanup: io::Result<Output>) -> io::Result<O
 
 fn terminate_and_collect(
     mut child: Child,
-    tracked_processes: &mut Vec<ProcessIdentity>,
+    root: &ProcessHandle,
+    tracked_processes: &mut Vec<ProcessHandle>,
 ) -> io::Result<Output> {
-    terminate_owned_process_tree(&mut child, tracked_processes)?;
+    terminate_owned_process_tree(&mut child, root, tracked_processes)?;
     collect_bounded_output(&mut child)
 }
 
 fn terminate_owned_process_tree(
     child: &mut Child,
-    tracked_processes: &mut Vec<ProcessIdentity>,
+    root: &ProcessHandle,
+    tracked_processes: &mut Vec<ProcessHandle>,
 ) -> io::Result<()> {
-    refresh_owned_processes(child, tracked_processes)?;
-    let process_group_id = owned_child_pid(child)?;
+    refresh_owned_processes(child, root, tracked_processes)?;
     let mut child_exited = child.try_wait()?.is_some();
     if !child_exited {
-        signal_process_group(process_group_id, libc::SIGTERM)?;
+        signal_root_process_tree(root, libc::SIGTERM)?;
     }
     signal_tracked_processes(tracked_processes, libc::SIGTERM)?;
     if !child_exited {
@@ -151,9 +234,9 @@ fn terminate_owned_process_tree(
         return Ok(());
     }
 
-    refresh_owned_processes(child, tracked_processes)?;
+    refresh_owned_processes(child, root, tracked_processes)?;
     if !child_exited {
-        signal_process_group(process_group_id, libc::SIGKILL)?;
+        signal_root_process_tree(root, libc::SIGKILL)?;
     }
     signal_tracked_processes(tracked_processes, libc::SIGKILL)?;
     if !child_exited {
@@ -180,6 +263,16 @@ fn owned_child_pid(child: &Child) -> io::Result<i32> {
     })
 }
 
+fn capture_owned_child(child: &Child) -> io::Result<ProcessHandle> {
+    let pid = owned_child_pid(child)?;
+    ProcessHandle::capture(pid)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "owned gate child exited before its pidfd identity could be captured",
+        )
+    })
+}
+
 fn signal_process_group(process_group_id: i32, signal: i32) -> io::Result<()> {
     // SAFETY: The direct child is still owned, so its unreaped PID cannot be reused. Fixtures
     // call `setsid` before exec, making this group exclusive to the fixture. `ESRCH` means the
@@ -195,27 +288,22 @@ fn signal_process_group(process_group_id: i32, signal: i32) -> io::Result<()> {
     Ok(())
 }
 
-fn signal_tracked_processes(processes: &[ProcessIdentity], signal: i32) -> io::Result<()> {
+fn signal_root_process_tree(root: &ProcessHandle, signal: i32) -> io::Result<()> {
+    if root.has_pidfd() {
+        root.send_signal(signal)?;
+    }
+    signal_process_group(root.identity.pid, signal)
+}
+
+fn signal_tracked_processes(processes: &[ProcessHandle], signal: i32) -> io::Result<()> {
     for process in processes {
-        if !process.is_running()? {
-            continue;
-        }
-        // SAFETY: `is_running` validated this PID with its Linux start-time tick before the
-        // signal. A later PID reuse can only occur after the original process has exited.
-        unsafe {
-            if libc::kill(process.pid, signal) == -1 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(error);
-                }
-            }
-        }
+        process.send_signal(signal)?;
     }
     Ok(())
 }
 
 fn wait_for_tracked_processes_exit(
-    processes: &[ProcessIdentity],
+    processes: &[ProcessHandle],
     timeout: Duration,
 ) -> io::Result<bool> {
     let deadline = Instant::now() + timeout;
@@ -252,30 +340,32 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> io::Result<bool>
 
 fn refresh_owned_processes(
     child: &Child,
-    tracked_processes: &mut Vec<ProcessIdentity>,
+    root: &ProcessHandle,
+    tracked_processes: &mut Vec<ProcessHandle>,
 ) -> io::Result<()> {
     track_output_pipe_holders(child, tracked_processes)?;
     let mut pending = Vec::new();
-    for process in tracked_processes.iter().copied() {
+    for process in tracked_processes.iter() {
         if process.is_running()? {
-            pending.push(process);
+            pending.push(process.identity);
         }
     }
-    if let Some(root) = inspect_process(owned_child_pid(child)?)? {
+    if root.is_running()? {
         pending.push(root.identity);
     }
 
     let mut visited = HashSet::new();
-    while let Some(process) = pending.pop() {
-        if !visited.insert(process) || !process.is_running()? {
+    while let Some(identity) = pending.pop() {
+        if !visited.insert(identity) || !identity.is_running()? {
             continue;
         }
-        if !tracked_processes.contains(&process) {
-            tracked_processes.push(process);
-        }
-        for child_pid in child_pids(process.pid)? {
-            if let Some(descendant) = inspect_process(child_pid)? {
+        for descendant in capture_live_children(identity)? {
+            if !tracked_processes
+                .iter()
+                .any(|tracked| tracked.identity == descendant.identity)
+            {
                 pending.push(descendant.identity);
+                tracked_processes.push(descendant);
             }
         }
     }
@@ -284,7 +374,7 @@ fn refresh_owned_processes(
 
 fn track_output_pipe_holders(
     child: &Child,
-    tracked_processes: &mut Vec<ProcessIdentity>,
+    tracked_processes: &mut Vec<ProcessHandle>,
 ) -> io::Result<()> {
     let mut pipe_targets = Vec::new();
     if let Some(stdout) = child.stdout.as_ref() {
@@ -308,13 +398,23 @@ fn track_output_pipe_holders(
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
             continue;
         };
-        if pid == current_pid || !process_holds_pipe(&entry.path().join("fd"), &pipe_targets)? {
+        if pid == current_pid {
             continue;
         }
-        if let Some(process) = inspect_process(pid)?
-            && !tracked_processes.contains(&process.identity)
+        let process = match ProcessHandle::capture(pid) {
+            Ok(Some(process)) => process,
+            Ok(None) => continue,
+            Err(error) if process_scan_error(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if !process_holds_pipe(&process, &pipe_targets)? {
+            continue;
+        }
+        if !tracked_processes
+            .iter()
+            .any(|tracked| tracked.identity == process.identity)
         {
-            tracked_processes.push(process.identity);
+            tracked_processes.push(process);
         }
     }
     Ok(())
@@ -324,11 +424,12 @@ fn pipe_target(fd: i32) -> io::Result<PathBuf> {
     fs::read_link(format!("/proc/self/fd/{fd}"))
 }
 
-fn process_holds_pipe(
-    fd_directory: &std::path::Path,
-    pipe_targets: &[PathBuf],
-) -> io::Result<bool> {
-    let entries = match fs::read_dir(fd_directory) {
+fn process_holds_pipe(process: &ProcessHandle, pipe_targets: &[PathBuf]) -> io::Result<bool> {
+    if !process.is_running()? {
+        return Ok(false);
+    }
+    let fd_directory = PathBuf::from(format!("/proc/{}/fd", process.identity.pid));
+    let entries = match fs::read_dir(&fd_directory) {
         Ok(entries) => entries,
         Err(error) if process_scan_error(&error) => return Ok(false),
         Err(error) => return Err(error),
@@ -345,10 +446,33 @@ fn process_holds_pipe(
             Err(error) => return Err(error),
         };
         if pipe_targets.contains(&target) {
-            return Ok(true);
+            return process.is_running();
         }
     }
     Ok(false)
+}
+
+fn capture_live_children(parent: ProcessIdentity) -> io::Result<Vec<ProcessHandle>> {
+    if !parent.is_running()? {
+        return Ok(Vec::new());
+    }
+    let child_pids = child_pids(parent.pid)?;
+    if !parent.is_running()? {
+        return Ok(Vec::new());
+    }
+
+    let mut children = Vec::new();
+    for child_pid in child_pids {
+        if let Some(child) = ProcessHandle::capture_child(parent, child_pid)?
+            && child.is_running()?
+        {
+            children.push(child);
+        }
+    }
+    if !parent.is_running()? {
+        return Ok(Vec::new());
+    }
+    Ok(children)
 }
 
 fn child_pids(parent_pid: i32) -> io::Result<Vec<i32>> {
@@ -390,8 +514,23 @@ fn inspect_process(pid: i32) -> io::Result<Option<ProcessSnapshot>> {
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "Linux proc stat missing state")
         })?;
+    let parent_pid = fields
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Linux proc stat missing parent PID",
+            )
+        })?
+        .parse()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Linux proc parent PID was not numeric",
+            )
+        })?;
     let start_time_ticks = fields
-        .nth(18)
+        .nth(17)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -410,8 +549,51 @@ fn inspect_process(pid: i32) -> io::Result<Option<ProcessSnapshot>> {
             pid,
             start_time_ticks,
         },
+        parent_pid,
         state,
     }))
+}
+
+fn open_pidfd(pid: i32) -> io::Result<Option<OwnedFd>> {
+    // SAFETY: `SYS_pidfd_open` receives a validated signed PID and no pointers. A successful
+    // syscall returns a fresh owned file descriptor, transferred into `OwnedFd` below.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) };
+    if pidfd == -1 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) | Some(libc::ENOSYS) | Some(libc::EINVAL) => Ok(None),
+            _ => Err(error),
+        };
+    }
+    let pidfd = i32::try_from(pidfd).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pidfd_open returned a descriptor outside the RawFd range",
+        )
+    })?;
+    // SAFETY: `pidfd_open` returned this new descriptor exactly once, so `OwnedFd` owns it.
+    Ok(Some(unsafe { OwnedFd::from_raw_fd(pidfd) }))
+}
+
+fn send_pidfd_signal(pidfd: &OwnedFd, signal: i32) -> io::Result<()> {
+    // SAFETY: `pidfd` is an owned descriptor returned by `pidfd_open`; the null siginfo pointer
+    // and flags 0 select the kernel's ordinary signal delivery semantics for that fixed process.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0_u32,
+        )
+    };
+    if result == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 fn process_is_gone(error: &io::Error) -> bool {
@@ -473,326 +655,4 @@ fn receive_pipe_output(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::os::unix::fs::symlink;
-    use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
-
-    fn repo_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-    }
-
-    fn wait_for_file(path: &Path, timeout: Duration, description: &str) {
-        let deadline = Instant::now() + timeout;
-        while !path.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(path.exists(), "{description} did not become ready");
-    }
-
-    fn spawn_pipe_holding_child(ready_file: &Path, pid_file: &Path) -> Child {
-        let mut command = Command::new("/bin/bash");
-        command
-            .args([
-                "-c",
-                r#"
-                    : >"${READY_FILE:?}"
-                    printf '%s\n' "${BASHPID}" >"${PID_FILE:?}"
-                    ( trap '' TERM; exec /bin/sleep 60 ) &
-                    while true; do sleep 0.01; done
-                "#,
-            ])
-            .env("READY_FILE", ready_file)
-            .env("PID_FILE", pid_file)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        spawn_in_own_session(&mut command).expect("spawn isolated fixture")
-    }
-
-    fn spawn_setsid_pipe_holding_child(
-        ready_file: &Path,
-        pid_file: &Path,
-        exit_after_ready: bool,
-    ) -> Child {
-        let mut command = Command::new("/bin/bash");
-        command
-            .args([
-                "-c",
-                r#"
-                    setsid /bin/bash -c '
-                        trap "" TERM
-                        pid="${BASHPID}"
-                        start_time="$(awk "{print \$22}" "/proc/${pid}/stat")"
-                        printf "%s %s\n" "${pid}" "${start_time}" >"${PID_FILE:?}"
-                        : >"${READY_FILE:?}"
-                        while true; do
-                            printf "escaped stdout\n"
-                            printf "escaped stderr\n" >&2
-                            /bin/sleep 60
-                        done
-                    ' &
-                    if [[ "${EXIT_AFTER_READY:?}" == "1" ]]; then
-                        while [[ ! -e "${READY_FILE:?}" ]]; do /bin/sleep 0.01; done
-                        exit 0
-                    fi
-                    while true; do /bin/sleep 0.01; done
-                "#,
-            ])
-            .env("READY_FILE", ready_file)
-            .env("PID_FILE", pid_file)
-            .env("EXIT_AFTER_READY", if exit_after_ready { "1" } else { "0" })
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        spawn_in_own_session(&mut command).expect("spawn isolated fixture")
-    }
-
-    fn process_identity_from_pid_file(pid_file: &Path) -> ProcessIdentity {
-        let pid_file = fs::read_to_string(pid_file).expect("read escaped process identity");
-        let mut fields = pid_file.split_whitespace();
-        let pid = fields
-            .next()
-            .expect("escaped process PID")
-            .parse()
-            .expect("numeric escaped process PID");
-        let start_time_ticks = fields
-            .next()
-            .expect("escaped process start time")
-            .parse()
-            .expect("numeric escaped process start time");
-        assert!(
-            fields.next().is_none(),
-            "unexpected escaped process identity"
-        );
-        ProcessIdentity {
-            pid,
-            start_time_ticks,
-        }
-    }
-
-    fn assert_process_identity_gone(identity: ProcessIdentity) {
-        assert!(
-            !identity
-                .is_running()
-                .expect("inspect escaped process identity"),
-            "escaped process remained alive: {identity:?}"
-        );
-    }
-
-    #[test]
-    fn procfs_exit_errors_are_treated_as_absent_processes() {
-        assert!(process_is_gone(&io::Error::from(io::ErrorKind::NotFound)));
-        assert!(process_is_gone(&io::Error::from_raw_os_error(libc::ESRCH)));
-    }
-
-    #[test]
-    fn gate_child_wait_timeout_reaps_descendants_that_hold_pipes() {
-        let fixture = tempfile::tempdir().expect("create pipe-holder fixture");
-        let ready_file = fixture.path().join("ready");
-        let pid_file = fixture.path().join("pid");
-        let mut gate = GateChild::new(spawn_pipe_holding_child(&ready_file, &pid_file));
-        wait_for_file(&ready_file, Duration::from_secs(2), "pipe-holder fixture");
-
-        let started = Instant::now();
-        let error = gate
-            .wait_with_timeout(Duration::from_millis(50))
-            .expect_err("a gate timeout must return an error");
-
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "GateChild timeout cleanup must not hang on inherited pipes"
-        );
-    }
-
-    #[test]
-    fn gate_child_drop_reaps_descendants_that_hold_pipes() {
-        let fixture = tempfile::tempdir().expect("create drop pipe-holder fixture");
-        let ready_file = fixture.path().join("ready");
-        let pid_file = fixture.path().join("pid");
-        let started = Instant::now();
-        {
-            let gate = GateChild::new(spawn_pipe_holding_child(&ready_file, &pid_file));
-            wait_for_file(&ready_file, Duration::from_secs(2), "pipe-holder fixture");
-            drop(gate);
-        }
-
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "GateChild Drop cleanup must not hang on inherited pipes"
-        );
-    }
-
-    #[test]
-    fn gate_child_timeout_terminates_setsid_escape_without_hanging() {
-        let fixture = tempfile::tempdir().expect("create setsid pipe-holder fixture");
-        let ready_file = fixture.path().join("ready");
-        let pid_file = fixture.path().join("pid");
-        let mut gate = GateChild::new(spawn_setsid_pipe_holding_child(
-            &ready_file,
-            &pid_file,
-            false,
-        ));
-        wait_for_file(
-            &ready_file,
-            Duration::from_secs(2),
-            "setsid pipe-holder fixture",
-        );
-        let escaped = process_identity_from_pid_file(&pid_file);
-
-        let started = Instant::now();
-        let error = gate
-            .wait_with_timeout(Duration::from_millis(50))
-            .expect_err("a gate timeout must return an error");
-
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "GateChild timeout cleanup must not hang on setsid descendants"
-        );
-        assert_process_identity_gone(escaped);
-    }
-
-    #[test]
-    fn gate_child_drop_terminates_setsid_escape_without_hanging() {
-        let fixture = tempfile::tempdir().expect("create setsid drop fixture");
-        let ready_file = fixture.path().join("ready");
-        let pid_file = fixture.path().join("pid");
-        let escaped;
-        let started = Instant::now();
-        {
-            let gate = GateChild::new(spawn_setsid_pipe_holding_child(
-                &ready_file,
-                &pid_file,
-                false,
-            ));
-            wait_for_file(
-                &ready_file,
-                Duration::from_secs(2),
-                "setsid pipe-holder fixture",
-            );
-            escaped = process_identity_from_pid_file(&pid_file);
-            drop(gate);
-        }
-
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "GateChild Drop cleanup must not hang on setsid descendants"
-        );
-        assert_process_identity_gone(escaped);
-    }
-
-    #[test]
-    fn gate_child_reaps_setsid_escape_after_leader_exits() {
-        let fixture = tempfile::tempdir().expect("create exited-leader fixture");
-        let ready_file = fixture.path().join("ready");
-        let pid_file = fixture.path().join("pid");
-        let mut child = spawn_setsid_pipe_holding_child(&ready_file, &pid_file, true);
-        wait_for_file(
-            &ready_file,
-            Duration::from_secs(2),
-            "setsid pipe-holder fixture",
-        );
-        let escaped = process_identity_from_pid_file(&pid_file);
-        assert!(
-            wait_for_child_exit(&mut child, Duration::from_secs(2))
-                .expect("wait for exited leader"),
-            "the fixture leader did not exit"
-        );
-
-        let started = Instant::now();
-        let mut tracked_processes = Vec::new();
-        let output = terminate_and_collect(child, &mut tracked_processes)
-            .expect("reap exited leader and escaped descendant");
-
-        assert!(
-            output.status.success(),
-            "fixture leader status: {}",
-            output.status
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "cleanup must not depend on the escaped process retaining its parent"
-        );
-        assert_process_identity_gone(escaped);
-    }
-
-    #[test]
-    fn rest_gate_fuser_diagnostic_cannot_outlive_lock_budget() {
-        let fixture = tempfile::tempdir().expect("create fuser-timeout fixture");
-        let bin_dir = fixture.path().join("bin");
-        fs::create_dir(&bin_dir).expect("create fixture bin directory");
-        symlink(
-            repo_root().join("tests/fixtures/local-gate-command-proxy.sh"),
-            bin_dir.join("fuser"),
-        )
-        .expect("link fuser proxy");
-        let target = fixture.path().join("target");
-        fs::create_dir(&target).expect("create isolated target");
-        let target = fs::canonicalize(target).expect("canonical isolated target");
-        let mut lock_file = target.as_os_str().to_os_string();
-        lock_file.push(".lock");
-        let lock_file = PathBuf::from(lock_file);
-        let holder_ready_file = fixture.path().join("holder-ready");
-        let mut holder_command = Command::new("/bin/bash");
-        holder_command
-            .args([
-                "-c",
-                r#"
-                    exec {lock_fd}>"${LOCK_FILE:?}"
-                    flock "${lock_fd}"
-                    : >"${HOLDER_READY_FILE:?}"
-                    exec /bin/sleep 60
-                "#,
-            ])
-            .env("LOCK_FILE", &lock_file)
-            .env("HOLDER_READY_FILE", &holder_ready_file)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let _holder = GateChild::new(
-            spawn_in_own_session(&mut holder_command).expect("spawn isolated lock holder"),
-        );
-        wait_for_file(&holder_ready_file, Duration::from_secs(2), "lock holder");
-
-        let inherited_path = std::env::var_os("PATH").expect("PATH is set");
-        let path = std::env::join_paths(
-            std::iter::once(bin_dir).chain(std::env::split_paths(&inherited_path)),
-        )
-        .expect("construct fixture PATH");
-        let fuser_ready_file = fixture.path().join("fuser-ready");
-        let fuser_pid_file = fixture.path().join("fuser.pid");
-        let mut command = Command::new("/bin/bash");
-        command
-            .arg(repo_root().join("scripts/gates/rest-tests.sh"))
-            .current_dir(repo_root())
-            .env("PATH", path)
-            .env("REST_GATE_DRY_RUN", "1")
-            .env("REST_GATE_LOCK_TIMEOUT_SECS", "1")
-            .env("REST_GATE_TARGET_DIR", &target)
-            .env("REST_TEST_TARGETS_PER_BATCH", "999")
-            .env("REST_GATE_FUSER_NEVER_RETURN_READY_FILE", &fuser_ready_file)
-            .env("REST_GATE_FUSER_PID_FILE", &fuser_pid_file)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut gate =
-            GateChild::new(spawn_in_own_session(&mut command).expect("spawn isolated REST gate"));
-        wait_for_file(&fuser_ready_file, Duration::from_secs(2), "stalled fuser");
-
-        let started = Instant::now();
-        let output = gate
-            .wait_with_timeout(Duration::from_secs(3))
-            .expect("reap REST gate");
-
-        assert_eq!(output.status.code(), Some(75));
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "the fuser diagnostic exceeded the advertised lock deadline: stderr={}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
+include!("local_gate_child_tests.rs");

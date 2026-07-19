@@ -21,7 +21,8 @@ fn run_bash_script(
     envs: &[(&str, &str)],
     timeout: Duration,
 ) -> Output {
-    let mut gate = GateChild::new(spawn_bash_script(script, args, envs));
+    let mut gate = GateChild::new(spawn_bash_script(script, args, envs))
+        .expect("capture isolated bash script identity");
     gate.wait_with_timeout(timeout)
         .expect("wait for bash script")
 }
@@ -457,7 +458,8 @@ fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
                     .expect("UTF-8 lock holder release path"),
             ),
         ],
-    ));
+    ))
+    .expect("capture isolated REST gate identity");
     wait_for_file(
         &fuser_ready_file,
         Duration::from_secs(2),
@@ -629,7 +631,8 @@ fn rest_gate_fails_with_a_bounded_lock_timeout() {
             ),
             ("REST_GATE_FUSER_STALL_AFTER_RELEASE", "1"),
         ],
-    ));
+    ))
+    .expect("capture isolated REST gate identity");
     wait_for_file(
         &fuser_ready_file,
         Duration::from_secs(2),
