@@ -8,6 +8,7 @@ use std::time::Instant;
 use super::*;
 
 const READS_PER_PUMP: usize = 1;
+const DROP_EXIT_CODE: i32 = 125;
 
 impl ProcessIdentity {
     pub fn still_refers_to_original_process(self) -> bool {
@@ -286,7 +287,7 @@ impl DeadlineChild {
         poll_many(&mut pollfds, deadline)
     }
 
-    pub(super) fn close_stdin(&mut self) {
+    pub(crate) fn close_stdin(&mut self) {
         if let Some(active) = self.active_mut() {
             active.stdin.take();
         }

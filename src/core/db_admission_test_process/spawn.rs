@@ -7,6 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use super::fd_layout::{Pipe, pipe_cloexec, relocate_fd_at_least_three, set_nonblocking};
 use super::{ProcessIdentity, SetupStage};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -188,11 +189,6 @@ pub(super) struct RawSpawn {
     pub group_error: Option<io::Error>,
 }
 
-struct Pipe {
-    read: OwnedFd,
-    write: OwnedFd,
-}
-
 struct PreparedSpawn {
     executable: CString,
     _argv: Vec<CString>,
@@ -326,7 +322,7 @@ impl PreparedSpawn {
             .read(true)
             .write(true)
             .open("/dev/null")?;
-        let dev_null: OwnedFd = dev_null_file.into();
+        let dev_null: OwnedFd = relocate_fd_at_least_three(dev_null_file.into())?;
         let (stdin_pipe, stdout_pipe, stderr_pipe) = match spec.stdio {
             StdioMode::Capture => (None, Some(Pipe::new()?), Some(Pipe::new()?)),
             StdioMode::PipedInput => (Some(Pipe::new()?), None, None),
@@ -409,13 +405,6 @@ impl PreparedSpawn {
                 errno: 0,
             },
         })
-    }
-}
-
-impl Pipe {
-    fn new() -> io::Result<Self> {
-        let (read, write) = pipe_cloexec()?;
-        Ok(Self { read, write })
     }
 }
 
@@ -536,33 +525,6 @@ fn os_cstring(value: &OsStr, field: &str) -> io::Result<CString> {
             format!("{field} contains an interior NUL byte"),
         )
     })
-}
-
-fn pipe_cloexec() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [-1; 2];
-    // SAFETY: `fds` is writable storage for exactly two descriptor integers as required by
-    // pipe2; O_CLOEXEC does not affect Rust memory validity.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: successful pipe2 initialized two distinct nonnegative FDs whose ownership has not
-    // yet been wrapped; each is transferred exactly once into its OwnedFd.
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-}
-
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-    // SAFETY: callers pass an open descriptor they retain for both fcntl calls; F_GETFL does not
-    // dereference Rust memory and returns the descriptor's current flag word.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `fd` remains open and `flags` came from its successful F_GETFL call, so OR-ing
-    // O_NONBLOCK preserves all existing file-status flags while updating the same descriptor.
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 fn establish_process_group(pid: libc::pid_t) -> io::Result<()> {

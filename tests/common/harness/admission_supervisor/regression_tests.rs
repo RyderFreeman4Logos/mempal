@@ -14,46 +14,6 @@ const DESCENDANT_TEST: &str =
     "admission_supervisor::regression_tests::supervisor_descendant_fixture";
 const SUSTAINED_STDOUT_WRITER_COUNT: usize = 8;
 
-#[derive(Debug)]
-struct ExactProcessGuard {
-    identity: ProcessIdentity,
-    armed: bool,
-}
-
-impl ExactProcessGuard {
-    fn new(identity: ProcessIdentity) -> Self {
-        Self {
-            identity,
-            armed: true,
-        }
-    }
-
-    fn assert_gone(mut self, context: &str) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while self.identity.still_refers_to_original_process() && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(
-            !self.identity.still_refers_to_original_process(),
-            "{context}: original process {:?} is still present",
-            self.identity
-        );
-        self.armed = false;
-    }
-}
-
-impl Drop for ExactProcessGuard {
-    fn drop(&mut self) {
-        if self.armed && self.identity.still_refers_to_original_process() {
-            // SAFETY: the start-time identity check rules out PID reuse before this test-only
-            // fallback sends SIGKILL to the exact fixture process.
-            unsafe {
-                libc::kill(self.identity.pid, libc::SIGKILL);
-            }
-        }
-    }
-}
-
 fn current_test_spec(case: &str) -> SpawnSpec {
     let executable = std::env::current_exe().expect("current test executable");
     let mut spec = SpawnSpec::new(executable).expect("absolute test executable");
@@ -74,24 +34,6 @@ fn fixture_command(case: &str) -> Command {
         .env_remove(FIXTURE_CASE_ENV)
         .env(DESCENDANT_CASE_ENV, case);
     command
-}
-
-fn process_identity(pid: libc::pid_t) -> ProcessIdentity {
-    ProcessIdentity {
-        pid,
-        start_time_ticks: Some(read_start_time(pid)),
-    }
-}
-
-fn read_start_time(pid: libc::pid_t) -> u64 {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read process stat");
-    let (_, fields) = stat.rsplit_once(") ").expect("process stat fields");
-    fields
-        .split_whitespace()
-        .nth(19)
-        .expect("process start-time field")
-        .parse()
-        .expect("numeric process start time")
 }
 
 fn append_identity(path: &Path, identity: ProcessIdentity, ready: bool) {

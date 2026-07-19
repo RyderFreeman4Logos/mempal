@@ -5,11 +5,12 @@
 
 #[path = "db_admission_test_process/capture.rs"]
 mod capture;
+#[path = "db_admission_test_process/fd_layout.rs"]
+mod fd_layout;
 #[path = "db_admission_test_process/lifecycle.rs"]
 mod lifecycle;
 #[path = "db_admission_test_process/spawn.rs"]
 mod spawn;
-
 use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -23,7 +24,6 @@ pub use spawn::{SpawnSpec, StdioMode, TestSetupGate};
 const CLEANUP_RESERVE: Duration = Duration::from_millis(500);
 const TERM_GRACE: Duration = Duration::from_millis(100);
 const POLL_SLICE: Duration = Duration::from_millis(25);
-const DROP_EXIT_CODE: i32 = 125;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessIdentity {
