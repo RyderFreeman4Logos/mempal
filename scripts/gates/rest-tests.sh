@@ -18,6 +18,18 @@ if ! [[ "${REST_GATE_LOCK_TIMEOUT_SECS}" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
+monotonic_centiseconds() {
+    local uptime_seconds
+    local whole_seconds
+    local fractional_seconds
+
+    read -r uptime_seconds _ </proc/uptime
+    whole_seconds="${uptime_seconds%%.*}"
+    fractional_seconds="${uptime_seconds#*.}00"
+    fractional_seconds="${fractional_seconds:0:2}"
+    printf '%s\n' "$((10#${whole_seconds} * 100 + 10#${fractional_seconds}))"
+}
+
 # REST batches clean package artifacts between phases. Keep that cleanup in a
 # dedicated target directory so it cannot delete another Cargo process's files.
 mkdir -p -- "${rest_target_dir}"
@@ -35,10 +47,12 @@ exec {rest_lock_fd}>"${rest_lock_file}"
 # The top-level shell owns this descriptor. Every non-lock child closes its
 # copy so a detached test descendant cannot extend the gate's lock lifetime.
 if ! flock -n "${rest_lock_fd}"; then
-    # SECONDS is a shell-local monotonic elapsed counter. Start the acquisition
-    # budget before diagnostics so a slow holder probe cannot add a second
-    # lock-wait window after the advertised deadline has elapsed.
-    rest_lock_wait_started="${SECONDS}"
+    # Use one subsecond monotonic deadline for diagnostics and acquisition.
+    # `SECONDS` is integer-quantized, so it can charge a subsecond diagnostic
+    # a full second when it crosses a tick boundary.
+    rest_lock_wait_deadline_centiseconds=$((
+        $(monotonic_centiseconds) + REST_GATE_LOCK_TIMEOUT_SECS * 100
+    ))
     echo "rest gate waiting for lock: ${rest_lock_file} (pid=$$)" >&2
     if command -v fuser >/dev/null 2>&1; then
         (
@@ -46,9 +60,13 @@ if ! flock -n "${rest_lock_fd}"; then
             fuser -v "${rest_lock_file}" >&2
         ) || true
     fi
-    rest_lock_wait_elapsed=$((SECONDS - rest_lock_wait_started))
-    rest_lock_wait_remaining=$((REST_GATE_LOCK_TIMEOUT_SECS - rest_lock_wait_elapsed))
-    if ((rest_lock_wait_remaining <= 0)) \
+    rest_lock_wait_remaining_centiseconds=$((
+        rest_lock_wait_deadline_centiseconds - $(monotonic_centiseconds)
+    ))
+    rest_lock_wait_remaining="$(printf '%d.%02d' \
+        "$((rest_lock_wait_remaining_centiseconds / 100))" \
+        "$((rest_lock_wait_remaining_centiseconds % 100))")"
+    if ((rest_lock_wait_remaining_centiseconds <= 0)) \
         || ! flock -w "${rest_lock_wait_remaining}" "${rest_lock_fd}"; then
         echo "rest gate lock timed out after ${REST_GATE_LOCK_TIMEOUT_SECS}s: ${rest_lock_file}" >&2
         exit 75

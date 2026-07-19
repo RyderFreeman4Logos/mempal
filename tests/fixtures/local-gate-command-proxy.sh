@@ -29,7 +29,15 @@ case "${0##*/}" in
         exit 0
         ;;
     fuser)
-        if [[ -n "${REST_GATE_FUSER_READY_FILE:-}" ]]; then
+        if [[ -n "${REST_GATE_FUSER_DELAY_SECS:-}" ]]; then
+            sleep "${REST_GATE_FUSER_DELAY_SECS}"
+            if [[ -n "${REST_GATE_FUSER_ADVANCE_PARENT_SECONDS:-}" ]]; then
+                rest_gate_pid="$(awk '{print $4}' "/proc/${PPID}/stat")"
+                kill -USR1 "${rest_gate_pid}"
+            fi
+            : >"${REST_GATE_FUSER_RELEASED_FILE:?}"
+            : >"${REST_GATE_LOCK_HOLDER_RELEASE_FILE:?}"
+        elif [[ -n "${REST_GATE_FUSER_READY_FILE:-}" ]]; then
             : >"${REST_GATE_FUSER_READY_FILE}"
             while [[ ! -e "${REST_GATE_FUSER_RELEASE_FILE:?}" ]]; do
                 sleep 0.01

@@ -5,6 +5,13 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+#[path = "support/local_gate_child.rs"]
+mod local_gate_child;
+
+#[cfg(unix)]
+use local_gate_child::{GateChild, reap_owned_child};
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -103,7 +110,7 @@ impl LockHolder {
     fn release_and_reap(&mut self) {
         fs::write(&self.release_file, "release\n").expect("release lock holder");
         let child = self.child.take().expect("lock holder already reaped");
-        reap_owned_lock_holder(child).expect("reap released lock holder");
+        reap_owned_child(child).expect("reap released lock holder");
     }
 }
 
@@ -112,50 +119,9 @@ impl Drop for LockHolder {
     fn drop(&mut self) {
         let _ = fs::write(&self.release_file, "release\n");
         if let Some(child) = self.child.take() {
-            let _ = reap_owned_lock_holder(child);
+            let _ = reap_owned_child(child);
         }
     }
-}
-
-#[cfg(unix)]
-fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> io::Result<bool> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait()?.is_some() {
-            return Ok(true);
-        }
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-#[cfg(unix)]
-fn reap_owned_lock_holder(mut child: Child) -> io::Result<()> {
-    if wait_for_child_exit(&mut child, Duration::from_secs(1))? {
-        child.wait_with_output()?;
-        return Ok(());
-    }
-
-    let pid = child.id() as i32;
-    // SAFETY: The child remains owned and unreaped here, so this PID cannot have been reused.
-    unsafe {
-        if libc::kill(pid, libc::SIGTERM) == -1 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error);
-            }
-        }
-    }
-    if wait_for_child_exit(&mut child, Duration::from_millis(250))? {
-        child.wait_with_output()?;
-        return Ok(());
-    }
-
-    let _ = child.kill();
-    child.wait_with_output()?;
-    Ok(())
 }
 
 fn sleeper_pids(timeout_secs: &str) -> Vec<String> {
@@ -470,7 +436,7 @@ fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
     .expect("construct fixture PATH");
 
     let script = repo_root().join("scripts/gates/rest-tests.sh");
-    let gate = spawn_bash_script(
+    let mut gate = GateChild::new(spawn_bash_script(
         &script,
         &[],
         &[
@@ -510,14 +476,16 @@ fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
                     .expect("UTF-8 lock holder release path"),
             ),
         ],
-    );
+    ));
     wait_for_file(
         &fuser_ready_file,
         Duration::from_secs(2),
         "REST lock diagnostic",
     );
     fs::write(&fuser_release_file, "release\n").expect("release REST lock diagnostic");
-    let output = wait_with_timeout(gate, Duration::from_secs(5)).expect("reap REST gate");
+    let output = gate
+        .wait_with_timeout(Duration::from_secs(5))
+        .expect("reap REST gate");
     wait_for_file(
         &fuser_released_file,
         Duration::from_secs(2),
@@ -547,6 +515,80 @@ fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
 
 #[cfg(unix)]
 #[test]
+fn rest_gate_does_not_lose_subsecond_budget_at_a_seconds_tick() {
+    let fixture = tempfile::tempdir().expect("create subsecond lock fixture");
+    let bin_dir = fixture.path().join("bin");
+    fs::create_dir(&bin_dir).expect("create fixture bin directory");
+    symlink_path_command_to_stable_proxy(&bin_dir, "fuser");
+    let target = fixture.path().join("target");
+    fs::create_dir(&target).expect("create isolated target");
+    let target = fs::canonicalize(target).expect("canonical isolated target");
+    let mut lock_file = target.as_os_str().to_os_string();
+    lock_file.push(".lock");
+    let lock_file = PathBuf::from(lock_file);
+    let bash_env_file = fixture.path().join("advance-seconds.sh");
+    // This test-only signal handler simulates the one integer `SECONDS` tick
+    // that the former budget math could over-count during a 0.30s diagnostic.
+    fs::write(&bash_env_file, "trap 'SECONDS=$((SECONDS + 1))' USR1\n")
+        .expect("write SECONDS debug environment");
+    let fuser_released_file = fixture.path().join("fuser-released");
+    let mut lock_holder = LockHolder::spawn(&lock_file, fixture.path());
+    let inherited_path = std::env::var_os("PATH").expect("PATH is set");
+    let path = std::env::join_paths(
+        std::iter::once(bin_dir).chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("construct fixture PATH");
+
+    let script = repo_root().join("scripts/gates/rest-tests.sh");
+    let output = run_bash_script(
+        &script,
+        &[],
+        &[
+            ("PATH", path.to_str().expect("UTF-8 fixture PATH")),
+            ("REST_GATE_DRY_RUN", "1"),
+            ("REST_GATE_LOCK_TIMEOUT_SECS", "1"),
+            ("REST_TEST_TARGETS_PER_BATCH", "999"),
+            (
+                "BASH_ENV",
+                bash_env_file.to_str().expect("UTF-8 Bash environment path"),
+            ),
+            (
+                "REST_GATE_TARGET_DIR",
+                target.to_str().expect("UTF-8 target path"),
+            ),
+            ("REST_GATE_FUSER_DELAY_SECS", "0.30"),
+            ("REST_GATE_FUSER_ADVANCE_PARENT_SECONDS", "1"),
+            (
+                "REST_GATE_FUSER_RELEASED_FILE",
+                fuser_released_file
+                    .to_str()
+                    .expect("UTF-8 fuser release path"),
+            ),
+            (
+                "REST_GATE_LOCK_HOLDER_RELEASE_FILE",
+                lock_holder
+                    .release_file
+                    .to_str()
+                    .expect("UTF-8 lock holder release path"),
+            ),
+        ],
+        Duration::from_secs(5),
+    );
+    lock_holder.release_and_reap();
+
+    assert!(
+        fuser_released_file.exists(),
+        "the diagnostic must release the holder inside the real lock budget"
+    );
+    assert!(
+        output.status.success(),
+        "a subsecond diagnostic that crosses a SECONDS tick must not exhaust a 1s budget: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn rest_gate_fails_with_a_bounded_lock_timeout() {
     let fixture = tempfile::tempdir().expect("create timeout fixture");
     let bin_dir = fixture.path().join("bin");
@@ -569,7 +611,7 @@ fn rest_gate_fails_with_a_bounded_lock_timeout() {
     .expect("construct fixture PATH");
 
     let script = repo_root().join("scripts/gates/rest-tests.sh");
-    let gate = spawn_bash_script(
+    let mut gate = GateChild::new(spawn_bash_script(
         &script,
         &[],
         &[
@@ -605,7 +647,7 @@ fn rest_gate_fails_with_a_bounded_lock_timeout() {
                     .expect("UTF-8 lock holder release path"),
             ),
         ],
-    );
+    ));
     wait_for_file(
         &fuser_ready_file,
         Duration::from_secs(2),
@@ -624,7 +666,9 @@ fn rest_gate_fails_with_a_bounded_lock_timeout() {
         "the holder must outlive a full advertised lock budget"
     );
     fs::write(&fuser_release_file, "release\n").expect("release blocked REST lock diagnostic");
-    let output = wait_with_timeout(gate, Duration::from_secs(5)).expect("reap REST gate");
+    let output = gate
+        .wait_with_timeout(Duration::from_secs(5))
+        .expect("reap REST gate");
     wait_for_file(
         &fuser_released_file,
         Duration::from_secs(2),
