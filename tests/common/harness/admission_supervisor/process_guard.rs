@@ -1,7 +1,6 @@
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use super::ProcessIdentity;
+use super::{DeadlineChild, ProcessIdentity, SpawnSpec};
 
 #[derive(Debug)]
 pub(crate) struct ExactProcessGuard {
@@ -58,22 +57,22 @@ fn read_start_time(pid: libc::pid_t) -> u64 {
 
 #[test]
 fn identity_revocation_after_observation_never_yields_a_bare_signal_target() {
-    let mut fixture = Command::new("/bin/sleep")
-        .arg("30")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn direct fixture");
-    let identity = process_identity(fixture.id() as libc::pid_t);
+    let mut spec = SpawnSpec::new("/bin/sleep").expect("absolute sleep executable");
+    spec.arg("30");
+    let mut fixture =
+        DeadlineChild::spawn(spec, Duration::from_secs(2)).expect("spawn supervised fixture");
+    let identity = fixture.identity();
     assert!(
         identity.still_refers_to_original_process(),
         "fixture must be observable before revocation"
     );
 
     let target = ExactProcessGuard::fallback_target_after_observation(identity, || {
-        fixture.kill().expect("terminate owned fixture");
-        fixture.wait().expect("reap owned fixture");
+        let cleanup = fixture
+            .force_kill_with_timeout(Duration::from_secs(2))
+            .expect_complete("fence and reap owned fixture");
+        assert!(cleanup.kill_fence_sent);
+        assert!(cleanup.errors.is_empty(), "{cleanup:#?}");
         assert!(
             !identity.still_refers_to_original_process(),
             "fixture identity must be revoked before a signal target can be used"
