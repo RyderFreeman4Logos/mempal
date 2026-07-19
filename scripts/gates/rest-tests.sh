@@ -35,6 +35,10 @@ exec {rest_lock_fd}>"${rest_lock_file}"
 # The top-level shell owns this descriptor. Every non-lock child closes its
 # copy so a detached test descendant cannot extend the gate's lock lifetime.
 if ! flock -n "${rest_lock_fd}"; then
+    # SECONDS is a shell-local monotonic elapsed counter. Start the acquisition
+    # budget before diagnostics so a slow holder probe cannot add a second
+    # lock-wait window after the advertised deadline has elapsed.
+    rest_lock_wait_started="${SECONDS}"
     echo "rest gate waiting for lock: ${rest_lock_file} (pid=$$)" >&2
     if command -v fuser >/dev/null 2>&1; then
         (
@@ -42,7 +46,10 @@ if ! flock -n "${rest_lock_fd}"; then
             fuser -v "${rest_lock_file}" >&2
         ) || true
     fi
-    if ! flock -w "${REST_GATE_LOCK_TIMEOUT_SECS}" "${rest_lock_fd}"; then
+    rest_lock_wait_elapsed=$((SECONDS - rest_lock_wait_started))
+    rest_lock_wait_remaining=$((REST_GATE_LOCK_TIMEOUT_SECS - rest_lock_wait_elapsed))
+    if ((rest_lock_wait_remaining <= 0)) \
+        || ! flock -w "${rest_lock_wait_remaining}" "${rest_lock_fd}"; then
         echo "rest gate lock timed out after ${REST_GATE_LOCK_TIMEOUT_SECS}s: ${rest_lock_file}" >&2
         exit 75
     fi

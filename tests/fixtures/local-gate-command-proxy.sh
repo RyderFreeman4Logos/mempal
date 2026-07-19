@@ -28,6 +28,17 @@ case "${0##*/}" in
         fi
         exit 0
         ;;
+    fuser)
+        if [[ -n "${REST_GATE_FUSER_READY_FILE:-}" ]]; then
+            : >"${REST_GATE_FUSER_READY_FILE}"
+            while [[ ! -e "${REST_GATE_FUSER_RELEASE_FILE:?}" ]]; do
+                sleep 0.01
+            done
+            : >"${REST_GATE_FUSER_RELEASED_FILE:?}"
+            : >"${REST_GATE_LOCK_HOLDER_RELEASE_FILE:?}"
+        fi
+        exit 0
+        ;;
     csa)
         printf '%s\n' "$*" >>"${REVIEW_CHECK_FIXTURE_LOG:?}"
         exit 42

@@ -34,6 +34,11 @@ fn run_bash_script(
     envs: &[(&str, &str)],
     timeout: Duration,
 ) -> Output {
+    let child = spawn_bash_script(script, args, envs);
+    wait_with_timeout(child, timeout).expect("wait for bash script")
+}
+
+fn spawn_bash_script(script: &Path, args: &[&str], envs: &[(&str, &str)]) -> Child {
     let mut command = Command::new("/bin/bash");
     command
         .arg(script)
@@ -44,8 +49,113 @@ fn run_bash_script(
     for (key, value) in envs {
         command.env(key, value);
     }
-    let child = command.spawn().expect("spawn bash script");
-    wait_with_timeout(child, timeout).expect("wait for bash script")
+    command.spawn().expect("spawn bash script")
+}
+
+fn wait_for_file(path: &Path, timeout: Duration, description: &str) {
+    let deadline = Instant::now() + timeout;
+    while !path.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(path.exists(), "{description} did not become ready");
+}
+
+#[cfg(unix)]
+struct LockHolder {
+    child: Option<Child>,
+    release_file: PathBuf,
+}
+
+#[cfg(unix)]
+impl LockHolder {
+    fn spawn(lock_file: &Path, fixture_root: &Path) -> Self {
+        let ready_file = fixture_root.join("lock-holder-ready");
+        let release_file = fixture_root.join("lock-holder-release");
+        let child = Command::new("/bin/bash")
+            .args([
+                "-c",
+                r#"
+                    exec {lock_fd}>"${LOCK_FILE:?}"
+                    flock "${lock_fd}"
+                    : >"${LOCK_READY_FILE:?}"
+                    while [[ ! -e "${LOCK_RELEASE_FILE:?}" ]]; do
+                        sleep 0.01
+                    done
+                "#,
+            ])
+            .env("LOCK_FILE", lock_file)
+            .env("LOCK_READY_FILE", &ready_file)
+            .env("LOCK_RELEASE_FILE", &release_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn coordinated lock holder");
+        let holder = Self {
+            child: Some(child),
+            release_file,
+        };
+        wait_for_file(&ready_file, Duration::from_secs(2), "lock holder");
+
+        holder
+    }
+
+    fn release_and_reap(&mut self) {
+        fs::write(&self.release_file, "release\n").expect("release lock holder");
+        let child = self.child.take().expect("lock holder already reaped");
+        reap_owned_lock_holder(child).expect("reap released lock holder");
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LockHolder {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.release_file, "release\n");
+        if let Some(child) = self.child.take() {
+            let _ = reap_owned_lock_holder(child);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn reap_owned_lock_holder(mut child: Child) -> io::Result<()> {
+    if wait_for_child_exit(&mut child, Duration::from_secs(1))? {
+        child.wait_with_output()?;
+        return Ok(());
+    }
+
+    let pid = child.id() as i32;
+    // SAFETY: The child remains owned and unreaped here, so this PID cannot have been reused.
+    unsafe {
+        if libc::kill(pid, libc::SIGTERM) == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+    }
+    if wait_for_child_exit(&mut child, Duration::from_millis(250))? {
+        child.wait_with_output()?;
+        return Ok(());
+    }
+
+    let _ = child.kill();
+    child.wait_with_output()?;
+    Ok(())
 }
 
 fn sleeper_pids(timeout_secs: &str) -> Vec<String> {
@@ -335,9 +445,13 @@ fn rest_gate_children_cannot_retain_the_parent_lock() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
     let fixture = tempfile::tempdir().expect("create lock fixture");
+    let bin_dir = fixture.path().join("bin");
+    fs::create_dir(&bin_dir).expect("create fixture bin directory");
+    symlink_path_command_to_stable_proxy(&bin_dir, "fuser");
     let target = fixture.path().join("target");
     fs::create_dir(&target).expect("create isolated target");
     let target = fs::canonicalize(target).expect("canonical isolated target");
@@ -345,24 +459,22 @@ fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
     lock_file.push(".lock");
     let lock_file = PathBuf::from(lock_file);
     let unsafe_override = fixture.path().join("different.lock");
-    let ready_file = fixture.path().join("lock-ready");
-    let lock_holder = Command::new("flock")
-        .arg(&lock_file)
-        .args(["/bin/bash", "-c", "touch \"$LOCK_READY\"; sleep 1"])
-        .env("LOCK_READY", &ready_file)
-        .spawn()
-        .expect("spawn lock holder");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !ready_file.exists() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(25));
-    }
-    assert!(ready_file.exists(), "lock holder did not become ready");
+    let fuser_ready_file = fixture.path().join("fuser-ready");
+    let fuser_release_file = fixture.path().join("fuser-release");
+    let fuser_released_file = fixture.path().join("fuser-released");
+    let mut lock_holder = LockHolder::spawn(&lock_file, fixture.path());
+    let inherited_path = std::env::var_os("PATH").expect("PATH is set");
+    let path = std::env::join_paths(
+        std::iter::once(bin_dir).chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("construct fixture PATH");
 
     let script = repo_root().join("scripts/gates/rest-tests.sh");
-    let output = run_bash_script(
+    let gate = spawn_bash_script(
         &script,
         &[],
         &[
+            ("PATH", path.to_str().expect("UTF-8 fixture PATH")),
             ("REST_GATE_DRY_RUN", "1"),
             ("REST_GATE_LOCK_TIMEOUT_SECS", "3"),
             (
@@ -374,10 +486,44 @@ fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
                 target.to_str().expect("UTF-8 target path"),
             ),
             ("REST_TEST_TARGETS_PER_BATCH", "999"),
+            (
+                "REST_GATE_FUSER_READY_FILE",
+                fuser_ready_file.to_str().expect("UTF-8 fuser ready path"),
+            ),
+            (
+                "REST_GATE_FUSER_RELEASE_FILE",
+                fuser_release_file
+                    .to_str()
+                    .expect("UTF-8 fuser release path"),
+            ),
+            (
+                "REST_GATE_FUSER_RELEASED_FILE",
+                fuser_released_file
+                    .to_str()
+                    .expect("UTF-8 fuser released path"),
+            ),
+            (
+                "REST_GATE_LOCK_HOLDER_RELEASE_FILE",
+                lock_holder
+                    .release_file
+                    .to_str()
+                    .expect("UTF-8 lock holder release path"),
+            ),
         ],
-        Duration::from_secs(10),
     );
-    wait_with_timeout(lock_holder, Duration::from_secs(3)).expect("reap lock holder");
+    wait_for_file(
+        &fuser_ready_file,
+        Duration::from_secs(2),
+        "REST lock diagnostic",
+    );
+    fs::write(&fuser_release_file, "release\n").expect("release REST lock diagnostic");
+    let output = wait_with_timeout(gate, Duration::from_secs(5)).expect("reap REST gate");
+    wait_for_file(
+        &fuser_released_file,
+        Duration::from_secs(2),
+        "REST lock diagnostic release",
+    );
+    lock_holder.release_and_reap();
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -399,33 +545,35 @@ fn rest_gate_reports_when_another_rest_gate_holds_the_lock() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn rest_gate_fails_with_a_bounded_lock_timeout() {
     let fixture = tempfile::tempdir().expect("create timeout fixture");
+    let bin_dir = fixture.path().join("bin");
+    fs::create_dir(&bin_dir).expect("create fixture bin directory");
+    symlink_path_command_to_stable_proxy(&bin_dir, "fuser");
     let target = fixture.path().join("target");
     fs::create_dir(&target).expect("create isolated target");
     let target = fs::canonicalize(target).expect("canonical isolated target");
     let mut lock_file = target.as_os_str().to_os_string();
     lock_file.push(".lock");
     let lock_file = PathBuf::from(lock_file);
-    let ready_file = fixture.path().join("lock-ready");
-    let lock_holder = Command::new("flock")
-        .arg(&lock_file)
-        .args(["/bin/bash", "-c", "touch \"$LOCK_READY\"; sleep 3"])
-        .env("LOCK_READY", &ready_file)
-        .spawn()
-        .expect("spawn lock holder");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !ready_file.exists() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(25));
-    }
-    assert!(ready_file.exists(), "lock holder did not become ready");
+    let fuser_ready_file = fixture.path().join("fuser-ready");
+    let fuser_release_file = fixture.path().join("fuser-release");
+    let fuser_released_file = fixture.path().join("fuser-released");
+    let mut lock_holder = LockHolder::spawn(&lock_file, fixture.path());
+    let inherited_path = std::env::var_os("PATH").expect("PATH is set");
+    let path = std::env::join_paths(
+        std::iter::once(bin_dir).chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("construct fixture PATH");
 
     let script = repo_root().join("scripts/gates/rest-tests.sh");
-    let output = run_bash_script(
+    let gate = spawn_bash_script(
         &script,
         &[],
         &[
+            ("PATH", path.to_str().expect("UTF-8 fixture PATH")),
             ("REST_GATE_DRY_RUN", "1"),
             ("REST_GATE_LOCK_TIMEOUT_SECS", "1"),
             (
@@ -433,10 +581,56 @@ fn rest_gate_fails_with_a_bounded_lock_timeout() {
                 target.to_str().expect("UTF-8 target path"),
             ),
             ("REST_TEST_TARGETS_PER_BATCH", "999"),
+            (
+                "REST_GATE_FUSER_READY_FILE",
+                fuser_ready_file.to_str().expect("UTF-8 fuser ready path"),
+            ),
+            (
+                "REST_GATE_FUSER_RELEASE_FILE",
+                fuser_release_file
+                    .to_str()
+                    .expect("UTF-8 fuser release path"),
+            ),
+            (
+                "REST_GATE_FUSER_RELEASED_FILE",
+                fuser_released_file
+                    .to_str()
+                    .expect("UTF-8 fuser released path"),
+            ),
+            (
+                "REST_GATE_LOCK_HOLDER_RELEASE_FILE",
+                lock_holder
+                    .release_file
+                    .to_str()
+                    .expect("UTF-8 lock holder release path"),
+            ),
         ],
-        Duration::from_secs(5),
     );
-    wait_with_timeout(lock_holder, Duration::from_secs(5)).expect("reap lock holder");
+    wait_for_file(
+        &fuser_ready_file,
+        Duration::from_secs(2),
+        "blocked REST lock diagnostic",
+    );
+
+    let budget_probe = Command::new("flock")
+        .args(["-w", "1"])
+        .arg(&lock_file)
+        .arg("true")
+        .status()
+        .expect("run REST lock deadline probe");
+    assert_eq!(
+        budget_probe.code(),
+        Some(1),
+        "the holder must outlive a full advertised lock budget"
+    );
+    fs::write(&fuser_release_file, "release\n").expect("release blocked REST lock diagnostic");
+    let output = wait_with_timeout(gate, Duration::from_secs(5)).expect("reap REST gate");
+    wait_for_file(
+        &fuser_released_file,
+        Duration::from_secs(2),
+        "blocked REST lock diagnostic release",
+    );
+    lock_holder.release_and_reap();
 
     assert_eq!(output.status.code(), Some(75));
     let stderr = String::from_utf8_lossy(&output.stderr);
