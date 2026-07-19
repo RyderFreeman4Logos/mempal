@@ -31,6 +31,8 @@ case "${0##*/}" in
             while [[ ! -s "${HOLDER_PID_FILE}" || ! -e "${HOLDER_READY_FILE}" ]]; do
                 sleep 0.01
             done
+            # Let GateChild's descendant monitor retain the holder identity before this leader exits.
+            sleep 0.2
             kill -TERM "$$"
         fi
         exit 0

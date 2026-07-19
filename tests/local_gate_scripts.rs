@@ -13,7 +13,9 @@ mod local_gate_child;
 mod local_gate_pid_safety;
 
 #[cfg(unix)]
-use local_gate_child::{GateChild, OwnedGateChild, reap_owned_child, spawn_in_own_session};
+use local_gate_child::{
+    GateChild, OwnedGateChild, capture_recorded_process, reap_owned_child, spawn_in_own_session,
+};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -377,6 +379,20 @@ fn rest_gate_children_cannot_retain_the_parent_lock() {
         fs::read_to_string(&holder_lock_state_file).expect("read holder lock state"),
         "closed\n",
         "the simulated Cargo descendant must not inherit the REST lock descriptor"
+    );
+    let holder_survived = capture_recorded_process(holder_identity)
+        .expect("re-verify recorded holder identity after gate cleanup")
+        .is_some();
+    if let Some(holder) = capture_recorded_process(holder_identity)
+        .expect("capture the recorded holder only when its identity still matches")
+    {
+        holder
+            .send_signal(libc::SIGKILL)
+            .expect("pidfd-safe fallback cleanup for a leaked recorded holder");
+    }
+    assert!(
+        !holder_survived,
+        "the recorded descriptor holder must terminate with the gate process tree"
     );
 
     let second = run_bash_script(

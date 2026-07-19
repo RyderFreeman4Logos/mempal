@@ -7,6 +7,7 @@ use super::*;
 pub(crate) struct OwnedGateChild {
     child: Child,
     first_cleanup_error: Option<io::Error>,
+    cleanup_deadline: Option<Instant>,
 }
 
 impl OwnedGateChild {
@@ -14,6 +15,7 @@ impl OwnedGateChild {
         Self {
             child,
             first_cleanup_error: None,
+            cleanup_deadline: None,
         }
     }
 
@@ -35,7 +37,11 @@ impl OwnedGateChild {
         self.first_cleanup_error.take()
     }
 
-    pub(super) fn ensure_direct_child_cleanup(&mut self) {
+    pub(super) fn ensure_direct_child_cleanup(&mut self, deadline: Instant) {
+        self.cleanup_deadline = Some(
+            self.cleanup_deadline
+                .map_or(deadline, |existing| existing.min(deadline)),
+        );
         let mut first_error = None;
         let mut record = |error: io::Error| {
             if first_error.is_none() {
@@ -65,7 +71,7 @@ impl OwnedGateChild {
             {
                 record(error);
             }
-            match wait_for_child_exit(&mut self.child, PROCESS_GROUP_KILL_TIMEOUT) {
+            match wait_for_child_exit_until(&mut self.child, deadline) {
                 Ok(true) => {}
                 Ok(false) => record(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -83,7 +89,7 @@ impl OwnedGateChild {
 
 impl Drop for OwnedGateChild {
     fn drop(&mut self) {
-        self.ensure_direct_child_cleanup();
+        self.ensure_direct_child_cleanup(self.cleanup_deadline.unwrap_or_else(cleanup_deadline));
     }
 }
 

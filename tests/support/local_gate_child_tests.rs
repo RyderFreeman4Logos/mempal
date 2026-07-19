@@ -66,6 +66,7 @@ mod tests {
                     ' &
                     if [[ "${EXIT_AFTER_READY:?}" == "1" ]]; then
                         while [[ ! -e "${READY_FILE:?}" ]]; do /bin/sleep 0.01; done
+                        /bin/sleep 0.2
                         exit 0
                     fi
                     while true; do /bin/sleep 0.01; done
@@ -415,7 +416,11 @@ mod tests {
                 .expect("pipe reader remains visible for fallback recheck"),
             pipe_targets,
         );
-        signal_tracked_processes(&[fallback], libc::SIGTERM)
+        signal_tracked_processes(
+            &[fallback],
+            libc::SIGTERM,
+            Instant::now() + Duration::from_secs(1),
+        )
             .expect("recheck a pipe fallback before signaling");
         let reader_was_tracked = gate
             .tracked_processes
@@ -450,7 +455,12 @@ mod tests {
             spawn_setsid_escape_after_release(&release_file, &ready_file, &pid_file);
         let root = capture_owned_child(child.child()).expect("capture release-coordinated root");
         let mut tracked_processes = Vec::new();
-        refresh_owned_processes(child.child(), &root, &mut tracked_processes)
+        refresh_owned_processes(
+            child.child(),
+            &root,
+            &mut tracked_processes,
+            Instant::now() + Duration::from_secs(1),
+        )
             .expect("initial discovery before escape creation");
 
         fs::write(&release_file, "release\n").expect("release escaped descendant creation");
@@ -466,7 +476,12 @@ mod tests {
             "leader did not exit after creating its escaped descendant"
         );
 
-        refresh_after_leader_reap(child.child_mut(), &root, &mut tracked_processes)
+        refresh_after_leader_reap(
+            child.child_mut(),
+            &root,
+            &mut tracked_processes,
+            Instant::now() + Duration::from_secs(1),
+        )
             .expect("rediscover pipe descendants after leader reaping");
         let escaped_was_rediscovered = tracked_processes
             .iter()
@@ -515,7 +530,7 @@ mod tests {
         )
         .expect("worker-thread child PID fits i32");
 
-        let descendants = capture_live_children(parent.identity)
+        let descendants = capture_live_children(parent.identity, Instant::now() + Duration::from_secs(1))
             .expect("enumerate children across every parent task");
         release_sender
             .send(())
@@ -669,23 +684,27 @@ mod tests {
         let fixture = tempfile::tempdir().expect("create exited-leader fixture");
         let ready_file = fixture.path().join("ready");
         let pid_file = fixture.path().join("pid");
-        let mut child = spawn_setsid_pipe_holding_child(&ready_file, &pid_file, true);
+        let mut gate = GateChild::new(spawn_setsid_pipe_holding_child(
+            &ready_file,
+            &pid_file,
+            true,
+        ))
+        .expect("capture exited leader identity");
         wait_for_file(
             &ready_file,
             Duration::from_secs(2),
             "setsid pipe-holder fixture",
         );
         let escaped = process_identity_from_pid_file(&pid_file);
-        let root = capture_owned_child(child.child()).expect("capture exited leader identity");
         assert!(
-            wait_for_child_exit(child.child_mut(), Duration::from_secs(2))
+            wait_for_child_exit(gate.child.child_mut(), Duration::from_secs(2))
                 .expect("wait for exited leader"),
             "the fixture leader did not exit"
         );
 
         let started = Instant::now();
-        let mut tracked_processes = Vec::new();
-        let output = terminate_and_collect(&mut child, &root, &mut tracked_processes)
+        let output = gate
+            .wait_with_timeout(Duration::from_millis(50))
             .expect("reap exited leader and escaped descendant");
 
         assert!(
