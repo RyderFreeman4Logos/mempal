@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -9,7 +9,11 @@ use std::time::{Duration, Instant};
 mod local_gate_child;
 
 #[cfg(unix)]
-use local_gate_child::{GateChild, reap_owned_child, spawn_in_own_session};
+#[path = "support/local_gate_pid_safety.rs"]
+mod local_gate_pid_safety;
+
+#[cfg(unix)]
+use local_gate_child::{GateChild, OwnedGateChild, reap_owned_child, spawn_in_own_session};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -27,7 +31,7 @@ fn run_bash_script(
         .expect("wait for bash script")
 }
 
-fn spawn_bash_script(script: &Path, args: &[&str], envs: &[(&str, &str)]) -> Child {
+fn spawn_bash_script(script: &Path, args: &[&str], envs: &[(&str, &str)]) -> OwnedGateChild {
     let mut command = Command::new("/bin/bash");
     command
         .arg(script)
@@ -51,7 +55,7 @@ fn wait_for_file(path: &Path, timeout: Duration, description: &str) {
 
 #[cfg(unix)]
 struct LockHolder {
-    child: Option<Child>,
+    child: Option<OwnedGateChild>,
     release_file: PathBuf,
 }
 
@@ -103,29 +107,6 @@ impl Drop for LockHolder {
         if let Some(child) = self.child.take() {
             let _ = reap_owned_child(child);
         }
-    }
-}
-
-fn sleeper_pids(timeout_secs: &str) -> Vec<String> {
-    let ps = Command::new("ps")
-        .args(["-eo", "pid=,args="])
-        .output()
-        .expect("run ps");
-    let stdout = String::from_utf8_lossy(&ps.stdout);
-    let expected = format!("sleep {timeout_secs}");
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            let (pid, args) = trimmed.split_once(' ')?;
-            (args.trim() == expected).then(|| pid.to_string())
-        })
-        .collect()
-}
-
-fn kill_pids(pids: &[String]) {
-    for pid in pids {
-        let _ = Command::new("kill").arg(pid).status();
     }
 }
 
@@ -185,7 +166,10 @@ fn cargo_test_wrapper_times_out_and_reports_process_context() {
 #[test]
 fn cargo_test_wrapper_success_does_not_leave_timeout_sleeper() {
     let script = repo_root().join("scripts/gates/cargo-test-with-timeout.sh");
-    kill_pids(&sleeper_pids("313"));
+    let timeout_secs = format!("9{}", std::process::id());
+    local_gate_pid_safety::terminate_recorded_processes(&local_gate_pid_safety::sleeper_processes(
+        &timeout_secs,
+    ));
 
     let status = Command::new("timeout")
         .arg("3s")
@@ -193,15 +177,15 @@ fn cargo_test_wrapper_success_does_not_leave_timeout_sleeper() {
         .arg(&script)
         .args(["/bin/bash", "-c", "true"])
         .current_dir(repo_root())
-        .env("MEMPAL_CARGO_TEST_TIMEOUT_SECS", "313")
+        .env("MEMPAL_CARGO_TEST_TIMEOUT_SECS", &timeout_secs)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .expect("run wrapper through timeout");
 
     assert!(status.success());
-    let leaked = sleeper_pids("313");
-    kill_pids(&leaked);
+    let leaked = local_gate_pid_safety::sleeper_processes(&timeout_secs);
+    local_gate_pid_safety::terminate_recorded_processes(&leaked);
     assert!(
         leaked.is_empty(),
         "timeout sleeper leaked after successful wrapper run: {leaked:?}"
@@ -329,7 +313,11 @@ fn rest_gate_children_cannot_retain_the_parent_lock() {
     let target = fixture.path().join("target");
     let triggered_file = fixture.path().join("cargo-triggered");
     let holder_pid_file = fixture.path().join("holder.pid");
+    let holder_lock_state_file = fixture.path().join("holder-lock-state");
     let holder_ready_file = fixture.path().join("holder-ready");
+    let mut lock_file = target.as_os_str().to_os_string();
+    lock_file.push(".lock");
+    let lock_file = PathBuf::from(lock_file);
     let path = format!(
         "{}:{}",
         bin_dir.display(),
@@ -357,6 +345,16 @@ fn rest_gate_children_cannot_retain_the_parent_lock() {
                 "HOLDER_READY_FILE",
                 holder_ready_file.to_str().expect("UTF-8 holder ready path"),
             ),
+            (
+                "HOLDER_LOCK_FILE",
+                lock_file.to_str().expect("UTF-8 lock file path"),
+            ),
+            (
+                "HOLDER_LOCK_STATE_FILE",
+                holder_lock_state_file
+                    .to_str()
+                    .expect("UTF-8 holder lock state path"),
+            ),
         ],
         Duration::from_secs(10),
     );
@@ -367,6 +365,18 @@ fn rest_gate_children_cannot_retain_the_parent_lock() {
     assert!(
         holder_ready_file.exists(),
         "descriptor holder did not start"
+    );
+    let holder_identity = local_gate_pid_safety::recorded_process_identity(
+        &fs::read_to_string(&holder_pid_file).expect("read holder process identity"),
+    );
+    assert!(
+        holder_identity.pid > 0 && holder_identity.start_time_ticks > 0,
+        "holder fixture must record a complete PID identity"
+    );
+    assert_eq!(
+        fs::read_to_string(&holder_lock_state_file).expect("read holder lock state"),
+        "closed\n",
+        "the simulated Cargo descendant must not inherit the REST lock descriptor"
     );
 
     let second = run_bash_script(
@@ -384,8 +394,6 @@ fn rest_gate_children_cannot_retain_the_parent_lock() {
         Duration::from_secs(5),
     );
 
-    let holder_pid = fs::read_to_string(&holder_pid_file).expect("read holder pid");
-    kill_pids(&[holder_pid.trim().to_string()]);
     assert!(
         second.status.success(),
         "detached child retained REST lock: stderr={}",

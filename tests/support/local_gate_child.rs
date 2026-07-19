@@ -41,6 +41,15 @@ struct ProcessHandle {
     pidfd: Option<OwnedFd>,
 }
 
+#[path = "local_gate_direct_child.rs"]
+mod local_gate_direct_child;
+pub(crate) use local_gate_direct_child::OwnedGateChild;
+use local_gate_direct_child::{CleanupDiagnostics, capture_owned_child, timeout_error};
+
+#[path = "local_gate_recorded_process.rs"]
+mod local_gate_recorded_process;
+pub(crate) use local_gate_recorded_process::{RecordedProcessIdentity, capture_recorded_process};
+
 enum TrackedProcessSource {
     Descendant,
     PipeFallback { pipe_targets: Vec<PathBuf> },
@@ -145,12 +154,12 @@ impl ProcessHandle {
 }
 
 pub(crate) struct GateChild {
-    child: Option<Child>,
+    child: OwnedGateChild,
     root: ProcessHandle,
     tracked_processes: Vec<TrackedProcess>,
 }
 
-pub(crate) fn spawn_in_own_session(command: &mut Command) -> io::Result<Child> {
+pub(crate) fn spawn_in_own_session(command: &mut Command) -> io::Result<OwnedGateChild> {
     // SAFETY: The post-fork closure invokes only async-signal-safe `setsid` before exec.
     unsafe {
         command.pre_exec(|| {
@@ -160,14 +169,27 @@ pub(crate) fn spawn_in_own_session(command: &mut Command) -> io::Result<Child> {
             Ok(())
         });
     }
-    command.spawn()
+    command.spawn().map(OwnedGateChild::new)
 }
 
 impl GateChild {
-    pub(crate) fn new(child: Child) -> io::Result<Self> {
-        let root = capture_owned_child(&child)?;
+    pub(crate) fn new(child: OwnedGateChild) -> io::Result<Self> {
+        let root = capture_owned_child(child.child())?;
         Ok(Self {
-            child: Some(child),
+            child,
+            root,
+            tracked_processes: Vec::new(),
+        })
+    }
+
+    #[cfg(test)]
+    fn new_with_capture_for_test(
+        child: OwnedGateChild,
+        capture: impl FnOnce(&Child) -> io::Result<ProcessHandle>,
+    ) -> io::Result<Self> {
+        let root = capture(child.child())?;
+        Ok(Self {
+            child,
             root,
             tracked_processes: Vec::new(),
         })
@@ -177,15 +199,10 @@ impl GateChild {
         let deadline = Instant::now() + timeout;
         loop {
             self.refresh_tracked_processes()?;
-            let exited = self
-                .child
-                .as_mut()
-                .expect("gate child already reaped")
-                .try_wait()?
-                .is_some();
+            let exited = self.child.child_mut().try_wait()?.is_some();
             if exited {
                 return terminate_and_collect(
-                    self.child.take().expect("gate child already reaped"),
+                    &mut self.child,
                     &self.root,
                     &mut self.tracked_processes,
                 );
@@ -193,11 +210,7 @@ impl GateChild {
             if Instant::now() >= deadline {
                 return timeout_error(
                     timeout,
-                    terminate_and_collect(
-                        self.child.take().expect("gate child already reaped"),
-                        &self.root,
-                        &mut self.tracked_processes,
-                    ),
+                    terminate_and_collect(&mut self.child, &self.root, &mut self.tracked_processes),
                 );
             }
             thread::sleep(Duration::from_millis(25));
@@ -205,49 +218,50 @@ impl GateChild {
     }
 
     fn refresh_tracked_processes(&mut self) -> io::Result<()> {
-        let child = self.child.as_ref().expect("gate child already reaped");
-        refresh_owned_processes(child, &self.root, &mut self.tracked_processes)
+        refresh_owned_processes(self.child.child(), &self.root, &mut self.tracked_processes)
     }
 }
 
 impl Drop for GateChild {
     fn drop(&mut self) {
-        if let Some(child) = self.child.take() {
-            let _ = terminate_and_collect(child, &self.root, &mut self.tracked_processes);
-        }
+        let _ = terminate_and_collect(&mut self.child, &self.root, &mut self.tracked_processes);
     }
 }
 
-pub(crate) fn reap_owned_child(child: Child) -> io::Result<()> {
-    let root = capture_owned_child(&child)?;
+pub(crate) fn reap_owned_child(mut child: OwnedGateChild) -> io::Result<()> {
+    let root = capture_owned_child(child.child())?;
     let mut tracked_processes = Vec::new();
-    terminate_and_collect(child, &root, &mut tracked_processes).map(|_| ())
-}
-
-fn timeout_error(timeout: Duration, cleanup: io::Result<Output>) -> io::Result<Output> {
-    match cleanup {
-        Ok(output) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "child did not exit within {timeout:?}; stdout={}, stderr={}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        )),
-        Err(error) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("child did not exit within {timeout:?}; cleanup failed: {error}"),
-        )),
-    }
+    terminate_and_collect(&mut child, &root, &mut tracked_processes).map(|_| ())
 }
 
 fn terminate_and_collect(
-    mut child: Child,
+    child: &mut OwnedGateChild,
     root: &ProcessHandle,
     tracked_processes: &mut Vec<TrackedProcess>,
 ) -> io::Result<Output> {
-    terminate_owned_process_tree(&mut child, root, tracked_processes)?;
-    collect_bounded_output(&mut child)
+    let mut diagnostics = CleanupDiagnostics::default();
+    if let Err(error) = terminate_owned_process_tree(child.child_mut(), root, tracked_processes) {
+        diagnostics.record(error);
+    }
+    let output = match collect_bounded_output(child.child_mut()) {
+        Ok(output) => Some(output),
+        Err(error) => {
+            diagnostics.record(error);
+            None
+        }
+    };
+
+    if diagnostics.has_error() {
+        child.ensure_direct_child_cleanup();
+        if let Some(error) = child.take_cleanup_error() {
+            diagnostics.record(error);
+        }
+        return Err(diagnostics
+            .into_error()
+            .expect("cleanup diagnostic is present"));
+    }
+
+    Ok(output.expect("output collection succeeds without cleanup diagnostics"))
 }
 
 fn terminate_owned_process_tree(
@@ -255,64 +269,63 @@ fn terminate_owned_process_tree(
     root: &ProcessHandle,
     tracked_processes: &mut Vec<TrackedProcess>,
 ) -> io::Result<()> {
-    refresh_owned_processes(child, root, tracked_processes)?;
-    let mut child_exited = refresh_after_leader_reap(child, root, tracked_processes)?;
+    let mut diagnostics = CleanupDiagnostics::default();
+    let _ = diagnostics.capture(refresh_owned_processes(child, root, tracked_processes));
+    let mut child_exited = diagnostics
+        .capture(refresh_after_leader_reap(child, root, tracked_processes))
+        .unwrap_or(false);
     if !child_exited {
-        signal_root_process_tree(root, libc::SIGTERM)?;
+        let _ = diagnostics.capture(signal_root_process_tree(root, libc::SIGTERM));
     }
-    signal_tracked_processes(tracked_processes, libc::SIGTERM)?;
+    let _ = diagnostics.capture(signal_tracked_processes(tracked_processes, libc::SIGTERM));
     if !child_exited {
-        child_exited = wait_for_child_exit(child, PROCESS_GROUP_TERM_TIMEOUT)?;
+        child_exited = diagnostics
+            .capture(wait_for_child_exit(child, PROCESS_GROUP_TERM_TIMEOUT))
+            .unwrap_or(false);
         if child_exited {
-            refresh_owned_processes(child, root, tracked_processes)?;
+            let _ = diagnostics.capture(refresh_owned_processes(child, root, tracked_processes));
         }
     }
     if child_exited
-        && wait_for_tracked_processes_exit(tracked_processes, PROCESS_GROUP_TERM_TIMEOUT)?
+        && diagnostics
+            .capture(wait_for_tracked_processes_exit(
+                tracked_processes,
+                PROCESS_GROUP_TERM_TIMEOUT,
+            ))
+            .unwrap_or(false)
     {
-        return Ok(());
+        return diagnostics.finish();
     }
 
-    refresh_owned_processes(child, root, tracked_processes)?;
+    let _ = diagnostics.capture(refresh_owned_processes(child, root, tracked_processes));
     if !child_exited {
-        signal_root_process_tree(root, libc::SIGKILL)?;
+        let _ = diagnostics.capture(signal_root_process_tree(root, libc::SIGKILL));
     }
-    signal_tracked_processes(tracked_processes, libc::SIGKILL)?;
+    let _ = diagnostics.capture(signal_tracked_processes(tracked_processes, libc::SIGKILL));
     if !child_exited {
-        child_exited = wait_for_child_exit(child, PROCESS_GROUP_KILL_TIMEOUT)?;
+        child_exited = diagnostics
+            .capture(wait_for_child_exit(child, PROCESS_GROUP_KILL_TIMEOUT))
+            .unwrap_or(false);
         if child_exited {
-            refresh_owned_processes(child, root, tracked_processes)?;
+            let _ = diagnostics.capture(refresh_owned_processes(child, root, tracked_processes));
         }
     }
     if child_exited
-        && wait_for_tracked_processes_exit(tracked_processes, PROCESS_GROUP_KILL_TIMEOUT)?
+        && diagnostics
+            .capture(wait_for_tracked_processes_exit(
+                tracked_processes,
+                PROCESS_GROUP_KILL_TIMEOUT,
+            ))
+            .unwrap_or(false)
     {
-        return Ok(());
+        return diagnostics.finish();
     }
 
-    Err(io::Error::new(
+    diagnostics.record(io::Error::new(
         io::ErrorKind::TimedOut,
         "owned gate process tree did not exit after SIGKILL",
-    ))
-}
-
-fn owned_child_pid(child: &Child) -> io::Result<i32> {
-    i32::try_from(child.id()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "owned gate child PID exceeds i32 range",
-        )
-    })
-}
-
-fn capture_owned_child(child: &Child) -> io::Result<ProcessHandle> {
-    let pid = owned_child_pid(child)?;
-    ProcessHandle::capture(pid)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "owned gate child exited before its pidfd identity could be captured",
-        )
-    })
+    ));
+    diagnostics.finish()
 }
 
 fn signal_process_group(process_group_id: i32, signal: i32) -> io::Result<()> {
@@ -331,17 +344,20 @@ fn signal_process_group(process_group_id: i32, signal: i32) -> io::Result<()> {
 }
 
 fn signal_root_process_tree(root: &ProcessHandle, signal: i32) -> io::Result<()> {
+    let mut diagnostics = CleanupDiagnostics::default();
     if root.has_pidfd() {
-        root.send_signal(signal)?;
+        let _ = diagnostics.capture(root.send_signal(signal));
     }
-    signal_process_group(root.identity.pid, signal)
+    let _ = diagnostics.capture(signal_process_group(root.identity.pid, signal));
+    diagnostics.finish()
 }
 
 fn signal_tracked_processes(processes: &[TrackedProcess], signal: i32) -> io::Result<()> {
+    let mut diagnostics = CleanupDiagnostics::default();
     for process in processes {
-        process.send_signal(signal)?;
+        let _ = diagnostics.capture(process.send_signal(signal));
     }
-    Ok(())
+    diagnostics.finish()
 }
 
 fn wait_for_tracked_processes_exit(

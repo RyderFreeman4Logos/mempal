@@ -17,7 +17,14 @@ case "${0##*/}" in
             : >"${FAKE_CARGO_TRIGGERED}"
             (
                 trap '' HUP
-                printf '%s\n' "${BASHPID}" >"${HOLDER_PID_FILE:?}"
+                pid="${BASHPID}"
+                start_time="$(awk '{print $22}' "/proc/${pid}/stat")"
+                printf '%s %s\n' "${pid}" "${start_time}" >"${HOLDER_PID_FILE:?}"
+                if find "/proc/${pid}/fd" -lname "${HOLDER_LOCK_FILE:?}" -print -quit | grep -q .; then
+                    printf 'open\n' >"${HOLDER_LOCK_STATE_FILE:?}"
+                else
+                    printf 'closed\n' >"${HOLDER_LOCK_STATE_FILE:?}"
+                fi
                 : >"${HOLDER_READY_FILE:?}"
                 exec /bin/sleep 30
             ) </dev/null >/dev/null 2>&1 &
