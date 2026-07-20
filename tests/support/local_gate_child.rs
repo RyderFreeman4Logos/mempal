@@ -266,13 +266,17 @@ impl GateChild {
 
     fn terminate_and_collect_until(&mut self, deadline: Instant) -> io::Result<Output> {
         self.descendant_monitor
-            .stop_and_drain(&mut self.tracked_processes, deadline);
-        terminate_and_collect_until(
+            .drain_discovered(&mut self.tracked_processes, deadline);
+        let result = terminate_and_collect_until(
             &mut self.child,
             &self.root,
             &mut self.tracked_processes,
+            &mut self.descendant_monitor,
             deadline,
-        )
+        );
+        self.descendant_monitor
+            .stop_and_drain(&mut self.tracked_processes, deadline);
+        result
     }
 }
 
@@ -285,13 +289,17 @@ impl Drop for GateChild {
 pub(crate) fn reap_owned_child(mut child: OwnedGateChild) -> io::Result<()> {
     let root = capture_owned_child(child.child())?;
     let mut tracked_processes = Vec::new();
-    terminate_and_collect_until(
+    let mut descendant_monitor = DescendantMonitor::spawn(root.identity)?;
+    let deadline = cleanup_deadline();
+    let result = terminate_and_collect_until(
         &mut child,
         &root,
         &mut tracked_processes,
-        cleanup_deadline(),
-    )
-    .map(|_| ())
+        &mut descendant_monitor,
+        deadline,
+    );
+    descendant_monitor.stop_and_drain(&mut tracked_processes, deadline);
+    result.map(|_| ())
 }
 
 fn terminate_and_collect(
@@ -299,19 +307,34 @@ fn terminate_and_collect(
     root: &ProcessHandle,
     tracked_processes: &mut Vec<TrackedProcess>,
 ) -> io::Result<Output> {
-    terminate_and_collect_until(child, root, tracked_processes, cleanup_deadline())
+    let deadline = cleanup_deadline();
+    let mut descendant_monitor = DescendantMonitor::spawn(root.identity)?;
+    let result = terminate_and_collect_until(
+        child,
+        root,
+        tracked_processes,
+        &mut descendant_monitor,
+        deadline,
+    );
+    descendant_monitor.stop_and_drain(tracked_processes, deadline);
+    result
 }
 
 fn terminate_and_collect_until(
     child: &mut OwnedGateChild,
     root: &ProcessHandle,
     tracked_processes: &mut Vec<TrackedProcess>,
+    descendant_monitor: &mut DescendantMonitor,
     deadline: Instant,
 ) -> io::Result<Output> {
     let mut diagnostics = CleanupDiagnostics::default();
-    if let Err(error) =
-        terminate_owned_process_tree(child.child_mut(), root, tracked_processes, deadline)
-    {
+    if let Err(error) = terminate_owned_process_tree(
+        child.child_mut(),
+        root,
+        tracked_processes,
+        descendant_monitor,
+        deadline,
+    ) {
         diagnostics.record(error);
     }
     let output = match collect_bounded_output(child.child_mut(), deadline) {
@@ -339,29 +362,44 @@ fn terminate_owned_process_tree(
     child: &mut Child,
     root: &ProcessHandle,
     tracked_processes: &mut Vec<TrackedProcess>,
+    descendant_monitor: &mut DescendantMonitor,
     deadline: Instant,
 ) -> io::Result<()> {
     let mut diagnostics = CleanupDiagnostics::default();
     let term_deadline = deadline.min(Instant::now() + TERMINATION_GRACE_PERIOD);
     let discovery_deadline = discovery_deadline(deadline);
-    let mut child_exited = diagnostics.capture(child.try_wait()).flatten().is_some();
-    let _ = diagnostics.capture(signal_root_process_tree(root, libc::SIGTERM));
+    let leader_alive = match child.try_wait() {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(error) => {
+            diagnostics.record(error);
+            false
+        }
+    };
+    let mut child_exited = !leader_alive;
+    let _ = diagnostics.capture(signal_root_process_tree(root, !child_exited, libc::SIGTERM));
     let _ = diagnostics.capture(signal_tracked_processes(
         tracked_processes,
         libc::SIGTERM,
         term_deadline,
     ));
     if !child_exited {
-        child_exited = diagnostics
-            .capture(wait_for_child_exit_until(child, term_deadline))
-            .unwrap_or(false);
+        child_exited = match wait_for_child_exit_until(child, term_deadline) {
+            Ok(exited) => exited,
+            Err(error) => {
+                diagnostics.record(error);
+                true
+            }
+        };
     }
+    descendant_monitor.drain_discovered(tracked_processes, discovery_deadline);
     let _ = diagnostics.capture(refresh_owned_processes(
         child,
         root,
         tracked_processes,
         discovery_deadline,
     ));
+    descendant_monitor.drain_discovered(tracked_processes, discovery_deadline);
     if child_exited
         && diagnostics
             .capture(wait_for_tracked_processes_exit(
@@ -379,16 +417,21 @@ fn terminate_owned_process_tree(
         tracked_processes,
         discovery_deadline,
     ));
-    let _ = diagnostics.capture(signal_root_process_tree(root, libc::SIGKILL));
+    descendant_monitor.drain_discovered(tracked_processes, discovery_deadline);
+    let _ = diagnostics.capture(signal_root_process_tree(root, !child_exited, libc::SIGKILL));
     let _ = diagnostics.capture(signal_tracked_processes(
         tracked_processes,
         libc::SIGKILL,
         deadline,
     ));
     if !child_exited {
-        child_exited = diagnostics
-            .capture(wait_for_child_exit_until(child, deadline))
-            .unwrap_or(false);
+        child_exited = match wait_for_child_exit_until(child, deadline) {
+            Ok(exited) => exited,
+            Err(error) => {
+                diagnostics.record(error);
+                true
+            }
+        };
     }
     if child_exited
         && diagnostics
@@ -407,8 +450,8 @@ fn terminate_owned_process_tree(
 
 fn signal_process_group(process_group_id: i32, signal: i32) -> io::Result<()> {
     // SAFETY: Fixtures call `setsid` before exec, making this group exclusive to the fixture.
-    // Linux keeps a live process-group ID allocated after its leader exits; if the group is gone,
-    // `ESRCH` is harmless. This permits cleanup after the direct child has been reaped.
+    // The caller only invokes this while the direct child has not been reaped, so its numeric
+    // PID cannot be reused as an unrelated process-group ID.
     unsafe {
         if libc::kill(-process_group_id, signal) == -1 {
             let error = io::Error::last_os_error();
@@ -420,12 +463,16 @@ fn signal_process_group(process_group_id: i32, signal: i32) -> io::Result<()> {
     Ok(())
 }
 
-fn signal_root_process_tree(root: &ProcessHandle, signal: i32) -> io::Result<()> {
+fn signal_root_process_tree(
+    root: &ProcessHandle,
+    leader_alive: bool,
+    signal: i32,
+) -> io::Result<()> {
     let mut diagnostics = CleanupDiagnostics::default();
-    if root.has_pidfd() {
-        let _ = diagnostics.capture(root.send_signal(signal));
+    let _ = diagnostics.capture(root.send_signal(signal));
+    if leader_alive {
+        let _ = diagnostics.capture(signal_process_group(root.identity.pid, signal));
     }
-    let _ = diagnostics.capture(signal_process_group(root.identity.pid, signal));
     diagnostics.finish()
 }
 
