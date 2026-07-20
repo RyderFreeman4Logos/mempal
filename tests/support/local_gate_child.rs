@@ -377,6 +377,7 @@ fn terminate_owned_process_tree(
         }
     };
     let mut child_exited = !leader_alive;
+    descendant_monitor.drain_discovered(tracked_processes, term_deadline);
     let _ = diagnostics.capture(signal_root_process_tree(root, !child_exited, libc::SIGTERM));
     let _ = diagnostics.capture(signal_tracked_processes(
         tracked_processes,
@@ -392,14 +393,14 @@ fn terminate_owned_process_tree(
             }
         };
     }
-    descendant_monitor.drain_discovered(tracked_processes, discovery_deadline);
+    descendant_monitor.drain_discovered(tracked_processes, deadline);
     let _ = diagnostics.capture(refresh_owned_processes(
         child,
         root,
         tracked_processes,
         discovery_deadline,
     ));
-    descendant_monitor.drain_discovered(tracked_processes, discovery_deadline);
+    descendant_monitor.drain_discovered(tracked_processes, deadline);
     if child_exited
         && diagnostics
             .capture(wait_for_tracked_processes_exit(
@@ -417,7 +418,7 @@ fn terminate_owned_process_tree(
         tracked_processes,
         discovery_deadline,
     ));
-    descendant_monitor.drain_discovered(tracked_processes, discovery_deadline);
+    descendant_monitor.drain_discovered(tracked_processes, deadline);
     let _ = diagnostics.capture(signal_root_process_tree(root, !child_exited, libc::SIGKILL));
     let _ = diagnostics.capture(signal_tracked_processes(
         tracked_processes,
@@ -433,6 +434,12 @@ fn terminate_owned_process_tree(
             }
         };
     }
+    descendant_monitor.drain_discovered(tracked_processes, deadline);
+    let _ = diagnostics.capture(signal_tracked_processes(
+        tracked_processes,
+        libc::SIGKILL,
+        deadline,
+    ));
     if child_exited
         && diagnostics
             .capture(wait_for_tracked_processes_exit(tracked_processes, deadline))

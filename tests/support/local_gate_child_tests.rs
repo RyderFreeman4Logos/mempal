@@ -565,12 +565,7 @@ mod tests {
         let writer = spawn_in_own_session(&mut writer_command).expect("spawn pipe writer");
         let mut gate = GateChild::new(writer).expect("capture pipe writer identity");
         let scan_result = gate.refresh_tracked_processes();
-        let cleanup_result = terminate_and_collect(
-            &mut gate.child,
-            &gate.root,
-            &mut gate.tracked_processes,
-        )
-        .map(|_| ());
+        let cleanup_result = gate.terminate_and_collect_until(cleanup_deadline()).map(|_| ());
         let unrelated_cleanup = reap_owned_child(unrelated);
 
         scan_result.expect("unrelated non-UTF-8 comm must be skipped during global scan");
