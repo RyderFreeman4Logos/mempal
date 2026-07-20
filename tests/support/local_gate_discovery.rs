@@ -85,15 +85,16 @@ impl DescendantMonitor {
 
     /// Synchronously captures descendants while the root is still available, then drains
     /// discoveries queued by the monitor thread.
+    ///
+    /// Unlike the monitor worker's short polling slice, a terminating caller supplies its
+    /// full remaining deadline here. This is the only discovery path that can reliably retain
+    /// a pidfd for a descendant before its leader exits and the descendant is reparented.
     pub(super) fn discover_and_drain(
         &mut self,
         tracked_processes: &mut Vec<TrackedProcess>,
         deadline: Instant,
     ) {
-        if let Ok(descendants) = discover_live_descendants(
-            self.root,
-            deadline.min(Instant::now() + MONITOR_DISCOVERY_BUDGET),
-        ) {
+        if let Ok(descendants) = discover_live_descendants(self.root, deadline) {
             for process in descendants {
                 if Instant::now() >= deadline {
                     break;

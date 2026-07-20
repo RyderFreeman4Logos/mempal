@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 /// A gate timeout may spend this bounded interval terminating and draining its process tree.
 const CLEANUP_TIMEOUT_MARGIN: Duration = Duration::from_millis(250);
 const TERMINATION_GRACE_PERIOD: Duration = Duration::from_millis(50);
+const TERMINATION_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(2);
+const POST_KILL_DISCOVERY_RESERVE: Duration = Duration::from_millis(25);
 const OUTPUT_DRAIN_RESERVE: Duration = Duration::from_millis(50);
 
 fn cleanup_deadline() -> Instant {
@@ -368,6 +370,11 @@ fn terminate_owned_process_tree(
     let mut diagnostics = CleanupDiagnostics::default();
     let term_deadline = deadline.min(Instant::now() + TERMINATION_GRACE_PERIOD);
     let discovery_deadline = discovery_deadline(deadline);
+    // Do not let a pre-KILL procfs pass spend the final window required to discover children
+    // of processes that are still dying after SIGKILL.
+    let pre_kill_discovery_deadline = discovery_deadline
+        .checked_sub(POST_KILL_DISCOVERY_RESERVE)
+        .unwrap_or_else(Instant::now);
     let leader_alive = match child.try_wait() {
         Ok(Some(_)) => false,
         Ok(None) => true,
@@ -377,14 +384,54 @@ fn terminate_owned_process_tree(
         }
     };
     let mut child_exited = !leader_alive;
+
+    // Capture an identity for a setsid escape before the leader receives SIGTERM. Once the
+    // leader has exited, the escape can be reparented and no longer be discoverable from root.
     descendant_monitor.discover_and_drain(tracked_processes, term_deadline);
     let _ = diagnostics.capture(signal_root_process_tree(root, !child_exited, libc::SIGTERM));
-    descendant_monitor.discover_and_drain(tracked_processes, term_deadline);
-    let _ = diagnostics.capture(signal_tracked_processes(
-        tracked_processes,
-        libc::SIGTERM,
-        term_deadline,
-    ));
+
+    // A SIGTERM handler can create a setsid escape after the first discovery pass. Repeatedly
+    // drain the monitor and synchronously discover descendants while the leader may still be
+    // alive. Once the leader has been reaped, signal every tracked identity via pidfd; this
+    // avoids killing an escape while the leader's TERM handler is still publishing it. The
+    // synchronous discovery receives the grace deadline itself, never the monitor's 10ms
+    // polling slice. Pipe-holder discovery remains outside this loop because its whole-/proc
+    // scan can consume the grace period before a TERM handler creates its escaped child.
+    let mut retry_without_progress = true;
+    while Instant::now() < term_deadline {
+        let tracked_before = tracked_processes.len();
+        descendant_monitor.discover_and_drain(tracked_processes, term_deadline);
+        descendant_monitor.drain_discovered(tracked_processes, term_deadline);
+        if !child_exited {
+            child_exited = match child.try_wait() {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(error) => {
+                    diagnostics.record(error);
+                    true
+                }
+            };
+        }
+        if child_exited {
+            let _ = diagnostics.capture(signal_tracked_processes(
+                tracked_processes,
+                libc::SIGTERM,
+                term_deadline,
+            ));
+        }
+
+        let made_progress = tracked_processes.len() > tracked_before;
+        if !made_progress && !retry_without_progress {
+            break;
+        }
+        retry_without_progress = false;
+
+        let remaining = term_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(TERMINATION_DISCOVERY_POLL_INTERVAL));
+    }
     if !child_exited {
         child_exited = match wait_for_child_exit_until(child, term_deadline) {
             Ok(exited) => exited,
@@ -399,7 +446,7 @@ fn terminate_owned_process_tree(
         child,
         root,
         tracked_processes,
-        discovery_deadline,
+        pre_kill_discovery_deadline,
     ));
     descendant_monitor.drain_discovered(tracked_processes, deadline);
     if child_exited
@@ -417,10 +464,26 @@ fn terminate_owned_process_tree(
         child,
         root,
         tracked_processes,
-        discovery_deadline,
+        pre_kill_discovery_deadline,
     ));
     descendant_monitor.drain_discovered(tracked_processes, deadline);
     let _ = diagnostics.capture(signal_root_process_tree(root, !child_exited, libc::SIGKILL));
+    let _ = diagnostics.capture(signal_tracked_processes(
+        tracked_processes,
+        libc::SIGKILL,
+        deadline,
+    ));
+    // SIGKILL can leave a still-running tracked process briefly able to expose a child. Make
+    // one final discovery pass before the final pidfd sweep so that child is not stranded when
+    // its parent is reaped.
+    descendant_monitor.discover_and_drain(tracked_processes, deadline);
+    let _ = diagnostics.capture(refresh_owned_processes(
+        child,
+        root,
+        tracked_processes,
+        discovery_deadline,
+    ));
+    descendant_monitor.drain_discovered(tracked_processes, deadline);
     let _ = diagnostics.capture(signal_tracked_processes(
         tracked_processes,
         libc::SIGKILL,
