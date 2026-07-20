@@ -83,7 +83,9 @@ impl DescendantMonitor {
         }
     }
 
-    pub(super) fn stop_and_drain(
+    /// Synchronously captures descendants while the root is still available, then drains
+    /// discoveries queued by the monitor thread.
+    pub(super) fn discover_and_drain(
         &mut self,
         tracked_processes: &mut Vec<TrackedProcess>,
         deadline: Instant,
@@ -104,6 +106,15 @@ impl DescendantMonitor {
                 }
             }
         }
+        self.drain_discovered(tracked_processes, deadline);
+    }
+
+    pub(super) fn stop_and_drain(
+        &mut self,
+        tracked_processes: &mut Vec<TrackedProcess>,
+        deadline: Instant,
+    ) {
+        self.discover_and_drain(tracked_processes, deadline);
         let _ = self.stop_sender.send(());
         loop {
             if Instant::now() >= deadline {

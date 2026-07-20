@@ -377,8 +377,9 @@ fn terminate_owned_process_tree(
         }
     };
     let mut child_exited = !leader_alive;
-    descendant_monitor.drain_discovered(tracked_processes, term_deadline);
+    descendant_monitor.discover_and_drain(tracked_processes, term_deadline);
     let _ = diagnostics.capture(signal_root_process_tree(root, !child_exited, libc::SIGTERM));
+    descendant_monitor.discover_and_drain(tracked_processes, term_deadline);
     let _ = diagnostics.capture(signal_tracked_processes(
         tracked_processes,
         libc::SIGTERM,
