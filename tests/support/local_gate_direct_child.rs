@@ -6,21 +6,14 @@ use super::*;
 /// Dropping a `std::process::Child` alone neither terminates nor reaps it.
 pub(crate) struct OwnedGateChild {
     child: Child,
-    pid: i32,
-    subreaper_baseline_children: Option<HashSet<ProcessIdentity>>,
     first_cleanup_error: Option<io::Error>,
     cleanup_deadline: Option<Instant>,
 }
 
 impl OwnedGateChild {
     pub(crate) fn new(child: Child) -> Self {
-        let pid = i32::try_from(child.id()).expect("owned gate child PID fits i32");
-        register_gate_child(pid);
-        let subreaper_baseline_children = capture_subreaper_baseline(pid, cleanup_deadline()).ok();
         Self {
             child,
-            pid,
-            subreaper_baseline_children,
             first_cleanup_error: None,
             cleanup_deadline: None,
         }
@@ -32,14 +25,6 @@ impl OwnedGateChild {
 
     pub(super) fn child_mut(&mut self) -> &mut Child {
         &mut self.child
-    }
-
-    pub(super) fn subreaper_baseline_children(&self) -> Option<&HashSet<ProcessIdentity>> {
-        self.subreaper_baseline_children.as_ref()
-    }
-
-    pub(super) fn has_reaped_status(&self) -> bool {
-        gate_child_has_reaped_status(self.pid)
     }
 
     fn record_cleanup_error(&mut self, error: io::Error) {
@@ -64,7 +49,7 @@ impl OwnedGateChild {
             }
         };
 
-        let already_reaped = match try_wait_child(&mut self.child) {
+        let already_reaped = match self.child.try_wait() {
             Ok(Some(_)) => true,
             Ok(None) => false,
             Err(error) => {
@@ -105,7 +90,6 @@ impl OwnedGateChild {
 impl Drop for OwnedGateChild {
     fn drop(&mut self) {
         self.ensure_direct_child_cleanup(self.cleanup_deadline.unwrap_or_else(cleanup_deadline));
-        unregister_gate_child(self.pid);
     }
 }
 

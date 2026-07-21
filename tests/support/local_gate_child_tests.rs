@@ -224,7 +224,6 @@ mod tests {
                 start_time_ticks: expected.start_time_ticks + 1,
             },
             parent_pid: 1,
-            session_id: 4242,
             state: 'S',
         };
 
@@ -246,7 +245,6 @@ mod tests {
                 start_time_ticks: direct_child.start_time_ticks + 1,
             },
             parent_pid: 1,
-            session_id: 4242,
             state: 'S',
         };
 

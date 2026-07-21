@@ -154,10 +154,9 @@ pub(super) fn refresh_after_leader_reap(
     tracked_processes: &mut Vec<TrackedProcess>,
     deadline: Instant,
 ) -> io::Result<bool> {
-    let reaped = try_wait_child(child)?.is_some();
+    let reaped = child.try_wait()?.is_some();
     if reaped {
         refresh_owned_processes(child, root, tracked_processes, deadline)?;
-        refresh_reparented_children_after_leader_reap(root, tracked_processes, deadline)?;
     }
     Ok(reaped)
 }
@@ -363,20 +362,6 @@ pub(super) fn capture_live_children(
     parent: ProcessIdentity,
     deadline: Instant,
 ) -> io::Result<Vec<ProcessHandle>> {
-    Ok(capture_children(parent, deadline)?
-        .into_iter()
-        .filter_map(|child| match child.is_running() {
-            Ok(true) => Some(Ok(child)),
-            Ok(false) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<io::Result<Vec<_>>>()?)
-}
-
-pub(super) fn capture_children(
-    parent: ProcessIdentity,
-    deadline: Instant,
-) -> io::Result<Vec<ProcessHandle>> {
     if Instant::now() >= deadline || !parent.is_running()? {
         return Ok(Vec::new());
     }
@@ -387,7 +372,9 @@ pub(super) fn capture_children(
         if Instant::now() >= deadline {
             return Ok(children);
         }
-        if let Some(child) = ProcessHandle::capture_child(parent, child_pid)? {
+        if let Some(child) = ProcessHandle::capture_child(parent, child_pid)?
+            && child.is_running()?
+        {
             children.push(child);
         }
     }

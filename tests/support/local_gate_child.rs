@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::io::Read;
@@ -10,9 +9,24 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// A gate timeout may spend this bounded interval terminating and draining its process tree.
+const CLEANUP_TIMEOUT_MARGIN: Duration = Duration::from_millis(250);
 const TERMINATION_GRACE_PERIOD: Duration = Duration::from_millis(50);
 const TERMINATION_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const POST_KILL_DISCOVERY_RESERVE: Duration = Duration::from_millis(25);
+const OUTPUT_DRAIN_RESERVE: Duration = Duration::from_millis(50);
+
+fn cleanup_deadline() -> Instant {
+    Instant::now() + CLEANUP_TIMEOUT_MARGIN
+}
+
+/// Leaves a bounded output-drain reserve while every discovery pass shares one absolute deadline.
+fn discovery_deadline(cleanup_deadline: Instant) -> Instant {
+    Instant::now()
+        + cleanup_deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(OUTPUT_DRAIN_RESERVE)
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ProcessIdentity {
@@ -33,7 +47,6 @@ impl ProcessIdentity {
 struct ProcessSnapshot {
     identity: ProcessIdentity,
     parent_pid: i32,
-    session_id: i32,
     state: char,
 }
 
@@ -41,16 +54,6 @@ struct ProcessHandle {
     identity: ProcessIdentity,
     pidfd: Option<OwnedFd>,
 }
-
-#[path = "local_gate_child_lifecycle.rs"]
-mod local_gate_child_lifecycle;
-use local_gate_child_lifecycle::{
-    CLEANUP_TIMEOUT_MARGIN, SubreaperContext, capture_subreaper_baseline, cleanup_deadline,
-    discovery_deadline, ensure_child_subreaper, gate_child_has_reaped_status, process_is_gone,
-    refresh_reparented_children_after_leader_reap, register_gate_child, signal_process_group,
-    signal_root_process_tree, subreaper_operation_guard, terminate_and_collect, try_wait_child,
-    unregister_gate_child, wait_for_child_exit, wait_for_child_exit_until,
-};
 
 #[path = "local_gate_direct_child.rs"]
 mod local_gate_direct_child;
@@ -64,8 +67,8 @@ pub(crate) use local_gate_recorded_process::{RecordedProcessIdentity, capture_re
 #[path = "local_gate_discovery.rs"]
 mod local_gate_discovery;
 use local_gate_discovery::{
-    DescendantMonitor, capture_children, capture_live_children, output_pipe_targets,
-    process_holds_writable_pipe, refresh_after_leader_reap, refresh_owned_processes,
+    DescendantMonitor, capture_live_children, output_pipe_targets, process_holds_writable_pipe,
+    refresh_after_leader_reap, refresh_owned_processes,
 };
 
 enum TrackedProcessSource {
@@ -179,8 +182,6 @@ pub(crate) struct GateChild {
 }
 
 pub(crate) fn spawn_in_own_session(command: &mut Command) -> io::Result<OwnedGateChild> {
-    ensure_child_subreaper()?;
-    let _operation_guard = subreaper_operation_guard();
     // SAFETY: The post-fork closure invokes only async-signal-safe `setsid` before exec.
     unsafe {
         command.pre_exec(|| {
@@ -229,7 +230,7 @@ impl GateChild {
                     self.terminate_and_collect_until(cleanup_deadline()),
                 );
             }
-            if try_wait_child(self.child.child_mut())?.is_some() {
+            if self.child.child_mut().try_wait()?.is_some() {
                 return self.terminate_and_collect_until(cleanup_deadline());
             }
             self.refresh_tracked_processes_until(deadline)?;
@@ -239,7 +240,7 @@ impl GateChild {
                     self.terminate_and_collect_until(cleanup_deadline()),
                 );
             }
-            if try_wait_child(self.child.child_mut())?.is_some() {
+            if self.child.child_mut().try_wait()?.is_some() {
                 return self.terminate_and_collect_until(cleanup_deadline());
             }
             thread::sleep(
@@ -288,9 +289,6 @@ impl Drop for GateChild {
 }
 
 pub(crate) fn reap_owned_child(mut child: OwnedGateChild) -> io::Result<()> {
-    if child.has_reaped_status() {
-        return Ok(());
-    }
     let root = capture_owned_child(child.child())?;
     let mut tracked_processes = Vec::new();
     let mut descendant_monitor = DescendantMonitor::spawn(root.identity)?;
@@ -306,6 +304,24 @@ pub(crate) fn reap_owned_child(mut child: OwnedGateChild) -> io::Result<()> {
     result.map(|_| ())
 }
 
+fn terminate_and_collect(
+    child: &mut OwnedGateChild,
+    root: &ProcessHandle,
+    tracked_processes: &mut Vec<TrackedProcess>,
+) -> io::Result<Output> {
+    let deadline = cleanup_deadline();
+    let mut descendant_monitor = DescendantMonitor::spawn(root.identity)?;
+    let result = terminate_and_collect_until(
+        child,
+        root,
+        tracked_processes,
+        &mut descendant_monitor,
+        deadline,
+    );
+    descendant_monitor.stop_and_drain(tracked_processes, deadline);
+    result
+}
+
 fn terminate_and_collect_until(
     child: &mut OwnedGateChild,
     root: &ProcessHandle,
@@ -314,13 +330,11 @@ fn terminate_and_collect_until(
     deadline: Instant,
 ) -> io::Result<Output> {
     let mut diagnostics = CleanupDiagnostics::default();
-    let subreaper_baseline = child.subreaper_baseline_children().cloned();
     if let Err(error) = terminate_owned_process_tree(
         child.child_mut(),
         root,
         tracked_processes,
         descendant_monitor,
-        subreaper_baseline.as_ref(),
         deadline,
     ) {
         diagnostics.record(error);
@@ -351,7 +365,6 @@ fn terminate_owned_process_tree(
     root: &ProcessHandle,
     tracked_processes: &mut Vec<TrackedProcess>,
     descendant_monitor: &mut DescendantMonitor,
-    subreaper_baseline: Option<&HashSet<ProcessIdentity>>,
     deadline: Instant,
 ) -> io::Result<()> {
     let mut diagnostics = CleanupDiagnostics::default();
@@ -362,12 +375,7 @@ fn terminate_owned_process_tree(
     let pre_kill_discovery_deadline = discovery_deadline
         .checked_sub(POST_KILL_DISCOVERY_RESERVE)
         .unwrap_or_else(Instant::now);
-    let mut subreaper_context = diagnostics.capture(SubreaperContext::capture(
-        root.identity.pid,
-        subreaper_baseline,
-        term_deadline,
-    ));
-    let leader_alive = match try_wait_child(child) {
+    let leader_alive = match child.try_wait() {
         Ok(Some(_)) => false,
         Ok(None) => true,
         Err(error) => {
@@ -395,7 +403,7 @@ fn terminate_owned_process_tree(
         descendant_monitor.discover_and_drain(tracked_processes, term_deadline);
         descendant_monitor.drain_discovered(tracked_processes, term_deadline);
         if !child_exited {
-            child_exited = match try_wait_child(child) {
+            child_exited = match child.try_wait() {
                 Ok(Some(_)) => true,
                 Ok(None) => false,
                 Err(error) => {
@@ -433,18 +441,6 @@ fn terminate_owned_process_tree(
             }
         };
     }
-    let mut reparented_reaped = child_exited
-        && subreaper_context
-            .as_mut()
-            .and_then(|context| {
-                diagnostics.capture(context.signal_and_reap_until(
-                    root.identity,
-                    tracked_processes,
-                    libc::SIGTERM,
-                    term_deadline,
-                ))
-            })
-            .unwrap_or(false);
     descendant_monitor.drain_discovered(tracked_processes, deadline);
     let _ = diagnostics.capture(refresh_owned_processes(
         child,
@@ -454,7 +450,6 @@ fn terminate_owned_process_tree(
     ));
     descendant_monitor.drain_discovered(tracked_processes, deadline);
     if child_exited
-        && reparented_reaped
         && diagnostics
             .capture(wait_for_tracked_processes_exit(
                 tracked_processes,
@@ -503,19 +498,6 @@ fn terminate_owned_process_tree(
             }
         };
     }
-    if child_exited {
-        reparented_reaped = subreaper_context
-            .as_mut()
-            .and_then(|context| {
-                diagnostics.capture(context.signal_and_reap_until(
-                    root.identity,
-                    tracked_processes,
-                    libc::SIGKILL,
-                    deadline,
-                ))
-            })
-            .unwrap_or(false);
-    }
     descendant_monitor.drain_discovered(tracked_processes, deadline);
     let _ = diagnostics.capture(signal_tracked_processes(
         tracked_processes,
@@ -523,7 +505,6 @@ fn terminate_owned_process_tree(
         deadline,
     ));
     if child_exited
-        && reparented_reaped
         && diagnostics
             .capture(wait_for_tracked_processes_exit(tracked_processes, deadline))
             .unwrap_or(false)
@@ -535,6 +516,34 @@ fn terminate_owned_process_tree(
         io::ErrorKind::TimedOut,
         "owned gate process tree did not exit after SIGKILL",
     ));
+    diagnostics.finish()
+}
+
+fn signal_process_group(process_group_id: i32, signal: i32) -> io::Result<()> {
+    // SAFETY: Fixtures call `setsid` before exec, making this group exclusive to the fixture.
+    // The caller only invokes this while the direct child has not been reaped, so its numeric
+    // PID cannot be reused as an unrelated process-group ID.
+    unsafe {
+        if libc::kill(-process_group_id, signal) == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn signal_root_process_tree(
+    root: &ProcessHandle,
+    leader_alive: bool,
+    signal: i32,
+) -> io::Result<()> {
+    let mut diagnostics = CleanupDiagnostics::default();
+    let _ = diagnostics.capture(root.send_signal(signal));
+    if leader_alive {
+        let _ = diagnostics.capture(signal_process_group(root.identity.pid, signal));
+    }
     diagnostics.finish()
 }
 
@@ -569,6 +578,26 @@ fn wait_for_tracked_processes_exit(
             }
         }
         if !any_running {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(10)),
+        );
+    }
+}
+
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> io::Result<bool> {
+    wait_for_child_exit_until(child, Instant::now() + timeout)
+}
+
+fn wait_for_child_exit_until(child: &mut Child, deadline: Instant) -> io::Result<bool> {
+    loop {
+        if child.try_wait()?.is_some() {
             return Ok(true);
         }
         if Instant::now() >= deadline {
@@ -623,32 +652,7 @@ fn inspect_process(pid: i32) -> io::Result<Option<ProcessSnapshot>> {
             "Linux proc parent PID was not numeric",
         )
     })?;
-    let _process_group_id = fields.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Linux proc stat missing process group ID",
-        )
-    })?;
-    let session_id = std::str::from_utf8(fields.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Linux proc stat missing session ID",
-        )
-    })?)
-    .map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Linux proc session ID was not numeric",
-        )
-    })?
-    .parse()
-    .map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Linux proc session ID was not numeric",
-        )
-    })?;
-    let start_time_ticks = std::str::from_utf8(fields.nth(15).ok_or_else(|| {
+    let start_time_ticks = std::str::from_utf8(fields.nth(17).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "Linux proc stat missing start time",
@@ -673,7 +677,6 @@ fn inspect_process(pid: i32) -> io::Result<Option<ProcessSnapshot>> {
             start_time_ticks,
         },
         parent_pid,
-        session_id,
         state,
     }))
 }
@@ -720,10 +723,14 @@ fn send_pidfd_signal(pidfd: &OwnedFd, signal: i32) -> io::Result<()> {
     Ok(())
 }
 
+fn process_is_gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
 fn collect_bounded_output(child: &mut Child, deadline: Instant) -> io::Result<Output> {
     let stdout = spawn_pipe_reader(child.stdout.take());
     let stderr = spawn_pipe_reader(child.stderr.take());
-    let status = try_wait_child(child)?.ok_or_else(|| {
+    let status = child.try_wait()?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::TimedOut,
             "owned gate child was not reaped before output collection",

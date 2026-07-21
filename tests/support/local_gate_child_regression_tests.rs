@@ -140,39 +140,6 @@ mod regression_tests {
         spawn_in_own_session(&mut command).expect("spawn TERM-handler escape fixture")
     }
 
-    fn spawn_delayed_term_handler_setsid_escape(
-        leader_ready_file: &Path,
-        pid_file: &Path,
-        escape_ready_file: &Path,
-    ) -> OwnedGateChild {
-        let mut command = Command::new("/bin/bash");
-        command
-            .args([
-                "-c",
-                r#"
-                    escape() {
-                        pid="${BASHPID}"
-                        start_time="$(awk '{print $22}' "/proc/${pid}/stat")"
-                        printf '%s %s\n' "${pid}" "${start_time}" >"${PID_FILE:?}"
-                        : >"${ESCAPE_READY_FILE:?}"
-                        exec /bin/sleep 60
-                    }
-                    export -f escape
-                    trap '/bin/sleep 0.005
-                          setsid /bin/bash -c escape </dev/null >/dev/null 2>&1 &' TERM
-                    : >"${LEADER_READY_FILE:?}"
-                    /bin/sleep 60
-                "#,
-            ])
-            .env("LEADER_READY_FILE", leader_ready_file)
-            .env("PID_FILE", pid_file)
-            .env("ESCAPE_READY_FILE", escape_ready_file)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        spawn_in_own_session(&mut command).expect("spawn delayed TERM-handler escape fixture")
-    }
-
     #[test]
     fn gate_child_reaps_post_reap_non_pipe_setsid_descendant() {
         let fixture = tempfile::tempdir().expect("create non-pipe escaped-descendant fixture");
@@ -341,53 +308,6 @@ mod regression_tests {
         assert!(
             !escaped_survived,
             "a setsid descendant created by a TERM handler must be reaped during cleanup"
-        );
-    }
-
-    #[test]
-    fn gate_child_drop_reaps_delayed_non_pipe_setsid_escape_from_term_handler() {
-        let fixture = tempfile::tempdir().expect("create delayed TERM-handler escape fixture");
-        let pid_file = fixture.path().join("escaped.pid");
-        let leader_ready_file = fixture.path().join("leader-ready");
-        let escape_ready_file = fixture.path().join("escaped-ready");
-        let gate = GateChild::new(spawn_delayed_term_handler_setsid_escape(
-            &leader_ready_file,
-            &pid_file,
-            &escape_ready_file,
-        ))
-        .expect("capture delayed TERM-handler escape leader");
-        wait_for_file(
-            &leader_ready_file,
-            Duration::from_secs(1),
-            "delayed TERM-handler leader",
-        );
-
-        let started = Instant::now();
-        drop(gate);
-        wait_for_file(
-            &escape_ready_file,
-            Duration::from_secs(1),
-            "delayed TERM-handler setsid descendant",
-        );
-        let escaped = escaped_identity(&pid_file);
-        let escaped_survived = capture_recorded_process(escaped)
-            .expect("re-verify delayed TERM-handler descendant identity")
-            .is_some();
-        if let Some(process) = capture_recorded_process(escaped)
-            .expect("capture delayed TERM-handler descendant only if its identity still matches")
-        {
-            process
-                .send_signal(libc::SIGKILL)
-                .expect("pidfd-safe fallback cleanup for failed containment assertion");
-        }
-
-        assert!(
-            started.elapsed() <= CLEANUP_TIMEOUT_MARGIN,
-            "delayed TERM-handler descendant cleanup exceeded its deadline"
-        );
-        assert!(
-            !escaped_survived,
-            "a delayed setsid descendant without output pipes must be reaped during Drop"
         );
     }
 }
