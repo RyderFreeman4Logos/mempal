@@ -221,9 +221,9 @@ clippy-fast:
 
 # Fast test tier for pre-commit. Slow endpoint and long-running migration tests
 # are behind the `integration` feature.
-# CARGO_BUILD_JOBS=2 limits parallel LLVM codegen to avoid OOM on this host.
+# Cargo parallelism controlled by ~/.cargo/config.toml
 test:
-    CARGO_BUILD_JOBS=2 bash scripts/gates/cargo-test-with-timeout.sh {{cargo}} test
+    bash scripts/gates/cargo-test-with-timeout.sh {{cargo}} test
 
 # REST feature test tier, batched to control disk and memory pressure.
 test-rest:
@@ -240,7 +240,7 @@ test-f pattern:
 
 # Regression gate for the exact all-feature linker command from #698.
 test-onnx-link:
-    CARGO_BUILD_JOBS=1 {{cargo}} test --locked --all-features -j 1 --no-run
+    {{cargo}} test --locked --all-features --no-run
 
 # ONNX feature test using the checksum-pinned official shared runtime.
 test-onnx: test-onnx-link
