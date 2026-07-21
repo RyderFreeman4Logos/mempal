@@ -34,6 +34,7 @@ pub(crate) fn build_resource_usage(
 /// Degraded status used when spawn_blocking panics or is cancelled.
 pub(crate) fn build_resource_usage_degraded() -> ResourceUsageDto {
     ResourceUsageDto {
+        profile_admission: ProfileDbAdmissionDto::unavailable(),
         counters: ResourceCounterDto::from(crate::observability::resource_counters()),
         ..ResourceUsageDto::default()
     }
@@ -84,6 +85,10 @@ impl DaemonRecoveryDto {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ProfileDbAdmissionDto {
     pub active_holders: usize,
+    pub reaped_stale_holders_this_snapshot: usize,
+    pub unknown_holders: usize,
+    pub unknown_holder_generations: Vec<u64>,
+    pub unknown_holder_diagnostics: Vec<UnknownHolderDiagnosticDto>,
     pub configured_holder_limit: usize,
     pub configured_cache_bytes: u64,
     pub active_cache_bytes: u64,
@@ -91,6 +96,21 @@ pub struct ProfileDbAdmissionDto {
     pub holders: Vec<ProfileDbHolderDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl ProfileDbAdmissionDto {
+    fn unavailable() -> Self {
+        Self {
+            error: Some("profile admission diagnostics unavailable".to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct UnknownHolderDiagnosticDto {
+    pub generation: u64,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -112,6 +132,17 @@ impl From<crate::core::db_admission::DbAdmissionSnapshot> for ProfileDbAdmission
             .unwrap_or(0);
         Self {
             active_holders: value.active_holders,
+            reaped_stale_holders_this_snapshot: value.reaped_stale_holders_this_snapshot,
+            unknown_holders: value.unknown_holders,
+            unknown_holder_generations: value.unknown_holder_generations,
+            unknown_holder_diagnostics: value
+                .unknown_holder_diagnostics
+                .into_iter()
+                .map(|diagnostic| UnknownHolderDiagnosticDto {
+                    generation: diagnostic.generation,
+                    reason: diagnostic.reason.to_string(),
+                })
+                .collect(),
             configured_holder_limit: value.configured_holder_limit,
             configured_cache_bytes: value.configured_cache_bytes,
             active_cache_bytes: value.active_cache_bytes,
@@ -240,5 +271,20 @@ impl From<crate::observability::ResourceCounterSnapshot> for ResourceCounterDto 
             access_writeback_skipped_total: value.access_writeback_skipped_total,
             access_writeback_failed_total: value.access_writeback_failed_total,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn degraded_resource_usage_marks_admission_diagnostics_unavailable() {
+        let usage = build_resource_usage_degraded();
+
+        assert!(
+            usage.profile_admission.error.is_some(),
+            "degraded status must not serialize admission diagnostics as healthy zeroes"
+        );
     }
 }

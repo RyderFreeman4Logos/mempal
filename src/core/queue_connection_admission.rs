@@ -60,6 +60,12 @@ pub fn queue_stats_readonly(path: &Path) -> Result<QueueStats> {
     compute_queue_stats(&connection, DEFAULT_MAX_INGEST_ACTIVE_BYTES)
 }
 
+/// Compute queue diagnostics from an existing connection without opening or
+/// admitting another profile holder.
+pub fn queue_stats(connection: &Connection) -> Result<QueueStats> {
+    compute_queue_stats(connection, DEFAULT_MAX_INGEST_ACTIVE_BYTES)
+}
+
 #[cfg(test)]
 #[path = "queue_admission_tests.rs"]
 mod tests;

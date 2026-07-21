@@ -42,6 +42,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **MCP admission**: stale PID-namespace admission holders are now reaped on
+  process exit; supervised test fixtures have bounded cleanup and output
+  draining by deadline (#790).
 - **Development gates**: accept receipt roots below an ignored, untracked
   checkout-local symlink without weakening Git tracking checks (#802).
 - **DB admission**: preserve actionable SQLite diagnostics when a configured
