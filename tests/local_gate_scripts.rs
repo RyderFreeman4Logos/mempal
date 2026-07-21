@@ -594,6 +594,37 @@ fn rest_gate_does_not_lose_subsecond_budget_at_a_seconds_tick() {
     );
 }
 
+#[test]
+fn rest_gate_rejects_lock_timeout_over_one_day() {
+    let fixture = tempfile::tempdir().expect("create invalid timeout fixture");
+    let target = fixture.path().join("target");
+    let script = repo_root().join("scripts/gates/rest-tests.sh");
+
+    for timeout_secs in ["86401", "18446744073709551615"] {
+        let output = run_bash_script(
+            &script,
+            &[],
+            &[
+                ("REST_GATE_DRY_RUN", "1"),
+                ("REST_GATE_LOCK_TIMEOUT_SECS", timeout_secs),
+                (
+                    "REST_GATE_TARGET_DIR",
+                    target.to_str().expect("UTF-8 target path"),
+                ),
+                ("REST_TEST_TARGETS_PER_BATCH", "999"),
+            ],
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(output.status.code(), Some(2), "timeout_secs={timeout_secs}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("REST_GATE_LOCK_TIMEOUT_SECS must be a positive integer <= 86400"),
+            "timeout_secs={timeout_secs}, stderr={stderr}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn rest_gate_fails_with_a_bounded_lock_timeout() {

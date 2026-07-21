@@ -17,6 +17,12 @@ if ! [[ "${REST_GATE_LOCK_TIMEOUT_SECS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "REST_GATE_LOCK_TIMEOUT_SECS must be a positive integer" >&2
     exit 2
 fi
+# Reject values longer than 5 digits before any bash arithmetic to prevent
+# signed-64-bit overflow (e.g. 18446744073709551615 wraps to -1).
+if ((${#REST_GATE_LOCK_TIMEOUT_SECS} > 5)) || ((10#${REST_GATE_LOCK_TIMEOUT_SECS} > 86400)); then
+    echo "REST_GATE_LOCK_TIMEOUT_SECS must be a positive integer <= 86400" >&2
+    exit 2
+fi
 
 monotonic_centiseconds() {
     local uptime_seconds
@@ -51,7 +57,7 @@ if ! flock -n "${rest_lock_fd}"; then
     # `SECONDS` is integer-quantized, so it can charge a subsecond diagnostic
     # a full second when it crosses a tick boundary.
     rest_lock_wait_deadline_centiseconds=$((
-        $(monotonic_centiseconds) + REST_GATE_LOCK_TIMEOUT_SECS * 100
+        $(monotonic_centiseconds) + 10#${REST_GATE_LOCK_TIMEOUT_SECS} * 100
     ))
     echo "rest gate waiting for lock: ${rest_lock_file} (pid=$$)" >&2
     rest_lock_wait_remaining_centiseconds=$((

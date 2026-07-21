@@ -39,6 +39,9 @@ pub(super) fn sleeper_processes(timeout_secs: &str) -> Vec<RecordedProcessIdenti
         .args(["-eo", "pid=,args="])
         .output()
         .expect("run ps");
+    if !ps.status.success() {
+        panic!("ps exited with status {}", ps.status);
+    }
     let stdout = String::from_utf8_lossy(&ps.stdout);
     let expected = format!("sleep {timeout_secs}");
     stdout
