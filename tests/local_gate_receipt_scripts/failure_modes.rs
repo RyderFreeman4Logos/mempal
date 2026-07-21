@@ -1,6 +1,7 @@
 use super::{
     GateFixture, configure_fixture_git_environment, fixture, fixture_git_command, receipt_files,
-    repo_root, run_fixture, successful_aggregate, wait_with_timeout, write_executable,
+    repo_root, run_fixture, successful_aggregate, symlink_path_command_to_stable_proxy,
+    wait_with_timeout,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -68,43 +69,10 @@ fn fixture_path(prepend: &Path) -> std::ffi::OsString {
     .expect("construct fixture PATH")
 }
 
-fn faulted_git_script() -> &'static str {
-    r#"#!/usr/bin/env bash
-set -euo pipefail
-
-if [ "${1:-}" = "status" ] && [ "${LOCAL_GATE_RECEIPT_FAULT_KIND:?}" = "status" ]; then
-    if [ -n "${LOCAL_GATE_RECEIPT_FAULT_ARM:-}" ] && [ ! -e "${LOCAL_GATE_RECEIPT_FAULT_ARM}" ]; then
-        exec "${LOCAL_GATE_RECEIPT_REAL_GIT:?}" "$@"
-    fi
-    printf '%s\n' 'faulted-status' >>"${LOCAL_GATE_RECEIPT_FAULT_LOG:?}"
-    exit 42
-fi
-
-if [ "${1:-}" = "rev-parse" ] && [ "${LOCAL_GATE_RECEIPT_FAULT_KIND:?}" = "git-dir" ] && [ "${2:-}" = "--git-dir" ]; then
-    "${LOCAL_GATE_RECEIPT_REAL_GIT:?}" "$@"
-    printf '%s\n' 'faulted-git-dir' >>"${LOCAL_GATE_RECEIPT_FAULT_LOG:?}"
-    exit 42
-fi
-
-if [ "${1:-}" = "rev-parse" ] && [ "${LOCAL_GATE_RECEIPT_FAULT_KIND:?}" = "git-common-dir" ] && [ "${2:-}" = "--git-common-dir" ]; then
-    "${LOCAL_GATE_RECEIPT_REAL_GIT:?}" "$@"
-    printf '%s\n' 'faulted-git-common-dir' >>"${LOCAL_GATE_RECEIPT_FAULT_LOG:?}"
-    exit 42
-fi
-
-if [ "${1:-}" = "check-ignore" ] && [ "${LOCAL_GATE_RECEIPT_FAULT_KIND:?}" = "check-ignore" ]; then
-    printf '%s\n' 'faulted-check-ignore' >>"${LOCAL_GATE_RECEIPT_FAULT_LOG:?}"
-    exit 42
-fi
-
-exec "${LOCAL_GATE_RECEIPT_REAL_GIT:?}" "$@"
-"#
-}
-
 fn fault_shim(fixture: &GateFixture, kind: FaultKind, arm: bool) -> FaultShim {
     let bin_dir = fixture.root.join(format!("fault-bin-{}", kind.label()));
     fs::create_dir(&bin_dir).expect("create fault shim directory");
-    write_executable(&bin_dir.join("git"), faulted_git_script());
+    symlink_path_command_to_stable_proxy(&bin_dir, "git");
 
     FaultShim {
         log: fixture.root.join(format!("fault-{}.log", kind.label())),
@@ -160,7 +128,7 @@ fn assert_fault_shim_is_selective(fixture: &GateFixture, shim: &FaultShim) {
 }
 
 fn run_fixture_with_fault(fixture: &GateFixture, action: &str, shim: &FaultShim) -> Output {
-    let mut command = Command::new("bash");
+    let mut command = Command::new("/bin/bash");
     command
         .arg(&fixture.script)
         .arg(action)
@@ -336,15 +304,12 @@ fn review_check_rejects_missing_csa_before_publication_sentinel() {
     let tempdir = tempfile::tempdir().expect("create missing-csa fixture directory");
     let bin_dir = tempdir.path().join("bin");
     fs::create_dir(&bin_dir).expect("create missing-csa PATH");
-    let real_bash = find_real_executable("bash");
-    std::os::unix::fs::symlink(&real_bash, bin_dir.join("bash"))
-        .expect("link real bash into missing-csa PATH");
     let sentinel = tempdir.path().join("publication-success");
-    let mut command = Command::new(&real_bash);
+    let mut command = Command::new("/bin/bash");
     command
         .args([
             "-c",
-            "bash \"$1\" && : >\"$2\"",
+            "/bin/bash \"$1\" && : >\"$2\"",
             "--",
             repo_root()
                 .join("scripts/hooks/review-check.sh")

@@ -54,7 +54,10 @@ fn tiered_config_disabled() -> ContextConfig {
 }
 
 fn make_drawer(id: &str, room: &str, importance: i32, days_ago: i64) -> Drawer {
-    let added_at = (now_secs() - days_ago * 86_400).to_string();
+    make_drawer_at(id, room, importance, now_secs() - days_ago * 86_400)
+}
+
+fn make_drawer_at(id: &str, room: &str, importance: i32, added_at_unix: i64) -> Drawer {
     Drawer {
         id: id.to_string(),
         content: format!("content for drawer {id} with some text to estimate tokens"),
@@ -62,7 +65,7 @@ fn make_drawer(id: &str, room: &str, importance: i32, days_ago: i64) -> Drawer {
         room: Some(room.to_string()),
         source_file: Some(format!("tests://{id}.md")),
         source_type: SourceType::AgentInference,
-        added_at,
+        added_at: added_at_unix.to_string(),
         importance,
         effective_importance: importance as f64,
         ..Drawer::default()
@@ -249,9 +252,15 @@ fn test_tiered_t3_respects_recency_window() {
     let (_, db) = new_db();
     let now = now_unix_secs();
     // drawer_old: 10 days ago — outside 3-day window
-    insert(&db, &make_drawer("drawer-old", "general", 1, 10));
-    // drawer_new: today — inside 3-day window
-    insert(&db, &make_drawer("drawer-new", "general", 1, 0));
+    insert(
+        &db,
+        &make_drawer_at("drawer-old", "general", 1, now - 10 * 86_400),
+    );
+    // drawer_new: one day ago — clearly inside the three-day window.
+    insert(
+        &db,
+        &make_drawer_at("drawer-new", "general", 1, now - 86_400),
+    );
 
     let items = fetch_t3(
         &db,

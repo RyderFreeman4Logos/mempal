@@ -4,12 +4,16 @@
 # bypass pre-commit. Fix the actual code.
 
 set shell := ["bash", "-c"]
+
+# IO scheduling: run cargo at idle priority to avoid starving interactive processes
+_io_prefix := "ionice -c 3 nice -n 19"
+
 set tempdir := "."
 set dotenv-load := true
 
 _repo_root := `git rev-parse --show-toplevel`
 export MISE_TRUSTED_CONFIG_PATHS := _repo_root
-cargo := `if command -v mise >/dev/null 2>&1; then printf '%s' 'mise x rust@stable -- cargo'; else printf '%s' 'cargo'; fi`
+cargo := _io_prefix + " " + `if command -v mise >/dev/null 2>&1; then printf '%s' 'mise x rust@stable -- cargo'; else printf '%s' 'cargo'; fi`
 
 # Default local gate before push/merge.
 default: local-gates
@@ -217,9 +221,9 @@ clippy-fast:
 
 # Fast test tier for pre-commit. Slow endpoint and long-running migration tests
 # are behind the `integration` feature.
-# CARGO_BUILD_JOBS=2 limits parallel LLVM codegen to avoid OOM on this host.
+# Cargo parallelism controlled by ~/.cargo/config.toml
 test:
-    CARGO_BUILD_JOBS=2 bash scripts/gates/cargo-test-with-timeout.sh {{cargo}} test
+    bash scripts/gates/cargo-test-with-timeout.sh {{cargo}} test
 
 # REST feature test tier, batched to control disk and memory pressure.
 test-rest:
@@ -236,7 +240,7 @@ test-f pattern:
 
 # Regression gate for the exact all-feature linker command from #698.
 test-onnx-link:
-    CARGO_BUILD_JOBS=1 {{cargo}} test --locked --all-features -j 1 --no-run
+    {{cargo}} test --locked --all-features --no-run
 
 # ONNX feature test using the checksum-pinned official shared runtime.
 test-onnx: test-onnx-link
