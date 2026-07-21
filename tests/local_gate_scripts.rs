@@ -711,10 +711,7 @@ fn just_onnx_recipe_uses_checksum_pinned_shared_runtime() {
         .expect("read ONNX test gate");
 
     assert!(justfile.contains("bash scripts/gates/onnx-tests.sh"));
-    assert!(
-        justfile
-            .contains("CARGO_BUILD_JOBS=1 {{cargo}} test --locked --all-features -j 1 --no-run")
-    );
+    assert!(justfile.contains("{{cargo}} test --locked --all-features --no-run"));
     assert!(justfile.contains("just test-onnx-link"));
     assert!(cargo_toml.contains("default-features = false"));
     assert!(cargo_toml.contains("\"load-dynamic\""));
