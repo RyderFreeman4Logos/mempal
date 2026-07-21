@@ -4,12 +4,16 @@
 # bypass pre-commit. Fix the actual code.
 
 set shell := ["bash", "-c"]
+
+# IO scheduling: run cargo at idle priority to avoid starving interactive processes
+_io_prefix := "ionice -c 3 nice -n 19"
+
 set tempdir := "."
 set dotenv-load := true
 
 _repo_root := `git rev-parse --show-toplevel`
 export MISE_TRUSTED_CONFIG_PATHS := _repo_root
-cargo := `if command -v mise >/dev/null 2>&1; then printf '%s' 'mise x rust@stable -- cargo'; else printf '%s' 'cargo'; fi`
+cargo := _io_prefix + " " + `if command -v mise >/dev/null 2>&1; then printf '%s' 'mise x rust@stable -- cargo'; else printf '%s' 'cargo'; fi`
 
 # Default local gate before push/merge.
 default: local-gates
