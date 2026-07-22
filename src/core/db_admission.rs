@@ -9,7 +9,7 @@
 //! legacy fail-closed diagnostics without treating PID reuse as ownership.
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,6 +23,9 @@ use super::db_admission_lease::{
     HolderLiveness, create_holder_lease, holder_lease_liveness, remove_holder_lease,
     sweep_unreferenced_holder_leases,
 };
+use super::db_admission_state::{
+    ADMISSION_STATE_SCHEMA_VERSION, load_state, lock_state, save_state, sweep_staged_state_files,
+};
 
 pub(super) use super::db_admission_paths::AdmissionPaths;
 pub use budget::BudgetExceededReason;
@@ -33,8 +36,8 @@ const DEFAULT_MAX_HOLDERS: usize = 16;
 /// MCP/daemon process can still open its async pool under load (#809).
 const DEFAULT_RESERVED_SERVICE_HOLDERS: usize = 2;
 const DEFAULT_MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
-const ADMISSION_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
-const ADMISSION_LOCK_RETRY: Duration = Duration::from_millis(2);
+pub(super) const ADMISSION_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
+pub(super) const ADMISSION_LOCK_RETRY: Duration = Duration::from_millis(2);
 pub(super) const ADMISSION_RELEASE_MAX_ATTEMPTS: u8 = 3;
 pub(super) const ADMISSION_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(50);
 pub(super) const HOLDER_LEASE_VERSION: u8 = 1;
@@ -172,6 +175,20 @@ pub enum DbAdmissionError {
         #[source]
         source: io::Error,
     },
+    #[error("database admission sidecar directory is unsafe at {path}: {reason}")]
+    UnsafeSidecarDirectory { path: PathBuf, reason: &'static str },
+    #[error("database admission sidecar is unsafe at {path}: {reason}")]
+    UnsafeSidecar { path: PathBuf, reason: &'static str },
+    #[error(
+        "database admission state exceeds {max_bytes} bytes at {path}: observed {actual_bytes} bytes"
+    )]
+    StateTooLarge {
+        path: PathBuf,
+        max_bytes: usize,
+        actual_bytes: u64,
+    },
+    #[error("database admission state schema version {version} is unsupported at {path}")]
+    UnsupportedStateVersion { path: PathBuf, version: u32 },
     #[error("database admission state is invalid at {path}: {source}")]
     InvalidState {
         path: PathBuf,
@@ -230,10 +247,27 @@ pub struct DbAdmissionSnapshot {
     pub available_cache_bytes: u64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct AdmissionState {
-    next_generation: u64,
-    holders: Vec<DbAdmissionHolder>,
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdmissionState {
+    #[serde(default = "default_admission_state_schema_version")]
+    pub(super) schema_version: u32,
+    pub(super) next_generation: u64,
+    pub(super) holders: Vec<DbAdmissionHolder>,
+}
+
+impl Default for AdmissionState {
+    fn default() -> Self {
+        Self {
+            schema_version: default_admission_state_schema_version(),
+            next_generation: 0,
+            holders: Vec::new(),
+        }
+    }
+}
+
+const fn default_admission_state_schema_version() -> u32 {
+    ADMISSION_STATE_SCHEMA_VERSION
 }
 
 #[derive(Debug)]
@@ -261,6 +295,7 @@ impl ProfileDbAdmission {
         validate_request(request, config)?;
         let paths = AdmissionPaths::new(db_path)?;
         let _lock = lock_state(&paths.lock_path)?;
+        sweep_staged_state_files(&paths)?;
         let mut state = load_state(&paths.state_path)?;
         sweep_unreferenced_holder_leases(&paths, &state.holders)?;
         let reaped = reap_stale_holders(&paths, &mut state);
@@ -318,7 +353,7 @@ impl ProfileDbAdmission {
         state
             .holders
             .sort_by_key(|holder| (holder.generation, holder.pid));
-        if let Err(error) = save_state(&paths.state_path, &state) {
+        if let Err(error) = save_state(&paths, &state) {
             drop(lease);
             if let Err(cleanup_error) = remove_holder_lease(&lease_path) {
                 tracing::warn!(%cleanup_error, "failed to clean up unpublished holder lease");
@@ -347,6 +382,7 @@ impl ProfileDbAdmission {
     ) -> Result<DbAdmissionSnapshot, DbAdmissionError> {
         let paths = AdmissionPaths::new(db_path)?;
         let _lock = lock_state(&paths.lock_path)?;
+        sweep_staged_state_files(&paths)?;
         let mut state = load_state(&paths.state_path)?;
         sweep_unreferenced_holder_leases(&paths, &state.holders)?;
         let reaped = reap_stale_holders(&paths, &mut state);
@@ -398,12 +434,13 @@ impl ProfileDbAdmission {
 
     pub(super) fn release(&self) -> Result<bool, DbAdmissionError> {
         let _lock = lock_state(&self.lock_path)?;
-        let mut state = load_state(&self.state_path)?;
         let paths = AdmissionPaths {
             database_path: self.database_path.clone(),
             state_path: self.state_path.clone(),
             lock_path: self.lock_path.clone(),
         };
+        sweep_staged_state_files(&paths)?;
+        let mut state = load_state(&self.state_path)?;
         sweep_unreferenced_holder_leases(&paths, &state.holders)?;
         let before = state.holders.len();
         state.holders.retain(|holder| {
@@ -413,7 +450,7 @@ impl ProfileDbAdmission {
         });
         let released = state.holders.len() != before;
         if released {
-            save_state(&self.state_path, &state)?;
+            save_state(&paths, &state)?;
             #[cfg(test)]
             fault_injection::exit_if(CrashPoint::ReleaseStateSavedBeforeLeaseUnlink);
         }
@@ -433,84 +470,6 @@ fn validate_request(
     config: DbAdmissionConfig,
 ) -> Result<(), DbAdmissionError> {
     budget::validate_request(request, config)
-}
-
-fn lock_state(path: &Path) -> Result<File, DbAdmissionError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .map_err(|source| DbAdmissionError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let started = std::time::Instant::now();
-    loop {
-        match imp::try_lock_exclusive(&file) {
-            Ok(true) => return Ok(file),
-            Ok(false) if started.elapsed() < ADMISSION_LOCK_TIMEOUT => {
-                std::thread::sleep(ADMISSION_LOCK_RETRY);
-            }
-            Ok(false) => {
-                return Err(DbAdmissionError::Busy {
-                    path: path.to_path_buf(),
-                    timeout_ms: ADMISSION_LOCK_TIMEOUT.as_millis() as u64,
-                });
-            }
-            Err(source) => {
-                return Err(DbAdmissionError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
-        }
-    }
-}
-
-fn load_state(path: &Path) -> Result<AdmissionState, DbAdmissionError> {
-    match fs::read(path) {
-        Ok(bytes) if bytes.is_empty() => Ok(AdmissionState::default()),
-        Ok(bytes) => {
-            serde_json::from_slice(&bytes).map_err(|source| DbAdmissionError::InvalidState {
-                path: path.to_path_buf(),
-                source,
-            })
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(AdmissionState::default()),
-        Err(source) => Err(DbAdmissionError::Io {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-fn save_state(path: &Path, state: &AdmissionState) -> Result<(), DbAdmissionError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut staged =
-        tempfile::NamedTempFile::new_in(parent).map_err(|source| DbAdmissionError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    serde_json::to_writer(staged.as_file_mut(), state).map_err(|source| {
-        DbAdmissionError::InvalidState {
-            path: path.to_path_buf(),
-            source,
-        }
-    })?;
-    staged
-        .as_file()
-        .sync_all()
-        .map_err(|source| DbAdmissionError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    staged.persist(path).map_err(|error| DbAdmissionError::Io {
-        path: path.to_path_buf(),
-        source: error.error,
-    })?;
-    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -551,7 +510,7 @@ fn persist_reaped_holders(
     if reaped.reaped_stale_holders_this_snapshot == 0 {
         return Ok(());
     }
-    save_state(&paths.state_path, state)?;
+    save_state(paths, state)?;
     #[cfg(test)]
     fault_injection::exit_if(CrashPoint::ReapStateSavedBeforeOrphanSweep);
     sweep_unreferenced_holder_leases(paths, &state.holders)?;

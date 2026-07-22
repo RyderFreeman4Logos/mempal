@@ -42,6 +42,13 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **DB admission sidecars**: restrict lock/state files to owner-safe directories,
+  reject symlink/hard-link/inode substitution, bound and version persisted state,
+  reclaim only grammar-validated staged files, and fsync publication/removal
+  ordering with deterministic crash recovery coverage (#796).
+- **DB admission SQLite opens**: use the admitted canonical database path for
+  raw and queue read-only connections, closing symlink-retarget TOCTOU windows
+  between admission and SQLite open (#797).
 - **Mind-model bootstrap tests**: use isolated SQLite/config fixtures and a
   fail-closed REST fallback address so they cannot reach a live daemon (#807).
 - **MCP ingest worker tests**: wait for the idle queue claim's I/O-burst sample

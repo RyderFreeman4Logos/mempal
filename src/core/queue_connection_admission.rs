@@ -27,7 +27,7 @@ impl QueueConnectionAdmission {
         }
     }
 
-    pub(super) fn ensure(&self, db_path: &Path) -> Result<()> {
+    pub(super) fn ensure(&self, db_path: &Path) -> Result<std::path::PathBuf> {
         let mut admission = self
             .guard
             .lock()
@@ -42,20 +42,48 @@ impl QueueConnectionAdmission {
                 ),
             )?);
         }
-        Ok(())
+        Ok(admission
+            .as_ref()
+            .expect("queue admission is initialized")
+            .database_path()
+            .to_path_buf())
+    }
+
+    pub(super) fn open_sqlite(&self, db_path: &Path, flags: OpenFlags) -> Result<Connection> {
+        let admitted_path = self.ensure(db_path)?;
+        Ok(Connection::open_with_flags(
+            admitted_path,
+            flags | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?)
+    }
+
+    pub(super) fn open_read_write(&self, db_path: &Path) -> Result<Connection> {
+        self.open_sqlite(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
     }
 }
 
 /// Read queue statistics without startup reclamation or a writable connection.
 pub fn queue_stats_readonly(path: &Path) -> Result<QueueStats> {
+    queue_stats_readonly_with_opener(path, |resolved_path| {
+        Connection::open_with_flags(
+            resolved_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+    })
+}
+
+fn queue_stats_readonly_with_opener(
+    path: &Path,
+    open: impl FnOnce(&Path) -> rusqlite::Result<Connection>,
+) -> Result<QueueStats> {
     if !path.exists() {
         return Err(QueueError::DatabaseMissing(path.to_path_buf()));
     }
-    let _admission = ProfileDbAdmission::acquire(
+    let admission = ProfileDbAdmission::acquire(
         path,
         DbAdmissionRequest::new(DbHolderClass::current_process(), 1, 2 * 1024 * 1024),
     )?;
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let connection = open(admission.database_path())?;
     connection.pragma_update(None, "cache_size", QUEUE_SQLITE_CACHE_SIZE_KIB)?;
     compute_queue_stats(&connection, DEFAULT_MAX_INGEST_ACTIVE_BYTES)
 }

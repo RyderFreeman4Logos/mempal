@@ -5,6 +5,7 @@ use std::rc::Rc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CrashPoint {
     LeaseCreatedBeforeStatePublish,
+    StateTempSyncedBeforeRename,
     ReleaseStateSavedBeforeLeaseUnlink,
     ReapStateSavedBeforeOrphanSweep,
 }
@@ -13,8 +14,9 @@ impl CrashPoint {
     pub(super) const fn exit_code(self) -> i32 {
         match self {
             Self::LeaseCreatedBeforeStatePublish => 86,
-            Self::ReleaseStateSavedBeforeLeaseUnlink => 87,
-            Self::ReapStateSavedBeforeOrphanSweep => 88,
+            Self::StateTempSyncedBeforeRename => 87,
+            Self::ReleaseStateSavedBeforeLeaseUnlink => 88,
+            Self::ReapStateSavedBeforeOrphanSweep => 89,
         }
     }
 }

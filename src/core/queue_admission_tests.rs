@@ -2,6 +2,9 @@ use crate::core::db::Database;
 use crate::core::db_admission::ProfileDbAdmission;
 use crate::core::queue::{PendingMessageStore, QueueError};
 
+#[cfg(unix)]
+use rusqlite::{Connection, OpenFlags};
+
 use super::{QUEUE_CONNECTION_CACHE_BYTES, QUEUE_CONNECTIONS_PER_CACHE, queue_stats_readonly};
 
 #[test]
@@ -63,4 +66,35 @@ fn queue_cache_clones_share_admission_and_forks_register_separately() {
             .active_holders,
         0
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn readonly_stats_open_the_admitted_target_after_symlink_retarget() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first_target = temp.path().join("first.db");
+    let second_target = temp.path().join("second.db");
+    let link_path = temp.path().join("palace.db");
+    drop(Database::open(&first_target).expect("initialize first database"));
+    drop(Database::open(&second_target).expect("initialize second database"));
+    symlink(&first_target, &link_path).expect("link first database");
+    let expected = first_target.canonicalize().expect("canonical first target");
+
+    let stats = super::queue_stats_readonly_with_opener(&link_path, |resolved_path| {
+        assert_eq!(
+            resolved_path, expected,
+            "stats must open the admitted target"
+        );
+        std::fs::remove_file(&link_path).expect("remove first symlink");
+        symlink(&second_target, &link_path).expect("retarget database symlink");
+        Connection::open_with_flags(
+            resolved_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+    })
+    .expect("readonly stats must retain the first target");
+
+    assert_eq!(stats.pending, 0);
 }

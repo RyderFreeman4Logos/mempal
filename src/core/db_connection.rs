@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use super::db::DbError;
 use super::db_admission::{DbAdmissionRequest, DbHolderClass, ProfileDbAdmission};
@@ -33,6 +33,20 @@ impl AdmittedSqliteConnection {
         holder_class: DbHolderClass,
         cache_size_kib: i64,
     ) -> Result<Self, DbError> {
+        Self::open_with_opener(path, holder_class, cache_size_kib, |resolved_path| {
+            Connection::open_with_flags(
+                resolved_path,
+                OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+        })
+    }
+
+    fn open_with_opener(
+        path: &Path,
+        holder_class: DbHolderClass,
+        cache_size_kib: i64,
+        open: impl FnOnce(&Path) -> rusqlite::Result<Connection>,
+    ) -> Result<Self, DbError> {
         let admission = ProfileDbAdmission::acquire(
             path,
             DbAdmissionRequest::new(
@@ -41,12 +55,22 @@ impl AdmittedSqliteConnection {
                 cache_size_kib.unsigned_abs().saturating_mul(1024),
             ),
         )?;
-        let connection = Connection::open(path)?;
+        let connection = open(admission.database_path())?;
         connection.pragma_update(None, "cache_size", cache_size_kib)?;
         Ok(Self {
             connection,
             _admission: admission,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_after_admission(
+        path: &Path,
+        holder_class: DbHolderClass,
+        cache_size_kib: i64,
+        open: impl FnOnce(&Path) -> rusqlite::Result<Connection>,
+    ) -> Result<Self, DbError> {
+        Self::open_with_opener(path, holder_class, cache_size_kib, open)
     }
 
     pub(crate) fn connection(&self) -> &Connection {
