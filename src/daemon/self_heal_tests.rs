@@ -38,6 +38,10 @@ async fn lock_hook_ipc_tests() -> (
     (handler_guard, shutdown_guard)
 }
 
+fn short_tempdir() -> tempfile::TempDir {
+    tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+}
+
 struct LogCapture {
     buffer: Arc<Mutex<Vec<u8>>>,
 }
@@ -210,7 +214,7 @@ async fn send_hook_ipc_request(
 async fn test_hook_ipc_ack_requires_sqlite_persistence() {
     let _test_guard = lock_hook_ipc_tests().await;
     super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
 
@@ -242,7 +246,7 @@ async fn test_hook_ipc_ack_requires_sqlite_persistence() {
 async fn test_hook_ipc_rejects_sqlite_lock_without_waiting_for_persistence() {
     let _test_guard = lock_hook_ipc_tests().await;
     super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
     let lock_conn = rusqlite::Connection::open(&db_path).expect("open lock connection");
@@ -305,7 +309,7 @@ async fn test_hook_ipc_rejects_sqlite_lock_without_waiting_for_persistence() {
 async fn test_hook_ipc_stalled_request_times_out_without_persisting() {
     let _test_guard = lock_hook_ipc_tests().await;
     super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
 
@@ -350,7 +354,7 @@ async fn test_hook_ipc_stalled_request_times_out_without_persisting() {
 async fn test_hook_ipc_timeout_fallback_is_idempotent_with_slow_daemon_persist() {
     let _test_guard = lock_hook_ipc_tests().await;
     super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
 
@@ -422,7 +426,7 @@ async fn test_hook_ipc_timeout_fallback_is_idempotent_with_slow_daemon_persist()
 async fn test_hook_ipc_closed_peer_write_is_debug_only() {
     let _test_guard = lock_hook_ipc_tests().await;
     super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
 
@@ -465,7 +469,7 @@ async fn test_hook_ipc_listener_bounds_active_handlers() {
     let _test_guard = lock_hook_ipc_tests().await;
     let _shutdown_guard = ShutdownResetGuard::new();
     super::reset_hook_ipc_handler_counters_for_test();
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
     let mempal_home = tmp.path().join(".mempal");
     std::fs::create_dir_all(&mempal_home).expect("create mempal home");
@@ -538,7 +542,7 @@ async fn test_hook_ipc_listener_recovers_after_real_sqlite_contention() {
     let _test_guard = lock_hook_ipc_tests().await;
     let _shutdown_guard = ShutdownResetGuard::new();
     super::reset_hook_ipc_handler_counters_for_test();
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
     let mempal_home = tmp.path().join(".mempal");
     std::fs::create_dir_all(&mempal_home).expect("create mempal home");

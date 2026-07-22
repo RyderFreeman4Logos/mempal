@@ -5,6 +5,8 @@ use std::net::TcpListener;
 use std::process::Command;
 use std::sync::Arc;
 use std::thread;
+#[cfg(feature = "rest")]
+use std::time::Duration;
 use std::{fs, path::Path};
 
 use async_trait::async_trait;
@@ -21,6 +23,7 @@ use mempal::core::types::{
 use mempal::core::utils::{build_bootstrap_drawer_id_from_parts, build_drawer_id};
 use mempal::core::{
     anchor,
+    config::Config,
     db::{CURRENT_SCHEMA_VERSION, Database},
     protocol::MEMORY_PROTOCOL,
 };
@@ -99,8 +102,25 @@ fn create_v4_db(path: &std::path::Path) {
     .expect("apply v4 schema");
 }
 
+const HERMETIC_REST_ADDR: &str = "127.0.0.1:0";
+
+fn short_tempdir() -> TempDir {
+    TempDir::new_in("/tmp").expect("short tempdir")
+}
+
+fn isolated_mcp_test_config(db_path: &Path) -> Config {
+    let mut config = Config {
+        db_path: db_path.display().to_string(),
+        ..Default::default()
+    };
+    // A test that unexpectedly reaches the daemon REST fallback must fail
+    // locally rather than connect to a developer's default daemon.
+    config.api.addr = HERMETIC_REST_ADDR.to_string();
+    config
+}
+
 fn new_db() -> (TempDir, Database) {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
     let db = Database::open(&db_path).expect("open db");
     (tmp, db)
@@ -139,11 +159,12 @@ impl Embedder for StubEmbedder {
 }
 
 fn setup_mcp_server() -> (TempDir, Database, MempalMcpServer) {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
     let db = Database::open(&db_path).expect("open db");
-    let server = MempalMcpServer::new_with_factory(
+    let server = MempalMcpServer::new_with_factory_and_config(
         db_path,
+        isolated_mcp_test_config(db.path()),
         Arc::new(StubEmbedderFactory {
             vector: vec![0.1, 0.2, 0.3],
         }),
@@ -153,18 +174,8 @@ fn setup_mcp_server() -> (TempDir, Database, MempalMcpServer) {
 }
 
 #[cfg(feature = "rest")]
-fn setup_rest_mcp_server() -> (TempDir, Database, MempalMcpServer, mempal::api::ApiState) {
-    let tmp = TempDir::new().expect("tempdir");
-    let db_path = tmp.path().join("palace.db");
-    let db = Database::open(&db_path).expect("open db");
-    let factory = Arc::new(StubEmbedderFactory {
-        vector: vec![0.1, 0.2, 0.3],
-    });
-    let server = MempalMcpServer::new_with_factory(db_path.clone(), factory.clone())
-        .expect("create MCP server");
-    let state = mempal::api::ApiState::new(db_path, factory);
-    (tmp, db, server, state)
-}
+#[path = "mind_model_bootstrap/rest_tests.rs"]
+mod mind_model_bootstrap_rest_tests;
 
 fn expected_bootstrap_evidence_id(
     wing: &str,
@@ -199,29 +210,6 @@ fn expected_bootstrap_evidence_id(
             trigger_hints: None,
         },
     )
-}
-
-#[cfg(feature = "rest")]
-async fn post_rest_ingest(state: mempal::api::ApiState, payload: Value) -> (StatusCode, Value) {
-    let response = mempal::api::router(state)
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/api/ingest")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&payload).expect("serialize rest payload"),
-                ))
-                .expect("build rest request"),
-        )
-        .await
-        .expect("rest request should complete");
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read rest response body");
-    let body = serde_json::from_slice(&bytes).expect("parse rest response body");
-    (status, body)
 }
 
 fn mempal_bin() -> String {
@@ -266,7 +254,7 @@ fn init_git_repo(path: &Path) {
 }
 
 fn setup_cli_home() -> (TempDir, Database) {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let mempal_dir = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_dir).expect("create mempal home");
     let db = Database::open(&mempal_dir.join("palace.db")).expect("open cli db");
@@ -477,7 +465,7 @@ fn insert_cli_wake_up_drawer(db: &Database, drawer: &Drawer) {
 
 #[test]
 fn test_migration_backfills_legacy_drawers_with_bootstrap_defaults() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
     create_v4_db(&db_path);
 
@@ -813,134 +801,6 @@ async fn test_mcp_ingest_default_drawer_id_matches_bootstrap_identity() {
         response.drawer_id,
         build_drawer_id("mempal", Some("identity"), content)
     );
-}
-
-#[cfg(feature = "rest")]
-#[tokio::test]
-async fn test_rest_ingest_default_evidence_drawer_id_matches_mcp() {
-    let (_tmp, _db, server, state) = setup_rest_mcp_server();
-    let content = "REST default identity body";
-    let (status, body) = post_rest_ingest(
-        state,
-        json!({
-            "content": content,
-            "wing": "mempal",
-            "room": "identity"
-        }),
-    )
-    .await;
-    let mcp = server
-        .ingest_json_for_test(json!({
-            "content": content,
-            "wing": "mempal",
-            "room": "identity",
-            "dry_run": true
-        }))
-        .await
-        .expect("mcp dry-run should succeed");
-
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(body["drawer_id"], mcp.drawer_id);
-    assert_ne!(
-        body["drawer_id"],
-        build_drawer_id("mempal", Some("identity"), content)
-    );
-}
-
-#[cfg(feature = "rest")]
-#[tokio::test]
-async fn test_rest_ingest_stores_source_confidence_params() {
-    let (_tmp, db, _server, state) = setup_rest_mcp_server();
-    let (status, body) = post_rest_ingest(
-        state,
-        json!({
-            "content": "REST source confidence body",
-            "wing": "mempal",
-            "room": "confidence",
-            "source_type": "agent_observation",
-            "confidence": 0.73
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::CREATED);
-    let drawer_id = body["drawer_id"].as_str().expect("drawer_id string");
-    let drawer = db
-        .get_drawer(drawer_id)
-        .expect("load drawer")
-        .expect("drawer exists");
-
-    assert_eq!(drawer.source_type, SourceType::AgentObservation);
-    assert!((drawer.confidence - 0.73).abs() < f64::EPSILON);
-}
-
-#[cfg(feature = "rest")]
-#[tokio::test]
-async fn test_rest_after_mcp_default_ingest_reuses_existing_bootstrap_drawer() {
-    let (_tmp, db, server, state) = setup_rest_mcp_server();
-    let content = "Shared default identity body";
-    let mcp = server
-        .ingest_json_for_test(json!({
-            "content": content,
-            "wing": "mempal",
-            "room": "identity"
-        }))
-        .await
-        .expect("mcp write should succeed");
-
-    let (status, body) = post_rest_ingest(
-        state,
-        json!({
-            "content": content,
-            "wing": "mempal",
-            "room": "identity"
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(body["drawer_id"], mcp.drawer_id);
-    assert_eq!(db.drawer_count().expect("drawer count"), 1);
-}
-
-#[cfg(feature = "rest")]
-#[tokio::test]
-async fn test_rest_ingest_preserves_typed_fields_on_bootstrap_identity() {
-    let (_tmp, db, _server, state) = setup_rest_mcp_server();
-    let content = "REST typed fields are persisted";
-    let statement = "REST should preserve typed knowledge metadata.";
-    let (status, body) = post_rest_ingest(
-        state,
-        json!({
-            "content": content,
-            "wing": "mempal",
-            "room": "identity",
-            "memory_kind": "knowledge",
-            "statement": statement,
-            "tier": "shu",
-            "status": "promoted",
-            "supporting_refs": ["drawer_ev_001"]
-        }),
-    )
-    .await;
-    let expected = expected_bootstrap_evidence_id(
-        "mempal",
-        Some("identity"),
-        content,
-        &SourceType::AgentInference,
-    );
-
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(body["drawer_id"], expected);
-    let drawer = db
-        .get_drawer(&expected)
-        .expect("load rest drawer")
-        .expect("rest drawer exists");
-    assert_eq!(drawer.memory_kind, MemoryKind::Knowledge);
-    assert_eq!(drawer.statement.as_deref(), Some(statement));
-    assert_eq!(drawer.tier, Some(KnowledgeTier::Shu));
-    assert_eq!(drawer.status, Some(KnowledgeStatus::Promoted));
-    assert_eq!(drawer.supporting_refs, vec!["drawer_ev_001"]);
 }
 
 #[tokio::test]

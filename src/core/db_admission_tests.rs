@@ -9,6 +9,10 @@ use std::fs::{File, OpenOptions};
 #[cfg(target_os = "linux")]
 use std::path::Path;
 
+fn short_tempdir() -> tempfile::TempDir {
+    tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+}
+
 #[cfg(target_os = "linux")]
 fn holder(pid: u32, process_identity: &str, pid_namespace: Option<String>) -> DbAdmissionHolder {
     DbAdmissionHolder {
@@ -77,7 +81,7 @@ fn create_lease(paths: &AdmissionPaths, token: &str, lock: bool) -> File {
 #[cfg(target_os = "linux")]
 #[test]
 fn new_holder_record_stores_pid_namespace_identity() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let _admission = ProfileDbAdmission::acquire(
         &db_path,
@@ -116,7 +120,7 @@ fn cross_pid_namespace_holders_are_retained_when_pid_conflicts_or_is_missing() {
 #[cfg(target_os = "linux")]
 #[test]
 fn crashed_holder_in_nested_pid_namespace_is_reaped_from_lease() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&db_path).expect("admission paths");
     let token = "nested-crashed";
@@ -136,7 +140,7 @@ fn crashed_holder_in_nested_pid_namespace_is_reaped_from_lease() {
 #[cfg(target_os = "linux")]
 #[test]
 fn unrelated_host_pid_alias_does_not_keep_dead_namespaced_holder() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&db_path).expect("admission paths");
     let token = "host-pid-alias";
@@ -159,7 +163,7 @@ fn unrelated_host_pid_alias_does_not_keep_dead_namespaced_holder() {
 #[cfg(target_os = "linux")]
 #[test]
 fn live_foreign_namespace_owner_keeps_multiple_registrations() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&db_path).expect("admission paths");
     let first_token = "live-registration-one";
@@ -184,7 +188,7 @@ fn live_foreign_namespace_owner_keeps_multiple_registrations() {
 #[cfg(target_os = "linux")]
 #[test]
 fn repeated_smoke_style_crash_reap_cycles_do_not_grow_holder_state() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&db_path).expect("admission paths");
 
@@ -211,7 +215,7 @@ fn repeated_smoke_style_crash_reap_cycles_do_not_grow_holder_state() {
 #[cfg(target_os = "linux")]
 #[test]
 fn unreferenced_current_database_lease_is_reclaimed_on_next_snapshot() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&db_path).expect("admission paths");
     let token = "orphaned-before-state-publication";
@@ -231,7 +235,7 @@ fn unreferenced_current_database_lease_is_reclaimed_on_next_snapshot() {
 #[cfg(target_os = "linux")]
 #[test]
 fn old_writer_stripped_lease_version_still_uses_current_lease_as_liveness_anchor() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&db_path).expect("admission paths");
     let token = "old-writer-stripped-version";
@@ -255,7 +259,7 @@ fn old_writer_stripped_lease_version_still_uses_current_lease_as_liveness_anchor
 #[cfg(target_os = "linux")]
 #[test]
 fn orphan_sweep_retries_after_a_later_verifiable_pass() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&db_path).expect("admission paths");
     let token = "retry-after-unlink-verification";
@@ -284,7 +288,7 @@ fn orphan_sweep_retries_after_a_later_verifiable_pass() {
 #[cfg(target_os = "linux")]
 #[test]
 fn repeated_orphan_recovery_does_not_grow_current_lease_entries() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&db_path).expect("admission paths");
     write_raw_state(&paths.state_path, Vec::new());
@@ -305,7 +309,7 @@ fn repeated_orphan_recovery_does_not_grow_current_lease_entries() {
 #[cfg(target_os = "linux")]
 #[test]
 fn unknown_version_holder_protects_its_deterministic_lease_from_orphan_sweep() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&db_path).expect("admission paths");
     let token = "unknown-version-protected";
@@ -334,7 +338,7 @@ fn unknown_version_holder_protects_its_deterministic_lease_from_orphan_sweep() {
 #[cfg(target_os = "linux")]
 #[test]
 fn stale_reap_count_is_limited_to_the_snapshot_that_performed_recovery() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&db_path).expect("admission paths");
     let token = "snapshot-reap-count";
@@ -386,7 +390,7 @@ fn legacy_holder_without_pid_namespace_is_retained_fail_closed() {
 #[cfg(target_os = "linux")]
 #[test]
 fn snapshot_reports_unverifiable_legacy_holder() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&db_path).expect("admission paths");
     let mut legacy = raw_leased_holder("legacy-unknown", 23, "pid:[foreign-legacy]");
@@ -415,7 +419,7 @@ fn snapshot_reports_unverifiable_legacy_holder() {
 fn nofollow_lease_open_failure_is_reported_as_a_typed_unknown_reason() {
     use std::os::unix::fs::symlink;
 
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&db_path).expect("admission paths");
     let token = "nofollow-open-failure";
@@ -447,7 +451,7 @@ fn nofollow_lease_open_failure_is_reported_as_a_typed_unknown_reason() {
 #[cfg(target_os = "linux")]
 #[test]
 fn admission_paths_allow_directory_for_sqlite_diagnostics() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     std::fs::create_dir(&db_path).expect("create directory at database path");
 
@@ -462,7 +466,7 @@ fn admission_paths_allow_directory_for_sqlite_diagnostics() {
 #[cfg(target_os = "linux")]
 #[test]
 fn admission_paths_reject_regular_file_with_multiple_hard_links() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let alias_path = temp.path().join("palace-alias.db");
     std::fs::write(&db_path, b"sqlite fixture").expect("create database file");

@@ -1,11 +1,15 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+fn short_tempdir() -> tempfile::TempDir {
+    tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+}
+
 /// T1 — runtime-liveness (the core #345 property). On a single-worker runtime
 /// a ticker must keep advancing while a cold read is outstanding.
 #[tokio::test(flavor = "current_thread")]
 async fn t1_runtime_liveness_read_off_runtime() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 4)
         .expect("open async db")
         .with_read_delay(Duration::from_millis(300));
@@ -26,7 +30,7 @@ async fn t1_runtime_liveness_read_off_runtime() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t2_read_concurrency_up_to_n() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 4)
         .expect("open async db")
         .with_read_delay(Duration::from_millis(200));
@@ -46,7 +50,7 @@ async fn t2_read_concurrency_up_to_n() {
 
 #[tokio::test]
 async fn readers_are_query_only_low_cache_without_mmap() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 4).expect("open async db");
     let (query_only, cache_size, mmap_size): (i64, i64, i64) = adb
         .run_read(|db| {
@@ -68,7 +72,7 @@ async fn readers_are_query_only_low_cache_without_mmap() {
 
 #[tokio::test]
 async fn writer_is_writable() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 4).expect("open async db");
     let query_only: i64 = adb
         .run_write(|db| {
@@ -83,7 +87,7 @@ async fn writer_is_writable() {
 
 #[test]
 fn open_rejects_oversized_read_pool() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let path = tmp.path().join("palace.db");
     AsyncDb::open(&path, 15).expect("at-budget pool opens");
     assert!(matches!(
@@ -94,7 +98,7 @@ fn open_rejects_oversized_read_pool() {
 
 #[test]
 fn resource_snapshot_reports_configured_page_cache_budget() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), RESOURCE_BOUNDED_READERS)
         .expect("open async db");
     let snapshot = adb.resource_snapshot();
@@ -111,7 +115,7 @@ fn resource_snapshot_reports_configured_page_cache_budget() {
 
 #[test]
 fn reader_only_async_pool_does_not_open_writer() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let path = tmp.path().join("palace.db");
     Database::open(&path).expect("create database");
     let adb =
@@ -125,7 +129,7 @@ fn reader_only_async_pool_does_not_open_writer() {
 
 #[tokio::test]
 async fn reader_only_async_pool_runs_bounded_read_without_writer() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let path = tmp.path().join("palace.db");
     Database::open(&path).expect("create database");
     let adb = QueryOnlyAsyncDb::open(&path, 1).expect("open query-only async db");
@@ -143,7 +147,7 @@ async fn reader_only_async_pool_runs_bounded_read_without_writer() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_db_error_read_keeps_permit_until_checkin() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1).expect("open async db");
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let adb_for_cancel = adb.clone();
@@ -178,7 +182,7 @@ async fn cancelled_db_error_read_keeps_permit_until_checkin() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_anyhow_read_keeps_permit_until_checkin() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1).expect("open async db");
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let adb_for_cancel = adb.clone();
@@ -213,7 +217,7 @@ async fn cancelled_anyhow_read_keeps_permit_until_checkin() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deadline_anyhow_read_interrupts_sqlite_and_releases_reader() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1).expect("open async db");
     let start = Instant::now();
     let error = adb
@@ -245,7 +249,7 @@ async fn deadline_anyhow_read_interrupts_sqlite_and_releases_reader() {
 async fn async_db_and_query_only_open_via_symlink_succeed() {
     use std::os::unix::fs::symlink;
 
-    let tempdir = tempfile::tempdir().expect("tempdir");
+    let tempdir = short_tempdir();
     let target_path = tempdir.path().join("target.db");
     let link_path = tempdir.path().join("link.db");
     Database::open(&target_path).expect("create target db");
@@ -282,7 +286,7 @@ async fn async_db_and_query_only_open_via_symlink_succeed() {
 async fn async_db_symlink_retarget_does_not_divert_admitted_identity() {
     use std::os::unix::fs::symlink;
 
-    let tempdir = tempfile::tempdir().expect("tempdir");
+    let tempdir = short_tempdir();
     let target_a = tempdir.path().join("a.db");
     let target_b = tempdir.path().join("b.db");
     let link_path = tempdir.path().join("link.db");
