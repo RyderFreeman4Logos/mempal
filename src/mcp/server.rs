@@ -2222,6 +2222,27 @@ impl MempalMcpServer {
         Ok(async_db.clone())
     }
 
+    /// Fail closed for wait=true ingest when the MCP process cannot admit its
+    /// async pool due to holder/cache budget exhaustion. Queueing then timing
+    /// out would silently drop the caller's durable-decision expectation (#809).
+    /// Transient SQLite lock failures keep existing recovery paths.
+    async fn ensure_async_pool_for_wait_ingest(&self) -> std::result::Result<(), ErrorData> {
+        match self.async_db().await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let diagnostic =
+                    status_database_diagnostic(&self.db_path, "async_db", error.as_ref());
+                if diagnostic.failure_kind == "holder_budget_exceeded" {
+                    return Err(mcp_async_pool_admission_error(
+                        &self.db_path,
+                        error.as_ref(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
     async fn load_status_db_snapshot(
         &self,
         project_scope: ProjectSearchScope,
@@ -3950,6 +3971,12 @@ fn status_db_failure_kind(error: &(dyn std::error::Error + 'static)) -> &'static
         || summary.contains("sqlite_locked")
     {
         "locked_or_busy"
+    } else if summary.contains("holder budget exceeded")
+        || summary.contains("profile database holder budget")
+        || summary.contains("reserved_service_slots")
+        || summary.contains("pool cache budget exceeded")
+    {
+        "holder_budget_exceeded"
     } else if summary.contains("permission denied")
         || summary.contains("readonly")
         || summary.contains("read-only")
@@ -4007,6 +4034,9 @@ fn status_db_failure_hint(kind: &str) -> &'static str {
     match kind {
         "locked_or_busy" => {
             "Check for stale daemon/MCP processes holding palace.db, wait for the writer to finish, then retry status."
+        }
+        "holder_budget_exceeded" => {
+            "Profile SQLite holder budget is exhausted after stale reaping. Free live non-service holders (CLI/hook/API), wait for reserved service seats, then retry. Inspect resource_usage.profile_admission for reaped_stale_holders_this_snapshot and reserved_service_holders."
         }
         "path_or_permission" => {
             "Check that the configured database path exists, is a SQLite file, and is readable/writable by the current user."
@@ -6629,6 +6659,11 @@ impl MempalMcpServer {
             .await?;
         let mut daemon_rest_request = request.clone();
         daemon_rest_request.project_id = project_id.clone();
+        // wait=true callers expect a durable terminal result (or explicit refusal).
+        // Do not enqueue work the current MCP process cannot admit/run (#809).
+        if wait {
+            self.ensure_async_pool_for_wait_ingest().await?;
+        }
         let prepared = match tokio::time::timeout(
             self.ingest_admission_deadline,
             self.prepare_async_ingest_operation(
@@ -11711,6 +11746,15 @@ fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDt
                 diagnostic.source, diagnostic.summary, diagnostic.failure_kind, diagnostic.hint
             ),
         )
+    } else if diagnostic.failure_kind == "holder_budget_exceeded" {
+        (
+            "holder_budget_exceeded",
+            "write_refused",
+            format!(
+                "mempal profile holder budget is exhausted; write was refused before queueing. {}: {} ({}). {}",
+                diagnostic.source, diagnostic.summary, diagnostic.failure_kind, diagnostic.hint
+            ),
+        )
     } else {
         (
             "database_degraded",
@@ -11730,6 +11774,60 @@ fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDt
             "db_holder_summary": holder_summary,
             "safe_next_step": safe_next_step,
             "system_warnings": [warning],
+        })),
+    )
+}
+
+fn mcp_async_pool_admission_error(
+    db_path: &Path,
+    error: &(dyn std::error::Error + 'static),
+) -> ErrorData {
+    let diagnostic = status_database_diagnostic(db_path, "async_db", error);
+    let mut admission = match crate::core::db_admission::ProfileDbAdmission::snapshot(db_path) {
+        Ok(snapshot) => serde_json::json!({
+            "active_holders": snapshot.active_holders,
+            "configured_holder_limit": snapshot.configured_holder_limit,
+            "reaped_stale_holders_this_snapshot": snapshot.reaped_stale_holders_this_snapshot,
+            "reserved_service_holders": snapshot.reserved_service_holders,
+            "service_holders": snapshot.service_holders,
+            "active_cache_bytes": snapshot.active_cache_bytes,
+            "configured_cache_bytes": snapshot.configured_cache_bytes,
+            "available_cache_bytes": snapshot.available_cache_bytes,
+            "unknown_holders": snapshot.unknown_holders,
+        }),
+        Err(snapshot_error) => serde_json::json!({
+            "error": snapshot_error.to_string(),
+        }),
+    };
+    if let Some(object) = admission.as_object_mut() {
+        object.insert(
+            "async_pool_loaded".to_string(),
+            serde_json::Value::Bool(false),
+        );
+    }
+    let message = if diagnostic.failure_kind == "holder_budget_exceeded" {
+        format!(
+            "MCP async pool admission refused before wait=true ingest was accepted: {}. {}",
+            diagnostic.summary, diagnostic.hint
+        )
+    } else {
+        format!(
+            "MCP async pool could not be opened before wait=true ingest was accepted: {}. {}",
+            diagnostic.summary, diagnostic.hint
+        )
+    };
+    ErrorData::internal_error(
+        message,
+        Some(serde_json::json!({
+            "reason": if diagnostic.failure_kind == "holder_budget_exceeded" {
+                "holder_budget_exceeded"
+            } else {
+                "async_pool_unavailable"
+            },
+            "action": "write_refused",
+            "async_pool_loaded": false,
+            "database_diagnostic": diagnostic,
+            "profile_admission": admission,
         })),
     )
 }
@@ -21499,6 +21597,88 @@ prototypes = ["keep"]
             .await
             .expect("cleanup ingest completion");
         assert_eq!(completed.state, Some(IngestOperationState::Completed));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_wait_true_refuses_when_holder_budget_blocks_async_pool() {
+        let (_tempdir, db_path, server) = setup_server();
+        let server = server.with_async_db_open_error_for_test(
+            "failed to open MCP async database pool for /tmp/palace.db: profile database holder budget exceeded: active_holders=16/16, active_cache_bytes=155189248/268435456, requested_cache_bytes=50331648, reaped_stale_holders=0, reserved_service_holders=2, service_holders=16, reason=holder_limit",
+        );
+
+        let error = match server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "must refuse before false queue success".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("budget".to_string()),
+                wait: Some(true),
+                wait_timeout_secs: Some(5),
+                ..IngestRequest::default()
+            }))
+            .await
+        {
+            Ok(response) => panic!(
+                "wait=true ingest must fail closed on holder budget exhaustion, got {:?}",
+                response.0
+            ),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+        assert!(
+            error.message.contains("holder budget")
+                || error.message.contains("async pool admission refused"),
+            "error must be actionable: {}",
+            error.message
+        );
+        let data = error.data.expect("structured refusal data");
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("holder_budget_exceeded")
+        );
+        assert_eq!(
+            data.get("action").and_then(Value::as_str),
+            Some("write_refused")
+        );
+        assert_eq!(
+            data.get("async_pool_loaded").and_then(Value::as_bool),
+            Some(false)
+        );
+        let stats = PendingMessageStore::new_without_reclaim(&db_path)
+            .stats()
+            .expect("queue stats");
+        assert_eq!(
+            stats.pending, 0,
+            "holder-budget refusal must not accept a queued operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_wait_false_still_accepts_when_async_pool_budget_blocked() {
+        let (_tempdir, db_path, server) = setup_server();
+        let server = server.with_async_db_open_error_for_test(
+            "failed to open MCP async database pool for /tmp/palace.db: profile database holder budget exceeded: active_holders=16/16, active_cache_bytes=155189248/268435456, requested_cache_bytes=50331648, reaped_stale_holders=0, reserved_service_holders=2, service_holders=16, reason=holder_limit",
+        );
+
+        let response = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "async queue may still accept for daemon drain".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("budget-async".to_string()),
+                wait: Some(false),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("wait=false may still enqueue")
+            .0;
+
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(!response.timed_out);
+        assert!(response.operation_id.is_some());
+        let stats = PendingMessageStore::new_without_reclaim(&db_path)
+            .stats()
+            .expect("queue stats");
+        assert_eq!(stats.pending, 1);
     }
 
     #[tokio::test]

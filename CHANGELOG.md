@@ -42,6 +42,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **MCP admission**: reserve service holder seats for daemon/MCP, report
+  reaped/reserved budget diagnostics, and fail closed on `wait=true`
+  `mempal_ingest` when the MCP async pool cannot be admitted instead of
+  accepting a queued receipt that can only time out (#809).
 - **Rejudge apply**: add generation-bound artifact manifests, content-free typed
   OCC receipts, strict dry-run-to-execute receipt validation, and fail-closed
   schema/policy/file-hash/DB-generation checks while preserving soft-delete as
