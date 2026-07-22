@@ -42,6 +42,13 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **CLI integration tests**: route `ingest`/`delete` helpers through one
+  Linux-only deadline-aware subprocess supervisor (spawn, bounded capture,
+  pipe drain, TERM→KILL escalation, identity-safe reaping) so a hung CLI or
+  pipe-holding descendant cannot stall `cargo test`/local gates indefinitely
+  (#795). Stdin-write timeout paths now clean up the supervised child before
+  panicking (no active-child Drop / `_exit(125)`), and timeout diagnostics
+  measure wall time from before the helper call.
 - **MCP admission**: reserve service holder seats for daemon/MCP, report
   reaped/reserved budget diagnostics, and fail closed on `wait=true`
   `mempal_ingest` when the MCP async pool cannot be admitted instead of

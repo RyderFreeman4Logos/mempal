@@ -8,7 +8,14 @@ use super::db_admission::{
 };
 use super::db_admission_fault_injection::{self as fault_injection, CrashPoint};
 use super::db_admission_lease::fail_next_holder_lease_unlink;
-use super::db_admission_test_process::{DeadlineChild, SpawnSpec};
+
+// Test-only supervisor is shared with integration harnesses via path include (Rust 011).
+#[path = "db_admission_test_process.rs"]
+mod db_admission_test_process;
+
+const _: fn() = db_admission_test_process::reference_shared_test_api;
+
+use db_admission_test_process::{DeadlineChild, SpawnSpec};
 
 const FIXTURE_CASE_ENV: &str = "MEMPAL_DB_ADMISSION_FIXTURE_CASE";
 const FIXTURE_DATABASE_ENV: &str = "MEMPAL_DB_ADMISSION_FIXTURE_DATABASE";

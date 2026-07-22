@@ -1,14 +1,10 @@
 //! Linux-only, test-owned subprocess supervision for admission crash fixtures.
 //!
-//! The direct child stays unreaped as the process-group identity anchor until a
-//! final group fence has been issued and every owned pipe has reached EOF.
-//!
-//! When this module is path-included into a slim integration harness, not every
-//! API surface is consumed; allow unused code so callers can share one supervisor.
+//! Direct child stays unreaped as process-group anchor until final group fence
+//! and owned pipe EOF. Shared via path-include; no crate-level allows (Rust 011).
 
-#![allow(dead_code)]
-#![allow(unused_imports)]
-
+#[path = "db_admission_test_process/api_references.rs"]
+mod api_references;
 #[path = "db_admission_test_process/capture.rs"]
 mod capture;
 #[path = "db_admission_test_process/fd_layout.rs"]
@@ -23,6 +19,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
+pub use api_references::reference_shared_test_api;
 pub use capture::{BoundedCapture, CAPTURE_LIMIT_BYTES, CapturedBytes, render_diagnostic};
 use spawn::{RawSpawn, SETUP_RECORD_BYTES, decode_setup_record, spawn_owned};
 pub use spawn::{SpawnSpec, StdioMode, TestSetupGate};
@@ -433,18 +430,6 @@ impl DeadlineChild {
             timed_out = !child.wait_for_leader_exit(collection_deadline)?;
         }
         child.finish_output(deadline, timed_out)
-    }
-
-    /// Wait for a previously spawned child, drain pipes, escalate termination, and reap.
-    ///
-    /// Callers that wrote stdin after [`Self::spawn`] must close stdin first. On success the
-    /// returned report retains bounded stdout/stderr for existing assertions; timeout cleanup
-    /// still fences the process group and reaps before returning.
-    pub fn wait_output(mut self, timeout: Duration) -> Result<DeadlineOutput, SupervisionError> {
-        let deadline = deadline_after(timeout);
-        let collection_deadline = work_deadline(deadline, timeout);
-        let timed_out = !self.wait_for_leader_exit(collection_deadline)?;
-        self.finish_output(deadline, timed_out)
     }
 
     fn finish_output(
