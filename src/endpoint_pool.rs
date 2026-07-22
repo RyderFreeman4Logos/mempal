@@ -119,7 +119,7 @@ where
     where
         S: EndpointPoolStrategy<C>,
     {
-        let mut last_retryable = None;
+        let mut first_retryable = None;
         let mut earliest_retry_after: Option<Duration> = None;
         let mut first_saturated_endpoint: Option<Arc<EndpointPoolEntry<C>>> = None;
 
@@ -149,7 +149,9 @@ where
                         earliest_retry_after =
                             Some(min_retry_after(earliest_retry_after, retry_after));
                     }
-                    last_retryable = Some(error);
+                    if first_retryable.is_none() {
+                        first_retryable = Some(error);
+                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -163,10 +165,15 @@ where
             return Ok(output);
         }
 
-        match (last_retryable, earliest_retry_after) {
-            (None, Some(retry_after)) | (Some(_), Some(retry_after)) => {
-                Err(strategy.all_cooling_down_error(self.endpoints.len(), retry_after))
+        match (first_retryable, earliest_retry_after) {
+            (None, Some(retry_after)) => {
+                Err(strategy.all_cooling_down_error(self.endpoints.len(), retry_after, None))
             }
+            (Some(error), Some(retry_after)) => Err(strategy.all_cooling_down_error(
+                self.endpoints.len(),
+                retry_after,
+                Some(&error),
+            )),
             (Some(error), None) => Err(error),
             (None, None) => Err(strategy.no_endpoint_available_error()),
         }
@@ -259,7 +266,12 @@ where
         error: &Self::Error,
     ) -> Option<Duration>;
 
-    fn all_cooling_down_error(&self, endpoint_count: usize, retry_after: Duration) -> Self::Error;
+    fn all_cooling_down_error(
+        &self,
+        endpoint_count: usize,
+        retry_after: Duration,
+        first_retryable_error: Option<&Self::Error>,
+    ) -> Self::Error;
 
     fn no_endpoint_available_error(&self) -> Self::Error;
 
@@ -303,13 +315,19 @@ mod tests {
     #[derive(Debug)]
     enum Attempt {
         Saturated,
-        Retryable(Duration),
+        Retryable { retry_after: Duration, status: u16 },
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum ScriptError {
-        Retryable(Duration),
-        CoolingDown(Duration),
+        Retryable {
+            retry_after: Duration,
+            status: u16,
+        },
+        CoolingDown {
+            retry_after: Duration,
+            first_retryable_status: Option<u16>,
+        },
         Missing,
     }
 
@@ -339,7 +357,13 @@ mod tests {
                 .expect("scripted attempt")
             {
                 Attempt::Saturated => Ok(None),
-                Attempt::Retryable(retry_after) => Err(ScriptError::Retryable(retry_after)),
+                Attempt::Retryable {
+                    retry_after,
+                    status,
+                } => Err(ScriptError::Retryable {
+                    retry_after,
+                    status,
+                }),
             }
         }
 
@@ -357,7 +381,7 @@ mod tests {
         }
 
         fn should_try_next(&self, error: &Self::Error) -> bool {
-            matches!(error, ScriptError::Retryable(_))
+            matches!(error, ScriptError::Retryable { .. })
         }
 
         fn retry_after_for_error(
@@ -366,8 +390,8 @@ mod tests {
             error: &Self::Error,
         ) -> Option<Duration> {
             match error {
-                ScriptError::Retryable(retry_after) => Some(*retry_after),
-                ScriptError::CoolingDown(_) | ScriptError::Missing => None,
+                ScriptError::Retryable { retry_after, .. } => Some(*retry_after),
+                ScriptError::CoolingDown { .. } | ScriptError::Missing => None,
             }
         }
 
@@ -375,8 +399,15 @@ mod tests {
             &self,
             _endpoint_count: usize,
             retry_after: Duration,
+            first_retryable_error: Option<&Self::Error>,
         ) -> Self::Error {
-            ScriptError::CoolingDown(retry_after)
+            ScriptError::CoolingDown {
+                retry_after,
+                first_retryable_status: first_retryable_error.and_then(|error| match error {
+                    ScriptError::Retryable { status, .. } => Some(*status),
+                    ScriptError::CoolingDown { .. } | ScriptError::Missing => None,
+                }),
+            }
         }
 
         fn no_endpoint_available_error(&self) -> Self::Error {
@@ -406,9 +437,10 @@ mod tests {
                 ),
                 ScriptedClient {
                     id: "cooldown",
-                    attempts: Mutex::new(VecDeque::from([Attempt::Retryable(
-                        Duration::from_secs(60),
-                    )])),
+                    attempts: Mutex::new(VecDeque::from([Attempt::Retryable {
+                        retry_after: Duration::from_secs(60),
+                        status: 503,
+                    }])),
                     calls: Arc::clone(&calls),
                 },
             ),
@@ -423,6 +455,48 @@ mod tests {
         );
         assert_eq!(pool.endpoint_count(), 2);
         assert_eq!(pool.pool_capacity(), 2);
+    }
+
+    #[tokio::test]
+    async fn route_preserves_first_retryable_error_when_all_endpoints_cool_down() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let pool = EndpointPool::new(vec![
+            EndpointPoolItem::new(
+                EndpointPoolEndpoint::new("first", "first-model", 0, 1, Duration::from_secs(60)),
+                ScriptedClient {
+                    id: "first",
+                    attempts: Mutex::new(VecDeque::from([Attempt::Retryable {
+                        retry_after: Duration::from_secs(60),
+                        status: 429,
+                    }])),
+                    calls: Arc::clone(&calls),
+                },
+            ),
+            EndpointPoolItem::new(
+                EndpointPoolEndpoint::new("second", "second-model", 1, 1, Duration::from_secs(30)),
+                ScriptedClient {
+                    id: "second",
+                    attempts: Mutex::new(VecDeque::from([Attempt::Retryable {
+                        retry_after: Duration::from_secs(30),
+                        status: 503,
+                    }])),
+                    calls,
+                },
+            ),
+        ]);
+
+        let error = pool
+            .route(&ScriptedStrategy)
+            .await
+            .expect_err("all retryable endpoints should cool down");
+
+        assert_eq!(
+            error,
+            ScriptError::CoolingDown {
+                retry_after: Duration::from_secs(30),
+                first_retryable_status: Some(429),
+            }
+        );
     }
 
     struct ConcurrentSuccessAfterFailureStrategy {
@@ -446,7 +520,10 @@ mod tests {
                     self.release_first.notified().await;
                     Ok(Some("success".to_string()))
                 }
-                1 => Err(ScriptError::Retryable(Duration::from_secs(60))),
+                1 => Err(ScriptError::Retryable {
+                    retry_after: Duration::from_secs(60),
+                    status: 503,
+                }),
                 _ => Ok(Some("unexpected-success-after-cooldown".to_string())),
             }
         }
@@ -459,7 +536,7 @@ mod tests {
         }
 
         fn should_try_next(&self, error: &Self::Error) -> bool {
-            matches!(error, ScriptError::Retryable(_))
+            matches!(error, ScriptError::Retryable { .. })
         }
 
         fn retry_after_for_error(
@@ -468,8 +545,8 @@ mod tests {
             error: &Self::Error,
         ) -> Option<Duration> {
             match error {
-                ScriptError::Retryable(retry_after) => Some(*retry_after),
-                ScriptError::CoolingDown(_) | ScriptError::Missing => None,
+                ScriptError::Retryable { retry_after, .. } => Some(*retry_after),
+                ScriptError::CoolingDown { .. } | ScriptError::Missing => None,
             }
         }
 
@@ -477,8 +554,15 @@ mod tests {
             &self,
             _endpoint_count: usize,
             retry_after: Duration,
+            first_retryable_error: Option<&Self::Error>,
         ) -> Self::Error {
-            ScriptError::CoolingDown(retry_after)
+            ScriptError::CoolingDown {
+                retry_after,
+                first_retryable_status: first_retryable_error.and_then(|error| match error {
+                    ScriptError::Retryable { status, .. } => Some(*status),
+                    ScriptError::CoolingDown { .. } | ScriptError::Missing => None,
+                }),
+            }
         }
 
         fn no_endpoint_available_error(&self) -> Self::Error {
@@ -523,10 +607,17 @@ mod tests {
             .expect_err("newer cooldown should survive older success");
 
         assert_eq!(first, "success");
-        assert_eq!(second, ScriptError::CoolingDown(Duration::from_secs(60)));
+        assert_eq!(
+            second,
+            ScriptError::CoolingDown {
+                retry_after: Duration::from_secs(60),
+                first_retryable_status: Some(503),
+            }
+        );
         assert!(matches!(
             third,
-            ScriptError::CoolingDown(retry_after) if retry_after <= Duration::from_secs(60)
+            ScriptError::CoolingDown { retry_after, .. }
+                if retry_after <= Duration::from_secs(60)
         ));
         assert_eq!(strategy.calls.load(Ordering::SeqCst), 2);
     }

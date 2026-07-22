@@ -42,6 +42,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **Rejudge**: confirmation backlog drain now circuit-breaks on the first
+  retryable/cooldown failure instead of sweeping the entire backlog; adds
+  `--max-confirmations` bound and sanitized aggregate diagnostics (#793).
 - **MCP admission**: stale PID-namespace admission holders are now reaped on
   process exit; supervised test fixtures have bounded cleanup and output
   draining by deadline (#790).

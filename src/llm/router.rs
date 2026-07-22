@@ -152,12 +152,18 @@ impl EndpointPoolStrategy<LlmClient> for LlmRoutingStrategy<'_> {
         }
     }
 
-    fn all_cooling_down_error(&self, endpoint_count: usize, retry_after: Duration) -> Self::Error {
+    fn all_cooling_down_error(
+        &self,
+        endpoint_count: usize,
+        retry_after: Duration,
+        first_retryable_error: Option<&Self::Error>,
+    ) -> Self::Error {
         LlmError::TemporarilyUnavailable {
             retry_after,
             reason: format!(
                 "{endpoint_count} endpoint(s) are cooling down after retryable failures"
             ),
+            http_status: first_retryable_error.and_then(LlmError::http_status),
         }
     }
 

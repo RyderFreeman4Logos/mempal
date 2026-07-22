@@ -63,6 +63,7 @@ pub enum LlmError {
     TemporarilyUnavailable {
         retry_after: Duration,
         reason: String,
+        http_status: Option<StatusCode>,
     },
     #[error("missing LLM configuration: {0}")]
     MissingConfiguration(String),
@@ -84,6 +85,18 @@ impl LlmError {
             Self::DecodeResponse(_) | Self::MissingConfiguration(_) | Self::RemoteCallPolicy(_) => {
                 false
             }
+        }
+    }
+
+    pub fn http_status(&self) -> Option<StatusCode> {
+        match self {
+            Self::HttpStatus { status, .. } | Self::ClientError { status, .. } => Some(*status),
+            Self::TemporarilyUnavailable { http_status, .. } => *http_status,
+            Self::HttpRequest { .. }
+            | Self::DecodeResponse(_)
+            | Self::Timeout
+            | Self::MissingConfiguration(_)
+            | Self::RemoteCallPolicy(_) => None,
         }
     }
 

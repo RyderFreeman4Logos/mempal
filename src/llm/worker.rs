@@ -1183,12 +1183,12 @@ threshold = 0.5
             "strict parser error must not echo model-provided verdict text: {error:#}"
         );
     }
-
     #[test]
     fn test_llm_task_failure_disposition_uses_retry_after_as_queue_delay() {
         let error = Err::<(), _>(LlmError::TemporarilyUnavailable {
             retry_after: Duration::from_secs(7),
             reason: "model_cooldown".to_string(),
+            http_status: None,
         })
         .context("LLM gating request failed")
         .expect_err("synthetic error");
