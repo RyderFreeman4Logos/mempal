@@ -90,6 +90,8 @@ pub struct ProfileDbAdmissionDto {
     pub unknown_holder_generations: Vec<u64>,
     pub unknown_holder_diagnostics: Vec<UnknownHolderDiagnosticDto>,
     pub configured_holder_limit: usize,
+    pub reserved_service_holders: usize,
+    pub service_holders: usize,
     pub configured_cache_bytes: u64,
     pub active_cache_bytes: u64,
     pub available_cache_bytes: u64,
@@ -144,6 +146,8 @@ impl From<crate::core::db_admission::DbAdmissionSnapshot> for ProfileDbAdmission
                 })
                 .collect(),
             configured_holder_limit: value.configured_holder_limit,
+            reserved_service_holders: value.reserved_service_holders,
+            service_holders: value.service_holders,
             configured_cache_bytes: value.configured_cache_bytes,
             active_cache_bytes: value.active_cache_bytes,
             available_cache_bytes: value.available_cache_bytes,

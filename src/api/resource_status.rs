@@ -141,6 +141,8 @@ struct ProfileAdmissionStatus {
     unknown_holder_generations: Vec<u64>,
     unknown_holder_diagnostics: Vec<UnknownHolderDiagnosticStatus>,
     configured_holder_limit: usize,
+    reserved_service_holders: usize,
+    service_holders: usize,
     configured_cache_bytes: u64,
     active_cache_bytes: u64,
     available_cache_bytes: u64,
@@ -184,6 +186,8 @@ impl ProfileAdmissionStatus {
                 })
                 .collect(),
             configured_holder_limit: snapshot.configured_holder_limit,
+            reserved_service_holders: snapshot.reserved_service_holders,
+            service_holders: snapshot.service_holders,
             configured_cache_bytes: snapshot.configured_cache_bytes,
             active_cache_bytes: snapshot.active_cache_bytes,
             available_cache_bytes: snapshot.available_cache_bytes,
