@@ -15998,40 +15998,7 @@ pattern_boost = 0.2
         assert_ingest_worker_backoff_snapshot(0, 0, None);
     }
 
-    #[tokio::test(start_paused = true, flavor = "current_thread")]
-    async fn test_mcp_async_ingest_worker_backs_off_when_idle() {
-        crate::observability::reset_ingest_worker_backoff_for_tests();
-        crate::observability::reset_io_burst_for_tests();
-        let (_tempdir, db_path, server) = setup_server();
-        let queue = AsyncPendingMessageStore::from_store(
-            crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path),
-        );
-        let server = server.with_async_queue_for_test(queue);
-        let before_queue = io_burst_path(
-            &crate::observability::io_burst_snapshot(),
-            crate::observability::IoOperationPath::Queue,
-        );
-        let handle = server.spawn_scoped_ingest_drain_worker();
-
-        wait_for_ingest_worker_backoff_snapshot(1, 2_000, None).await;
-        #[cfg(target_os = "linux")]
-        {
-            let after_queue = io_burst_path(
-                &crate::observability::io_burst_snapshot(),
-                crate::observability::IoOperationPath::Queue,
-            );
-            assert!(
-                after_queue.sample_count > before_queue.sample_count,
-                "idle queue claims must be visible in IO burst telemetry"
-            );
-        }
-
-        tokio::time::advance(Duration::from_secs(2)).await;
-        wait_for_ingest_worker_backoff_snapshot(2, 4_000, None).await;
-
-        handle.shutdown_and_drain().await;
-        assert_ingest_worker_backoff_snapshot(0, 0, None);
-    }
+    include!("server/tests/ingest_worker_idle_backoff_test.rs");
 
     #[test]
     fn test_mcp_async_ingest_transient_write_backoff_sequence_caps_at_30s() {

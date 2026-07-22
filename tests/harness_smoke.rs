@@ -23,7 +23,7 @@ use tempfile::TempDir;
 
 #[test]
 fn vec0_snapshot_round_trips() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = TempDir::new_in("/tmp").expect("tempdir");
     let source = Database::open(&tmp.path().join("source.db")).expect("open source db");
     let target = Database::open(&tmp.path().join("target.db")).expect("open target db");
     let drawer = Drawer {
@@ -54,7 +54,7 @@ fn vec0_snapshot_round_trips() {
 
 #[test]
 fn migration_hook_smoke() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = TempDir::new_in("/tmp").expect("tempdir");
     let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
     let counting = CountingMigrationHook::new();
     apply_fork_ext_migrations_with_hook(db.conn(), Some(&counting))
@@ -69,7 +69,7 @@ fn migration_hook_smoke() {
 
 #[tokio::test]
 async fn mcp_stdio_initializes() -> Result<()> {
-    let tmp = TempDir::new()?;
+    let tmp = TempDir::new_in("/tmp")?;
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home)?;
     let db_path = mempal_home.join("palace.db");
@@ -93,7 +93,7 @@ async fn mcp_stdio_initializes() -> Result<()> {
 
 #[tokio::test]
 async fn mcp_stdio_initialize_does_not_wait_for_busy_db_or_noop_llm() -> Result<()> {
-    let tmp = TempDir::new()?;
+    let tmp = TempDir::new_in("/tmp")?;
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home)?;
     let db_path = mempal_home.join("palace.db");
@@ -122,7 +122,7 @@ async fn mcp_stdio_initialize_does_not_wait_for_busy_db_or_noop_llm() -> Result<
 
 #[tokio::test]
 async fn mcp_stdio_ingest_busy_after_status_keeps_transport_alive() -> Result<()> {
-    let tmp = TempDir::new()?;
+    let tmp = TempDir::new_in("/tmp")?;
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home)?;
     let db_path = mempal_home.join("palace.db");
@@ -199,7 +199,7 @@ async fn mcp_stdio_ingest_busy_after_status_keeps_transport_alive() -> Result<()
 
 #[tokio::test]
 async fn mcp_stdio_ingest_succeeds_with_existing_status_holder() -> Result<()> {
-    let tmp = TempDir::new()?;
+    let tmp = TempDir::new_in("/tmp")?;
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home)?;
     let db_path = mempal_home.join("palace.db");
@@ -279,7 +279,7 @@ async fn mcp_stdio_wait_ingest_under_durable_writer_lease_returns_queued_receipt
         ("daemon-owner", "daemon"),
         ("mcp-ingest-worker-issue-639", "mcp-ingest-worker"),
     ] {
-        let tmp = TempDir::new()?;
+        let tmp = TempDir::new_in("/tmp")?;
         let mempal_home = tmp.path().join(".mempal");
         fs::create_dir_all(&mempal_home)?;
         let db_path = mempal_home.join("palace.db");
@@ -364,7 +364,7 @@ async fn mcp_stdio_wait_ingest_under_durable_writer_lease_returns_queued_receipt
 
 #[tokio::test]
 async fn mcp_stdio_ingest_stalled_daemon_ipc_keeps_transport_alive() -> Result<()> {
-    let tmp = TempDir::new()?;
+    let tmp = TempDir::new_in("/tmp")?;
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home)?;
     let db_path = mempal_home.join("palace.db");
@@ -495,7 +495,7 @@ fn release_runtime_writer_lease(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn harness_integration_smoke() -> Result<()> {
-    let tmp = TempDir::new()?;
+    let tmp = TempDir::new_in("/tmp")?;
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home)?;
     let db_path = mempal_home.join("palace.db");

@@ -225,9 +225,13 @@ mod tests {
     use std::fs::File;
     use std::os::unix::fs::symlink;
 
+    fn short_tempdir() -> tempfile::TempDir {
+        tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+    }
+
     #[test]
     fn test_matches_fd_direct_target_does_not_require_fd_metadata() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = short_tempdir();
         let db_path = tmp.path().join("palace.db");
         File::create(&db_path).expect("db file");
         let identity = DbFileIdentity::from_resolved_path(&db_path);
@@ -237,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_matches_fd_rejects_non_absolute_fd_targets_after_direct_match() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = short_tempdir();
         let db_path = tmp.path().join("palace.db");
         File::create(&db_path).expect("db file");
         let identity = DbFileIdentity::from_resolved_path(&db_path);
@@ -247,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_matches_fd_rejects_unrelated_absolute_target_before_metadata_fallback() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = short_tempdir();
         let db_path = tmp.path().join("palace.db");
         let unrelated_path = tmp.path().join("notes.txt");
         File::create(&db_path).expect("db file");
@@ -259,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_matches_fd_canonical_target_keeps_matching_name_symlink_path_match() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = short_tempdir();
         let real_dir = tmp.path().join("real");
         let linked_dir = tmp.path().join("linked");
         fs::create_dir(&real_dir).expect("real dir");
@@ -275,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_matches_fd_canonical_target_matches_parent_symlink_after_recreate() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = short_tempdir();
         let real_dir = tmp.path().join("real");
         let linked_dir = tmp.path().join("linked");
         let stale_dir = tmp.path().join("stale");
@@ -294,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_matches_fd_does_not_strip_literal_deleted_suffix_path() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = short_tempdir();
         let db_path = tmp.path().join("palace.db");
         let literal_deleted_path = tmp.path().join("palace.db (deleted)");
         File::create(&db_path).expect("db file");
@@ -309,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_matches_fd_strips_kernel_deleted_suffix_when_target_path_is_missing() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = short_tempdir();
         let db_path = tmp.path().join("palace.db");
         let fd_path = tmp.path().join("fd-3");
         File::create(&db_path).expect("db file");
@@ -321,7 +325,7 @@ mod tests {
 
     #[test]
     fn test_from_existing_db_path_uses_canonical_parent_when_db_is_missing() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = short_tempdir();
         let db_path = tmp.path().join("palace.db");
         let identity = DbPathIdentity::from_existing_db_path(&db_path).expect("db identity");
 
@@ -335,7 +339,7 @@ mod tests {
 
     #[test]
     fn test_resolve_path_with_cwd_lossy_absolutizes_without_canonicalizing() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = short_tempdir();
         let real_dir = tmp.path().join("real");
         let linked_dir = tmp.path().join("linked");
         fs::create_dir(&real_dir).expect("real dir");
@@ -349,7 +353,7 @@ mod tests {
 
     #[test]
     fn test_canonicalize_if_present_uses_canonical_parent_when_file_is_missing() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = short_tempdir();
         let real_dir = tmp.path().join("real");
         let linked_dir = tmp.path().join("linked");
         fs::create_dir(&real_dir).expect("real dir");

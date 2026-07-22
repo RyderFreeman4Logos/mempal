@@ -42,6 +42,12 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **Mind-model bootstrap tests**: use isolated SQLite/config fixtures and a
+  fail-closed REST fallback address so they cannot reach a live daemon (#807).
+- **MCP ingest worker tests**: wait for the idle queue claim's I/O-burst sample
+  before asserting telemetry, removing the concurrent scheduling race (#808).
+- **Path-sensitive tests**: create daemon IPC, SQLite admission, and symlink
+  identity fixtures below a bounded `/tmp` root (#810).
 - **CLI integration tests**: route `ingest`/`delete` helpers through one
   Linux-only deadline-aware subprocess supervisor (spawn, bounded capture,
   pipe drain, TERM→KILL escalation, identity-safe reaping) so a hung CLI or

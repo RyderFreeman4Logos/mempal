@@ -164,9 +164,13 @@ mod tests {
     use super::*;
     use crate::core::db_admission::{DbAdmissionRequest, DbHolderClass, ProfileDbAdmission};
 
+    fn short_tempdir() -> tempfile::TempDir {
+        tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+    }
+
     #[test]
     fn db_admission_lease_control_opens_do_not_acquire_profile_admission() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
+        let tempdir = short_tempdir();
         let db_path = tempdir.path().join("palace.db");
         let _admitted = Database::open(&db_path).expect("open admitted database");
         let before = ProfileDbAdmission::snapshot(&db_path).expect("snapshot before lease control");
@@ -184,7 +188,7 @@ mod tests {
 
     #[test]
     fn diagnostic_operation_closes_without_consuming_an_admission_slot() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
+        let tempdir = short_tempdir();
         let db_path = tempdir.path().join("palace.db");
         let _admitted = Database::open(&db_path).expect("open admitted database");
         let before = ProfileDbAdmission::snapshot(&db_path).expect("snapshot before diagnostic");
@@ -209,7 +213,7 @@ mod tests {
     fn db_admission_canonical_path_survives_symbolic_link_retarget() {
         use std::os::unix::fs::symlink;
 
-        let tempdir = tempfile::tempdir().expect("tempdir");
+        let tempdir = short_tempdir();
         let first_target = tempdir.path().join("first.db");
         let second_target = tempdir.path().join("second.db");
         let link_path = tempdir.path().join("link.db");
@@ -235,7 +239,7 @@ mod tests {
     fn db_open_admitted_uses_canonical_path_for_symbolic_link() {
         use std::os::unix::fs::symlink;
 
-        let tempdir = tempfile::tempdir().expect("tempdir");
+        let tempdir = short_tempdir();
         let target_path = tempdir.path().join("target.db");
         let link_path = tempdir.path().join("link.db");
         Connection::open(&target_path).expect("create target database");
@@ -255,7 +259,7 @@ mod tests {
     fn db_open_unadmitted_rejects_symbolic_link() {
         use std::os::unix::fs::symlink;
 
-        let tempdir = tempfile::tempdir().expect("tempdir");
+        let tempdir = short_tempdir();
         let target_path = tempdir.path().join("target.db");
         let link_path = tempdir.path().join("link.db");
         Connection::open(&target_path).expect("create target database");
@@ -275,7 +279,7 @@ mod tests {
     fn db_open_lease_control_rejects_symbolic_link() {
         use std::os::unix::fs::symlink;
 
-        let tempdir = tempfile::tempdir().expect("tempdir");
+        let tempdir = short_tempdir();
         let target_path = tempdir.path().join("target.db");
         let link_path = tempdir.path().join("link.db");
         Connection::open(&target_path).expect("create target database");
@@ -295,7 +299,7 @@ mod tests {
     fn db_open_lease_control_accepts_canonical_path_from_admitted_open() {
         use std::os::unix::fs::symlink;
 
-        let tempdir = tempfile::tempdir().expect("tempdir");
+        let tempdir = short_tempdir();
         let target_path = tempdir.path().join("target.db");
         let link_path = tempdir.path().join("link.db");
         Connection::open(&target_path).expect("create target database");
