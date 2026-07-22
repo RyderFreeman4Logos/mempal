@@ -42,6 +42,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **Rejudge apply**: add generation-bound artifact manifests, content-free typed
+  OCC receipts, strict dry-run-to-execute receipt validation, and fail-closed
+  schema/policy/file-hash/DB-generation checks while preserving soft-delete as
+  the default (#794).
 - **Rejudge**: confirmation backlog drain now circuit-breaks on the first
   retryable/cooldown failure instead of sweeping the entire backlog; adds
   `--max-confirmations` bound and sanitized aggregate diagnostics (#793).

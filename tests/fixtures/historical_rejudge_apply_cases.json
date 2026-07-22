@@ -1,0 +1,8 @@
+[
+  { "drawer_id": "fixture-keep", "decision": "keep", "drift": "none" },
+  { "drawer_id": "fixture-valid", "decision": "delete", "drift": "none" },
+  { "drawer_id": "fixture-content", "decision": "delete", "drift": "content_hash" },
+  { "drawer_id": "fixture-retention", "decision": "delete", "drift": "retention" },
+  { "drawer_id": "fixture-other", "decision": "delete", "drift": "incomplete_snapshot" },
+  { "drawer_id": "fixture-missing", "decision": "delete", "drift": "missing_current" }
+]
