@@ -452,10 +452,14 @@
 
         maintenance_rejudge_apply_command(
             &db,
+            &Config::default(),
             &confirmations_path,
+            None,
             &backup_dir,
-            false,
-            false,
+            HistoricalRejudgeApplyMode {
+                execute: false,
+                hard_delete: false,
+            },
             "json",
         )
         .expect("dry-run apply");
