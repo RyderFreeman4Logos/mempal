@@ -62,6 +62,10 @@ pub fn print_profile_resource_status(db_path: &Path, indent: &str) {
                 snapshot.active_holders, snapshot.configured_holder_limit
             );
             println!(
+                "{indent}service_holders: {} reserved_service_holders={}",
+                snapshot.service_holders, snapshot.reserved_service_holders
+            );
+            println!(
                 "{indent}cache_bytes: {}/{} available={}",
                 snapshot.active_cache_bytes,
                 snapshot.configured_cache_bytes,

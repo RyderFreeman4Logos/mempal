@@ -333,10 +333,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 174855
-baseline_lines = 22123
-issue = "781"
-rationale = "Pre-existing ratchet drift reconciled for #781 to exact tokenizer and line output; no-growth ratchet."
+baseline_tokens = 176363
+baseline_lines = 22273
+issue = "809"
+rationale = "Pre-existing monolith; #809 adds fail-closed wait=true pool-admission gate and actionable holder-budget diagnostics with a no-growth ratchet until the MCP server split lands."
 
 [[files]]
 path = "src/mcp/tools.rs"

@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use super::db_admission_budget as budget;
 #[cfg(test)]
 use super::db_admission_fault_injection::{self as fault_injection, CrashPoint};
 use super::db_admission_lease::{
@@ -23,7 +24,14 @@ use super::db_admission_lease::{
     sweep_unreferenced_holder_leases,
 };
 
+pub(super) use super::db_admission_paths::AdmissionPaths;
+pub use budget::BudgetExceededReason;
+
 const DEFAULT_MAX_HOLDERS: usize = 16;
+/// Slots reserved for long-lived service holders (daemon + MCP). Transient
+/// CLI/hook/api processes cannot fill the last reserved seats, so an active
+/// MCP/daemon process can still open its async pool under load (#809).
+const DEFAULT_RESERVED_SERVICE_HOLDERS: usize = 2;
 const DEFAULT_MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const ADMISSION_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const ADMISSION_LOCK_RETRY: Duration = Duration::from_millis(2);
@@ -72,20 +80,42 @@ impl DbHolderClass {
             _ => Self::Cli,
         }
     }
+
+    /// Long-lived service surfaces that may consume reserved holder seats.
+    pub const fn is_service_holder(self) -> bool {
+        matches!(self, Self::Daemon | Self::Mcp)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DbAdmissionConfig {
     pub max_holders: usize,
     pub max_cache_bytes: u64,
+    /// Seats reserved for [`DbHolderClass::is_service_holder`] processes.
+    pub reserved_service_holders: usize,
 }
 
 impl DbAdmissionConfig {
     pub const fn new(max_holders: usize, max_cache_bytes: u64) -> Self {
+        let reserved_service_holders = if DEFAULT_RESERVED_SERVICE_HOLDERS < max_holders {
+            DEFAULT_RESERVED_SERVICE_HOLDERS
+        } else {
+            max_holders
+        };
         Self {
             max_holders,
             max_cache_bytes,
+            reserved_service_holders,
         }
+    }
+
+    pub const fn with_reserved_service_holders(mut self, reserved_service_holders: usize) -> Self {
+        self.reserved_service_holders = if reserved_service_holders < self.max_holders {
+            reserved_service_holders
+        } else {
+            self.max_holders
+        };
+        self
     }
 }
 
@@ -123,7 +153,7 @@ pub enum DbAdmissionError {
     #[error("database admission state is busy after {timeout_ms}ms: {path}")]
     Busy { path: PathBuf, timeout_ms: u64 },
     #[error(
-        "profile database holder budget exceeded: active_holders={active_holders}/{max_holders}, active_cache_bytes={active_cache_bytes}/{max_cache_bytes}, requested_cache_bytes={requested_cache_bytes}"
+        "profile database holder budget exceeded: active_holders={active_holders}/{max_holders}, active_cache_bytes={active_cache_bytes}/{max_cache_bytes}, requested_cache_bytes={requested_cache_bytes}, reaped_stale_holders={reaped_stale_holders}, reserved_service_holders={reserved_service_holders}, service_holders={service_holders}, reason={reason}"
     )]
     BudgetExceeded {
         active_holders: usize,
@@ -131,6 +161,10 @@ pub enum DbAdmissionError {
         active_cache_bytes: u64,
         max_cache_bytes: u64,
         requested_cache_bytes: u64,
+        reaped_stale_holders: usize,
+        reserved_service_holders: usize,
+        service_holders: usize,
+        reason: BudgetExceededReason,
     },
     #[error("database admission I/O failed for {path}: {source}")]
     Io {
@@ -189,6 +223,8 @@ pub struct DbAdmissionSnapshot {
     pub unknown_holder_generations: Vec<u64>,
     pub unknown_holder_diagnostics: Vec<UnknownHolderDiagnostic>,
     pub configured_holder_limit: usize,
+    pub reserved_service_holders: usize,
+    pub service_holders: usize,
     pub configured_cache_bytes: u64,
     pub active_cache_bytes: u64,
     pub available_cache_bytes: u64,
@@ -233,9 +269,13 @@ impl ProfileDbAdmission {
         let active_cache_bytes = state.holders.iter().fold(0_u64, |total, holder| {
             total.saturating_add(holder.configured_cache_bytes)
         });
-        if state.holders.len() >= config.max_holders
-            || active_cache_bytes.saturating_add(request.configured_cache_bytes)
-                > config.max_cache_bytes
+        let service_holders = state
+            .holders
+            .iter()
+            .filter(|holder| holder.holder_class.is_service_holder())
+            .count();
+        if let Some(reason) =
+            budget::budget_exceeded_reason(state.holders.len(), request, config, active_cache_bytes)
         {
             return Err(DbAdmissionError::BudgetExceeded {
                 active_holders: state.holders.len(),
@@ -243,6 +283,10 @@ impl ProfileDbAdmission {
                 active_cache_bytes,
                 max_cache_bytes: config.max_cache_bytes,
                 requested_cache_bytes: request.configured_cache_bytes,
+                reaped_stale_holders: reaped.reaped_stale_holders_this_snapshot,
+                reserved_service_holders: config.reserved_service_holders,
+                service_holders,
+                reason,
             });
         }
 
@@ -310,6 +354,11 @@ impl ProfileDbAdmission {
         let active_cache_bytes = state.holders.iter().fold(0_u64, |total, holder| {
             total.saturating_add(holder.configured_cache_bytes)
         });
+        let service_holders = state
+            .holders
+            .iter()
+            .filter(|holder| holder.holder_class.is_service_holder())
+            .count();
         Ok(DbAdmissionSnapshot {
             active_holders: state.holders.len(),
             holders: state.holders,
@@ -322,6 +371,8 @@ impl ProfileDbAdmission {
                 .collect(),
             unknown_holder_diagnostics: reaped.unknown_holder_diagnostics,
             configured_holder_limit: config.max_holders,
+            reserved_service_holders: config.reserved_service_holders,
+            service_holders,
             configured_cache_bytes: config.max_cache_bytes,
             active_cache_bytes,
             available_cache_bytes: config.max_cache_bytes.saturating_sub(active_cache_bytes),
@@ -381,124 +432,7 @@ fn validate_request(
     request: DbAdmissionRequest,
     config: DbAdmissionConfig,
 ) -> Result<(), DbAdmissionError> {
-    if request.connection_count == 0 {
-        return Err(DbAdmissionError::InvalidRequest(
-            "connection_count must be positive",
-        ));
-    }
-    if request.configured_cache_bytes == 0 {
-        return Err(DbAdmissionError::InvalidRequest(
-            "configured_cache_bytes must be positive",
-        ));
-    }
-    if config.max_holders == 0 || config.max_cache_bytes == 0 {
-        return Err(DbAdmissionError::InvalidRequest(
-            "profile limits must be positive",
-        ));
-    }
-    Ok(())
-}
-
-pub(super) struct AdmissionPaths {
-    database_path: PathBuf,
-    pub(super) state_path: PathBuf,
-    lock_path: PathBuf,
-}
-
-impl AdmissionPaths {
-    pub(super) fn new(db_path: &Path) -> Result<Self, DbAdmissionError> {
-        // Canonicalize the full database path to prevent symlink aliases
-        // from bypassing the profile-wide admission budget.
-        let raw_parent = db_path.parent().unwrap_or_else(|| Path::new("."));
-        let parent = fs::canonicalize(raw_parent).unwrap_or_else(|_| raw_parent.to_path_buf());
-        fs::create_dir_all(&parent).map_err(|source| DbAdmissionError::Io {
-            path: parent.clone(),
-            source,
-        })?;
-
-        let lexical_name = db_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .ok_or(DbAdmissionError::InvalidRequest(
-                "database path must have a UTF-8 file name",
-            ))?;
-
-        let full_path = parent.join(lexical_name);
-        let (database_path, sidecar_dir, sidecar_name) = match fs::canonicalize(&full_path) {
-            Ok(canonical) => {
-                // Reject hard-linked regular databases: each link would get
-                // an independent admission budget, and SQLite WAL/shm files
-                // are not designed for multi-link access. Non-regular paths
-                // must reach SQLite so its existing diagnostics classify the
-                // underlying path/open failure.
-                #[cfg(unix)]
-                if let Ok(metadata) = fs::metadata(&canonical) {
-                    use std::os::unix::fs::MetadataExt;
-                    let nlink = metadata.nlink();
-                    if metadata.is_file() && nlink > 1 {
-                        return Err(DbAdmissionError::InvalidRequest(
-                            "database file has multiple hard links; admission identity cannot be established safely",
-                        ));
-                    }
-                }
-                let dir = canonical
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or(parent);
-                let name = canonical
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .filter(|n| !n.is_empty())
-                    .unwrap_or(lexical_name)
-                    .to_string();
-                (canonical, dir, name)
-            }
-            Err(_) => (full_path, parent, lexical_name.to_string()),
-        };
-
-        Ok(Self {
-            database_path,
-            state_path: sidecar_dir.join(format!(".{sidecar_name}.admission.json")),
-            lock_path: sidecar_dir.join(format!(".{sidecar_name}.admission.lock")),
-        })
-    }
-
-    pub(super) fn holder_lease_path(&self, token: &str) -> PathBuf {
-        let state_name = self
-            .state_path
-            .file_name()
-            .expect("validated admission state path has a file name")
-            .to_string_lossy();
-        // Never place serialized token text into a path: the state file is a
-        // trust boundary, while a fixed hash keeps the lease beside its state.
-        let lease_id = blake3::hash(token.as_bytes()).to_hex();
-        self.state_path
-            .with_file_name(format!("{state_name}.{}.lease", &lease_id[..24]))
-    }
-
-    pub(super) fn state_parent(&self) -> &Path {
-        self.state_path.parent().unwrap_or_else(|| Path::new("."))
-    }
-
-    pub(super) fn is_current_lease_path(&self, path: &Path) -> bool {
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            return false;
-        };
-        let state_name = self
-            .state_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        let Some(lease_id) = name
-            .strip_prefix(state_name)
-            .and_then(|rest| rest.strip_prefix('.'))
-            .and_then(|rest| rest.strip_suffix(".lease"))
-        else {
-            return false;
-        };
-        lease_id.len() == 24 && lease_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-    }
+    budget::validate_request(request, config)
 }
 
 fn lock_state(path: &Path) -> Result<File, DbAdmissionError> {

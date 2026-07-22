@@ -7,12 +7,14 @@ pub mod compaction;
 pub mod config;
 pub mod db;
 pub mod db_admission;
+mod db_admission_budget;
 #[cfg(all(test, target_os = "linux"))]
 mod db_admission_crash_tests;
 mod db_admission_diagnostics;
 #[cfg(test)]
 mod db_admission_fault_injection;
 mod db_admission_lease;
+mod db_admission_paths;
 mod db_admission_release;
 #[cfg(all(test, target_os = "linux"))]
 pub mod db_admission_test_process;
