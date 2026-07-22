@@ -287,7 +287,7 @@ impl DeadlineChild {
         poll_many(&mut pollfds, deadline)
     }
 
-    pub(crate) fn close_stdin(&mut self) {
+    pub fn close_stdin(&mut self) {
         if let Some(active) = self.active_mut() {
             active.stdin.take();
         }

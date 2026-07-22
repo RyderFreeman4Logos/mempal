@@ -1,13 +1,16 @@
 use super::*;
 
 fn run_delete(home: &Path, drawer_id: &str) -> Output {
-    Command::new(mempal_bin())
-        .args(["delete", drawer_id])
-        .env("HOME", home)
-        // Keep fixture identity independent of the developer's repo cwd.
-        .env("MEMPAL_PROJECT_ID", "cli-delete-fixture")
-        .output()
-        .expect("run mempal delete")
+    run_cli_output(
+        "mempal delete",
+        |spec| {
+            with_home(spec, home);
+            // Keep fixture identity independent of the developer's repo cwd.
+            spec.env("MEMPAL_PROJECT_ID", "cli-delete-fixture");
+            push_args(spec, ["delete", drawer_id]);
+        },
+        CLI_HELPER_DEADLINE,
+    )
 }
 
 fn insert_drawer(home: &Path, drawer_id: &str) {

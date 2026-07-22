@@ -1,22 +1,26 @@
 //! Integration tests for issue #82: friendly error messages when `mempal ingest`
 //! receives a file path or a nonexistent path instead of a directory.
 
+// Integration tests cannot import the library's cfg(test) module; path-include
+// the shared supervisor exactly like admission_supervisor does for db_admission.
+#[path = "common/harness/cli_deadline.rs"]
+mod cli_deadline;
 mod common;
+#[path = "ingest_cli_errors/deadline.rs"]
+mod deadline;
 #[path = "ingest_cli_errors/delete.rs"]
 mod delete;
 
 use std::fs;
-use std::io::{ErrorKind, Write};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
 
+use cli_deadline::{
+    CLI_HELPER_DEADLINE, push_args, run_cli_output, run_cli_stdin_output, with_home,
+};
 use common::harness::start as start_embed_mock;
 use serde_json::Value;
 use tempfile::TempDir;
-
-fn mempal_bin() -> String {
-    env!("CARGO_BIN_EXE_mempal").to_string()
-}
 
 fn setup_home() -> TempDir {
     let tmp = TempDir::new().expect("tempdir");
@@ -27,27 +31,39 @@ fn setup_home() -> TempDir {
 }
 
 fn run_ingest(home: &Path, target: &str, wing: &str) -> Output {
-    Command::new(mempal_bin())
-        .args(["ingest", target, "--wing", wing])
-        .env("HOME", home)
-        .output()
-        .expect("run mempal ingest")
+    run_cli_output(
+        "mempal ingest",
+        |spec| {
+            with_home(spec, home);
+            push_args(spec, ["ingest", target, "--wing", wing]);
+        },
+        CLI_HELPER_DEADLINE,
+    )
 }
 
 fn run_ingest_dry(home: &Path, target: &str, wing: &str) -> Output {
-    Command::new(mempal_bin())
-        .args(["ingest", target, "--wing", wing, "--dry-run"])
-        .env("HOME", home)
-        .output()
-        .expect("run mempal ingest --dry-run")
+    run_cli_output(
+        "mempal ingest --dry-run",
+        |spec| {
+            with_home(spec, home);
+            push_args(spec, ["ingest", target, "--wing", wing, "--dry-run"]);
+        },
+        CLI_HELPER_DEADLINE,
+    )
 }
 
 fn run_ingest_json(home: &Path, target: &str, wing: &str) -> Output {
-    Command::new(mempal_bin())
-        .args(["ingest", target, "--wing", wing, "--no-gate", "--json"])
-        .env("HOME", home)
-        .output()
-        .expect("run mempal ingest --json")
+    run_cli_output(
+        "mempal ingest --json",
+        |spec| {
+            with_home(spec, home);
+            push_args(
+                spec,
+                ["ingest", target, "--wing", wing, "--no-gate", "--json"],
+            );
+        },
+        CLI_HELPER_DEADLINE,
+    )
 }
 
 fn run_ingest_stdin_json(home: &Path, payload: &str, args: &[&str]) -> Output {
@@ -55,26 +71,16 @@ fn run_ingest_stdin_json(home: &Path, payload: &str, args: &[&str]) -> Output {
 }
 
 fn run_ingest_stdin_bytes(home: &Path, payload: &[u8], args: &[&str]) -> Output {
-    let mut command = Command::new(mempal_bin());
-    command
-        .arg("ingest")
-        .arg("--stdin")
-        .args(args)
-        .env("HOME", home)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn mempal ingest --stdin");
-    if let Some(stdin) = child.stdin.as_mut() {
-        match stdin.write_all(payload) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::BrokenPipe => {}
-            Err(error) => panic!("write stdin payload: {error}"),
-        }
-    }
-    child
-        .wait_with_output()
-        .expect("wait mempal ingest --stdin")
+    run_cli_stdin_output(
+        "mempal ingest --stdin",
+        |spec| {
+            with_home(spec, home);
+            push_args(spec, ["ingest", "--stdin"]);
+            push_args(spec, args.iter().copied());
+        },
+        payload,
+        CLI_HELPER_DEADLINE,
+    )
 }
 
 fn hold_daemon_writer_lease(home: &Path) -> mempal::core::types::RuntimeWriterLease {

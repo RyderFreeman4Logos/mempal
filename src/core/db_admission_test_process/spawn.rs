@@ -12,8 +12,12 @@ use super::{ProcessIdentity, SetupStage};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StdioMode {
+    /// stdin → /dev/null; capture stdout/stderr.
     Capture,
+    /// stdin → pipe; discard stdout/stderr to /dev/null.
     PipedInput,
+    /// stdin → pipe; capture stdout/stderr (CLI integration helpers).
+    CaptureWithInput,
 }
 
 #[derive(Debug)]
@@ -265,7 +269,7 @@ pub(super) fn spawn_owned(spec: SpawnSpec) -> io::Result<RawSpawn> {
     drop(setup_pipe.write);
 
     let stdin = match (stdio, stdin_pipe) {
-        (StdioMode::PipedInput, Some(pipe)) => {
+        (StdioMode::PipedInput | StdioMode::CaptureWithInput, Some(pipe)) => {
             drop(pipe.read);
             Some(pipe.write)
         }
@@ -326,6 +330,9 @@ impl PreparedSpawn {
         let (stdin_pipe, stdout_pipe, stderr_pipe) = match spec.stdio {
             StdioMode::Capture => (None, Some(Pipe::new()?), Some(Pipe::new()?)),
             StdioMode::PipedInput => (Some(Pipe::new()?), None, None),
+            StdioMode::CaptureWithInput => {
+                (Some(Pipe::new()?), Some(Pipe::new()?), Some(Pipe::new()?))
+            }
         };
         let setup_pipe = Pipe::new()?;
 
@@ -377,6 +384,31 @@ impl PreparedSpawn {
                     stdin.read.as_raw_fd(),
                     dev_null.as_raw_fd(),
                     dev_null.as_raw_fd(),
+                )
+            }
+            StdioMode::CaptureWithInput => {
+                let stdin = stdin_pipe.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "missing capture-with-input stdin",
+                    )
+                })?;
+                let stdout = stdout_pipe.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "missing capture-with-input stdout pipe",
+                    )
+                })?;
+                let stderr = stderr_pipe.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "missing capture-with-input stderr pipe",
+                    )
+                })?;
+                (
+                    stdin.read.as_raw_fd(),
+                    stdout.write.as_raw_fd(),
+                    stderr.write.as_raw_fd(),
                 )
             }
         };

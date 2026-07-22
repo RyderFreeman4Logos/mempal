@@ -2,6 +2,12 @@
 //!
 //! The direct child stays unreaped as the process-group identity anchor until a
 //! final group fence has been issued and every owned pipe has reached EOF.
+//!
+//! When this module is path-included into a slim integration harness, not every
+//! API surface is consumed; allow unused code so callers can share one supervisor.
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
 
 #[path = "db_admission_test_process/capture.rs"]
 mod capture;
@@ -426,16 +432,36 @@ impl DeadlineChild {
         if !timed_out {
             timed_out = !child.wait_for_leader_exit(collection_deadline)?;
         }
+        child.finish_output(deadline, timed_out)
+    }
+
+    /// Wait for a previously spawned child, drain pipes, escalate termination, and reap.
+    ///
+    /// Callers that wrote stdin after [`Self::spawn`] must close stdin first. On success the
+    /// returned report retains bounded stdout/stderr for existing assertions; timeout cleanup
+    /// still fences the process group and reaps before returning.
+    pub fn wait_output(mut self, timeout: Duration) -> Result<DeadlineOutput, SupervisionError> {
+        let deadline = deadline_after(timeout);
+        let collection_deadline = work_deadline(deadline, timeout);
+        let timed_out = !self.wait_for_leader_exit(collection_deadline)?;
+        self.finish_output(deadline, timed_out)
+    }
+
+    fn finish_output(
+        mut self,
+        deadline: Instant,
+        timed_out: bool,
+    ) -> Result<DeadlineOutput, SupervisionError> {
         let mode = if timed_out {
             CleanupMode::TermThenKill
         } else {
             CleanupMode::Kill
         };
-        match child.cleanup_until(deadline, mode) {
-            CleanupProgress::Complete(cleanup) => Ok(child.into_output(timed_out, cleanup)),
+        match self.cleanup_until(deadline, mode) {
+            CleanupProgress::Complete(cleanup) => Ok(self.into_output(timed_out, cleanup)),
             CleanupProgress::Incomplete { report, resources } => {
                 Err(SupervisionError::CleanupIncomplete(IncompleteCleanup {
-                    owner: Box::new(child),
+                    owner: Box::new(self),
                     report,
                     resources,
                 }))
