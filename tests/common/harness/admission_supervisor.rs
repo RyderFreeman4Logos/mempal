@@ -1,5 +1,9 @@
+// Regression modules below exercise the shared supervisor surface directly (Rust 011).
 #[path = "../../../src/core/db_admission_test_process.rs"]
 mod process;
+
+const _: fn() = process::reference_shared_test_api;
+
 #[path = "admission_supervisor/process_guard.rs"]
 mod process_guard;
 #[cfg(test)]

@@ -3,12 +3,11 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::*;
 
 const READS_PER_PUMP: usize = 1;
-const DROP_EXIT_CODE: i32 = 125;
 
 impl ProcessIdentity {
     pub fn still_refers_to_original_process(self) -> bool {
@@ -287,9 +286,38 @@ impl DeadlineChild {
         poll_many(&mut pollfds, deadline)
     }
 
-    pub(crate) fn close_stdin(&mut self) {
+    pub fn close_stdin(&mut self) {
         if let Some(active) = self.active_mut() {
             active.stdin.take();
+        }
+    }
+
+    /// Wait after spawn+stdin write: drain pipes, escalate termination, and reap.
+    pub fn wait_output(mut self, timeout: Duration) -> Result<DeadlineOutput, SupervisionError> {
+        let deadline = deadline_after(timeout);
+        let collection_deadline = work_deadline(deadline, timeout);
+        let timed_out = !self.wait_for_leader_exit(collection_deadline)?;
+        self.finish_output(deadline, timed_out)
+    }
+
+    /// Consume `self` while applying a kill fence so error paths can panic only
+    /// after ownership is either reaped or moved into [`IncompleteCleanup`].
+    ///
+    /// Prefer this over panicking while an active [`DeadlineChild`] is still in
+    /// scope so the caller can retain the cleanup report. `Drop` remains
+    /// fail-closed: it SIGKILLs an unreaped child group and performs a bounded
+    /// reap before panic unwinding continues.
+    pub fn force_kill_owned(
+        mut self,
+        timeout: Duration,
+    ) -> Result<CleanupReport, IncompleteCleanup> {
+        match self.cleanup_until(deadline_after(timeout), CleanupMode::Kill) {
+            CleanupProgress::Complete(report) => Ok(report),
+            CleanupProgress::Incomplete { report, resources } => Err(IncompleteCleanup {
+                owner: Box::new(self),
+                report,
+                resources,
+            }),
         }
     }
 
@@ -329,20 +357,13 @@ impl fmt::Debug for DeadlineChild {
 
 impl Drop for DeadlineChild {
     fn drop(&mut self) {
-        let Some(active) = self.active() else {
+        if self.active().is_none() {
             return;
-        };
-        let target = if active.group_ready {
-            -active.identity.pid
-        } else {
-            active.identity.pid
-        };
-        // SAFETY: Drop only reaches this fail-closed path while the owned direct child remains
-        // unreaped, so the target is either its verified PGID or its PID; _exit prevents the test
-        // process from continuing after cleanup ownership was abandoned.
-        unsafe {
-            libc::kill(target, libc::SIGKILL);
-            libc::_exit(DROP_EXIT_CODE);
         }
+        // Drop only reaches this fail-closed path while the direct child remains owned and
+        // unreaped. Keep the SIGKILL process-group fence, then use the ordinary bounded cleanup
+        // path to waitpid-reap the direct child. Do not hard-exit here: panic unwinding must be
+        // allowed to complete after abandoned cleanup ownership.
+        let _ = self.cleanup_until(deadline_after(CLEANUP_RESERVE), CleanupMode::Kill);
     }
 }

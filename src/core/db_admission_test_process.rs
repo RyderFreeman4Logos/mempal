@@ -1,8 +1,10 @@
 //! Linux-only, test-owned subprocess supervision for admission crash fixtures.
 //!
-//! The direct child stays unreaped as the process-group identity anchor until a
-//! final group fence has been issued and every owned pipe has reached EOF.
+//! Direct child stays unreaped as process-group anchor until final group fence
+//! and owned pipe EOF. Shared via path-include; no crate-level allows (Rust 011).
 
+#[path = "db_admission_test_process/api_references.rs"]
+mod api_references;
 #[path = "db_admission_test_process/capture.rs"]
 mod capture;
 #[path = "db_admission_test_process/fd_layout.rs"]
@@ -17,6 +19,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
+pub use api_references::reference_shared_test_api;
 pub use capture::{BoundedCapture, CAPTURE_LIMIT_BYTES, CapturedBytes, render_diagnostic};
 use spawn::{RawSpawn, SETUP_RECORD_BYTES, decode_setup_record, spawn_owned};
 pub use spawn::{SpawnSpec, StdioMode, TestSetupGate};
@@ -426,16 +429,24 @@ impl DeadlineChild {
         if !timed_out {
             timed_out = !child.wait_for_leader_exit(collection_deadline)?;
         }
+        child.finish_output(deadline, timed_out)
+    }
+
+    fn finish_output(
+        mut self,
+        deadline: Instant,
+        timed_out: bool,
+    ) -> Result<DeadlineOutput, SupervisionError> {
         let mode = if timed_out {
             CleanupMode::TermThenKill
         } else {
             CleanupMode::Kill
         };
-        match child.cleanup_until(deadline, mode) {
-            CleanupProgress::Complete(cleanup) => Ok(child.into_output(timed_out, cleanup)),
+        match self.cleanup_until(deadline, mode) {
+            CleanupProgress::Complete(cleanup) => Ok(self.into_output(timed_out, cleanup)),
             CleanupProgress::Incomplete { report, resources } => {
                 Err(SupervisionError::CleanupIncomplete(IncompleteCleanup {
-                    owner: Box::new(child),
+                    owner: Box::new(self),
                     report,
                     resources,
                 }))

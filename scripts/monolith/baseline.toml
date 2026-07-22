@@ -171,6 +171,14 @@ issue = "695"
 rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
 
 [[files]]
+path = "src/core/db_admission_test_process.rs"
+kind = "source"
+baseline_tokens = 5600
+baseline_lines = 810
+issue = "795"
+rationale = "Test-only deadline supervisor surface grew for CaptureWithInput/wait_output shared by CLI helpers; no-growth ratchet after #795."
+
+[[files]]
 path = "src/core/db_fork_ext.rs"
 kind = "source"
 baseline_tokens = 10435

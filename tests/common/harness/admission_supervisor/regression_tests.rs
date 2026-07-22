@@ -477,6 +477,38 @@ fn expired_cleanup_budget_cannot_report_success_or_drop_ownership() {
 }
 
 #[test]
+fn dropping_after_expired_cleanup_budget_reaps_owned_child() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let ready = temp.path().join("ready");
+    let mut spec = current_test_spec("term-resistant");
+    spec.env(READY_PATH_ENV, &ready);
+    let child =
+        DeadlineChild::spawn(spec, Duration::from_secs(2)).expect("spawn cleanup-state fixture");
+    let identity = child.identity();
+    wait_for_ready_file(&ready);
+
+    let incomplete = child
+        .force_kill_owned(Duration::ZERO)
+        .expect_err("expired cleanup budget must retain active ownership");
+
+    drop(incomplete);
+    ExactProcessGuard::new(identity).assert_gone("dropped cleanup fixture");
+    let mut status = 0;
+    // SAFETY: Drop must reap its still-owned direct child; WNOHANG verifies ECHILD without
+    // observing another process.
+    assert_eq!(
+        unsafe { libc::waitpid(identity.pid, &mut status, libc::WNOHANG) },
+        -1,
+        "dropped cleanup fixture direct child was not reaped"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD),
+        "dropped cleanup fixture must report ECHILD after Drop"
+    );
+}
+
+#[test]
 fn capture_boundaries_are_lossless_and_chunking_invariant() {
     for size in [
         512 * 1024 - 1,

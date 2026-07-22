@@ -16,8 +16,6 @@ mod db_admission_fault_injection;
 mod db_admission_lease;
 mod db_admission_paths;
 mod db_admission_release;
-#[cfg(all(test, target_os = "linux"))]
-pub mod db_admission_test_process;
 pub(crate) mod db_connection;
 pub(crate) mod deadline;
 pub use async_db::{AsyncDb, QueryOnlyAsyncDb};
