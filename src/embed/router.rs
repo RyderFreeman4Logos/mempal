@@ -179,7 +179,12 @@ impl EndpointPoolStrategy<OpenAiCompatibleEmbedder> for EmbeddingRoutingStrategy
         }
     }
 
-    fn all_cooling_down_error(&self, endpoint_count: usize, retry_after: Duration) -> Self::Error {
+    fn all_cooling_down_error(
+        &self,
+        endpoint_count: usize,
+        retry_after: Duration,
+        _first_retryable_error: Option<&Self::Error>,
+    ) -> Self::Error {
         EmbedError::TemporarilyUnavailable {
             retry_after,
             reason: format!(
