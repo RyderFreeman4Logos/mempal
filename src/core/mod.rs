@@ -16,6 +16,9 @@ mod db_admission_fault_injection;
 mod db_admission_lease;
 mod db_admission_paths;
 mod db_admission_release;
+#[cfg(test)]
+mod db_admission_sidecar_tests;
+mod db_admission_state;
 pub(crate) mod db_connection;
 pub(crate) mod deadline;
 pub use async_db::{AsyncDb, QueryOnlyAsyncDb};

@@ -31,7 +31,7 @@ fn admission_crash_fixture() {
     let point = crash_point_for_case(case.to_str().expect("UTF-8 fixture case"));
     let _crash_guard = fault_injection::arm(point);
     match point {
-        CrashPoint::LeaseCreatedBeforeStatePublish => {
+        CrashPoint::LeaseCreatedBeforeStatePublish | CrashPoint::StateTempSyncedBeforeRename => {
             let _admission = ProfileDbAdmission::acquire(
                 &database,
                 DbAdmissionRequest::new(DbHolderClass::Mcp, 1, 1024),
@@ -67,6 +67,33 @@ fn crash_after_lease_creation_before_state_publish_reclaims_orphan() {
     assert_eq!(snapshot.active_holders, 0);
     assert_eq!(snapshot.reaped_stale_holders_this_snapshot, 0);
     assert!(lease_paths(&paths).is_empty());
+    assert_capacity_reusable(&database);
+}
+
+#[test]
+fn crash_after_state_temp_sync_before_rename_reclaims_only_the_staged_state() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let database = temp.path().join("palace.db");
+    let paths = AdmissionPaths::new(&database).expect("admission paths");
+
+    assert_crashes_at(&database, CrashPoint::StateTempSyncedBeforeRename);
+    assert!(
+        !paths.state_path.exists(),
+        "state was not renamed before the crash"
+    );
+    assert_eq!(
+        state_temp_paths(&paths).len(),
+        1,
+        "crash strands one state temp"
+    );
+
+    let snapshot = ProfileDbAdmission::snapshot(&database).expect("recover staged state");
+    assert_eq!(snapshot.active_holders, 0);
+    assert!(state_temp_paths(&paths).is_empty());
+    assert!(
+        lease_paths(&paths).is_empty(),
+        "unpublished lease is also swept"
+    );
     assert_capacity_reusable(&database);
 }
 
@@ -196,6 +223,7 @@ fn assert_crashes_at(database: &Path, point: CrashPoint) {
 fn fixture_case(point: CrashPoint) -> &'static str {
     match point {
         CrashPoint::LeaseCreatedBeforeStatePublish => "lease-created-before-state-publish",
+        CrashPoint::StateTempSyncedBeforeRename => "state-temp-synced-before-rename",
         CrashPoint::ReleaseStateSavedBeforeLeaseUnlink => "release-state-saved-before-lease-unlink",
         CrashPoint::ReapStateSavedBeforeOrphanSweep => "reap-state-saved-before-orphan-sweep",
     }
@@ -204,6 +232,7 @@ fn fixture_case(point: CrashPoint) -> &'static str {
 fn crash_point_for_case(case: &str) -> CrashPoint {
     match case {
         "lease-created-before-state-publish" => CrashPoint::LeaseCreatedBeforeStatePublish,
+        "state-temp-synced-before-rename" => CrashPoint::StateTempSyncedBeforeRename,
         "release-state-saved-before-lease-unlink" => CrashPoint::ReleaseStateSavedBeforeLeaseUnlink,
         "reap-state-saved-before-orphan-sweep" => CrashPoint::ReapStateSavedBeforeOrphanSweep,
         other => panic!("unknown admission fixture case {other}"),
@@ -263,6 +292,16 @@ fn lease_paths(paths: &AdmissionPaths) -> Vec<PathBuf> {
         .collect::<Vec<_>>();
     leases.sort();
     leases
+}
+
+fn state_temp_paths(paths: &AdmissionPaths) -> Vec<PathBuf> {
+    let mut staged = std::fs::read_dir(paths.state_parent())
+        .expect("read admission sidecars")
+        .map(|entry| entry.expect("read sidecar entry").path())
+        .filter(|path| paths.is_current_state_temp_path(path))
+        .collect::<Vec<_>>();
+    staged.sort();
+    staged
 }
 
 fn assert_capacity_reusable(database: &Path) {

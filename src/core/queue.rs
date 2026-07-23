@@ -1882,8 +1882,8 @@ impl PendingMessageStore {
         &self,
         busy_timeout: Option<Duration>,
     ) -> Result<Connection> {
-        self.connection_cache.admission.ensure(&self.db_path)?;
-        let conn = Connection::open(&self.db_path)?;
+        let admission = &self.connection_cache.admission;
+        let conn = admission.open_sqlite(&self.db_path, OpenFlags::default())?;
         conn.busy_timeout(busy_timeout.unwrap_or(DEFAULT_BUSY_TIMEOUT))?;
         conn.pragma_update(
             None,
@@ -1896,8 +1896,8 @@ impl PendingMessageStore {
     }
 
     fn open_query_connection(&self) -> Result<Connection> {
-        self.connection_cache.admission.ensure(&self.db_path)?;
-        let conn = Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let admission = &self.connection_cache.admission;
+        let conn = admission.open_read_write(&self.db_path)?;
         conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
         conn.pragma_update(
             None,

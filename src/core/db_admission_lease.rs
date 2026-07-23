@@ -12,6 +12,7 @@ use std::path::Path;
 use super::db_admission::{
     AdmissionPaths, DbAdmissionError, DbAdmissionHolder, UnknownHolderReason, imp,
 };
+use super::db_admission_state::sync_parent_directory;
 
 #[cfg(test)]
 thread_local! {
@@ -68,17 +69,27 @@ pub(super) enum HolderLiveness {
 }
 
 pub(super) fn create_holder_lease(path: &Path) -> Result<File, DbAdmissionError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|source| DbAdmissionError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let file = open_new_lease(path).map_err(|source| DbAdmissionError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
     match imp::try_lock_exclusive(&file) {
-        Ok(true) => Ok(file),
+        Ok(true) => {
+            file.sync_all().map_err(|source| DbAdmissionError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            sync_parent_directory(path.parent().unwrap_or_else(|| Path::new("."))).map_err(
+                |source| DbAdmissionError::Io {
+                    path: path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .to_path_buf(),
+                    source,
+                },
+            )?;
+            Ok(file)
+        }
         Ok(false) => {
             if let Err(error) = remove_holder_lease(path) {
                 tracing::warn!(%error, "failed to clean up unexpectedly locked holder lease");
@@ -112,7 +123,15 @@ pub(super) fn remove_holder_lease(path: &Path) -> Result<(), DbAdmissionError> {
         });
     }
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_parent_directory(path.parent().unwrap_or_else(|| Path::new("."))).map_err(
+            |source| DbAdmissionError::Io {
+                path: path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf(),
+                source,
+            },
+        ),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(DbAdmissionError::Io {
             path: path.to_path_buf(),
@@ -175,6 +194,28 @@ pub(super) fn sweep_unreferenced_holder_leases(
 }
 
 #[cfg(unix)]
+fn open_new_lease(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_new_lease(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+#[cfg(unix)]
 fn open_current_lease(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -218,7 +259,10 @@ fn remove_unreferenced_lease(path: &Path) -> io::Result<bool> {
         return Ok(false);
     }
     match fs::remove_file(path) {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            sync_parent_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
+            Ok(true)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
