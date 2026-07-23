@@ -42,6 +42,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- Add `maintenance rejudge rebind` CLI for safe checkpoint binding update (#819)
+- Harden `test_daemon_sigterm_drains_running_ingest_async_before_reclaim` fixture isolation under full-suite admission contention
 - **DB admission sidecars**: restrict lock/state files to owner-safe directories,
   reject symlink/hard-link/inode substitution, bound and version persisted state,
   reclaim only grammar-validated staged files, and fsync publication/removal
