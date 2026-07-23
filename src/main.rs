@@ -180,6 +180,7 @@ fn write_cli_stdout_line(args: std::fmt::Arguments<'_>) {
 mod case_skill;
 mod daemon_cli;
 mod foresight_cli;
+mod historical_rejudge_rebind;
 mod insights;
 mod longmemeval;
 mod patterns;
@@ -2541,6 +2542,12 @@ struct MaintenanceRejudgeArgs {
 
 #[derive(Subcommand)]
 enum MaintenanceRejudgeCommands {
+    /// Rebind an equivalent in-flight full-sweep checkpoint to current config identity.
+    Rebind {
+        /// Persist the validated binding; omit for a read-only preflight.
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+    },
     /// Apply deferred deletions from a read-only rejudge confirmations artifact.
     Apply {
         /// Absolute path to confirmations.jsonl produced by --candidates-file scan mode.
@@ -4384,6 +4391,21 @@ fn run() -> Result<()> {
                         max_confirmations,
                     },
                 )),
+                Some(MaintenanceRejudgeCommands::Rebind { execute }) => {
+                    if llm_concurrency != DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY
+                        || max_confirmations.is_some()
+                    {
+                        bail!(
+                            "checkpoint rebind does not accept --llm-concurrency or --max-confirmations"
+                        );
+                    }
+                    historical_rejudge_rebind::maintenance_rejudge_rebind_command(
+                        &db,
+                        config.as_ref(),
+                        options,
+                        execute,
+                    )
+                }
                 Some(MaintenanceRejudgeCommands::Apply {
                     confirmations_file,
                     receipt_file,
@@ -4855,6 +4877,7 @@ fn maintenance_rejudge_command_is_dry_run(args: &MaintenanceRejudgeArgs) -> bool
     match &args.command {
         Some(MaintenanceRejudgeCommands::Apply { execute, .. }) => !*execute,
         Some(MaintenanceRejudgeCommands::Restore { execute, .. }) => !*execute,
+        Some(MaintenanceRejudgeCommands::Rebind { execute }) => !*execute,
         None => !args.execute,
     }
 }
@@ -17416,6 +17439,12 @@ Drain persisted Spark confirmations later without rerunning Qwen:
 
 Resume an interrupted execute sweep:
   mempal maintenance rejudge --all --resume --execute --backup-dir /ssd/mirror-rootfs/home/obj/bak/mempal/
+
+Resume an interrupted execute sweep after a safe rebind preflight:
+  mempal maintenance rejudge --all --resume --page-size 500 --proposal-llm-endpoint qwen --confirm-llm-endpoint spark --format json rebind
+
+Persist only the validated checkpoint binding (no drawer mutation):
+  mempal maintenance rejudge --all --resume --page-size 500 --proposal-llm-endpoint qwen --confirm-llm-endpoint spark --format json rebind --execute
 
 Restore from a backup file:
   mempal maintenance rejudge restore --backup /path/to/rejudge-backup.sqlite --execute
