@@ -789,9 +789,11 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
 
     let mut child = spawn_foreground_daemon(tmp.path(), "drain-running-ingest-async");
 
+    // Reuse the enqueue store so polling does not repeatedly register and
+    // release an admission sidecar holder while the daemon claims the row.
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        let record = PendingMessageStore::new_without_reclaim(&db_path)
+        let record = store
             .operation_status(&operation_id)
             .expect("load operation status")
             .expect("operation record exists");
@@ -800,7 +802,7 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let running = PendingMessageStore::new_without_reclaim(&db_path)
+    let running = store
         .operation_status(&operation_id)
         .expect("load running status")
         .expect("operation record exists");
@@ -822,7 +824,7 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
         child.diagnostics()
     );
 
-    let completed = PendingMessageStore::new_without_reclaim(&db_path)
+    let completed = store
         .operation_status(&operation_id)
         .expect("load completed status")
         .expect("operation record exists");
