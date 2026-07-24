@@ -480,24 +480,17 @@ fn test_ingest_wait_json_admission_blocked_output_includes_capacity_and_headroom
 
     assert!(
         !output.status.success(),
-        "admission exhaustion must fail closed, stdout={}, stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "admission exhaustion must fail closed"
     );
-    let stdout: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-        panic!(
-            "parse admission-blocked JSON receipt: {error}; stdout={}, stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-    });
+    let stdout: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("admission-blocked receipt was not valid JSON"));
     assert_eq!(stdout["outcome"], "admission_blocked");
     assert_eq!(stdout["reason"], "holder_budget_exceeded");
     assert_eq!(stdout["capacity"]["holders"], 16);
     assert_eq!(stdout["headroom"]["holders"], 0);
     assert!(
         cleanup_ids_from_ingest_json(&stdout).is_empty(),
-        "blocked create must not expose cleanup-safe IDs: {stdout}"
+        "blocked receipt exposed cleanup IDs"
     );
 }
 
