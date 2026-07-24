@@ -1,3 +1,5 @@
+#[path = "common/harness/cli_deadline.rs"]
+mod cli_deadline;
 mod common;
 
 use std::collections::BTreeSet;
@@ -8,6 +10,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use cli_deadline::{CLI_HELPER_DEADLINE, push_args, run_cli_stdin_output, with_home};
 use common::harness::embed_mock::start as start_embed_mock;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
@@ -460,22 +463,29 @@ fn test_ingest_wait_json_admission_blocked_output_includes_capacity_and_headroom
         })
         .collect::<Vec<_>>();
 
-    let output = run_cli_with_stdin(
-        home.path(),
-        &[
-            "ingest",
-            "--stdin",
-            "--wing",
-            "smoke",
-            "--source-type",
-            "user_explicit",
-            "--no-gate",
-            "--wait",
-            "--wait-timeout-secs",
-            "5",
-            "--json",
-        ],
+    let output = run_cli_stdin_output(
+        "mempal ingest --stdin --wait admission blocked",
+        |spec| {
+            with_home(spec, home.path());
+            push_args(
+                spec,
+                [
+                    "ingest",
+                    "--stdin",
+                    "--wing",
+                    "smoke",
+                    "--source-type",
+                    "user_explicit",
+                    "--no-gate",
+                    "--wait",
+                    "--wait-timeout-secs",
+                    "5",
+                    "--json",
+                ],
+            );
+        },
         br#"{"content":"admission-blocked JSON receipt must stay machine-readable"}"#,
+        CLI_HELPER_DEADLINE,
     );
 
     assert!(

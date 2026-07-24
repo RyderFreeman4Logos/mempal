@@ -11830,6 +11830,8 @@ fn mcp_async_pool_admission_error(
         message,
         Some(serde_json::json!({
             "outcome": "admission_blocked",
+            "created_drawer_ids": [],
+            "cleanup_drawer_ids": [],
             "reason": if diagnostic.failure_kind == "holder_budget_exceeded" {
                 "holder_budget_exceeded"
             } else {
