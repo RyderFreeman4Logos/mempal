@@ -1,5 +1,3 @@
-#[path = "common/harness/cli_deadline.rs"]
-mod cli_deadline;
 mod common;
 
 use std::collections::BTreeSet;
@@ -10,7 +8,6 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use cli_deadline::{CLI_HELPER_DEADLINE, push_args, run_cli_stdin_output, with_home};
 use common::harness::embed_mock::start as start_embed_mock;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
@@ -129,6 +126,46 @@ fn run_cli_with_stdin(home: &Path, args: &[&str], payload: &[u8]) -> Output {
         stdin.write_all(payload).expect("write stdin payload");
     }
     child.wait_with_output().expect("wait mempal")
+}
+
+/// Bounded variant for tests that exercise admission-blocked CLI paths
+/// where the child could hang indefinitely under regression.
+fn run_cli_with_stdin_bounded(
+    home: &Path,
+    args: &[&str],
+    payload: &[u8],
+    timeout: Duration,
+) -> Output {
+    use std::io::Write as _;
+
+    let mut child = Command::new(mempal_bin())
+        .args(args)
+        .env("HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mempal");
+    if let Some(stdin) = child.stdin.as_mut() {
+        if let Err(e) = stdin.write_all(payload) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("stdin write failed: {e}");
+        }
+    }
+    // Bounded wait: poll then reap; static-only panic (no stdout/stderr).
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("poll child").is_some() {
+            return child.wait_with_output().expect("collect child output");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("bounded CLI probe did not exit within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn spawn_cli(home: &Path, args: &[&str]) -> Child {
@@ -463,29 +500,23 @@ fn test_ingest_wait_json_admission_blocked_output_includes_capacity_and_headroom
         })
         .collect::<Vec<_>>();
 
-    let output = run_cli_stdin_output(
-        "mempal ingest --stdin --wait admission blocked",
-        |spec| {
-            with_home(spec, home.path());
-            push_args(
-                spec,
-                [
-                    "ingest",
-                    "--stdin",
-                    "--wing",
-                    "smoke",
-                    "--source-type",
-                    "user_explicit",
-                    "--no-gate",
-                    "--wait",
-                    "--wait-timeout-secs",
-                    "5",
-                    "--json",
-                ],
-            );
-        },
+    let output = run_cli_with_stdin_bounded(
+        home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--wing",
+            "smoke",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+            "--wait",
+            "--wait-timeout-secs",
+            "5",
+            "--json",
+        ],
         br#"{"content":"admission-blocked JSON receipt must stay machine-readable"}"#,
-        CLI_HELPER_DEADLINE,
+        Duration::from_secs(30),
     );
 
     assert!(

@@ -621,10 +621,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/write_wait_cli.rs"
 kind = "test"
-baseline_tokens = 15490
-baseline_lines = 1967
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 15565
+baseline_lines = 1963
+issue = "821"
+rationale = "#821 adds admission-blocked receipt tests, cleanup-safe ID deletion tests, and a bounded CLI probe helper with explicit subprocess cleanup; recalibrated to exact tokenizer/line output with a no-growth ratchet."
 
 [[files]]
 path = "tests/xurl_embed.rs"
