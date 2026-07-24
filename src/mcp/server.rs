@@ -11793,6 +11793,14 @@ fn mcp_async_pool_admission_error(
             "active_cache_bytes": snapshot.active_cache_bytes,
             "configured_cache_bytes": snapshot.configured_cache_bytes,
             "available_cache_bytes": snapshot.available_cache_bytes,
+            "capacity": {
+                "holders": snapshot.configured_holder_limit,
+                "cache_bytes": snapshot.configured_cache_bytes,
+            },
+            "headroom": {
+                "holders": snapshot.configured_holder_limit.saturating_sub(snapshot.active_holders),
+                "cache_bytes": snapshot.available_cache_bytes,
+            },
             "unknown_holders": snapshot.unknown_holders,
         }),
         Err(snapshot_error) => serde_json::json!({
@@ -11805,6 +11813,8 @@ fn mcp_async_pool_admission_error(
             serde_json::Value::Bool(false),
         );
     }
+    let capacity = admission.get("capacity").cloned();
+    let headroom = admission.get("headroom").cloned();
     let message = if diagnostic.failure_kind == "holder_budget_exceeded" {
         format!(
             "MCP async pool admission refused before wait=true ingest was accepted: {}. {}",
@@ -11819,6 +11829,7 @@ fn mcp_async_pool_admission_error(
     ErrorData::internal_error(
         message,
         Some(serde_json::json!({
+            "outcome": "admission_blocked",
             "reason": if diagnostic.failure_kind == "holder_budget_exceeded" {
                 "holder_budget_exceeded"
             } else {
@@ -11828,6 +11839,8 @@ fn mcp_async_pool_admission_error(
             "async_pool_loaded": false,
             "database_diagnostic": diagnostic,
             "profile_admission": admission,
+            "capacity": capacity,
+            "headroom": headroom,
         })),
     )
 }
@@ -21600,6 +21613,10 @@ prototypes = ["keep"]
         );
         let data = error.data.expect("structured refusal data");
         assert_eq!(
+            data.get("outcome").and_then(Value::as_str),
+            Some("admission_blocked")
+        );
+        assert_eq!(
             data.get("reason").and_then(Value::as_str),
             Some("holder_budget_exceeded")
         );
@@ -21611,6 +21628,8 @@ prototypes = ["keep"]
             data.get("async_pool_loaded").and_then(Value::as_bool),
             Some(false)
         );
+        assert_eq!(data["capacity"]["holders"], 16);
+        assert_eq!(data["headroom"]["holders"], 15);
         let stats = PendingMessageStore::new_without_reclaim(&db_path)
             .stats()
             .expect("queue stats");

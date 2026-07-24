@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use common::harness::embed_mock::start as start_embed_mock;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
+use mempal::core::db_admission::{DbAdmissionRequest, DbHolderClass, ProfileDbAdmission};
 use mempal::core::queue::PendingMessageStore;
 use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType, Triple};
 use mempal::core::utils::build_triple_id;
@@ -446,6 +447,58 @@ fn cleanup_ids_from_ingest_json(json: &Value) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+#[test]
+fn test_ingest_wait_json_admission_blocked_output_includes_capacity_and_headroom() {
+    let home = setup_home();
+    let db_path = home.path().join(".mempal/palace.db");
+    let _holders = (0..16)
+        .map(|_| {
+            ProfileDbAdmission::acquire(&db_path, DbAdmissionRequest::new(DbHolderClass::Mcp, 1, 1))
+                .expect("fill profile holder budget")
+        })
+        .collect::<Vec<_>>();
+
+    let output = run_cli_with_stdin(
+        home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--wing",
+            "smoke",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+            "--wait",
+            "--wait-timeout-secs",
+            "5",
+            "--json",
+        ],
+        br#"{"content":"admission-blocked JSON receipt must stay machine-readable"}"#,
+    );
+
+    assert!(
+        !output.status.success(),
+        "admission exhaustion must fail closed, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "parse admission-blocked JSON receipt: {error}; stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(stdout["outcome"], "admission_blocked");
+    assert_eq!(stdout["reason"], "holder_budget_exceeded");
+    assert_eq!(stdout["capacity"]["holders"], 16);
+    assert_eq!(stdout["headroom"]["holders"], 0);
+    assert!(
+        cleanup_ids_from_ingest_json(&stdout).is_empty(),
+        "blocked create must not expose cleanup-safe IDs: {stdout}"
+    );
 }
 
 fn cleanup_ids_from_operation_stdout(stdout: &str) -> Vec<String> {
