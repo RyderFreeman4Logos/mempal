@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import time
 import unittest
 from email.message import Message
 from pathlib import Path
@@ -45,7 +46,48 @@ class ReviewFixTests(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=error):
             self.smoke._rest_ingest_fallback("content", "unit_rest_http_error")
 
-        error.read.assert_called_once_with(8192)
+        error.read.assert_called_once_with(8193)
+        error.close()
+
+    def test_rest_ingest_hard_deadline_interrupts_slow_drip_http_error_body(self) -> None:
+        error = HTTPError(
+            "http://127.0.0.1:3080/api/ingest",
+            503,
+            "service unavailable",
+            Message(),
+            io.BytesIO(),
+        )
+
+        def slow_drip_read(n: int = -1) -> bytes:
+            del n
+            received = bytearray()
+            while True:
+                received.extend(b"x")
+                time.sleep(0.01)
+
+        error.read = slow_drip_read
+        real_setitimer = self.smoke.signal.setitimer
+
+        def accelerated_timer(
+            which: int,
+            seconds: float,
+            interval: float = 0.0,
+        ) -> tuple[float, float]:
+            if seconds == 35:
+                seconds = 0.1
+            return real_setitimer(which, seconds, interval)
+
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=error),
+            mock.patch.object(self.smoke.signal, "setitimer", side_effect=accelerated_timer),
+        ):
+            started = time.monotonic()
+            result = self.smoke._rest_ingest_fallback(
+                "content", "unit_rest_slow_drip_http_error"
+            )
+
+        self.assertEqual(result, ([], None))
+        self.assertLess(time.monotonic() - started, 1.0)
         error.close()
 
     def test_unreaped_child_returns_requested_rest_fallback_shape(self) -> None:

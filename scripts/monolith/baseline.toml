@@ -101,10 +101,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "skills/smoke-test/scripts/full_smoke.py"
 kind = "source"
-baseline_tokens = 20982
-baseline_lines = 2206
+baseline_tokens = 21083
+baseline_lines = 2209
 issue = "825"
-rationale = "#825 adds admission-blocked receipt recognition plus cleanup-safe smoke regressions; exact no-growth ratchet."
+rationale = "#825 review F1 adds a bounded REST fallback body-read deadline; exact no-growth ratchet."
 
 [[files]]
 path = "skills/smoke-test/tests/test_full_smoke_receipts.py"

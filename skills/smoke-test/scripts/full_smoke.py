@@ -1286,16 +1286,9 @@ def recovery_fields(info: dict[str, Any]) -> dict[str, Any]:
 
 
 def _rest_ingest_fallback(
-    content: str,
-    label: str,
-    supersedes: str | None = None,
-    room: str = 'cli',
+    content: str, label: str, supersedes: str | None = None, room: str = 'cli'
 ) -> tuple[list[str], dict[str, Any] | None]:
-    """Retry direct writes through daemon REST with safe terminal outcomes.
-
-    Returns accepted IDs or a cleanup-safe no-write admission receipt. ``room``
-    selects the drawer room (``'cli'`` by default; MCP uses ``'mcp'``).
-    """
+    """Retry direct writes through daemon REST with safe terminal outcomes."""
     import urllib.request
     payload: dict[str, Any] = {
         'content': content,
@@ -1309,38 +1302,55 @@ def _rest_ingest_fallback(
     if supersedes:
         payload['supersedes'] = supersedes
     _checkpoint_manifest()
+    old_handler = signal.getsignal(signal.SIGALRM)
+    old_timer = signal.setitimer(signal.ITIMER_REAL, 0)
+
+    def _alarm_handler(_signum: int, _frame: Any) -> None:
+        raise TimeoutError('REST ingest fallback hard timeout')
+
+    signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.setitimer(signal.ITIMER_REAL, 35)
     try:
-        req = urllib.request.Request(
-            'http://127.0.0.1:3080/api/ingest',
-            data=json.dumps(payload).encode(),
-            headers={'Content-Type': 'application/json'},
-            method='POST',
-        )
-        resp = urllib.request.urlopen(req, timeout=30)
-        if resp.status in (200, 201):
-            body = json.loads(resp.read().decode())
-            ids = created_ids_from(body)
+        try:
+            req = urllib.request.Request(
+                'http://127.0.0.1:3080/api/ingest',
+                data=json.dumps(payload).encode(),
+                headers={'Content-Type': 'application/json'},
+                method='POST',
+            )
+            resp = urllib.request.urlopen(req, timeout=30)
+            if resp.status in (200, 201):
+                body = json.loads(resp.read().decode())
+                ids = created_ids_from(body)
+                receipt = create_terminal_receipt(body)
+                if ids:
+                    _remember_created_ids(ids)
+                    note(label, True, created_id_count=len(ids), json=json_shape(body))
+                    return ids, receipt
+                if receipt and receipt.get('outcome') == 'admission_blocked':
+                    note(label, True, http_status=resp.status, json=json_shape(body), **receipt)
+                    return [], receipt
+                note(label, False, error_type='MissingTerminalReceipt', http_status=resp.status, json=json_shape(body))
+                return [], None
+        except HTTPError as exc:
+            raw_body = exc.read(8193)
+            if len(raw_body) > 8192:
+                note(label, False, error_type='HTTPErrorBodyTooLarge', http_status=exc.code)
+                return [], None
+            body, shape = parse_json_bytes(raw_body)
             receipt = create_terminal_receipt(body)
-            if ids:
-                _remember_created_ids(ids)
-                note(label, True, created_id_count=len(ids), json=json_shape(body))
-                return ids, receipt
             if receipt and receipt.get('outcome') == 'admission_blocked':
-                note(label, True, http_status=resp.status, json=json_shape(body), **receipt)
+                note(label, True, http_status=exc.code, json=shape, **receipt)
                 return [], receipt
-            note(label, False, error_type='MissingTerminalReceipt', http_status=resp.status, json=json_shape(body))
+            note(label, False, error_type='HTTPError', http_status=exc.code, json=shape)
             return [], None
-    except HTTPError as exc:
-        body, shape = parse_json_bytes(exc.read(8192))
-        receipt = create_terminal_receipt(body)
-        if receipt and receipt.get('outcome') == 'admission_blocked':
-            note(label, True, http_status=exc.code, json=shape, **receipt)
-            return [], receipt
-        note(label, False, error_type='HTTPError', http_status=exc.code, json=shape)
-        return [], None
     except Exception as exc:
         note(label, False, error_type=type(exc).__name__)
         return [], None
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
+        signal.setitimer(signal.ITIMER_REAL, *old_timer)
     note(label, False, error_type='MissingTerminalReceipt')
     return [], None
 
