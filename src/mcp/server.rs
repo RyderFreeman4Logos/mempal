@@ -12683,6 +12683,7 @@ mod tests {
 
     use super::*;
     use crate::core::db::read_fork_ext_version;
+    use crate::core::db_admission::{DbAdmissionRequest, DbHolderClass, ProfileDbAdmission};
     use crate::core::types::BootstrapEvidenceArgs;
     use crate::core::types::{KnowledgeCard, KnowledgeEvidenceLink, KnowledgeEvidenceRole};
     use crate::embed::Embedder;
@@ -21635,6 +21636,59 @@ prototypes = ["keep"]
             stats.pending, 0,
             "holder-budget refusal must not accept a queued operation"
         );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_wait_true_admission_receipt_is_cleanup_safe_at_14_of_16_service_holders()
+     {
+        let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        // Keep the warning preflight from consuming a separate MCP holder: this
+        // fixture verifies the 14-holder snapshot produced by the real async-pool
+        // admission path below, not the query-only warning path.
+        let server = MempalMcpServer::new_with_factory(
+            db_path.clone(),
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+        .expect("create MCP server")
+        .with_query_only_async_db_open_error_for_test("query-only warning fixture");
+        let _holders = (0..14)
+            .map(|_| {
+                ProfileDbAdmission::acquire(
+                    &db_path,
+                    DbAdmissionRequest::new(DbHolderClass::Mcp, 1, 16 * 1024 * 1024),
+                )
+                .expect("fill service holder baseline")
+            })
+            .collect::<Vec<_>>();
+
+        let error = match server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "real holder baseline must refuse before queueing".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("budget".to_string()),
+                wait: Some(true),
+                wait_timeout_secs: Some(5),
+                ..IngestRequest::default()
+            }))
+            .await
+        {
+            Ok(_) => panic!("MCP wait=true admission must refuse at the service-holder baseline"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+        let data = error.data.expect("structured refusal data");
+        assert_eq!(data["outcome"], "admission_blocked");
+        assert_eq!(data["action"], "write_refused");
+        assert_eq!(data["reason"], "holder_budget_exceeded");
+        assert_eq!(data["created_drawer_ids"], serde_json::json!([]));
+        assert_eq!(data["cleanup_drawer_ids"], serde_json::json!([]));
+        assert_eq!(data["capacity"]["holders"], 16);
+        assert_eq!(data["profile_admission"]["service_holders"], 14);
+        assert_eq!(data["headroom"]["holders"], 2);
     }
 
     #[tokio::test]
