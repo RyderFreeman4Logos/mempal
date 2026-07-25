@@ -34,6 +34,7 @@ use mempal::core::{
         ReindexVectorStash, VECTOR_DISTANCE_METRIC, find_similar_clusters, fts_tokenize_content,
         vector_metadata_key,
     },
+    db_admission::DbAdmissionError,
     phase3::{
         CardContextDefaultProposalReport, CardContextRollbackControlReport, EvaluatorAdviceInput,
         EvaluatorAdviceReport, Phase3ReadinessReport, ResearchIngestPlanReport,
@@ -3900,7 +3901,16 @@ fn run() -> Result<()> {
             observability::print_empty_gating_stats(since);
             return Ok(());
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            if stdin_wait_json_ingest(&cli.command)
+                && let Some(admission_error) = stdin_ingest_holder_budget_error(&error)
+            {
+                print_stdin_ingest_admission_blocked_json(startup_admission_blocked_json(
+                    admission_error,
+                ))?;
+            }
+            return Err(error);
+        }
     };
 
     let cli_span =
@@ -4906,6 +4916,31 @@ fn command_retries_historical_rejudge_startup_open(command: &Commands) -> bool {
 
 fn command_retries_stdin_ingest_startup_open(command: &Commands) -> bool {
     matches!(command, Commands::Ingest { stdin: true, .. })
+}
+
+fn stdin_wait_json_ingest(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Ingest {
+            stdin: true,
+            wait: true,
+            json: true,
+            ..
+        }
+    )
+}
+
+fn stdin_ingest_holder_budget_error(error: &anyhow::Error) -> Option<&DbAdmissionError> {
+    error
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<DbError>() {
+            Some(DbError::Admission(admission @ DbAdmissionError::BudgetExceeded { .. })) => {
+                Some(admission)
+            }
+            _ => cause
+                .downcast_ref::<DbAdmissionError>()
+                .filter(|cause| matches!(cause, DbAdmissionError::BudgetExceeded { .. })),
+        })
 }
 
 fn cli_content_write_operation(command: &Commands) -> Option<&'static str> {
@@ -6327,11 +6362,22 @@ async fn run_stdin_wait_ingest_queue(
         bypass_novelty: resolved.bypass_novelty,
     };
     let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone())?;
-    let response = server
+    let response = match server
         .mempal_ingest_with_controls_scoped_worker(wait_request, controls)
         .await
-        .map(|response| response.0)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    {
+        Ok(response) => response.0,
+        Err(error) => {
+            if json
+                && let Some(data) = error.data.as_ref()
+                && data.get("reason").and_then(serde_json::Value::as_str)
+                    == Some("holder_budget_exceeded")
+            {
+                print_stdin_ingest_admission_blocked_json(data.clone())?;
+            }
+            return Err(anyhow::anyhow!(error.to_string()));
+        }
+    };
     if response.timed_out {
         print_ingest_wait_receipt_response(json, &response)?;
         std::io::stdout()
@@ -6752,6 +6798,61 @@ fn normalize_stdin_content(content: &str, no_strip_noise: bool) -> Result<String
 
 fn print_stdin_ingest_output(json: bool, dry_run: bool, stats: &IngestStats) -> Result<()> {
     print_stdin_ingest_output_with_created_ids(json, dry_run, stats, &[])
+}
+
+fn startup_admission_blocked_json(error: &DbAdmissionError) -> serde_json::Value {
+    let DbAdmissionError::BudgetExceeded {
+        active_holders,
+        max_holders,
+        active_cache_bytes,
+        max_cache_bytes,
+        requested_cache_bytes,
+        reaped_stale_holders,
+        reserved_service_holders,
+        service_holders,
+        reason,
+    } = error
+    else {
+        unreachable!("caller filters DbAdmissionError::BudgetExceeded");
+    };
+    serde_json::json!({
+        "reason": "holder_budget_exceeded",
+        "action": "write_refused",
+        "capacity": {"holders": max_holders, "cache_bytes": max_cache_bytes},
+        "headroom": {
+            "holders": max_holders.saturating_sub(*active_holders),
+            "cache_bytes": max_cache_bytes.saturating_sub(*active_cache_bytes),
+        },
+        "profile_admission": {
+            "active_holders": active_holders,
+            "configured_holder_limit": max_holders,
+            "active_cache_bytes": active_cache_bytes,
+            "configured_cache_bytes": max_cache_bytes,
+            "reaped_stale_holders_this_snapshot": reaped_stale_holders,
+            "reserved_service_holders": reserved_service_holders,
+            "service_holders": service_holders,
+            "requested_cache_bytes": requested_cache_bytes,
+            "budget_reason": reason.to_string(),
+        },
+    })
+}
+
+fn print_stdin_ingest_admission_blocked_json(mut output: serde_json::Value) -> Result<()> {
+    let object = output
+        .as_object_mut()
+        .context("admission-blocked error data must be a JSON object")?;
+    object.insert(
+        "outcome".to_string(),
+        serde_json::Value::String("admission_blocked".to_string()),
+    );
+    object.insert("created_drawer_ids".to_string(), serde_json::json!([]));
+    object.insert("cleanup_drawer_ids".to_string(), serde_json::json!([]));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output)
+            .context("failed to serialize admission-blocked stdin ingest JSON output")?
+    );
+    Ok(())
 }
 
 fn print_stdin_ingest_output_with_created_ids(

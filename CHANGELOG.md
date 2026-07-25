@@ -42,6 +42,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **CLI/MCP ingest admission**: return a machine-readable `admission_blocked`
+  receipt with holder/cache capacity and headroom plus empty cleanup IDs when
+  create admission refuses; successful create receipts retain exact
+  cleanup-safe drawer IDs (#821).
 - Add `maintenance rejudge rebind` CLI for safe checkpoint binding update (#819)
 - Harden `test_daemon_sigterm_drains_running_ingest_async_before_reclaim` fixture isolation under full-suite admission contention
 - **DB admission sidecars**: restrict lock/state files to owner-safe directories,
