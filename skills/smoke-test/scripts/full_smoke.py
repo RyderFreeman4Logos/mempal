@@ -1291,15 +1291,10 @@ def _rest_ingest_fallback(
     supersedes: str | None = None,
     room: str = 'cli',
 ) -> tuple[list[str], dict[str, Any] | None]:
-    """Retry ingest via the daemon REST API when CLI direct-write fails.
+    """Retry direct writes through daemon REST with safe terminal outcomes.
 
-    The fork's daemon holds a long-lived sqlite-writer lease. CLI ingest that
-    writes directly to the DB is rejected when the daemon is active. REST
-    ingest goes through the daemon and always succeeds.
-
-    ``room`` selects the wing/room the drawer is created in. CLI callers use the
-    default ``'cli'``; MCP callers pass ``'mcp'`` so the drawer lands in the room
-    the MCP assertions and cleanup paths expect.
+    Returns accepted IDs or a cleanup-safe no-write admission receipt. ``room``
+    selects the drawer room (``'cli'`` by default; MCP uses ``'mcp'``).
     """
     import urllib.request
     payload: dict[str, Any] = {
@@ -1336,7 +1331,7 @@ def _rest_ingest_fallback(
             note(label, False, error_type='MissingTerminalReceipt', http_status=resp.status, json=json_shape(body))
             return [], None
     except HTTPError as exc:
-        body, shape = parse_json_bytes(exc.read())
+        body, shape = parse_json_bytes(exc.read(8192))
         receipt = create_terminal_receipt(body)
         if receipt and receipt.get('outcome') == 'admission_blocked':
             note(label, True, http_status=exc.code, json=shape, **receipt)
@@ -1408,7 +1403,7 @@ def cli_crud() -> list[str]:
     # Fallback: if CLI direct-write fails due to daemon writer lease, retry via REST.
     # The fork's daemon holds a long-lived sqlite-writer lease; CLI ingest that
     # writes directly to the DB will be rejected when the daemon is active.
-    # REST ingest goes through the daemon and always succeeds.
+    # REST ingest goes through the daemon and either writes or returns a cleanup-safe no-write receipt.
     rest_receipt: dict[str, Any] | None = None
     if not ids:
         rest_ids, rest_receipt = _rest_ingest_fallback(
@@ -1552,7 +1547,7 @@ def finalize_cleanup_manifest(summary: dict[str, Any], *, checkpoint: bool = Tru
 def run_fallback_after_mcp_reaped(
     client: McpClient | None,
     label: str,
-    fallback: Any,
+    fallback: Any, failure_result: Any = None,
 ) -> Any:
     """Permit a write fallback only after every owned MCP holder is reaped."""
     if client is not None:
@@ -1565,7 +1560,7 @@ def run_fallback_after_mcp_reaped(
             reason='owned_mcp_holder_not_reaped',
             remaining_count=len(OWNED_MCP_CHILDREN),
         )
-        return []
+        return [] if failure_result is None else failure_result
     _checkpoint_manifest()
     result = fallback()
     if isinstance(result, list):
@@ -1723,8 +1718,7 @@ def mcp_crud() -> list[str]:
                     f'{MARKER} reversible MCP smoke drawer; nonce {NONCE}; lexical tokens azurequill basaltfern cobaltlyric; safe to delete',
                     'mcp_create_rest_fallback',
                     room='mcp',
-                ),
-            )
+                ), failure_result=([], None))
             client = None
             if rest_ids:
                 ids = rest_ids
@@ -1818,8 +1812,7 @@ def mcp_crud() -> list[str]:
                     'mcp_update_rest_fallback',
                     supersedes=created_id,
                     room='mcp',
-                ),
-            )
+                ), failure_result=([], None))
             client = None
             if rest_upd_ids:
                 upd_ids = rest_upd_ids
