@@ -1,4 +1,6 @@
 mod common;
+#[path = "write_wait_cli/ipc.rs"]
+mod ipc;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -205,18 +207,6 @@ fn daemon_runtime_dir(home: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn wait_for_path(path: &Path, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if path.exists() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("timed out waiting for {}", path.display());
-}
-
-#[cfg(unix)]
 fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -300,11 +290,7 @@ fn spawn_foreground_daemon(home: &Path) -> ForegroundDaemon {
         .spawn()
         .expect("spawn foreground daemon");
     let started_at = Instant::now();
-    wait_for_path(&home.join(".mempal/daemon.pid"), Duration::from_secs(10));
-    wait_for_path(
-        &home.join(".mempal/daemon-hook.sock"),
-        Duration::from_secs(10),
-    );
+    ipc::wait(&mut child, home, Duration::from_secs(10));
     if child.try_wait().expect("poll daemon").is_some() {
         let daemon = ForegroundDaemon {
             child,
