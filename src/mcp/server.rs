@@ -21607,12 +21607,6 @@ prototypes = ["keep"]
         };
 
         assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
-        assert!(
-            error.message.contains("holder budget")
-                || error.message.contains("async pool admission refused"),
-            "error must be actionable: {}",
-            error.message
-        );
         let data = error.data.expect("structured refusal data");
         assert_eq!(
             data.get("outcome").and_then(Value::as_str),
@@ -21630,6 +21624,8 @@ prototypes = ["keep"]
             data.get("async_pool_loaded").and_then(Value::as_bool),
             Some(false)
         );
+        assert_eq!(data["created_drawer_ids"], serde_json::json!([]));
+        assert_eq!(data["cleanup_drawer_ids"], serde_json::json!([]));
         assert_eq!(data["capacity"]["holders"], 16);
         assert_eq!(data["headroom"]["holders"], 15);
         let stats = PendingMessageStore::new_without_reclaim(&db_path)

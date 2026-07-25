@@ -490,13 +490,13 @@ fn cleanup_ids_from_ingest_json(json: &Value) -> Vec<String> {
 }
 
 #[test]
-fn test_ingest_wait_json_admission_blocked_output_includes_capacity_and_headroom() {
+fn test_ingest_wait_json_admission_blocked_output_is_cleanup_safe_at_14_of_16_service_holders() {
     let home = setup_home();
     let db_path = home.path().join(".mempal/palace.db");
-    let _holders = (0..16)
+    let _holders = (0..14)
         .map(|_| {
             ProfileDbAdmission::acquire(&db_path, DbAdmissionRequest::new(DbHolderClass::Mcp, 1, 1))
-                .expect("fill profile holder budget")
+                .expect("fill service holder baseline")
         })
         .collect::<Vec<_>>();
 
@@ -528,7 +528,8 @@ fn test_ingest_wait_json_admission_blocked_output_includes_capacity_and_headroom
     assert_eq!(stdout["outcome"], "admission_blocked");
     assert_eq!(stdout["reason"], "holder_budget_exceeded");
     assert_eq!(stdout["capacity"]["holders"], 16);
-    assert_eq!(stdout["headroom"]["holders"], 0);
+    assert_eq!(stdout["profile_admission"]["service_holders"], 14);
+    assert_eq!(stdout["headroom"]["holders"], 2);
     assert!(
         cleanup_ids_from_ingest_json(&stdout).is_empty(),
         "blocked receipt exposed cleanup IDs"

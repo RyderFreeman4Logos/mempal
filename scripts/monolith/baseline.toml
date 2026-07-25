@@ -101,10 +101,18 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "skills/smoke-test/scripts/full_smoke.py"
 kind = "source"
-baseline_tokens = 20209
-baseline_lines = 2129
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 20982
+baseline_lines = 2206
+issue = "825"
+rationale = "#825 adds admission-blocked receipt recognition plus cleanup-safe smoke regressions; exact no-growth ratchet."
+
+[[files]]
+path = "skills/smoke-test/tests/test_full_smoke_receipts.py"
+kind = "test"
+baseline_tokens = 6966
+baseline_lines = 801
+issue = "825"
+rationale = "#825 adds cleanup-safe admission-blocked smoke receipt regressions; exact no-growth ratchet."
 
 [[files]]
 path = "specs/fork-ext/p8-embed-qwen3-backend.spec.md"
@@ -605,10 +613,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/rest_typed_ingest.rs"
 kind = "test"
-baseline_tokens = 6192
-baseline_lines = 819
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 6511
+baseline_lines = 851
+issue = "825"
+rationale = "#825 adds the REST admission-blocked cleanup-safe no-write receipt regression; exact no-growth ratchet."
 
 [[files]]
 path = "tests/wiki.rs"
@@ -621,10 +629,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/write_wait_cli.rs"
 kind = "test"
-baseline_tokens = 15565
-baseline_lines = 1963
-issue = "821"
-rationale = "#821 adds admission-blocked receipt tests, cleanup-safe ID deletion tests, and a bounded CLI probe helper with explicit subprocess cleanup; recalibrated to exact tokenizer/line output with a no-growth ratchet."
+baseline_tokens = 15588
+baseline_lines = 1964
+issue = "825"
+rationale = "#825 adds the CLI admission-blocked cleanup-safe no-write receipt regression; exact no-growth ratchet."
 
 [[files]]
 path = "tests/xurl_embed.rs"

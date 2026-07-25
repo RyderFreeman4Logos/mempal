@@ -171,3 +171,35 @@ async fn sqlite_busy_response_body_is_retryable_non_500() {
         "body={body}"
     );
 }
+
+#[tokio::test]
+async fn holder_budget_response_is_cleanup_safe_no_write_receipt() {
+    let response = db_error_to_api_error(DbError::Admission(
+        crate::core::db_admission::DbAdmissionError::BudgetExceeded {
+            active_holders: 14,
+            max_holders: 16,
+            active_cache_bytes: 14,
+            max_cache_bytes: 16,
+            requested_cache_bytes: 1,
+            reaped_stale_holders: 0,
+            reserved_service_holders: 2,
+            service_holders: 14,
+            reason: crate::core::db_admission::BudgetExceededReason::ReservedServiceSlots,
+        },
+    ))
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read admission response");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("decode admission receipt");
+    let receipt = &body["error"];
+    assert_eq!(receipt["outcome"], "admission_blocked");
+    assert_eq!(receipt["action"], "write_refused");
+    assert_eq!(receipt["reason"], "holder_budget_exceeded");
+    assert_eq!(receipt["capacity"]["holders"], 16);
+    assert_eq!(receipt["headroom"]["holders"], 2);
+    assert_eq!(receipt["created_drawer_ids"], serde_json::json!([]));
+    assert_eq!(receipt["cleanup_drawer_ids"], serde_json::json!([]));
+}

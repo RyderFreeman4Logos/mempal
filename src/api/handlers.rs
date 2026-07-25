@@ -12,6 +12,7 @@ use crate::core::{
     anchor,
     config::{ConfigHandle, scrub_runtime_diagnostic_text},
     db::{Database, DbError, db_error_is_sqlite_lock},
+    db_admission::DbAdmissionError,
     project::resolve_project_id,
     queue::{QueueStats, failure_headline_count, queue_stats_readonly},
     remote_calls::{
@@ -1408,6 +1409,7 @@ pub(super) struct ApiError {
     recovery_hint: Option<&'static str>,
     retryable: Option<bool>,
     stale_daemon: Option<crate::stale_daemon::StaleDaemonDiagnostic>,
+    admission_receipt: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -1420,6 +1422,7 @@ impl ApiError {
             recovery_hint: None,
             retryable: None,
             stale_daemon: None,
+            admission_receipt: None,
         }
     }
 
@@ -1432,6 +1435,7 @@ impl ApiError {
             recovery_hint: None,
             retryable: Some(false),
             stale_daemon: None,
+            admission_receipt: None,
         }
     }
 
@@ -1446,6 +1450,7 @@ impl ApiError {
             recovery_hint: Some(REST_WRITE_RESTART_HINT),
             retryable: Some(false),
             stale_daemon: None,
+            admission_receipt: None,
         }
     }
 
@@ -1458,6 +1463,7 @@ impl ApiError {
             recovery_hint: Some(REST_STALE_DAEMON_RESTART_HINT),
             retryable: Some(false),
             stale_daemon: Some(diagnostic),
+            admission_receipt: None,
         }
     }
 
@@ -1470,6 +1476,57 @@ impl ApiError {
             recovery_hint: Some(REST_WRITE_DATABASE_BUSY_HINT),
             retryable: Some(true),
             stale_daemon: None,
+            admission_receipt: None,
+        }
+    }
+
+    fn holder_budget_admission(error: DbAdmissionError) -> Self {
+        let DbAdmissionError::BudgetExceeded {
+            active_holders,
+            max_holders,
+            active_cache_bytes,
+            max_cache_bytes,
+            requested_cache_bytes,
+            reaped_stale_holders,
+            reserved_service_holders,
+            service_holders,
+            reason,
+        } = error
+        else {
+            unreachable!("holder-budget receipt requires a budget admission error");
+        };
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "mempal profile holder budget is exhausted; write was refused before queueing"
+                .to_string(),
+            kind: "admission_blocked",
+            schema_skew: None,
+            recovery_hint: None,
+            retryable: Some(false),
+            stale_daemon: None,
+            admission_receipt: Some(json!({
+                "outcome": "admission_blocked",
+                "reason": "holder_budget_exceeded",
+                "action": "write_refused",
+                "created_drawer_ids": [],
+                "cleanup_drawer_ids": [],
+                "capacity": {"holders": max_holders, "cache_bytes": max_cache_bytes},
+                "headroom": {
+                    "holders": max_holders.saturating_sub(active_holders),
+                    "cache_bytes": max_cache_bytes.saturating_sub(active_cache_bytes),
+                },
+                "profile_admission": {
+                    "active_holders": active_holders,
+                    "configured_holder_limit": max_holders,
+                    "active_cache_bytes": active_cache_bytes,
+                    "configured_cache_bytes": max_cache_bytes,
+                    "reaped_stale_holders_this_snapshot": reaped_stale_holders,
+                    "reserved_service_holders": reserved_service_holders,
+                    "service_holders": service_holders,
+                    "requested_cache_bytes": requested_cache_bytes,
+                    "budget_reason": reason.to_string(),
+                },
+            })),
         }
     }
 
@@ -1482,6 +1539,7 @@ impl ApiError {
             recovery_hint: None,
             retryable: Some(false),
             stale_daemon: None,
+            admission_receipt: None,
         }
     }
 
@@ -1497,6 +1555,7 @@ impl ApiError {
             recovery_hint: None,
             retryable: Some(false),
             stale_daemon: None,
+            admission_receipt: None,
         }
     }
 
@@ -1515,6 +1574,7 @@ impl ApiError {
             recovery_hint: None,
             retryable: Some(true),
             stale_daemon: None,
+            admission_receipt: None,
         }
     }
 }
@@ -1541,6 +1601,12 @@ impl IntoResponse for ApiError {
         }
         if let Some(retryable) = self.retryable {
             error["retryable"] = json!(retryable);
+        }
+        if let Some(admission_receipt) = self.admission_receipt
+            && let (Some(error_fields), Some(receipt_fields)) =
+                (error.as_object_mut(), admission_receipt.as_object())
+        {
+            error_fields.extend(receipt_fields.clone());
         }
         if let Some(diagnostic) = self.stale_daemon {
             error["stale_daemon"] = json!(diagnostic.stale_daemon);
@@ -1871,6 +1937,9 @@ fn log_rest_write_failure(metadata: &RestWriteLogMetadata, error: &ApiError) {
 
 fn db_error_to_api_error(error: DbError) -> ApiError {
     match error {
+        DbError::Admission(admission @ DbAdmissionError::BudgetExceeded { .. }) => {
+            ApiError::holder_budget_admission(admission)
+        }
         DbError::UnsupportedSchemaVersion { current, supported } => {
             ApiError::schema_skew(current, supported)
         }

@@ -55,6 +55,75 @@ class ReceiptExtractionTests(unittest.TestCase):
         self.assertEqual(self.smoke.operation_id_from(receipts), "op-1")
         self.assertTrue(self.smoke.terminal_state(receipts))
 
+    def test_create_terminal_receipt_distinguishes_cleanup_from_no_write_admission(self) -> None:
+        accepted = self.smoke.create_terminal_receipt(
+            {"created_drawer_ids": ["drawer-created"], "cleanup_drawer_ids": ["drawer-created"]}
+        )
+        blocked = self.smoke.create_terminal_receipt(
+            {
+                "error": {
+                    "outcome": "admission_blocked",
+                    "action": "write_refused",
+                    "reason": "holder_budget_exceeded",
+                    "created_drawer_ids": [],
+                    "cleanup_drawer_ids": [],
+                }
+            }
+        )
+
+        self.assertEqual(
+            accepted,
+            {
+                "outcome": "write_accepted",
+                "created_drawer_ids": ["drawer-created"],
+                "cleanup_required": True,
+            },
+        )
+        self.assertEqual(
+            blocked,
+            {
+                "outcome": "admission_blocked",
+                "reason": "holder_budget_exceeded",
+                "cleanup_required": False,
+            },
+        )
+
+    def test_mcp_error_data_preserves_only_cleanup_safe_terminal_receipt(self) -> None:
+        receipt = self.smoke._SMOKE_RUNTIME.terminal_no_write_receipt({
+            "data": {
+                "outcome": "admission_blocked",
+                "reason": "holder_budget_exceeded",
+                "action": "write_refused",
+                "created_drawer_ids": [],
+                "cleanup_drawer_ids": [],
+                "capacity": {"holders": 16, "cache_bytes": 64},
+                "database_diagnostic": {"message": "must not reach smoke output"},
+            }
+        })
+
+        self.assertEqual(receipt["outcome"], "admission_blocked")
+        self.assertEqual(receipt["capacity"], {"holders": 16, "cache_bytes": 64})
+        self.assertNotIn("database_diagnostic", receipt)
+        self.assertEqual(
+            self.smoke.create_terminal_receipt({"terminal_receipt": receipt})["cleanup_required"],
+            False,
+        )
+
+    def test_no_write_admission_skips_create_cleanup_without_missing_id_failure(self) -> None:
+        setattr(self.smoke, "SUMMARY", {"groups": {}, "failures": []})
+        handled = self.smoke.note_no_write_create(
+            "mcp_create",
+            "mcp_inconclusive_no_cleanup_id",
+            {"outcome": "admission_blocked", "reason": "holder_budget_exceeded"},
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            self.smoke.SUMMARY["groups"]["mcp_inconclusive_no_cleanup_id"]["skipped"],
+            "admission_blocked_no_write",
+        )
+        self.assertNotIn("mcp_inconclusive_no_cleanup_id", self.smoke.SUMMARY["failures"])
+
     def test_recover_created_ids_waits_on_operation_receipt(self) -> None:
         calls: list[tuple[str, str]] = []
 
