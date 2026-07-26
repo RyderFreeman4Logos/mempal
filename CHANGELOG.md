@@ -42,6 +42,15 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **MCP context scope**: replace the shared `RetrievalScopeRequest` on
+  `mempal_context` with a dedicated `deny_unknown_fields` `ContextScopeRequest`
+  so search-only fields (`wing`, `room`, `session`, `memory_kind`, `tier`,
+  `status`, `anchor_kind`, `include_global`) are rejected by schema instead of a
+  runtime allow-then-reject path (#823).
+- **DB admission fixture**: extend the `pid_namespace_mcp_holder` registration
+  and reap deadlines from 10s to 30s and replace `yield_now()` busy-spins with a
+  bounded 50ms readiness sleep so the test no longer starves its own fixture
+  process under high host load (#823).
 - **CLI/MCP ingest admission**: return a machine-readable `admission_blocked`
   receipt with holder/cache capacity and headroom plus empty cleanup IDs when
   create admission refuses; successful create receipts retain exact
