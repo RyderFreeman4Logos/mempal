@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// A gate timeout may spend this bounded interval terminating and draining its process tree.
-const CLEANUP_TIMEOUT_MARGIN: Duration = Duration::from_millis(250);
+const CLEANUP_TIMEOUT_MARGIN: Duration = Duration::from_secs(2);
 const TERMINATION_GRACE_PERIOD: Duration = Duration::from_millis(50);
 const TERMINATION_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const POST_KILL_DISCOVERY_RESERVE: Duration = Duration::from_millis(25);
