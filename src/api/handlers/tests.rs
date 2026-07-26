@@ -173,8 +173,8 @@ async fn sqlite_busy_response_body_is_retryable_non_500() {
 }
 
 #[tokio::test]
-async fn holder_budget_response_is_cleanup_safe_no_write_receipt() {
-    let response = db_error_to_api_error(DbError::Admission(
+async fn holder_budget_write_response_is_cleanup_safe() {
+    let response = db_error_to_write_api_error(DbError::Admission(
         crate::core::db_admission::DbAdmissionError::BudgetExceeded {
             active_holders: 14,
             max_holders: 16,

@@ -5,6 +5,10 @@ mod ipc;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
@@ -1079,6 +1083,29 @@ fn test_ingest_wait_duplicate_under_mcp_ingest_worker_lease_avoids_writer_confli
     }
     let db = Database::open(&home.path().join(".mempal/palace.db")).expect("open db");
     assert_eq!(db.drawer_count().expect("drawer count"), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_ipc_readiness_connect_respects_deadline_when_accept_queue_is_full() {
+    let temp = tempfile::tempdir().expect("create IPC test directory");
+    let socket_path = temp.path().join("daemon-hook.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind IPC listener");
+    // SAFETY: listener owns a valid Unix-domain socket descriptor for this call.
+    let listen_result = unsafe { libc::listen(listener.as_raw_fd(), 0) };
+    assert_eq!(listen_result, 0, "set IPC listener backlog");
+    let _queued_connection = UnixStream::connect(&socket_path).expect("fill IPC accept queue");
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(100);
+    assert!(
+        !ipc::readiness_probe(&socket_path, 0, deadline),
+        "a non-accepting IPC listener must not become ready"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "IPC readiness connect must not outlive its deadline"
+    );
 }
 
 #[cfg(unix)]

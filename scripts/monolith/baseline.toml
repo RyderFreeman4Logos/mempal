@@ -613,10 +613,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/rest_typed_ingest.rs"
 kind = "test"
-baseline_tokens = 6511
-baseline_lines = 851
+baseline_tokens = 6832
+baseline_lines = 892
 issue = "825"
-rationale = "#825 adds the REST admission-blocked cleanup-safe no-write receipt regression; exact no-growth ratchet."
+rationale = "#825 adds GET holder-budget admission regression (no write_refused create receipt on pinned_facts/taxonomy); exact no-growth ratchet."
 
 [[files]]
 path = "tests/wiki.rs"
@@ -629,10 +629,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/write_wait_cli.rs"
 kind = "test"
-baseline_tokens = 15588
-baseline_lines = 1964
+baseline_tokens = 15760
+baseline_lines = 1977
 issue = "825"
-rationale = "#825 adds the CLI admission-blocked cleanup-safe no-write receipt regression; exact no-growth ratchet."
+rationale = "#825 adds deadline-bounded IPC connect readiness regression for non-accepting listeners; exact no-growth ratchet."
 
 [[files]]
 path = "tests/xurl_embed.rs"
