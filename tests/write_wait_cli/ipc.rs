@@ -236,10 +236,7 @@ fn wait_for_connect(fd: std::os::fd::RawFd, deadline: Instant) -> io::Result<()>
             return Err(error);
         }
         if pollfd.revents & libc::POLLNVAL != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "invalid readiness probe socket",
-            ));
+            return Err(io::Error::other("invalid readiness probe socket"));
         }
 
         let mut socket_error: libc::c_int = 0;
