@@ -142,13 +142,12 @@ use super::tools::{
     Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse,
     ProjectsListResponse, ProjectsResumeRequest, ProjectsResumeResponse, QueueFailureBucketDto,
     QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
-    ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievalScopeRequest,
-    RetrievedKnowledgeCardDto, RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto,
-    RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse,
-    SearchResultDto, SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount,
-    StatusDetail, StatusRequest, StatusResponse, StatusScope, SystemWarning, TaxonomyEntryDto,
-    TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto,
-    TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
+    ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievedKnowledgeCardDto, RollbackRequest,
+    RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto,
+    SearchRequest, SearchResponse, SearchResultDto, SkillDto, SkillRequest, SkillResponse,
+    SkillSummaryDto, SourceTypeCount, StatusDetail, StatusRequest, StatusResponse, StatusScope,
+    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto,
+    TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
 fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool {
@@ -4554,36 +4553,10 @@ fn effective_search_scope(
     })
 }
 
-fn reject_context_search_only_scope(
-    scope: &RetrievalScopeRequest,
-) -> std::result::Result<(), ErrorData> {
-    for (field, present) in [
-        ("wing", scope.wing.is_some()),
-        ("room", scope.room.is_some()),
-        ("session", scope.session.is_some()),
-        ("include_global", scope.include_global.unwrap_or(false)),
-        ("memory_kind", scope.memory_kind.is_some()),
-        ("tier", scope.tier.is_some()),
-        ("status", scope.status.is_some()),
-        ("anchor_kind", scope.anchor_kind.is_some()),
-    ] {
-        if present {
-            return Err(ErrorData::invalid_params(
-                format!("scope.{field} is supported by mempal_search, not mempal_context"),
-                None,
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn effective_context_scope(
     request: &ContextRequest,
 ) -> std::result::Result<EffectiveMcpContextScope, ErrorData> {
     let scope = request.scope.as_ref();
-    if let Some(scope) = scope {
-        reject_context_search_only_scope(scope)?;
-    }
     Ok(EffectiveMcpContextScope {
         project_id: merge_scope_string(
             scope.and_then(|value| value.project_id.as_ref()),
@@ -12688,6 +12661,8 @@ mod tests {
     use crate::core::types::{KnowledgeCard, KnowledgeEvidenceLink, KnowledgeEvidenceRole};
     use crate::embed::Embedder;
     use crate::mcp::tools::INGEST_SOURCE_TYPE_SCHEMA_DESCRIPTION;
+
+    mod context_scope_schema_tests;
 
     #[derive(Clone)]
     struct StubEmbedderFactory {
