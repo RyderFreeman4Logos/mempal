@@ -101,10 +101,18 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "skills/smoke-test/scripts/full_smoke.py"
 kind = "source"
-baseline_tokens = 20209
-baseline_lines = 2129
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 21083
+baseline_lines = 2209
+issue = "825"
+rationale = "#825 review F1 adds a bounded REST fallback body-read deadline; exact no-growth ratchet."
+
+[[files]]
+path = "skills/smoke-test/tests/test_full_smoke_receipts.py"
+kind = "test"
+baseline_tokens = 6966
+baseline_lines = 801
+issue = "825"
+rationale = "#825 adds cleanup-safe admission-blocked smoke receipt regressions; exact no-growth ratchet."
 
 [[files]]
 path = "specs/fork-ext/p8-embed-qwen3-backend.spec.md"
@@ -341,10 +349,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 176363
-baseline_lines = 22273
-issue = "809"
-rationale = "Pre-existing monolith; #809 adds fail-closed wait=true pool-admission gate and actionable holder-budget diagnostics with a no-growth ratchet until the MCP server split lands."
+baseline_tokens = 176773
+baseline_lines = 22311
+issue = "825"
+rationale = "Pre-existing monolith; #825 adds a real 14/16 MCP wait=true ProfileDbAdmission regression proving admission_blocked receipts are cleanup-safe with empty drawer IDs; no-growth ratchet until the MCP server split lands."
 
 [[files]]
 path = "src/mcp/tools.rs"
@@ -605,10 +613,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/rest_typed_ingest.rs"
 kind = "test"
-baseline_tokens = 6192
-baseline_lines = 819
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 6832
+baseline_lines = 892
+issue = "825"
+rationale = "#825 adds GET holder-budget admission regression (no write_refused create receipt on pinned_facts/taxonomy); exact no-growth ratchet."
 
 [[files]]
 path = "tests/wiki.rs"
@@ -621,10 +629,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/write_wait_cli.rs"
 kind = "test"
-baseline_tokens = 15565
-baseline_lines = 1963
-issue = "821"
-rationale = "#821 adds admission-blocked receipt tests, cleanup-safe ID deletion tests, and a bounded CLI probe helper with explicit subprocess cleanup; recalibrated to exact tokenizer/line output with a no-growth ratchet."
+baseline_tokens = 15760
+baseline_lines = 1977
+issue = "825"
+rationale = "#825 adds deadline-bounded IPC connect readiness regression for non-accepting listeners; exact no-growth ratchet."
 
 [[files]]
 path = "tests/xurl_embed.rs"

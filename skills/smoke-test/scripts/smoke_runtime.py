@@ -38,6 +38,48 @@ __all__ = [
 ]
 
 
+def terminal_no_write_receipt(error: Any) -> dict[str, Any] | None:
+    """Extract the cleanup-safe subset of a terminal MCP JSON-RPC refusal.
+
+    JSON-RPC error messages can include diagnostics. The smoke summary must only retain
+    the documented admission receipt fields it needs to decide that no cleanup is required.
+    """
+    if not isinstance(error, dict):
+        return None
+    data = error.get("data")
+    if not isinstance(data, dict):
+        return None
+    if (
+        data.get("outcome") != "admission_blocked"
+        or data.get("action") != "write_refused"
+        or not isinstance(data.get("reason"), str)
+        or data.get("created_drawer_ids") != []
+        or data.get("cleanup_drawer_ids") != []
+    ):
+        return None
+
+    receipt: dict[str, Any] = {
+        "outcome": "admission_blocked",
+        "reason": data["reason"],
+        "action": "write_refused",
+        "created_drawer_ids": [],
+        "cleanup_drawer_ids": [],
+    }
+    for key in ("capacity", "headroom"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            numeric = {
+                field: amount
+                for field, amount in value.items()
+                if field in {"holders", "cache_bytes"}
+                and isinstance(amount, int)
+                and not isinstance(amount, bool)
+            }
+            if numeric:
+                receipt[key] = numeric
+    return receipt
+
+
 class CleanupManifest:
     """Persist only cleanup-authorized drawer IDs using atomic replacement."""
 
@@ -391,13 +433,16 @@ class McpClient:
             )
             elapsed_ms = int((time.monotonic() - started_at) * 1000)
             if "error" in message:
-                encoded_error = json.dumps(message["error"]).encode()
-                return None, {
+                receipt = terminal_no_write_receipt(message["error"])
+                info: dict[str, Any] = {
                     "ok": False,
                     "latency_ms": elapsed_ms,
                     "error_code": message["error"].get("code"),
-                    "error_message_bytes": len(encoded_error),
+                    "error_message_bytes": len(json.dumps(message["error"]).encode()),
                 }
+                if receipt is not None:
+                    info["terminal_receipt"] = receipt
+                return None, info
             structured = message.get("result", {}).get("structuredContent")
             return structured, {
                 "ok": isinstance(structured, dict),

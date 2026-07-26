@@ -1,8 +1,14 @@
 mod common;
+#[path = "write_wait_cli/ipc.rs"]
+mod ipc;
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
@@ -205,18 +211,6 @@ fn daemon_runtime_dir(home: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn wait_for_path(path: &Path, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if path.exists() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("timed out waiting for {}", path.display());
-}
-
-#[cfg(unix)]
 fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -300,11 +294,7 @@ fn spawn_foreground_daemon(home: &Path) -> ForegroundDaemon {
         .spawn()
         .expect("spawn foreground daemon");
     let started_at = Instant::now();
-    wait_for_path(&home.join(".mempal/daemon.pid"), Duration::from_secs(10));
-    wait_for_path(
-        &home.join(".mempal/daemon-hook.sock"),
-        Duration::from_secs(10),
-    );
+    ipc::wait(&mut child, home, Duration::from_secs(10));
     if child.try_wait().expect("poll daemon").is_some() {
         let daemon = ForegroundDaemon {
             child,
@@ -490,13 +480,13 @@ fn cleanup_ids_from_ingest_json(json: &Value) -> Vec<String> {
 }
 
 #[test]
-fn test_ingest_wait_json_admission_blocked_output_includes_capacity_and_headroom() {
+fn test_ingest_wait_json_admission_blocked_output_is_cleanup_safe_at_14_of_16_service_holders() {
     let home = setup_home();
     let db_path = home.path().join(".mempal/palace.db");
-    let _holders = (0..16)
+    let _holders = (0..14)
         .map(|_| {
             ProfileDbAdmission::acquire(&db_path, DbAdmissionRequest::new(DbHolderClass::Mcp, 1, 1))
-                .expect("fill profile holder budget")
+                .expect("fill service holder baseline")
         })
         .collect::<Vec<_>>();
 
@@ -528,7 +518,8 @@ fn test_ingest_wait_json_admission_blocked_output_includes_capacity_and_headroom
     assert_eq!(stdout["outcome"], "admission_blocked");
     assert_eq!(stdout["reason"], "holder_budget_exceeded");
     assert_eq!(stdout["capacity"]["holders"], 16);
-    assert_eq!(stdout["headroom"]["holders"], 0);
+    assert_eq!(stdout["profile_admission"]["service_holders"], 14);
+    assert_eq!(stdout["headroom"]["holders"], 2);
     assert!(
         cleanup_ids_from_ingest_json(&stdout).is_empty(),
         "blocked receipt exposed cleanup IDs"
@@ -1092,6 +1083,29 @@ fn test_ingest_wait_duplicate_under_mcp_ingest_worker_lease_avoids_writer_confli
     }
     let db = Database::open(&home.path().join(".mempal/palace.db")).expect("open db");
     assert_eq!(db.drawer_count().expect("drawer count"), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_ipc_readiness_connect_respects_deadline_when_accept_queue_is_full() {
+    let temp = tempfile::tempdir().expect("create IPC test directory");
+    let socket_path = temp.path().join("daemon-hook.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind IPC listener");
+    // SAFETY: listener owns a valid Unix-domain socket descriptor for this call.
+    let listen_result = unsafe { libc::listen(listener.as_raw_fd(), 0) };
+    assert_eq!(listen_result, 0, "set IPC listener backlog");
+    let _queued_connection = UnixStream::connect(&socket_path).expect("fill IPC accept queue");
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(100);
+    assert!(
+        !ipc::readiness_probe(&socket_path, 0, deadline),
+        "a non-accepting IPC listener must not become ready"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "IPC readiness connect must not outlive its deadline"
+    );
 }
 
 #[cfg(unix)]

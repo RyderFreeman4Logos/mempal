@@ -16,9 +16,9 @@ import sys
 import tempfile
 import time
 import resource
-import urllib.error
 import urllib.parse
 import urllib.request
+from urllib.error import HTTPError
 from pathlib import Path
 from typing import Any
 
@@ -1020,7 +1020,7 @@ def call_reranker_endpoint(config: dict[str, Any], endpoint: str) -> tuple[Any |
                 **without_ok(shape),
                 **endpoint_fields,
             }
-    except urllib.error.HTTPError as exc:
+    except HTTPError as exc:
         return None, {
             'ok': False,
             'reason': 'http_error',
@@ -1105,7 +1105,11 @@ def receipt_dicts_from(value: Any) -> list[dict[str, Any]]:
     receipts: list[dict[str, Any]] = []
     if isinstance(value, dict):
         receipts.append(value)
-        for key in ('structuredContent', 'result', 'payload', 'response'):
+        # MCP JSON-RPC and REST errors wrap their documented terminal receipts
+        # under ``error.data`` and ``error`` respectively. Keep traversal
+        # deliberately limited to those protocol envelopes; arbitrary JSON
+        # object shapes must not become cleanup evidence.
+        for key in ('structuredContent', 'result', 'payload', 'response', 'error', 'data', 'terminal_receipt'):
             nested = value.get(key)
             if isinstance(nested, (dict, list)):
                 receipts.extend(receipt_dicts_from(nested))
@@ -1124,6 +1128,48 @@ def created_ids_from(value: Any) -> list[str]:
             if isinstance(values, list):
                 ids.extend(x for x in values if isinstance(x, str) and x)
     return list(dict.fromkeys(ids))
+
+
+def create_terminal_receipt(value: Any) -> dict[str, Any] | None:
+    """Classify only the documented cleanup-safe create terminal contracts."""
+    receipts = receipt_dicts_from(value)
+    for receipt in receipts:
+        if receipt.get('outcome') != 'admission_blocked':
+            continue
+        if receipt.get('action') != 'write_refused':
+            return None
+        created = receipt.get('created_drawer_ids')
+        cleanup = receipt.get('cleanup_drawer_ids')
+        if created != [] or cleanup != []:
+            return None
+        reason = receipt.get('reason')
+        return {
+            'outcome': 'admission_blocked',
+            'reason': reason if isinstance(reason, str) and reason else 'unknown_admission_reason',
+            'cleanup_required': False,
+        }
+    created_ids = created_ids_from(value)
+    if created_ids:
+        return {
+            'outcome': 'write_accepted',
+            'created_drawer_ids': created_ids,
+            'cleanup_required': True,
+        }
+    return None
+
+
+def note_no_write_create(create_label: str, downstream_label: str, receipt: dict[str, Any] | None) -> bool:
+    """Record a proven no-write admission without requesting cleanup."""
+    if not receipt or receipt.get('outcome') != 'admission_blocked':
+        return False
+    fields = {
+        'outcome': 'admission_blocked',
+        'reason': receipt.get('reason'),
+        'cleanup_required': False,
+    }
+    note(create_label, True, **fields)
+    note(downstream_label, True, skipped='admission_blocked_no_write', **fields)
+    return True
 
 
 def terminal_state(value: Any) -> bool:
@@ -1215,12 +1261,16 @@ def wait_operation(operation_id: str, name: str) -> Any | None:
 def recover_created_ids(value: Any, wait_label: str) -> tuple[list[str], dict[str, Any]]:
     ids = created_ids_from(value)
     operation_id = operation_id_from(value)
+    receipt = create_terminal_receipt(value)
     info: dict[str, Any] = {
         'operation_id_present': bool(operation_id),
         'operation_state': operation_state_from(value),
         'recovered_via': None,
         'recovered_state': None,
     }
+    if receipt and receipt.get('outcome') == 'admission_blocked':
+        info.update(receipt)
+        return [], info
     if ids or operation_id is None:
         return ids, info
 
@@ -1235,17 +1285,10 @@ def recovery_fields(info: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in info.items() if value not in (None, False)}
 
 
-def _rest_ingest_fallback(content: str, label: str, supersedes: str | None = None, room: str = 'cli') -> list[str]:
-    """Retry ingest via the daemon REST API when CLI direct-write fails.
-
-    The fork's daemon holds a long-lived sqlite-writer lease. CLI ingest that
-    writes directly to the DB is rejected when the daemon is active. REST
-    ingest goes through the daemon and always succeeds.
-
-    ``room`` selects the wing/room the drawer is created in. CLI callers use the
-    default ``'cli'``; MCP callers pass ``'mcp'`` so the drawer lands in the room
-    the MCP assertions and cleanup paths expect.
-    """
+def _rest_ingest_fallback(
+    content: str, label: str, supersedes: str | None = None, room: str = 'cli'
+) -> tuple[list[str], dict[str, Any] | None]:
+    """Retry direct writes through daemon REST with safe terminal outcomes."""
     import urllib.request
     payload: dict[str, Any] = {
         'content': content,
@@ -1259,24 +1302,57 @@ def _rest_ingest_fallback(content: str, label: str, supersedes: str | None = Non
     if supersedes:
         payload['supersedes'] = supersedes
     _checkpoint_manifest()
+    old_handler = signal.getsignal(signal.SIGALRM)
+    old_timer = signal.setitimer(signal.ITIMER_REAL, 0)
+
+    def _alarm_handler(_signum: int, _frame: Any) -> None:
+        raise TimeoutError('REST ingest fallback hard timeout')
+
+    signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.setitimer(signal.ITIMER_REAL, 35)
     try:
-        req = urllib.request.Request(
-            'http://127.0.0.1:3080/api/ingest',
-            data=json.dumps(payload).encode(),
-            headers={'Content-Type': 'application/json'},
-            method='POST',
-        )
-        resp = urllib.request.urlopen(req, timeout=30)
-        if resp.status in (200, 201):
-            body = json.loads(resp.read().decode())
-            ids = created_ids_from(body)
-            _remember_created_ids(ids)
-            note(label, bool(ids), created_id_count=len(ids), json=json_shape(body))
-            return ids
+        try:
+            req = urllib.request.Request(
+                'http://127.0.0.1:3080/api/ingest',
+                data=json.dumps(payload).encode(),
+                headers={'Content-Type': 'application/json'},
+                method='POST',
+            )
+            resp = urllib.request.urlopen(req, timeout=30)
+            if resp.status in (200, 201):
+                body = json.loads(resp.read().decode())
+                ids = created_ids_from(body)
+                receipt = create_terminal_receipt(body)
+                if ids:
+                    _remember_created_ids(ids)
+                    note(label, True, created_id_count=len(ids), json=json_shape(body))
+                    return ids, receipt
+                if receipt and receipt.get('outcome') == 'admission_blocked':
+                    note(label, True, http_status=resp.status, json=json_shape(body), **receipt)
+                    return [], receipt
+                note(label, False, error_type='MissingTerminalReceipt', http_status=resp.status, json=json_shape(body))
+                return [], None
+        except HTTPError as exc:
+            raw_body = exc.read(8193)
+            if len(raw_body) > 8192:
+                note(label, False, error_type='HTTPErrorBodyTooLarge', http_status=exc.code)
+                return [], None
+            body, shape = parse_json_bytes(raw_body)
+            receipt = create_terminal_receipt(body)
+            if receipt and receipt.get('outcome') == 'admission_blocked':
+                note(label, True, http_status=exc.code, json=shape, **receipt)
+                return [], receipt
+            note(label, False, error_type='HTTPError', http_status=exc.code, json=shape)
+            return [], None
     except Exception as exc:
         note(label, False, error_type=type(exc).__name__)
-        return []
-    return []
+        return [], None
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
+        signal.setitimer(signal.ITIMER_REAL, *old_timer)
+    note(label, False, error_type='MissingTerminalReceipt')
+    return [], None
 
 
 def _mcp_tool_with_hard_timeout(
@@ -1331,14 +1407,16 @@ def cli_crud() -> list[str]:
         timeout=130,
     )
     ids, create_recovery = recover_created_ids(parsed, 'cli_create_wait')
+    direct_receipt = create_terminal_receipt(parsed)
     _remember_created_ids(ids)
 
     # Fallback: if CLI direct-write fails due to daemon writer lease, retry via REST.
     # The fork's daemon holds a long-lived sqlite-writer lease; CLI ingest that
     # writes directly to the DB will be rejected when the daemon is active.
-    # REST ingest goes through the daemon and always succeeds.
+    # REST ingest goes through the daemon and either writes or returns a cleanup-safe no-write receipt.
+    rest_receipt: dict[str, Any] | None = None
     if not ids:
-        rest_ids = _rest_ingest_fallback(
+        rest_ids, rest_receipt = _rest_ingest_fallback(
             f'{MARKER} reversible CLI smoke drawer; nonce {NONCE}; lexical tokens quorvax nimbledrift zettaplum; safe to delete',
             'cli_create_rest_fallback',
         )
@@ -1349,6 +1427,12 @@ def cli_crud() -> list[str]:
     elif ids and create_recovery.get('recovered_via'):
         note('cli_create', True, created_id_count=len(ids), **recovery_fields(create_recovery))
     if not ids:
+        if (
+            direct_receipt and direct_receipt.get('outcome') == 'admission_blocked'
+            and rest_receipt and rest_receipt.get('outcome') == 'admission_blocked'
+            and note_no_write_create('cli_create', 'cli_crud', direct_receipt)
+        ):
+            return cleanup_ids
         note('cli_crud', False, reason='create_missing_created_drawer_ids', **recovery_fields(create_recovery))
         return cleanup_ids
     cleanup_ids.extend(ids)
@@ -1381,7 +1465,7 @@ def cli_crud() -> list[str]:
 
     # Fallback: retry update via REST if direct write failed (writer lease).
     if not upd_ids:
-        rest_upd_ids = _rest_ingest_fallback(
+        rest_upd_ids, _rest_update_receipt = _rest_ingest_fallback(
             f'{MARKER} reversible CLI smoke drawer updated; nonce {NONCE[::-1]}; lexical tokens ploverquartz rivetmint yondercoil; safe to delete',
             'cli_update_rest_fallback',
             supersedes=created_id,
@@ -1473,7 +1557,7 @@ def finalize_cleanup_manifest(summary: dict[str, Any], *, checkpoint: bool = Tru
 def run_fallback_after_mcp_reaped(
     client: McpClient | None,
     label: str,
-    fallback: Any,
+    fallback: Any, failure_result: Any = None,
 ) -> Any:
     """Permit a write fallback only after every owned MCP holder is reaped."""
     if client is not None:
@@ -1486,7 +1570,7 @@ def run_fallback_after_mcp_reaped(
             reason='owned_mcp_holder_not_reaped',
             remaining_count=len(OWNED_MCP_CHILDREN),
         )
-        return []
+        return [] if failure_result is None else failure_result
     _checkpoint_manifest()
     result = fallback()
     if isinstance(result, list):
@@ -1598,6 +1682,7 @@ def mcp_crud() -> list[str]:
         _checkpoint_manifest()
         create, info = _mcp_tool_with_hard_timeout(client, 'mempal_ingest', create_args, timeout=30)
         ids = created_ids_from(create)
+        mcp_receipt = create_terminal_receipt([create, info])
         _remember_created_ids(ids)
         create_operation_id = operation_id_from(create)
         create_recovery: dict[str, Any] = {
@@ -1634,16 +1719,16 @@ def mcp_crud() -> list[str]:
 
         # Fallback: if MCP ingest fails/hangs (writer lease), retry via REST so
         # follow-on read/delete paths still have a drawer to exercise.
+        rest_receipt: dict[str, Any] | None = None
         if not ids:
-            rest_ids = run_fallback_after_mcp_reaped(
+            rest_ids, rest_receipt = run_fallback_after_mcp_reaped(
                 client,
                 'create_rest',
                 lambda: _rest_ingest_fallback(
                     f'{MARKER} reversible MCP smoke drawer; nonce {NONCE}; lexical tokens azurequill basaltfern cobaltlyric; safe to delete',
                     'mcp_create_rest_fallback',
                     room='mcp',
-                ),
-            )
+                ), failure_result=([], None))
             client = None
             if rest_ids:
                 ids = rest_ids
@@ -1652,6 +1737,12 @@ def mcp_crud() -> list[str]:
 
         if ids:
             clear_probe_failures('mcp_create_rest', 'mcp_create_rest_fallback')
+        if not ids and (
+            mcp_receipt and mcp_receipt.get('outcome') == 'admission_blocked'
+            and rest_receipt and rest_receipt.get('outcome') == 'admission_blocked'
+            and note_no_write_create('mcp_create', 'mcp_inconclusive_no_cleanup_id', mcp_receipt)
+        ):
+            return cleanup_ids
         # MCP create passes when the MCP tool returned IDs immediately or when a
         # queued operation was recovered via mempal_operation_status. REST
         # fallback keeps the suite going but does not mask MCP write failure.
@@ -1723,7 +1814,7 @@ def mcp_crud() -> list[str]:
         # Fallback: if MCP update fails/hangs (writer lease), retry via REST so
         # follow-on read/delete paths still have an updated drawer to exercise.
         if not upd_ids:
-            rest_upd_ids = run_fallback_after_mcp_reaped(
+            rest_upd_ids, _rest_update_receipt = run_fallback_after_mcp_reaped(
                 client,
                 'update_rest',
                 lambda: _rest_ingest_fallback(
@@ -1731,8 +1822,7 @@ def mcp_crud() -> list[str]:
                     'mcp_update_rest_fallback',
                     supersedes=created_id,
                     room='mcp',
-                ),
-            )
+                ), failure_result=([], None))
             client = None
             if rest_upd_ids:
                 upd_ids = rest_upd_ids

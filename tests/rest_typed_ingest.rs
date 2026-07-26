@@ -11,6 +11,7 @@ use axum::http::{Request, StatusCode, header::CONTENT_TYPE};
 use mempal::api::ApiState;
 use mempal::core::config::ConfigHandle;
 use mempal::core::db::Database;
+use mempal::core::db_admission::{DbAdmissionRequest, DbHolderClass, ProfileDbAdmission};
 use mempal::core::types::{
     Drawer, KnowledgeStatus, MemoryDomain, MemoryKind, SourceType, default_confidence,
 };
@@ -226,6 +227,78 @@ fn insert_pinned_drawer(db: &Database, args: PinnedDrawerArgs<'_>) {
         ..Drawer::default()
     };
     db.insert_drawer(&drawer).expect("insert drawer");
+}
+
+#[tokio::test]
+async fn test_rest_ingest_admission_receipt_is_cleanup_safe_at_14_of_16_service_holders() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    let _holders = (0..14)
+        .map(|_| {
+            ProfileDbAdmission::acquire(
+                &env.db_path,
+                DbAdmissionRequest::new(DbHolderClass::Mcp, 1, 1),
+            )
+            .expect("fill service holder baseline")
+        })
+        .collect::<Vec<_>>();
+    let (status, body) = post_json(
+        env.state(Arc::new(StaticEmbedderFactory { dim: 4 })),
+        "/api/ingest",
+        json!({"content": "holder receipt", "wing": "rest"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let receipt = &body["error"];
+    assert_eq!(receipt["outcome"], "admission_blocked");
+    assert_eq!(receipt["action"], "write_refused");
+    assert_eq!(receipt["reason"], "holder_budget_exceeded");
+    assert_eq!(receipt["capacity"]["holders"], 16);
+    assert_eq!(receipt["headroom"]["holders"], 2);
+    assert_eq!(receipt["created_drawer_ids"], json!([]));
+    assert_eq!(receipt["cleanup_drawer_ids"], json!([]));
+}
+
+#[tokio::test]
+async fn test_rest_read_admission_rejection_omits_write_receipt_for_pinned_facts_and_taxonomy() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    let _holders = (0..14)
+        .map(|_| {
+            ProfileDbAdmission::acquire(
+                &env.db_path,
+                DbAdmissionRequest::new(DbHolderClass::Mcp, 1, 1),
+            )
+            .expect("fill service holder baseline")
+        })
+        .collect::<Vec<_>>();
+
+    for uri in ["/api/pinned_facts", "/api/taxonomy"] {
+        let (status, body) =
+            get_json(env.state(Arc::new(StaticEmbedderFactory { dim: 4 })), uri).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let error = &body["error"];
+        assert!(
+            error.get("action").is_none(),
+            "read admission errors must omit the create-only action"
+        );
+        assert!(
+            error.get("created_drawer_ids").is_none(),
+            "read admission errors must omit created drawer ids"
+        );
+        assert!(
+            error.get("cleanup_drawer_ids").is_none(),
+            "read admission errors must omit cleanup drawer ids"
+        );
+        assert!(
+            !error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("write was refused before queueing")),
+            "read admission errors must omit create-only messaging"
+        );
+    }
 }
 
 #[tokio::test]

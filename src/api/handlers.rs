@@ -12,6 +12,7 @@ use crate::core::{
     anchor,
     config::{ConfigHandle, scrub_runtime_diagnostic_text},
     db::{Database, DbError, db_error_is_sqlite_lock},
+    db_admission::DbAdmissionError,
     project::resolve_project_id,
     queue::{QueueStats, failure_headline_count, queue_stats_readonly},
     remote_calls::{
@@ -886,7 +887,7 @@ async fn process_ingest_request(
         );
         let drawer_id = db
             .resolve_available_drawer_id(&preferred_drawer_id)
-            .map_err(db_error_to_api_error)?;
+            .map_err(db_error_to_write_api_error)?;
         if !raw_turn
             && let Some(outcome) = evaluate_fact_check_gate(
                 &drawer_id,
@@ -897,7 +898,7 @@ async fn process_ingest_request(
                 &config.ingest_gating.fact_check,
                 validated.confidence,
             )
-            .map_err(db_error_to_api_error)?
+            .map_err(db_error_to_write_api_error)?
         {
             fact_check_warnings.extend(outcome.warnings);
             if outcome.decision.is_rejected() {
@@ -965,7 +966,7 @@ async fn process_ingest_request(
         let drawer_exists = *exact_duplicate
             || db
                 .drawer_exists(drawer_id.as_str())
-                .map_err(db_error_to_api_error)?;
+                .map_err(db_error_to_write_api_error)?;
 
         if !drawer_exists {
             let source_file = source_file_or_synthetic(drawer_id, request.source.as_deref());
@@ -1026,9 +1027,9 @@ async fn process_ingest_request(
                 request.valid_from.as_deref(),
                 request.valid_until.as_deref(),
             )
-            .map_err(db_error_to_api_error)?;
+            .map_err(db_error_to_write_api_error)?;
             db.insert_vector_with_project(drawer_id, vector, project_id.as_deref())
-                .map_err(db_error_to_api_error)?;
+                .map_err(db_error_to_write_api_error)?;
             newly_created_drawer_ids.push(drawer_id.clone());
         }
         drawer_ids.push(drawer_id.clone());
@@ -1408,6 +1409,7 @@ pub(super) struct ApiError {
     recovery_hint: Option<&'static str>,
     retryable: Option<bool>,
     stale_daemon: Option<crate::stale_daemon::StaleDaemonDiagnostic>,
+    admission_receipt: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -1420,6 +1422,7 @@ impl ApiError {
             recovery_hint: None,
             retryable: None,
             stale_daemon: None,
+            admission_receipt: None,
         }
     }
 
@@ -1432,6 +1435,7 @@ impl ApiError {
             recovery_hint: None,
             retryable: Some(false),
             stale_daemon: None,
+            admission_receipt: None,
         }
     }
 
@@ -1446,6 +1450,7 @@ impl ApiError {
             recovery_hint: Some(REST_WRITE_RESTART_HINT),
             retryable: Some(false),
             stale_daemon: None,
+            admission_receipt: None,
         }
     }
 
@@ -1458,6 +1463,7 @@ impl ApiError {
             recovery_hint: Some(REST_STALE_DAEMON_RESTART_HINT),
             retryable: Some(false),
             stale_daemon: Some(diagnostic),
+            admission_receipt: None,
         }
     }
 
@@ -1470,6 +1476,72 @@ impl ApiError {
             recovery_hint: Some(REST_WRITE_DATABASE_BUSY_HINT),
             retryable: Some(true),
             stale_daemon: None,
+            admission_receipt: None,
+        }
+    }
+
+    fn holder_budget_unavailable() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message:
+                "mempal profile holder budget is exhausted; retry after capacity becomes available"
+                    .to_string(),
+            kind: "admission_unavailable",
+            schema_skew: None,
+            recovery_hint: None,
+            retryable: Some(true),
+            stale_daemon: None,
+            admission_receipt: None,
+        }
+    }
+
+    fn holder_budget_admission(error: DbAdmissionError) -> Self {
+        let DbAdmissionError::BudgetExceeded {
+            active_holders,
+            max_holders,
+            active_cache_bytes,
+            max_cache_bytes,
+            requested_cache_bytes,
+            reaped_stale_holders,
+            reserved_service_holders,
+            service_holders,
+            reason,
+        } = error
+        else {
+            unreachable!("holder-budget receipt requires a budget admission error");
+        };
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "mempal profile holder budget is exhausted; write was refused before queueing"
+                .to_string(),
+            kind: "admission_blocked",
+            schema_skew: None,
+            recovery_hint: None,
+            retryable: Some(false),
+            stale_daemon: None,
+            admission_receipt: Some(json!({
+                "outcome": "admission_blocked",
+                "reason": "holder_budget_exceeded",
+                "action": "write_refused",
+                "created_drawer_ids": [],
+                "cleanup_drawer_ids": [],
+                "capacity": {"holders": max_holders, "cache_bytes": max_cache_bytes},
+                "headroom": {
+                    "holders": max_holders.saturating_sub(active_holders),
+                    "cache_bytes": max_cache_bytes.saturating_sub(active_cache_bytes),
+                },
+                "profile_admission": {
+                    "active_holders": active_holders,
+                    "configured_holder_limit": max_holders,
+                    "active_cache_bytes": active_cache_bytes,
+                    "configured_cache_bytes": max_cache_bytes,
+                    "reaped_stale_holders_this_snapshot": reaped_stale_holders,
+                    "reserved_service_holders": reserved_service_holders,
+                    "service_holders": service_holders,
+                    "requested_cache_bytes": requested_cache_bytes,
+                    "budget_reason": reason.to_string(),
+                },
+            })),
         }
     }
 
@@ -1482,6 +1554,7 @@ impl ApiError {
             recovery_hint: None,
             retryable: Some(false),
             stale_daemon: None,
+            admission_receipt: None,
         }
     }
 
@@ -1497,6 +1570,7 @@ impl ApiError {
             recovery_hint: None,
             retryable: Some(false),
             stale_daemon: None,
+            admission_receipt: None,
         }
     }
 
@@ -1515,6 +1589,7 @@ impl ApiError {
             recovery_hint: None,
             retryable: Some(true),
             stale_daemon: None,
+            admission_receipt: None,
         }
     }
 }
@@ -1541,6 +1616,12 @@ impl IntoResponse for ApiError {
         }
         if let Some(retryable) = self.retryable {
             error["retryable"] = json!(retryable);
+        }
+        if let Some(admission_receipt) = self.admission_receipt
+            && let (Some(error_fields), Some(receipt_fields)) =
+                (error.as_object_mut(), admission_receipt.as_object())
+        {
+            error_fields.extend(receipt_fields.clone());
         }
         if let Some(diagnostic) = self.stale_daemon {
             error["stale_daemon"] = json!(diagnostic.stale_daemon);
@@ -1799,7 +1880,7 @@ fn open_rest_write_database(db_path: &std::path::Path) -> Result<Database, ApiEr
     if let Some(diagnostic) = current_stale_daemon_diagnostic() {
         return Err(ApiError::stale_daemon(diagnostic));
     }
-    Database::open(db_path).map_err(db_error_to_api_error)
+    Database::open(db_path).map_err(db_error_to_write_api_error)
 }
 
 fn current_executable_deleted() -> bool {
@@ -1871,11 +1952,23 @@ fn log_rest_write_failure(metadata: &RestWriteLogMetadata, error: &ApiError) {
 
 fn db_error_to_api_error(error: DbError) -> ApiError {
     match error {
+        DbError::Admission(DbAdmissionError::BudgetExceeded { .. }) => {
+            ApiError::holder_budget_unavailable()
+        }
         DbError::UnsupportedSchemaVersion { current, supported } => {
             ApiError::schema_skew(current, supported)
         }
         other if db_error_is_sqlite_lock(&other) => ApiError::database_busy(),
         other => internal_error(other),
+    }
+}
+
+fn db_error_to_write_api_error(error: DbError) -> ApiError {
+    match error {
+        DbError::Admission(admission @ DbAdmissionError::BudgetExceeded { .. }) => {
+            ApiError::holder_budget_admission(admission)
+        }
+        other => db_error_to_api_error(other),
     }
 }
 
@@ -1895,7 +1988,7 @@ fn replacement_error(error: crate::core::db::DbError) -> ApiError {
         | crate::core::db::DbError::ReplacementTextAmbiguous { .. } => {
             ApiError::new(StatusCode::BAD_REQUEST, error.to_string())
         }
-        _ => db_error_to_api_error(error),
+        _ => db_error_to_write_api_error(error),
     }
 }
 
@@ -1909,7 +2002,7 @@ fn exact_duplicate_drawer_id(
 ) -> Result<Option<String>, ApiError> {
     Ok(db
         .find_active_drawers_by_content(content, wing, room, project_id)
-        .map_err(db_error_to_api_error)?
+        .map_err(db_error_to_write_api_error)?
         .into_iter()
         .find(|summary| Some(summary.id.as_str()) != excluded_drawer_id)
         .map(|summary| summary.id))
@@ -1917,7 +2010,7 @@ fn exact_duplicate_drawer_id(
 
 fn supersede_drawer_for_ingest(db: &Database, old_id: &str, new_id: &str) -> Result<(), ApiError> {
     db.supersede_drawer(old_id, &format!("replaced by {new_id}"))
-        .map_err(db_error_to_api_error)?;
+        .map_err(db_error_to_write_api_error)?;
     Ok(())
 }
 
