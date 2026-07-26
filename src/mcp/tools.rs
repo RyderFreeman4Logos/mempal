@@ -134,6 +134,19 @@ pub struct RetrievalScopeRequest {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContextScopeRequest {
+    /// Optional explicit project scope.
+    pub project_id: Option<String>,
+    /// Opt-in override to retrieve context across all projects for this request.
+    pub all_projects: Option<bool>,
+    /// Optional domain filter (`project`, `user`, `agent`, `skill`, `global`).
+    pub domain: Option<String>,
+    /// Optional bootstrap field filter.
+    pub field: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct SearchRequest {
     /// Natural-language query. Use the user's actual question verbatim
     /// when possible — the embedding model handles paraphrase and translation.
@@ -226,10 +239,8 @@ pub struct SearchResponse {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ContextRequest {
     pub query: String,
-    /// Unified retrieval scope. `mempal_context` supports `project_id`,
-    /// `all_projects`, `domain`, and `field`; search-only fields such as
-    /// `session`, `memory_kind`, and `status` are rejected instead of ignored.
-    pub scope: Option<RetrievalScopeRequest>,
+    /// Unified retrieval scope for `mempal_context`.
+    pub scope: Option<ContextScopeRequest>,
     pub field: Option<String>,
     pub domain: Option<String>,
     pub project_id: Option<String>,

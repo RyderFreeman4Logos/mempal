@@ -3,6 +3,14 @@
 # separate review work. Token counts use tokuin's gpt-4 model.
 
 [[files]]
+path = "CHANGELOG.md"
+kind = "doc"
+baseline_tokens = 8152
+baseline_lines = 579
+issue = "823"
+rationale = "#823 adds the changelog entry the changelog-check hook requires; CHANGELOG.md growth is unavoidable, exact no-growth ratchet."
+
+[[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
 kind = "source"
 baseline_tokens = 11269
