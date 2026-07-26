@@ -2056,7 +2056,15 @@ impl MempalMcpServer {
                 move |db| Ok(f(db)),
             )
             .await
-            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+            .map_err(|error| {
+                if let Some(diagnostic) =
+                    query_only_admission_diagnostic(&self.db_path, "query_only_async_db")
+                {
+                    mcp_query_only_pool_admission_error(&self.db_path, stage, diagnostic)
+                } else {
+                    ErrorData::internal_error(error.to_string(), None)
+                }
+            })?;
 
         match read {
             Some(Ok(result)) => Ok(result),
@@ -11751,11 +11759,7 @@ fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDt
     )
 }
 
-fn mcp_async_pool_admission_error(
-    db_path: &Path,
-    error: &(dyn std::error::Error + 'static),
-) -> ErrorData {
-    let diagnostic = status_database_diagnostic(db_path, "async_db", error);
+fn profile_admission_snapshot(db_path: &Path, pool_loaded_key: &str) -> serde_json::Value {
     let mut admission = match crate::core::db_admission::ProfileDbAdmission::snapshot(db_path) {
         Ok(snapshot) => serde_json::json!({
             "active_holders": snapshot.active_holders,
@@ -11775,17 +11779,29 @@ fn mcp_async_pool_admission_error(
                 "cache_bytes": snapshot.available_cache_bytes,
             },
             "unknown_holders": snapshot.unknown_holders,
+            "unknown_holder_diagnostics": snapshot.unknown_holder_diagnostics.iter().map(|diagnostic| {
+                serde_json::json!({
+                    "generation": diagnostic.generation,
+                    "reason": diagnostic.reason.to_string(),
+                })
+            }).collect::<Vec<_>>(),
         }),
         Err(snapshot_error) => serde_json::json!({
             "error": snapshot_error.to_string(),
         }),
     };
     if let Some(object) = admission.as_object_mut() {
-        object.insert(
-            "async_pool_loaded".to_string(),
-            serde_json::Value::Bool(false),
-        );
+        object.insert(pool_loaded_key.to_string(), serde_json::Value::Bool(false));
     }
+    admission
+}
+
+fn mcp_async_pool_admission_error(
+    db_path: &Path,
+    error: &(dyn std::error::Error + 'static),
+) -> ErrorData {
+    let diagnostic = status_database_diagnostic(db_path, "async_db", error);
+    let admission = profile_admission_snapshot(db_path, "async_pool_loaded");
     let capacity = admission.get("capacity").cloned();
     let headroom = admission.get("headroom").cloned();
     let message = if diagnostic.failure_kind == "holder_budget_exceeded" {
@@ -11812,6 +11828,47 @@ fn mcp_async_pool_admission_error(
             },
             "action": "write_refused",
             "async_pool_loaded": false,
+            "database_diagnostic": diagnostic,
+            "profile_admission": admission,
+            "capacity": capacity,
+            "headroom": headroom,
+        })),
+    )
+}
+
+fn query_only_admission_diagnostic(db_path: &Path, source: &str) -> Option<DatabaseDiagnosticDto> {
+    let snapshot = crate::core::db_admission::ProfileDbAdmission::snapshot(db_path).ok()?;
+    (snapshot.active_holders >= snapshot.configured_holder_limit).then(|| DatabaseDiagnosticDto {
+        path: db_path.display().to_string(),
+        source: source.to_string(),
+        failure_kind: "holder_budget_exceeded".to_string(),
+        summary: format!(
+            "profile database holder budget exceeded: active_holders={}/{}",
+            snapshot.active_holders, snapshot.configured_holder_limit
+        ),
+        hint: status_db_failure_hint("holder_budget_exceeded").to_string(),
+    })
+}
+
+fn mcp_query_only_pool_admission_error(
+    db_path: &Path,
+    operation: &'static str,
+    diagnostic: DatabaseDiagnosticDto,
+) -> ErrorData {
+    let admission = profile_admission_snapshot(db_path, "query_only_pool_loaded");
+    let capacity = admission.get("capacity").cloned();
+    let headroom = admission.get("headroom").cloned();
+    ErrorData::internal_error(
+        format!(
+            "MCP query-only pool admission refused for {operation}: {}. {}",
+            diagnostic.summary, diagnostic.hint
+        ),
+        Some(serde_json::json!({
+            "outcome": "admission_blocked",
+            "reason": "holder_budget_exceeded",
+            "action": "query_refused",
+            "operation": operation,
+            "query_only_pool_loaded": false,
             "database_diagnostic": diagnostic,
             "profile_admission": admission,
             "capacity": capacity,
@@ -18423,6 +18480,49 @@ prototypes = ["keep"]
         let error_text = error.to_string();
         assert!(error_text.contains("failed to open database"));
         assert!(error_text.contains("permission denied"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_context_reports_structured_query_only_pool_budget_refusal() {
+        let (_tempdir, db_path, server) = setup_server();
+        let _holders = (0..15)
+            .map(|_| {
+                ProfileDbAdmission::acquire(
+                    &db_path,
+                    DbAdmissionRequest::new(DbHolderClass::Mcp, 1, 1),
+                )
+                .expect("fill MCP holder budget")
+            })
+            .collect::<Vec<_>>();
+
+        let error = match server
+            .context_json_for_test(serde_json::json!({
+                "query": "holder budget diagnostic",
+                "max_items": 3
+            }))
+            .await
+        {
+            Ok(_) => panic!("context must refuse a saturated query-only pool"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+        let data = error.data.expect("structured query-only refusal data");
+        assert_eq!(data["outcome"], "admission_blocked");
+        assert_eq!(data["reason"], "holder_budget_exceeded");
+        assert_eq!(data["action"], "query_refused");
+        assert_eq!(data["operation"], "mempal_context");
+        assert_eq!(data["query_only_pool_loaded"], false);
+        assert_eq!(data["profile_admission"]["active_holders"], 16);
+        assert_eq!(data["profile_admission"]["unknown_holders"], 0);
+        assert_eq!(data["capacity"]["holders"], 16);
+        assert_eq!(data["headroom"]["holders"], 0);
+        assert!(
+            data["profile_admission"]["available_cache_bytes"]
+                .as_u64()
+                .is_some_and(|available| available > 0),
+            "holder-limit refusal must retain cache headroom diagnostics"
+        );
     }
 
     #[tokio::test]
