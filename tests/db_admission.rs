@@ -416,7 +416,7 @@ fn pid_namespace_mcp_holder_is_reaped_after_forced_exit_when_supported() {
         Duration::from_secs(5),
     )
     .expect("write namespaced child stdin");
-    let live_deadline = Instant::now() + Duration::from_secs(10);
+    let live_deadline = Instant::now() + Duration::from_secs(30);
     let live_snapshot = loop {
         let diagnostic = child.exit_diagnostic().expect("inspect namespaced fixture");
         if child.resources().leader != LeaderResourceState::Running {
@@ -431,7 +431,11 @@ fn pid_namespace_mcp_holder_is_reaped_after_forced_exit_when_supported() {
             Instant::now() < live_deadline,
             "namespaced MCP fixture did not register before deadline"
         );
-        std::thread::yield_now();
+        // Bounded sleep instead of yield_now: under high host load a busy-spin
+        // starves the fixture process we are waiting for. Matches the readiness
+        // probe pattern from #825 (tests/write_wait_cli/ipc.rs).
+        let remaining = live_deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(Duration::from_millis(50).min(remaining));
     };
     assert_eq!(live_snapshot.reaped_stale_holders_this_snapshot, 0);
     assert_eq!(live_snapshot.unknown_holders, 0);
@@ -442,7 +446,7 @@ fn pid_namespace_mcp_holder_is_reaped_after_forced_exit_when_supported() {
     assert!(cleanup.errors.is_empty(), "cleanup errors: {cleanup:?}");
     assert!(cleanup.kill_fence_sent);
 
-    let reap_deadline = Instant::now() + Duration::from_secs(10);
+    let reap_deadline = Instant::now() + Duration::from_secs(30);
     let mut reaped_total = 0usize;
     loop {
         if let Ok(snapshot) = ProfileDbAdmission::snapshot(&db_path) {
@@ -455,7 +459,8 @@ fn pid_namespace_mcp_holder_is_reaped_after_forced_exit_when_supported() {
             Instant::now() < reap_deadline,
             "namespaced MCP holder was not reaped before deadline"
         );
-        std::thread::yield_now();
+        let remaining = reap_deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(Duration::from_millis(50).min(remaining));
     }
     assert!(
         reaped_total > 0,
