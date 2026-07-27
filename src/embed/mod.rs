@@ -235,7 +235,7 @@ pub async fn build_backend_from_name(config: &Config, backend: &str) -> Result<B
                 .model
                 .as_deref()
                 .unwrap_or("minishlab/potion-multilingual-128M");
-            Ok(Box::new(model2vec::Model2VecEmbedder::new(model_id)?))
+            Ok(Box::new(model2vec::Model2VecEmbedder::new(model_id).await?))
         }
         #[cfg(feature = "onnx")]
         "onnx" => Ok(Box::new(onnx::OnnxEmbedder::new_or_download().await?)),
@@ -255,6 +255,18 @@ pub async fn build_backend_from_name(config: &Config, backend: &str) -> Result<B
         }
         other => Err(EmbedError::UnsupportedBackend(other.to_string())),
     }
+}
+
+#[cfg(any(feature = "model2vec", feature = "onnx", test))]
+pub(crate) async fn run_blocking_embedder_initialization<T>(
+    initialize: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(initialize)
+        .await
+        .map_err(EmbedError::WorkerPanic)?
 }
 
 struct ManagedEmbedder {
@@ -321,6 +333,40 @@ impl Embedder for ManagedEmbedder {
 mod tests {
     use super::*;
     use crate::core::config::{Config, EmbedEndpointConfig};
+
+    #[tokio::test]
+    async fn blocking_embedder_initialization_allows_a_deadline_to_fire() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut initialization = tokio::spawn(async move {
+            run_blocking_embedder_initialization(move || {
+                started_tx
+                    .send(())
+                    .expect("report that blocking initialization started");
+                release_rx.recv().expect("release blocking initialization");
+                Ok::<(), EmbedError>(())
+            })
+            .await
+        });
+
+        started_rx
+            .await
+            .expect("blocking initialization should start before its deadline");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut initialization)
+                .await
+                .is_err(),
+            "the deadline must fire while synchronous initialization is still blocked"
+        );
+
+        release_tx
+            .send(())
+            .expect("release blocking initialization after deadline");
+        initialization
+            .await
+            .expect("initialization task should not panic")
+            .expect("blocking initialization should finish after release");
+    }
 
     #[tokio::test]
     async fn remote_fallback_backend_is_blocked_before_router_construction() {

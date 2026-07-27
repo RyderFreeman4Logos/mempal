@@ -180,6 +180,7 @@ fn write_cli_stdout_line(args: std::fmt::Arguments<'_>) {
 
 mod case_skill;
 mod daemon_cli;
+mod deadline;
 mod foresight_cli;
 mod historical_rejudge_rebind;
 mod insights;
@@ -4956,6 +4957,8 @@ const STDIN_INGEST_SQLITE_LOCK_MAX_RETRIES: usize = 40;
 const STDIN_INGEST_STARTUP_BUSY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(100);
 const STDIN_INGEST_SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const CLI_CONTENT_WRITE_SQLITE_BUSY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(100);
 
 fn open_stdin_ingest_database_with_retry(path: &Path) -> Result<Database> {
     for attempt in 0..=STDIN_INGEST_SQLITE_LOCK_MAX_RETRIES {
@@ -4993,7 +4996,7 @@ fn open_cli_content_write_database_with_retry(
         {
             Ok(db) => {
                 db.conn()
-                    .busy_timeout(STDIN_INGEST_SQLITE_BUSY_TIMEOUT)
+                    .busy_timeout(CLI_CONTENT_WRITE_SQLITE_BUSY_TIMEOUT)
                     .with_context(|| {
                         format!("failed to set SQLite busy timeout for {operation}")
                     })?;
@@ -5053,6 +5056,30 @@ fn classify_cli_content_write_result<T>(
             )
         }
         Err(error) => Err(error),
+    }
+}
+
+const CLI_CONTENT_WRITE_SQLITE_LOCK_RETRY_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+fn execute_cli_content_write_with_retry<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    let retry_deadline = std::time::Instant::now() + CLI_CONTENT_WRITE_SQLITE_LOCK_RETRY_DEADLINE;
+    let mut attempt = 0;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_transient_sqlite_lock_error(&error) => {
+                let remaining = retry_deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(
+                    historical_rejudge_sqlite_lock_retry_delay(attempt).min(remaining),
+                );
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -5251,7 +5278,7 @@ where
 {
     let runtime = tokio::runtime::Runtime::new().context("failed to construct tokio runtime")?;
     let result = runtime.block_on(future);
-    if result.as_ref().err().is_some_and(is_ingest_wait_timed_out) {
+    if result.as_ref().err().is_some_and(needs_bounded) {
         runtime.shutdown_timeout(std::time::Duration::from_millis(100));
     }
     result
@@ -7770,6 +7797,15 @@ fn cli_search_db_deadline(config: &Config) -> std::time::Duration {
     std::time::Duration::from_secs(config.api.search_db_deadline_secs)
 }
 
+const CLI_SEARCH_TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+fn cli_search_remaining_deadline(deadline: std::time::Instant) -> Result<std::time::Duration> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(deadline::Exceeded.into());
+    }
+    Ok(remaining)
+}
+
 fn cli_search_rerank_deadline(config: &Config) -> std::time::Duration {
     let deadline_secs = config
         .search
@@ -7955,9 +7991,13 @@ async fn apply_cli_reranker_bounded(
 }
 
 fn cli_bm25_fallback_outcome(
-    request: CliSearchDbRequest,
+    mut request: CliSearchDbRequest,
     mut warnings: Vec<String>,
+    total_deadline: std::time::Instant,
 ) -> Result<SearchOutcome> {
+    request.deadline = request
+        .deadline
+        .min(cli_search_remaining_deadline(total_deadline)?);
     let deadline = request.deadline;
     match run_cli_bm25_search_bounded(request)? {
         Some(Ok(results)) => Ok(SearchOutcome {
@@ -7991,6 +8031,7 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
     config: &Config,
     embedder: &E,
     request: CliSearchExecutionRequest<'_>,
+    total_deadline: std::time::Instant,
 ) -> Result<SearchOutcome> {
     let CliSearchExecutionRequest {
         query,
@@ -8000,6 +8041,7 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
         options,
         top_k,
     } = request;
+    cli_search_remaining_deadline(total_deadline)?;
     if top_k == 0 {
         return Ok(SearchOutcome {
             results: Vec::new(),
@@ -8011,17 +8053,21 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
     let db_path = db.path().to_path_buf();
     let db_deadline = cli_search_db_deadline(config);
     let mut warnings = Vec::new();
+    let route_deadline = db_deadline.min(cli_search_remaining_deadline(total_deadline)?);
     let route = match run_cli_route_bounded(
         db_path.clone(),
         query.to_string(),
         wing.map(str::to_string),
         room.map(str::to_string),
-        db_deadline,
+        route_deadline,
     )? {
         Some(Ok(route)) => route,
         Some(Err(error)) => return Err(error),
         None => {
-            warnings.push(cli_search_timeout_warning("route resolution", db_deadline));
+            warnings.push(cli_search_timeout_warning(
+                "route resolution",
+                route_deadline,
+            ));
             fallback_cli_search_route(
                 wing,
                 room,
@@ -8040,12 +8086,10 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
         ));
         None
     } else {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(vector_search_circuit.search_deadline_secs),
-            embedder.embed(&[query]),
-        )
-        .await
-        {
+        let embed_deadline =
+            std::time::Duration::from_secs(vector_search_circuit.search_deadline_secs)
+                .min(cli_search_remaining_deadline(total_deadline)?);
+        match tokio::time::timeout(embed_deadline, embedder.embed(&[query])).await {
             Ok(Ok(vectors)) => match vectors.into_iter().next() {
                 Some(vector) => Some(vector),
                 None if vector_search_circuit.bm25_fallback_enabled => {
@@ -8081,7 +8125,7 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
         scope,
         options,
         top_k,
-        deadline: db_deadline,
+        deadline: db_deadline.min(cli_search_remaining_deadline(total_deadline)?),
     };
 
     let outcome = if let Some(query_vector) = query_vector {
@@ -8100,7 +8144,7 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
                         new_dim,
                         current_dim,
                     ));
-                    cli_bm25_fallback_outcome(db_request, warnings)?
+                    cli_bm25_fallback_outcome(db_request, warnings, total_deadline)?
                 } else {
                     return Err(error);
                 }
@@ -8108,7 +8152,7 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
             Some(Err(error)) => return Err(error),
             None if vector_search_circuit.bm25_fallback_enabled => {
                 warnings.push(cli_search_timeout_warning("hybrid search", db_deadline));
-                cli_bm25_fallback_outcome(db_request, warnings)?
+                cli_bm25_fallback_outcome(db_request, warnings, total_deadline)?
             }
             None => bail!(
                 "{}",
@@ -8116,10 +8160,17 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
             ),
         }
     } else {
-        cli_bm25_fallback_outcome(db_request, warnings)?
+        cli_bm25_fallback_outcome(db_request, warnings, total_deadline)?
     };
 
-    Ok(apply_cli_reranker_bounded(query, outcome, cli_search_rerank_deadline(config)).await)
+    let outcome = apply_cli_reranker_bounded(
+        query,
+        outcome,
+        cli_search_rerank_deadline(config).min(cli_search_remaining_deadline(total_deadline)?),
+    )
+    .await;
+    cli_search_remaining_deadline(total_deadline)?;
+    Ok(outcome)
 }
 
 async fn search_command(
@@ -8127,95 +8178,128 @@ async fn search_command(
     config: &Config,
     options: SearchCommandOptions<'_>,
 ) -> Result<()> {
-    let current_dir = env::current_dir().ok();
-    let resolved_project = resolve_project_id(options.project, config, current_dir.as_deref())
-        .context("failed to resolve search project id")?;
-    let scope = ProjectSearchScope::from_request(
-        resolved_project,
-        options.include_global,
-        options.all_projects,
-        config.search.strict_project_isolation,
-    );
-    let room = resolve_room_session_scope(options.room, options.session)?;
-    let embedder = build_embedder(config).await?;
-    let outcome = cli_search_with_bounded_reads(
-        db,
-        config,
-        &*embedder,
-        CliSearchExecutionRequest {
-            query: options.query,
-            wing: options.wing,
-            room: room.as_deref(),
-            scope,
-            options: SearchOptions {
-                filters: options.filters,
-                with_neighbors: options.with_neighbors,
-                include_raw_turns: options.include_raw_turns,
-                include_expired: options.include_expired,
+    search_command_with_embedder_initializer(db, config, options, CLI_SEARCH_TOTAL_DEADLINE, || {
+        build_embedder(config)
+    })
+    .await
+}
+
+async fn search_command_with_embedder_initializer<F, Fut>(
+    db: &Database,
+    config: &Config,
+    options: SearchCommandOptions<'_>,
+    total_deadline_duration: std::time::Duration,
+    initialize_embedder: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Box<dyn Embedder>>>,
+{
+    match tokio::time::timeout(total_deadline_duration, async {
+        let total_deadline = std::time::Instant::now() + total_deadline_duration;
+        let current_dir = env::current_dir().ok();
+        let resolved_project = resolve_project_id(options.project, config, current_dir.as_deref())
+            .context("failed to resolve search project id")?;
+        let scope = ProjectSearchScope::from_request(
+            resolved_project,
+            options.include_global,
+            options.all_projects,
+            config.search.strict_project_isolation,
+        );
+        let room = resolve_room_session_scope(options.room, options.session)?;
+        cli_search_remaining_deadline(total_deadline)?;
+        let embedder = initialize_embedder().await?;
+        cli_search_remaining_deadline(total_deadline)?;
+        let outcome = cli_search_with_bounded_reads(
+            db,
+            config,
+            &*embedder,
+            CliSearchExecutionRequest {
+                query: options.query,
+                wing: options.wing,
+                room: room.as_deref(),
+                scope,
+                options: SearchOptions {
+                    filters: options.filters,
+                    with_neighbors: options.with_neighbors,
+                    include_raw_turns: options.include_raw_turns,
+                    include_expired: options.include_expired,
+                },
+                top_k: options.top_k,
             },
-            top_k: options.top_k,
-        },
-    )
-    .await?;
-    for warning in &outcome.warnings {
-        eprintln!("warning: {warning}");
-    }
-    let results = outcome
-        .results
-        .into_iter()
-        .map(build_cli_search_result)
-        .collect::<Vec<_>>();
-
-    if options.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&results).context("failed to serialize search results")?
-        );
-        return Ok(());
-    }
-    if results.is_empty() {
-        println!("no results");
-        return Ok(());
-    }
-
-    for result in &results {
-        let room = result.room.clone().unwrap_or_else(|| "default".to_string());
-        println!(
-            "[{:.3}] {}/{} {}",
-            result.similarity, result.wing, room, result.drawer_id
-        );
-        println!("source: {}", result.source_file);
-        println!(
-            "kind: {} domain: {} field: {} anchor: {} {}",
-            result.memory_kind, result.domain, result.field, result.anchor_kind, result.anchor_id
-        );
-        if let Some(parent_anchor_id) = result.parent_anchor_id.as_deref() {
-            println!("parent_anchor: {parent_anchor_id}");
+            total_deadline,
+        )
+        .await?;
+        for warning in &outcome.warnings {
+            eprintln!("warning: {warning}");
         }
-        if let Some(tier) = result.tier.as_deref() {
+        let results = outcome
+            .results
+            .into_iter()
+            .map(build_cli_search_result)
+            .collect::<Vec<_>>();
+
+        if options.json {
             println!(
-                "knowledge: tier={tier} status={}",
-                result.status.as_deref().unwrap_or("unknown")
+                "{}",
+                serde_json::to_string_pretty(&results)
+                    .context("failed to serialize search results")?
             );
+            return Ok(());
         }
-        if let Some(statement) = result.statement.as_deref() {
-            println!("statement: {statement}");
+        if results.is_empty() {
+            println!("no results");
+            return Ok(());
         }
-        if !result.tunnel_hints.is_empty() {
-            println!("tunnel: also in {}", result.tunnel_hints.join(", "));
-        }
-        if let Some(neighbors) = result.neighbors.as_ref() {
-            if let Some(prev) = neighbors.prev.as_ref() {
-                println!("prev[{}]: {}", prev.chunk_index, prev.content);
+
+        for result in &results {
+            let room = result.room.clone().unwrap_or_else(|| "default".to_string());
+            println!(
+                "[{:.3}] {}/{} {}",
+                result.similarity, result.wing, room, result.drawer_id
+            );
+            println!("source: {}", result.source_file);
+            println!(
+                "kind: {} domain: {} field: {} anchor: {} {}",
+                result.memory_kind,
+                result.domain,
+                result.field,
+                result.anchor_kind,
+                result.anchor_id
+            );
+            if let Some(parent_anchor_id) = result.parent_anchor_id.as_deref() {
+                println!("parent_anchor: {parent_anchor_id}");
             }
-            if let Some(next) = neighbors.next.as_ref() {
-                println!("next[{}]: {}", next.chunk_index, next.content);
+            if let Some(tier) = result.tier.as_deref() {
+                println!(
+                    "knowledge: tier={tier} status={}",
+                    result.status.as_deref().unwrap_or("unknown")
+                );
             }
+            if let Some(statement) = result.statement.as_deref() {
+                println!("statement: {statement}");
+            }
+            if !result.tunnel_hints.is_empty() {
+                println!("tunnel: also in {}", result.tunnel_hints.join(", "));
+            }
+            if let Some(neighbors) = result.neighbors.as_ref() {
+                if let Some(prev) = neighbors.prev.as_ref() {
+                    println!("prev[{}]: {}", prev.chunk_index, prev.content);
+                }
+                if let Some(next) = neighbors.next.as_ref() {
+                    println!("next[{}]: {}", next.chunk_index, next.content);
+                }
+            }
+            println!("{}", result.content);
+            println!();
         }
-        println!("{}", result.content);
-        println!();
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(deadline::Exceeded.into()),
     }
-    Ok(())
 }
 
 fn export_command(db: &Database, config: &Config, command: ExportCommands) -> Result<()> {
@@ -12710,8 +12794,10 @@ fn delete_command(db: &Database, config: &Config, options: DeleteCommandOptions<
     let deleted = classify_cli_content_write_result(
         db,
         "delete",
-        db.soft_delete_drawer_in_project(options.drawer_id, drawer_project_id.as_deref())
-            .context("failed to soft-delete drawer"),
+        execute_cli_content_write_with_retry(|| {
+            db.soft_delete_drawer_in_project(options.drawer_id, drawer_project_id.as_deref())
+                .context("failed to soft-delete drawer")
+        }),
     )?;
     if !deleted {
         bail!("drawer not found: {}", options.drawer_id);
@@ -12740,8 +12826,10 @@ fn pin_command(db: &Database, drawer_id: &str) -> Result<()> {
     if !classify_cli_content_write_result(
         db,
         "pin",
-        db.pin_drawer(drawer_id, None)
-            .context("failed to pin drawer"),
+        execute_cli_content_write_with_retry(|| {
+            db.pin_drawer(drawer_id, None)
+                .context("failed to pin drawer")
+        }),
     )? {
         bail!("drawer not found: {drawer_id}");
     }
@@ -12755,7 +12843,9 @@ fn unpin_command(db: &Database, drawer_id: &str) -> Result<()> {
     if !classify_cli_content_write_result(
         db,
         "unpin",
-        db.unpin_drawer(drawer_id).context("failed to unpin drawer"),
+        execute_cli_content_write_with_retry(|| {
+            db.unpin_drawer(drawer_id).context("failed to unpin drawer")
+        }),
     )? {
         bail!("drawer not found: {drawer_id}");
     }
@@ -24789,6 +24879,9 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    #[path = "cli_search_retry_831_tests.rs"]
+    mod cli_search_retry_831_tests;
+
     const TEST_TARGET_FINGERPRINT: &str = "test-embedder:8:target";
 
     #[test]
@@ -25071,6 +25164,34 @@ api_model = "text-embedding-3-large"
     }
 
     #[tokio::test]
+    async fn cli_search_total_deadline_returns_clear_error_without_running_a_stage() {
+        let (_tmp, db) = new_temp_db();
+        let config = Config::default();
+        let embedder = RecordingEmbedder::default();
+        let expired_deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+
+        let error = cli_search_with_bounded_reads(
+            &db,
+            &config,
+            &embedder,
+            CliSearchExecutionRequest {
+                query: "expired total deadline query",
+                wing: None,
+                room: None,
+                scope: ProjectSearchScope::all_projects(),
+                options: SearchOptions::default(),
+                top_k: 3,
+            },
+            expired_deadline,
+        )
+        .await
+        .expect_err("an expired CLI search deadline must fail before the next stage");
+
+        assert!(format!("{error:#}").contains("CLI search total deadline exceeded"));
+        assert!(embedder.seen_texts().is_empty());
+    }
+
+    #[tokio::test]
     async fn cli_search_db_deadline_returns_empty_bm25_json_safe_outcome() {
         let (_tmp, db) = new_temp_db();
         let mut config = Config::default();
@@ -25090,6 +25211,7 @@ api_model = "text-embedding-3-large"
                 options: SearchOptions::default(),
                 top_k: 3,
             },
+            std::time::Instant::now() + CLI_SEARCH_TOTAL_DEADLINE,
         )
         .await
         .expect("bounded CLI search");
@@ -26071,6 +26193,9 @@ fn is_ingest_wait_timed_out(error: &anyhow::Error) -> bool {
         .any(|source| source.downcast_ref::<IngestWaitTimedOut>().is_some())
 }
 
+fn needs_bounded(error: &anyhow::Error) -> bool {
+    is_ingest_wait_timed_out(error) || deadline::is(error)
+}
 #[cfg(test)]
 mod ingest_wait_timeout_error_tests {
     use super::*;

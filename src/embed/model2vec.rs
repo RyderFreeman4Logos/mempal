@@ -16,23 +16,29 @@ pub struct Model2VecEmbedder {
 }
 
 impl Model2VecEmbedder {
-    pub fn new(model_id: &str) -> Result<Self> {
-        let model = model2vec_rs::model::StaticModel::from_pretrained(model_id, None, None, None)
-            .map_err(|e| {
-            EmbedError::Runtime(format!("failed to load model2vec model '{model_id}': {e}"))
-        })?;
-        // Probe embedding dimensions by encoding a test string
-        let probe = model.encode_single("dim_probe");
-        let dimensions = probe.len();
-        Ok(Self {
-            model,
-            dimensions,
-            model_name: model_id.to_string(),
+    pub async fn new(model_id: &str) -> Result<Self> {
+        let model_id = model_id.to_string();
+        super::run_blocking_embedder_initialization(move || {
+            let model =
+                model2vec_rs::model::StaticModel::from_pretrained(&model_id, None, None, None)
+                    .map_err(|error| {
+                        EmbedError::Runtime(format!(
+                            "failed to load model2vec model '{model_id}': {error}"
+                        ))
+                    })?;
+            // Probe embedding dimensions by encoding a test string.
+            let dimensions = model.encode_single("dim_probe").len();
+            Ok(Self {
+                model,
+                dimensions,
+                model_name: model_id,
+            })
         })
+        .await
     }
 
-    pub fn new_default() -> Result<Self> {
-        Self::new(DEFAULT_MODEL)
+    pub async fn new_default() -> Result<Self> {
+        Self::new(DEFAULT_MODEL).await
     }
 }
 
