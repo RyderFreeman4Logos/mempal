@@ -8,6 +8,13 @@ use std::time::{Duration, Instant};
 #[path = "local_gate_receipt_scripts/failure_modes.rs"]
 mod failure_modes;
 
+/// Bounded wait for local-gate fixture *script* children under load / cold `target` rebuilds.
+/// Keep well under cargo test timeouts while remaining larger than the old 5s flake budget.
+const FIXTURE_CHILD_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Direct fixture `git` commands stay short: they should finish quickly unless intentionally
+/// stalled, and the stalled-git reaper test outer RED bound assumes a ~5s self-timeout.
+const FIXTURE_GIT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -19,7 +26,7 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> io::Result<Output> 
             return child.wait_with_output();
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            kill_waited_child_process_group(&mut child)?;
             let output = child.wait_with_output()?;
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -32,6 +39,39 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> io::Result<Output> 
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+#[cfg(unix)]
+fn spawn_waited_child(command: &mut Command) -> io::Result<Child> {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0).spawn()
+}
+
+#[cfg(unix)]
+fn kill_waited_child_process_group(child: &mut Child) -> io::Result<()> {
+    let pid = i32::try_from(child.id()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "waited child PID exceeds i32 range",
+        )
+    })?;
+    // Every wait_with_timeout caller uses spawn_waited_child, so this targets only the
+    // child-owned process group and clears descendants that inherited captured pipes.
+    if unsafe { libc::kill(-pid, libc::SIGKILL) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn spawn_waited_child(command: &mut Command) -> io::Result<Child> {
+    command.spawn()
+}
+
+#[cfg(not(unix))]
+fn kill_waited_child_process_group(child: &mut Child) -> io::Result<()> {
+    child.kill()
 }
 
 fn bounded_diagnostic(output: &[u8]) -> String {
@@ -107,8 +147,8 @@ fn run_bash_script(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_fixture_git_environment(&mut command, working_dir);
-    let child = command.spawn().expect("spawn fixture gate script");
-    wait_with_timeout(child, Duration::from_secs(5)).expect("wait for fixture gate script")
+    let child = spawn_waited_child(&mut command).expect("spawn fixture gate script");
+    wait_with_timeout(child, FIXTURE_CHILD_WAIT_TIMEOUT).expect("wait for fixture gate script")
 }
 
 fn fixture_git_command(working_dir: &Path, args: &[&str]) -> Command {
@@ -119,11 +159,10 @@ fn fixture_git_command(working_dir: &Path, args: &[&str]) -> Command {
 }
 
 fn run_fixture_git_with_timeout(working_dir: &Path, args: &[&str]) -> io::Result<Output> {
-    let child = fixture_git_command(working_dir, args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    wait_with_timeout(child, Duration::from_secs(5))
+    let mut command = fixture_git_command(working_dir, args);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = spawn_waited_child(&mut command)?;
+    wait_with_timeout(child, FIXTURE_GIT_WAIT_TIMEOUT)
 }
 
 fn fixture_git_output(working_dir: &Path, args: &[&str]) -> Output {
@@ -302,8 +341,8 @@ fn run_review_check(fake_bin_dir: &Path, log: &Path, csa_context: (&str, &str)) 
         .env(csa_context.0, csa_context.1)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = command.spawn().expect("spawn review-check fixture");
-    wait_with_timeout(child, Duration::from_secs(5)).expect("wait for review-check fixture")
+    let child = spawn_waited_child(&mut command).expect("spawn review-check fixture");
+    wait_with_timeout(child, FIXTURE_CHILD_WAIT_TIMEOUT).expect("wait for review-check fixture")
 }
 
 #[test]
