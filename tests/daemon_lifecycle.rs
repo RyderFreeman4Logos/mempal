@@ -228,7 +228,7 @@ dim = 4
 base_url = "{base_url}"
 model = "test-embed"
 dim = 4
-request_timeout_secs = 5
+request_timeout_secs = 15
 
 [hooks]
 enabled = true
@@ -788,26 +788,23 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
         .expect("enqueue async ingest");
 
     let mut child = spawn_foreground_daemon(tmp.path(), "drain-running-ingest-async");
-
-    // Reuse the enqueue store so polling does not repeatedly register and
-    // release an admission sidecar holder while the daemon claims the row.
+    // Poll with the existing store.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
+    let running = loop {
         let record = store
             .operation_status(&operation_id)
             .expect("load operation status")
             .expect("operation record exists");
-        if record.op_state == "running" {
-            break;
+        if record.op_state == "running" && handle.request_count() > 0 {
+            break record;
         }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not reach the paused embed request before SIGTERM"
+        );
         std::thread::sleep(Duration::from_millis(100));
-    }
-    let running = store
-        .operation_status(&operation_id)
-        .expect("load running status")
-        .expect("operation record exists");
+    };
     assert_eq!(running.op_state, "running");
-
     child.signal_or_panic(libc::SIGTERM, "failed to send SIGTERM");
     assert!(
         !wait_for_child_exit(&mut child, Duration::from_millis(300)),
@@ -828,7 +825,14 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
         .operation_status(&operation_id)
         .expect("load completed status")
         .expect("operation record exists");
-    assert_eq!(completed.op_state, "completed");
+    assert_eq!(
+        completed.op_state,
+        "completed",
+        "drained ingest must complete: op_state={}, failure_detail={:.160}, rejected_reason={:.160}",
+        completed.op_state,
+        completed.failure_detail.as_deref().unwrap_or("none"),
+        completed.rejected_reason.as_deref().unwrap_or("none")
+    );
     let db = Database::open(&db_path).expect("open db");
     assert_eq!(db.drawer_count().expect("drawer count"), 1);
 
