@@ -342,9 +342,9 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 path = "src/main.rs"
 kind = "source"
 baseline_tokens = 258130
-baseline_lines = 33429
+baseline_lines = 33440
 issue = "831"
-rationale = "#831 adds bounded CLI content-write retry, total search deadline, and regression coverage; exact no-growth ratchet."
+rationale = "#831 extends the total CLI search deadline through embedder initialization; regression tests live in a sibling module, and the refreshed cap remains a no-growth ratchet."
 
 [[files]]
 path = "src/markdown_export.rs"
