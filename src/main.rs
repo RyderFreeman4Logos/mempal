@@ -180,6 +180,7 @@ fn write_cli_stdout_line(args: std::fmt::Arguments<'_>) {
 
 mod case_skill;
 mod daemon_cli;
+mod deadline;
 mod foresight_cli;
 mod historical_rejudge_rebind;
 mod insights;
@@ -5277,7 +5278,7 @@ where
 {
     let runtime = tokio::runtime::Runtime::new().context("failed to construct tokio runtime")?;
     let result = runtime.block_on(future);
-    if result.as_ref().err().is_some_and(is_ingest_wait_timed_out) {
+    if result.as_ref().err().is_some_and(needs_bounded) {
         runtime.shutdown_timeout(std::time::Duration::from_millis(100));
     }
     result
@@ -7797,14 +7798,10 @@ fn cli_search_db_deadline(config: &Config) -> std::time::Duration {
 }
 
 const CLI_SEARCH_TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
-
 fn cli_search_remaining_deadline(deadline: std::time::Instant) -> Result<std::time::Duration> {
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
     if remaining.is_zero() {
-        bail!(
-            "CLI search total deadline exceeded after {}s",
-            CLI_SEARCH_TOTAL_DEADLINE.as_secs()
-        );
+        return Err(deadline::Exceeded.into());
     }
     Ok(remaining)
 }
@@ -8301,10 +8298,7 @@ where
     .await
     {
         Ok(result) => result,
-        Err(_) => bail!(
-            "CLI search total deadline exceeded after {}s",
-            total_deadline_duration.as_secs()
-        ),
+        Err(_) => Err(deadline::Exceeded.into()),
     }
 }
 
@@ -26199,6 +26193,9 @@ fn is_ingest_wait_timed_out(error: &anyhow::Error) -> bool {
         .any(|source| source.downcast_ref::<IngestWaitTimedOut>().is_some())
 }
 
+fn needs_bounded(error: &anyhow::Error) -> bool {
+    is_ingest_wait_timed_out(error) || deadline::is(error)
+}
 #[cfg(test)]
 mod ingest_wait_timeout_error_tests {
     use super::*;
