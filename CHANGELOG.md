@@ -42,6 +42,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **MCP ingest**: preserve queued `wait=true` recovery when daemon hook IPC and
+  REST are unavailable, retaining an operation receipt for reconciliation (#834).
+- **CLI search**: reserve BM25 fallback budget so hybrid search cannot consume
+  the full CLI deadline (#833).
 - **CLI writes/search**: retry pin, unpin, and delete SQLite locks for 10 seconds; enforce a 120-second search deadline, including embedder initialization and bounded runtime teardown (#831).
 - **MCP full smoke**: follow accepted ingest wait-timeout operation receipts to
   recover cleanup-safe drawer IDs before classifying create or update as missing

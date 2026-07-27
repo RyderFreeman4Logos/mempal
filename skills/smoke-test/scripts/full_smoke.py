@@ -1776,7 +1776,7 @@ def mcp_crud() -> list[str]:
                 False,
                 reason='create_missing_created_drawer_ids',
                 **recovery_fields(create_recovery),
-                product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/715',
+                product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/834',
             )
             return cleanup_ids
         cleanup_ids.extend(ids)
@@ -1866,7 +1866,7 @@ def mcp_crud() -> list[str]:
                 False,
                 reason='update_missing_created_drawer_ids',
                 **recovery_fields(update_recovery),
-                product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/715',
+                product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/834',
             )
             return cleanup_ids
         cleanup_ids.extend(upd_ids)

@@ -7798,6 +7798,27 @@ fn cli_search_db_deadline(config: &Config) -> std::time::Duration {
 }
 
 const CLI_SEARCH_TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+const CLI_SEARCH_BM25_FALLBACK_RESERVE: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn cli_search_hybrid_deadline(
+    db_deadline: std::time::Duration,
+    remaining_deadline: std::time::Duration,
+) -> std::time::Duration {
+    cli_search_hybrid_deadline_with_bm25_reserve(
+        db_deadline,
+        remaining_deadline,
+        CLI_SEARCH_BM25_FALLBACK_RESERVE,
+    )
+}
+
+fn cli_search_hybrid_deadline_with_bm25_reserve(
+    db_deadline: std::time::Duration,
+    remaining_deadline: std::time::Duration,
+    bm25_reserve: std::time::Duration,
+) -> std::time::Duration {
+    db_deadline.min(remaining_deadline.saturating_sub(bm25_reserve))
+}
+
 fn cli_search_remaining_deadline(deadline: std::time::Instant) -> Result<std::time::Duration> {
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
     if remaining.is_zero() {
@@ -8118,6 +8139,7 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
         }
     };
 
+    let remaining_db_deadline = cli_search_remaining_deadline(total_deadline)?;
     let db_request = CliSearchDbRequest {
         db_path,
         query: query.to_string(),
@@ -8125,12 +8147,16 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
         scope,
         options,
         top_k,
-        deadline: db_deadline.min(cli_search_remaining_deadline(total_deadline)?),
+        deadline: db_deadline.min(remaining_db_deadline),
     };
+    let hybrid_deadline = cli_search_hybrid_deadline(db_deadline, remaining_db_deadline);
 
     let outcome = if let Some(query_vector) = query_vector {
         match run_cli_hybrid_search_bounded(CliHybridSearchRequest {
-            db: db_request.clone(),
+            db: CliSearchDbRequest {
+                deadline: hybrid_deadline,
+                ..db_request.clone()
+            },
             query_vector,
         })? {
             Some(Ok(results)) => SearchOutcome {
@@ -8145,18 +8171,24 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
                         current_dim,
                     ));
                     cli_bm25_fallback_outcome(db_request, warnings, total_deadline)?
+                } else if is_transient_sqlite_lock_error(&error) {
+                    warnings.push(
+                        "hybrid search encountered a transient SQLite lock; falling back to BM25-only search"
+                            .to_string(),
+                    );
+                    cli_bm25_fallback_outcome(db_request, warnings, total_deadline)?
                 } else {
                     return Err(error);
                 }
             }
             Some(Err(error)) => return Err(error),
             None if vector_search_circuit.bm25_fallback_enabled => {
-                warnings.push(cli_search_timeout_warning("hybrid search", db_deadline));
+                warnings.push(cli_search_timeout_warning("hybrid search", hybrid_deadline));
                 cli_bm25_fallback_outcome(db_request, warnings, total_deadline)?
             }
             None => bail!(
                 "{}",
-                cli_search_timeout_warning("hybrid search", db_deadline)
+                cli_search_timeout_warning("hybrid search", hybrid_deadline)
             ),
         }
     } else {
@@ -25161,6 +25193,53 @@ api_model = "text-embedding-3-large"
 
         assert!(outcome.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cli_hybrid_timeout_leaves_bm25_budget_for_followup() {
+        let total_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let hybrid_deadline = cli_search_hybrid_deadline_with_bm25_reserve(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(500),
+        );
+        assert_eq!(hybrid_deadline, std::time::Duration::from_millis(1500));
+
+        let hybrid = run_cli_search_read_bounded("hybrid-test", hybrid_deadline, || {
+            std::thread::sleep(std::time::Duration::from_millis(1600));
+        })
+        .expect("bounded hybrid stage");
+        assert!(hybrid.is_none(), "hybrid stage should time out");
+
+        let bm25 = run_cli_search_read_bounded(
+            "bm25-test",
+            cli_search_remaining_deadline(total_deadline).expect("BM25 reserve remains"),
+            || true,
+        )
+        .expect("bounded BM25 fallback");
+        assert_eq!(
+            bm25,
+            Some(true),
+            "BM25 must be attempted after hybrid timeout"
+        );
+    }
+
+    #[test]
+    fn cli_search_hybrid_deadline_reserves_default_bm25_budget() {
+        assert_eq!(
+            cli_search_hybrid_deadline(
+                std::time::Duration::from_secs(240),
+                CLI_SEARCH_TOTAL_DEADLINE,
+            ),
+            std::time::Duration::from_secs(90),
+        );
+        assert_eq!(
+            cli_search_hybrid_deadline(
+                std::time::Duration::from_secs(240),
+                std::time::Duration::from_secs(20),
+            ),
+            std::time::Duration::ZERO,
+        );
     }
 
     #[tokio::test]
