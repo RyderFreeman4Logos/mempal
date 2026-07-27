@@ -42,6 +42,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **MCP full smoke**: follow accepted ingest wait-timeout operation receipts to
+  recover cleanup-safe drawer IDs before classifying create or update as missing
+  IDs (#829).
 - **MCP context admission**: return an actionable structured `admission_blocked`
   diagnostic when a saturated profile holder budget prevents opening the
   query-only context pool (#824).

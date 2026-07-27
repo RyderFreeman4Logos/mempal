@@ -277,7 +277,7 @@ pub fn create_foresight(
         room,
         source_file: request
             .source_file
-            .or_else(|| Some(format!("foresight://{}", &drawer_id))),
+            .or_else(|| Some(format!("foresight://{}", drawer_id))),
         source_type,
         confidence: crate::core::types::default_confidence(source_type),
         added_at: created_at.clone(),

@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8188
-baseline_lines = 582
-issue = "824"
-rationale = "#824 adds the changelog entry required by changelog-check for the query-only MCP admission diagnostic; append-only growth is unavoidable, exact no-growth ratchet."
+baseline_tokens = 8225
+baseline_lines = 585
+issue = "829"
+rationale = "#829 adds the user-visible MCP full-smoke timeout-recovery changelog entry; append-only growth is unavoidable, exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -109,18 +109,18 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "skills/smoke-test/scripts/full_smoke.py"
 kind = "source"
-baseline_tokens = 21083
-baseline_lines = 2209
-issue = "825"
-rationale = "#825 review F1 adds a bounded REST fallback body-read deadline; exact no-growth ratchet."
+baseline_tokens = 21288
+baseline_lines = 2231
+issue = "829"
+rationale = "#829 follows accepted MCP wait-timeout operation receipts before create/update missing-ID classification; exact no-growth ratchet."
 
 [[files]]
 path = "skills/smoke-test/tests/test_full_smoke_receipts.py"
 kind = "test"
-baseline_tokens = 6966
-baseline_lines = 801
-issue = "825"
-rationale = "#825 adds cleanup-safe admission-blocked smoke receipt regressions; exact no-growth ratchet."
+baseline_tokens = 7012
+baseline_lines = 802
+issue = "829"
+rationale = "#829 adds timeout receipt operation-follow and no-operation fail-closed smoke regressions; exact no-growth ratchet."
 
 [[files]]
 path = "specs/fork-ext/p8-embed-qwen3-backend.spec.md"
