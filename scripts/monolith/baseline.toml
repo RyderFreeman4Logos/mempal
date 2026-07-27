@@ -6,7 +6,7 @@
 path = "CHANGELOG.md"
 kind = "doc"
 baseline_tokens = 8267
-baseline_lines = 588
+baseline_lines = 587
 issue = "831"
 rationale = "#831 adds the changelog entry required by the changelog-check hook; append-only growth is unavoidable, exact no-growth ratchet."
 

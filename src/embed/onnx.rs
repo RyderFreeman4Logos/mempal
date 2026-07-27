@@ -46,19 +46,22 @@ impl OnnxEmbedder {
         download_if_missing(&model_path, MODEL_URL).await?;
         download_if_missing(&tokenizer_path, TOKENIZER_URL).await?;
 
-        let session = Session::builder()
-            .map_err(|error| EmbedError::SessionBuilder(error.to_string()))?
-            .commit_from_file(&model_path)
-            .map_err(|error| EmbedError::LoadModel {
-                path: model_path.clone(),
-                message: error.to_string(),
-            })?;
-        let tokenizer = load_tokenizer(&tokenizer_path)?;
+        super::run_blocking_embedder_initialization(move || {
+            let session = Session::builder()
+                .map_err(|error| EmbedError::SessionBuilder(error.to_string()))?
+                .commit_from_file(&model_path)
+                .map_err(|error| EmbedError::LoadModel {
+                    path: model_path.clone(),
+                    message: error.to_string(),
+                })?;
+            let tokenizer = load_tokenizer(&tokenizer_path)?;
 
-        Ok(Self {
-            session: Arc::new(Mutex::new(session)),
-            tokenizer: Arc::new(Mutex::new(tokenizer)),
+            Ok(Self {
+                session: Arc::new(Mutex::new(session)),
+                tokenizer: Arc::new(Mutex::new(tokenizer)),
+            })
         })
+        .await
     }
 }
 

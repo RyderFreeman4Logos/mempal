@@ -29,7 +29,11 @@ async fn search_command_deadline_covers_embedder_initialization() {
         std::time::Duration::from_millis(20),
         move || async move {
             initialization_started_for_factory.store(1, Ordering::SeqCst);
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            })
+            .await
+            .expect("blocking embedder initialization task should not panic");
             Ok::<Box<dyn Embedder>, anyhow::Error>(Box::new(RecordingEmbedder::default()))
         },
     )
