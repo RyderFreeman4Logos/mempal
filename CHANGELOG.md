@@ -42,6 +42,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **CLI content writes/search**: retry transient SQLite write-lock failures for pin,
+  unpin, and delete mutations, and enforce a 120-second total search deadline
+  across all pipeline stages (#831).
 - **MCP full smoke**: follow accepted ingest wait-timeout operation receipts to
   recover cleanup-safe drawer IDs before classifying create or update as missing
   IDs (#829).

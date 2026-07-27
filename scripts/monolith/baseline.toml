@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8225
-baseline_lines = 585
-issue = "829"
-rationale = "#829 adds the user-visible MCP full-smoke timeout-recovery changelog entry; append-only growth is unavoidable, exact no-growth ratchet."
+baseline_tokens = 8267
+baseline_lines = 588
+issue = "831"
+rationale = "#831 adds the changelog entry required by the changelog-check hook; append-only growth is unavoidable, exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -341,10 +341,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/main.rs"
 kind = "source"
-baseline_tokens = 257734
-baseline_lines = 33347
-issue = "781"
-rationale = "Pre-existing ratchet drift reconciled for #781 to exact tokenizer and line output; no-growth ratchet."
+baseline_tokens = 258130
+baseline_lines = 33429
+issue = "831"
+rationale = "#831 adds bounded CLI content-write retry, total search deadline, and regression coverage; exact no-growth ratchet."
 
 [[files]]
 path = "src/markdown_export.rs"

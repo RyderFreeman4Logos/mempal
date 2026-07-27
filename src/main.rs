@@ -4956,6 +4956,8 @@ const STDIN_INGEST_SQLITE_LOCK_MAX_RETRIES: usize = 40;
 const STDIN_INGEST_STARTUP_BUSY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(100);
 const STDIN_INGEST_SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const CLI_CONTENT_WRITE_SQLITE_BUSY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(100);
 
 fn open_stdin_ingest_database_with_retry(path: &Path) -> Result<Database> {
     for attempt in 0..=STDIN_INGEST_SQLITE_LOCK_MAX_RETRIES {
@@ -4993,7 +4995,7 @@ fn open_cli_content_write_database_with_retry(
         {
             Ok(db) => {
                 db.conn()
-                    .busy_timeout(STDIN_INGEST_SQLITE_BUSY_TIMEOUT)
+                    .busy_timeout(CLI_CONTENT_WRITE_SQLITE_BUSY_TIMEOUT)
                     .with_context(|| {
                         format!("failed to set SQLite busy timeout for {operation}")
                     })?;
@@ -5054,6 +5056,24 @@ fn classify_cli_content_write_result<T>(
         }
         Err(error) => Err(error),
     }
+}
+
+const CLI_CONTENT_WRITE_SQLITE_LOCK_MAX_RETRIES: usize = 7;
+
+fn execute_cli_content_write_with_retry<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    for attempt in 0..=CLI_CONTENT_WRITE_SQLITE_LOCK_MAX_RETRIES {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if is_transient_sqlite_lock_error(&error)
+                    && attempt < CLI_CONTENT_WRITE_SQLITE_LOCK_MAX_RETRIES =>
+            {
+                std::thread::sleep(historical_rejudge_sqlite_lock_retry_delay(attempt));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("CLI content write retry loop returns on its terminal attempt")
 }
 
 fn open_historical_rejudge_startup_database_with_retry(
@@ -7770,6 +7790,19 @@ fn cli_search_db_deadline(config: &Config) -> std::time::Duration {
     std::time::Duration::from_secs(config.api.search_db_deadline_secs)
 }
 
+const CLI_SEARCH_TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn cli_search_remaining_deadline(deadline: std::time::Instant) -> Result<std::time::Duration> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        bail!(
+            "CLI search total deadline exceeded after {}s",
+            CLI_SEARCH_TOTAL_DEADLINE.as_secs()
+        );
+    }
+    Ok(remaining)
+}
+
 fn cli_search_rerank_deadline(config: &Config) -> std::time::Duration {
     let deadline_secs = config
         .search
@@ -7955,9 +7988,13 @@ async fn apply_cli_reranker_bounded(
 }
 
 fn cli_bm25_fallback_outcome(
-    request: CliSearchDbRequest,
+    mut request: CliSearchDbRequest,
     mut warnings: Vec<String>,
+    total_deadline: std::time::Instant,
 ) -> Result<SearchOutcome> {
+    request.deadline = request
+        .deadline
+        .min(cli_search_remaining_deadline(total_deadline)?);
     let deadline = request.deadline;
     match run_cli_bm25_search_bounded(request)? {
         Some(Ok(results)) => Ok(SearchOutcome {
@@ -7991,6 +8028,7 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
     config: &Config,
     embedder: &E,
     request: CliSearchExecutionRequest<'_>,
+    total_deadline: std::time::Instant,
 ) -> Result<SearchOutcome> {
     let CliSearchExecutionRequest {
         query,
@@ -8000,6 +8038,7 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
         options,
         top_k,
     } = request;
+    cli_search_remaining_deadline(total_deadline)?;
     if top_k == 0 {
         return Ok(SearchOutcome {
             results: Vec::new(),
@@ -8011,17 +8050,21 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
     let db_path = db.path().to_path_buf();
     let db_deadline = cli_search_db_deadline(config);
     let mut warnings = Vec::new();
+    let route_deadline = db_deadline.min(cli_search_remaining_deadline(total_deadline)?);
     let route = match run_cli_route_bounded(
         db_path.clone(),
         query.to_string(),
         wing.map(str::to_string),
         room.map(str::to_string),
-        db_deadline,
+        route_deadline,
     )? {
         Some(Ok(route)) => route,
         Some(Err(error)) => return Err(error),
         None => {
-            warnings.push(cli_search_timeout_warning("route resolution", db_deadline));
+            warnings.push(cli_search_timeout_warning(
+                "route resolution",
+                route_deadline,
+            ));
             fallback_cli_search_route(
                 wing,
                 room,
@@ -8040,12 +8083,10 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
         ));
         None
     } else {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(vector_search_circuit.search_deadline_secs),
-            embedder.embed(&[query]),
-        )
-        .await
-        {
+        let embed_deadline =
+            std::time::Duration::from_secs(vector_search_circuit.search_deadline_secs)
+                .min(cli_search_remaining_deadline(total_deadline)?);
+        match tokio::time::timeout(embed_deadline, embedder.embed(&[query])).await {
             Ok(Ok(vectors)) => match vectors.into_iter().next() {
                 Some(vector) => Some(vector),
                 None if vector_search_circuit.bm25_fallback_enabled => {
@@ -8081,7 +8122,7 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
         scope,
         options,
         top_k,
-        deadline: db_deadline,
+        deadline: db_deadline.min(cli_search_remaining_deadline(total_deadline)?),
     };
 
     let outcome = if let Some(query_vector) = query_vector {
@@ -8100,7 +8141,7 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
                         new_dim,
                         current_dim,
                     ));
-                    cli_bm25_fallback_outcome(db_request, warnings)?
+                    cli_bm25_fallback_outcome(db_request, warnings, total_deadline)?
                 } else {
                     return Err(error);
                 }
@@ -8108,7 +8149,7 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
             Some(Err(error)) => return Err(error),
             None if vector_search_circuit.bm25_fallback_enabled => {
                 warnings.push(cli_search_timeout_warning("hybrid search", db_deadline));
-                cli_bm25_fallback_outcome(db_request, warnings)?
+                cli_bm25_fallback_outcome(db_request, warnings, total_deadline)?
             }
             None => bail!(
                 "{}",
@@ -8116,10 +8157,17 @@ async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
             ),
         }
     } else {
-        cli_bm25_fallback_outcome(db_request, warnings)?
+        cli_bm25_fallback_outcome(db_request, warnings, total_deadline)?
     };
 
-    Ok(apply_cli_reranker_bounded(query, outcome, cli_search_rerank_deadline(config)).await)
+    let outcome = apply_cli_reranker_bounded(
+        query,
+        outcome,
+        cli_search_rerank_deadline(config).min(cli_search_remaining_deadline(total_deadline)?),
+    )
+    .await;
+    cli_search_remaining_deadline(total_deadline)?;
+    Ok(outcome)
 }
 
 async fn search_command(
@@ -8127,6 +8175,7 @@ async fn search_command(
     config: &Config,
     options: SearchCommandOptions<'_>,
 ) -> Result<()> {
+    let total_deadline = std::time::Instant::now() + CLI_SEARCH_TOTAL_DEADLINE;
     let current_dir = env::current_dir().ok();
     let resolved_project = resolve_project_id(options.project, config, current_dir.as_deref())
         .context("failed to resolve search project id")?;
@@ -8137,7 +8186,9 @@ async fn search_command(
         config.search.strict_project_isolation,
     );
     let room = resolve_room_session_scope(options.room, options.session)?;
+    cli_search_remaining_deadline(total_deadline)?;
     let embedder = build_embedder(config).await?;
+    cli_search_remaining_deadline(total_deadline)?;
     let outcome = cli_search_with_bounded_reads(
         db,
         config,
@@ -8155,6 +8206,7 @@ async fn search_command(
             },
             top_k: options.top_k,
         },
+        total_deadline,
     )
     .await?;
     for warning in &outcome.warnings {
@@ -12710,8 +12762,10 @@ fn delete_command(db: &Database, config: &Config, options: DeleteCommandOptions<
     let deleted = classify_cli_content_write_result(
         db,
         "delete",
-        db.soft_delete_drawer_in_project(options.drawer_id, drawer_project_id.as_deref())
-            .context("failed to soft-delete drawer"),
+        execute_cli_content_write_with_retry(|| {
+            db.soft_delete_drawer_in_project(options.drawer_id, drawer_project_id.as_deref())
+                .context("failed to soft-delete drawer")
+        }),
     )?;
     if !deleted {
         bail!("drawer not found: {}", options.drawer_id);
@@ -12740,8 +12794,10 @@ fn pin_command(db: &Database, drawer_id: &str) -> Result<()> {
     if !classify_cli_content_write_result(
         db,
         "pin",
-        db.pin_drawer(drawer_id, None)
-            .context("failed to pin drawer"),
+        execute_cli_content_write_with_retry(|| {
+            db.pin_drawer(drawer_id, None)
+                .context("failed to pin drawer")
+        }),
     )? {
         bail!("drawer not found: {drawer_id}");
     }
@@ -12755,7 +12811,9 @@ fn unpin_command(db: &Database, drawer_id: &str) -> Result<()> {
     if !classify_cli_content_write_result(
         db,
         "unpin",
-        db.unpin_drawer(drawer_id).context("failed to unpin drawer"),
+        execute_cli_content_write_with_retry(|| {
+            db.unpin_drawer(drawer_id).context("failed to unpin drawer")
+        }),
     )? {
         bail!("drawer not found: {drawer_id}");
     }
@@ -25071,6 +25129,64 @@ api_model = "text-embedding-3-large"
     }
 
     #[tokio::test]
+    async fn cli_search_total_deadline_returns_clear_error_without_running_a_stage() {
+        let (_tmp, db) = new_temp_db();
+        let config = Config::default();
+        let embedder = RecordingEmbedder::default();
+        let expired_deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+
+        let error = cli_search_with_bounded_reads(
+            &db,
+            &config,
+            &embedder,
+            CliSearchExecutionRequest {
+                query: "expired total deadline query",
+                wing: None,
+                room: None,
+                scope: ProjectSearchScope::all_projects(),
+                options: SearchOptions::default(),
+                top_k: 3,
+            },
+            expired_deadline,
+        )
+        .await
+        .expect_err("an expired CLI search deadline must fail before the next stage");
+
+        assert!(format!("{error:#}").contains("CLI search total deadline exceeded"));
+        assert!(embedder.seen_texts().is_empty());
+    }
+
+    #[test]
+    fn cli_content_write_retries_a_busy_mutation_until_the_lock_releases() {
+        let (_tmp, db) = new_temp_db();
+        insert_cli_test_drawer(&db, "cli-write-retry-busy");
+        db.conn()
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("make CLI content write fail fast while the blocker holds SQLite's write lock");
+        let blocker = rusqlite::Connection::open(db.path()).expect("open lock holder connection");
+        blocker
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("make lock holder fail fast");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold SQLite write lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(75));
+            blocker
+                .execute_batch("COMMIT;")
+                .expect("release SQLite write lock");
+        });
+
+        let pinned = execute_cli_content_write_with_retry(|| {
+            db.pin_drawer("cli-write-retry-busy", None)
+                .context("failed to pin drawer")
+        });
+        release.join().expect("join SQLite lock release");
+
+        assert!(pinned.expect("CLI content write must retry a transient SQLite lock"));
+    }
+
+    #[tokio::test]
     async fn cli_search_db_deadline_returns_empty_bm25_json_safe_outcome() {
         let (_tmp, db) = new_temp_db();
         let mut config = Config::default();
@@ -25090,6 +25206,7 @@ api_model = "text-embedding-3-large"
                 options: SearchOptions::default(),
                 top_k: 3,
             },
+            std::time::Instant::now() + CLI_SEARCH_TOTAL_DEADLINE,
         )
         .await
         .expect("bounded CLI search");
