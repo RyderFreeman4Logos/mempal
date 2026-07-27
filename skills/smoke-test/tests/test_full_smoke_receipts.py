@@ -126,6 +126,7 @@ class ReceiptExtractionTests(unittest.TestCase):
 
     def test_recover_created_ids_waits_on_operation_receipt(self) -> None:
         calls: list[tuple[str, str]] = []
+        timeout_receipt = {"operation_id": "op-timeout", "state": "queued", "timed_out": True}
 
         def fake_wait(operation_id: str, name: str) -> dict[str, Any]:
             calls.append((operation_id, name))
@@ -139,23 +140,23 @@ class ReceiptExtractionTests(unittest.TestCase):
         self.smoke.wait_operation = fake_wait
         try:
             ids, info = self.smoke.recover_created_ids(
-                {"operation_id": "op-timeout", "state": "queued", "timed_out": True},
+                timeout_receipt,
                 "unit_wait",
             )
         finally:
             self.smoke.wait_operation = original_wait
 
+        self.assertEqual(self.smoke.followable_timeout_operation_id(timeout_receipt), "op-timeout")
         self.assertEqual(ids, ["created-after-wait"])
         self.assertEqual(calls, [("op-timeout", "unit_wait")])
         self.assertEqual(info["recovered_via"], "unit_wait")
         self.assertEqual(info["recovered_state"], "completed")
 
     def test_recover_created_ids_reports_precise_non_pass_without_operation(self) -> None:
-        ids, info = self.smoke.recover_created_ids(
-            {"state": "queued", "timed_out": True},
-            "unused_wait",
-        )
+        timeout_without_operation = {"state": "queued", "timed_out": True}
+        ids, info = self.smoke.recover_created_ids(timeout_without_operation, "unused_wait")
 
+        self.assertIsNone(self.smoke.followable_timeout_operation_id(timeout_without_operation))
         self.assertEqual(ids, [])
         self.assertEqual(info["operation_state"], "queued")
         self.assertFalse(info["operation_id_present"])

@@ -1184,6 +1184,17 @@ def operation_id_from(value: Any) -> str | None:
     return None
 
 
+def followable_timeout_operation_id(value: Any) -> str | None:
+    """Return an accepted MCP wait-timeout receipt's operation ID, if any."""
+    if create_terminal_receipt(value) is not None:
+        return None
+    for receipt in receipt_dicts_from(value):
+        operation_id = receipt.get('operation_id')
+        if receipt.get('timed_out') is True and isinstance(operation_id, str) and operation_id:
+            return operation_id
+    return None
+
+
 def operation_state_from(value: Any) -> str | None:
     last_state: str | None = None
     for receipt in receipt_dicts_from(value):
@@ -1684,10 +1695,12 @@ def mcp_crud() -> list[str]:
         ids = created_ids_from(create)
         mcp_receipt = create_terminal_receipt([create, info])
         _remember_created_ids(ids)
-        create_operation_id = operation_id_from(create)
+        create_receipt = [create, info]
+        create_operation_id = operation_id_from(create_receipt)
+        create_timeout_operation_id = followable_timeout_operation_id(create_receipt)
         create_recovery: dict[str, Any] = {
             'operation_id_present': bool(create_operation_id),
-            'operation_state': operation_state_from(create),
+            'operation_state': operation_state_from(create_receipt),
         }
         if create_operation_id and client is not None:
             status_structured, status_info = client.tool(
@@ -1696,12 +1709,20 @@ def mcp_crud() -> list[str]:
                 timeout=30,
             )
             note('mcp_operation_status', bool(status_info.get('ok')), **without_ok(status_info))
+            status_ids = created_ids_from(status_structured)
+            if not ids and status_ids:
+                ids = status_ids
+                _remember_created_ids(ids)
+                create_recovery.update({
+                    'recovered_via': 'mcp_operation_status',
+                    'recovered_state': operation_state_from(status_structured),
+                })
         elif 'mempal_operation_status' in tool_names:
             note('mcp_operation_status', True, skipped='no_operation_receipt')
         else:
             note('mcp_operation_status', True, skipped='tool_not_advertised')
 
-        if not ids and create_operation_id:
+        if not ids and create_timeout_operation_id:
             # A non-terminal MCP ingest receipt means the daemon may still be
             # processing the write. Close this stdio server before following the
             # operation via CLI so the smoke runner never observes a result while
@@ -1709,7 +1730,7 @@ def mcp_crud() -> list[str]:
             waited = run_fallback_after_mcp_reaped(
                 client,
                 'create_cli_wait',
-                lambda: wait_operation(create_operation_id, 'mcp_create_cli_wait'),
+                lambda: wait_operation(create_timeout_operation_id, 'mcp_create_cli_wait'),
             )
             client = None
             ids = created_ids_from(waited)
@@ -1794,16 +1815,17 @@ def mcp_crud() -> list[str]:
         update, uinfo = _mcp_tool_with_hard_timeout(client, 'mempal_ingest', update_args, timeout=30)
         upd_ids = created_ids_from(update)
         _remember_created_ids(upd_ids)
+        update_receipt = [update, uinfo]
+        update_timeout_operation_id = followable_timeout_operation_id(update_receipt)
         update_recovery: dict[str, Any] = {
-            'operation_id_present': bool(operation_id_from(update)),
-            'operation_state': operation_state_from(update),
+            'operation_id_present': bool(operation_id_from(update_receipt)),
+            'operation_state': operation_state_from(update_receipt),
         }
-        if not upd_ids and operation_id_from(update):
-            operation_id = operation_id_from(update) or ''
+        if not upd_ids and update_timeout_operation_id:
             waited = run_fallback_after_mcp_reaped(
                 client,
                 'update_cli_wait',
-                lambda: wait_operation(operation_id, 'mcp_update_cli_wait'),
+                lambda: wait_operation(update_timeout_operation_id, 'mcp_update_cli_wait'),
             )
             client = None
             upd_ids = created_ids_from(waited)
