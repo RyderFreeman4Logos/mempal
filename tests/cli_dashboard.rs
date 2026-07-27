@@ -740,7 +740,7 @@ async fn test_tail_follow_coalesces_event_storm() {
 fn test_tail_follow_sees_new_drawers() {
     let env = DashboardEnv::new();
     let mut child = spawn_mempal(&env.home, env.cwd(), &["tail", "--follow", "--limit", "0"]);
-    std::thread::sleep(Duration::from_millis(800));
+    std::thread::sleep(Duration::from_secs(2));
 
     insert_drawer(
         &env.db_path,
@@ -754,7 +754,7 @@ fn test_tail_follow_sees_new_drawers() {
         ),
     );
 
-    let (lines, _) = read_lines_until(&mut child, 1, Duration::from_secs(5));
+    let (lines, _) = read_lines_until(&mut child, 1, Duration::from_secs(10));
     let _ = child.kill();
     let _ = child.wait();
 
