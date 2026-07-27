@@ -539,6 +539,14 @@ issue = "695"
 rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
 
 [[files]]
+path = "tests/local_gate_receipt_scripts.rs"
+kind = "test"
+baseline_tokens = 7371
+baseline_lines = 823
+issue = "833"
+rationale = "#833/#834 gate fixture hardening adds process-group kill/reap and bounded wait budgets for cold-target flake resistance; exact no-growth ratchet."
+
+[[files]]
 path = "tests/mind_model_bootstrap.rs"
 kind = "test"
 baseline_tokens = 21045

@@ -26,8 +26,15 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> io::Result<Output> 
             return child.wait_with_output();
         }
         if Instant::now() >= deadline {
-            kill_waited_child_process_group(&mut child)?;
+            // Always attempt kill, then always reap. ESRCH (already exited between
+            // try_wait and kill) is a normal race and must not skip wait_with_output.
+            let kill_error = kill_waited_child_process_group(&mut child).err();
             let output = child.wait_with_output()?;
+            if let Some(error) = kill_error {
+                if error.kind() != io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+            }
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
@@ -56,10 +63,25 @@ fn kill_waited_child_process_group(child: &mut Child) -> io::Result<()> {
             "waited child PID exceeds i32 range",
         )
     })?;
-    // Every wait_with_timeout caller uses spawn_waited_child, so this targets only the
-    // child-owned process group and clears descendants that inherited captured pipes.
+    // SAFETY:
+    // - `pid` is the live child PID returned by `Child::id` and converted to i32.
+    // - Every caller of this helper spawns via `spawn_waited_child`, which sets
+    //   `process_group(0)` so the child's PGID equals its PID.
+    // - Negative PID means "signal the process group", so only that child-owned
+    //   group is targeted (no other processes share this PGID).
+    // - The PID is reaped immediately after this call via `wait_with_output`, so
+    //   it cannot be reused for an unrelated process before reaping.
+    // - ESRCH (no such process) is a normal race when the child exits between
+    //   poll and kill; callers treat NotFound as non-fatal after reaping.
     if unsafe { libc::kill(-pid, libc::SIGKILL) } == -1 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "waited child process group already exited",
+            ));
+        }
+        return Err(err);
     }
     Ok(())
 }
@@ -71,7 +93,18 @@ fn spawn_waited_child(command: &mut Command) -> io::Result<Child> {
 
 #[cfg(not(unix))]
 fn kill_waited_child_process_group(child: &mut Child) -> io::Result<()> {
-    child.kill()
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            // Already exited on some platforms; treat as NotFound for the
+            // shared always-reap timeout path.
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "waited child already exited",
+            ))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn bounded_diagnostic(output: &[u8]) -> String {
