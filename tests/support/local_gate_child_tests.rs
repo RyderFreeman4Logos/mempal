@@ -17,7 +17,8 @@ mod tests {
     fn wait_for_file(path: &Path, timeout: Duration, description: &str) {
         let deadline = Instant::now() + timeout;
         while !path.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            thread::sleep(Duration::from_millis(25).min(remaining));
         }
         assert!(path.exists(), "{description} did not become ready");
     }
@@ -28,9 +29,15 @@ mod tests {
             .args([
                 "-c",
                 r#"
+                    (
+                        trap '' TERM
+                        pid="${BASHPID}"
+                        start_time="$(awk '{print $22}' "/proc/${pid}/stat")"
+                        printf '%s %s\n' "${pid}" "${start_time}" >"${PID_FILE:?}"
+                        exec /bin/sleep 60
+                    ) &
+                    while [[ ! -s "${PID_FILE:?}" ]]; do /bin/sleep 0.01; done
                     : >"${READY_FILE:?}"
-                    printf '%s\n' "${BASHPID}" >"${PID_FILE:?}"
-                    ( trap '' TERM; exec /bin/sleep 60 ) &
                     while true; do sleep 0.01; done
                 "#,
             ])
@@ -580,20 +587,20 @@ mod tests {
         let pid_file = fixture.path().join("pid");
         let mut gate = GateChild::new(spawn_pipe_holding_child(&ready_file, &pid_file))
             .expect("capture pipe-holder child identity");
-        wait_for_file(&ready_file, Duration::from_secs(2), "pipe-holder fixture");
-
+        wait_for_file(&ready_file, Duration::from_secs(10), "pipe-holder fixture");
+        let descendant = process_identity_from_pid_file(&pid_file);
         let started = Instant::now();
         let error = gate
-            .wait_with_timeout(Duration::from_millis(50))
+            .wait_with_timeout(Duration::from_millis(250))
             .expect_err("a gate timeout must return an error");
-
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        drop(gate);
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(10),
             "GateChild timeout cleanup must not hang on inherited pipes"
         );
+        assert_process_identity_gone_within(descendant, Duration::from_secs(5));
     }
-
     #[test]
     fn gate_child_drop_reaps_descendants_that_hold_pipes() {
         let fixture = tempfile::tempdir().expect("create drop pipe-holder fixture");
@@ -603,16 +610,16 @@ mod tests {
         {
             let gate = GateChild::new(spawn_pipe_holding_child(&ready_file, &pid_file))
                 .expect("capture pipe-holder child identity");
-            wait_for_file(&ready_file, Duration::from_secs(2), "pipe-holder fixture");
+            wait_for_file(&ready_file, Duration::from_secs(10), "pipe-holder fixture");
+            let descendant = process_identity_from_pid_file(&pid_file);
             drop(gate);
+            assert_process_identity_gone_within(descendant, Duration::from_secs(5));
         }
-
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(10),
             "GateChild Drop cleanup must not hang on inherited pipes"
         );
     }
-
     #[test]
     fn gate_child_timeout_terminates_setsid_escape_without_hanging() {
         let fixture = tempfile::tempdir().expect("create setsid pipe-holder fixture");

@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8152
-baseline_lines = 579
-issue = "823"
-rationale = "#823 adds the changelog entry the changelog-check hook requires; CHANGELOG.md growth is unavoidable, exact no-growth ratchet."
+baseline_tokens = 8188
+baseline_lines = 582
+issue = "824"
+rationale = "#824 adds the changelog entry required by changelog-check for the query-only MCP admission diagnostic; append-only growth is unavoidable, exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -357,10 +357,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 176773
-baseline_lines = 22311
-issue = "825"
-rationale = "Pre-existing monolith; #825 adds a real 14/16 MCP wait=true ProfileDbAdmission regression proving admission_blocked receipts are cleanup-safe with empty drawer IDs; no-growth ratchet until the MCP server split lands."
+baseline_tokens = 177616
+baseline_lines = 22410
+issue = "824"
+rationale = "#824 preserves original query-only open-error causes under holder saturation and adds the saturated permission-denied regression; exact no-growth ratchet until the MCP server split lands."
 
 [[files]]
 path = "src/mcp/tools.rs"

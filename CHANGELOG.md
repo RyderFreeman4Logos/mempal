@@ -42,6 +42,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **MCP context admission**: return an actionable structured `admission_blocked`
+  diagnostic when a saturated profile holder budget prevents opening the
+  query-only context pool (#824).
 - **MCP context scope**: replace the shared `RetrievalScopeRequest` on
   `mempal_context` with a dedicated `deny_unknown_fields` `ContextScopeRequest`
   so search-only fields (`wing`, `room`, `session`, `memory_kind`, `tier`,

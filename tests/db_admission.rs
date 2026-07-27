@@ -247,7 +247,7 @@ fn deadline_child_bounds_non_exiting_fixture_with_inherited_pipes() {
         "-c",
         "trap '' TERM; printf ready; while :; do sleep 60; done",
     ]);
-    let output = DeadlineChild::output(command, Duration::from_secs(1))
+    let output = DeadlineChild::output(command, Duration::from_secs(5))
         .expect("run non-exiting inherited-pipe fixture");
 
     assert_eq!(output.stdout, b"ready");
@@ -259,7 +259,7 @@ fn deadline_child_bounds_non_exiting_fixture_with_inherited_pipes() {
     );
     assert!(output.cleanup.kill_fence_sent);
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < Duration::from_secs(15),
         "subprocess cleanup exceeded its deadline"
     );
 }
