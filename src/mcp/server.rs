@@ -2057,12 +2057,15 @@ impl MempalMcpServer {
             )
             .await
             .map_err(|error| {
-                if let Some(diagnostic) =
-                    query_only_admission_diagnostic(&self.db_path, "query_only_async_db")
-                {
+                let diagnostic = status_database_diagnostic(
+                    &self.db_path,
+                    "query_only_async_db",
+                    error.as_ref(),
+                );
+                if diagnostic.failure_kind == "holder_budget_exceeded" {
                     mcp_query_only_pool_admission_error(&self.db_path, stage, diagnostic)
                 } else {
-                    ErrorData::internal_error(error.to_string(), None)
+                    ErrorData::internal_error(status_error_summary(error.as_ref()), None)
                 }
             })?;
 
@@ -2101,7 +2104,7 @@ impl MempalMcpServer {
         let async_db = self
             .query_only_async_db()
             .await
-            .map_err(|error| anyhow::anyhow!("{stage} failed to open database: {error}"))?;
+            .map_err(|error| error.context(format!("{stage} failed to open database")))?;
         let sqlite_deadline = Instant::now() + deadline;
         let read = async_db.run_read_anyhow_until(sqlite_deadline, move |db| {
             if let Some(delay) = delay {
@@ -11836,20 +11839,6 @@ fn mcp_async_pool_admission_error(
     )
 }
 
-fn query_only_admission_diagnostic(db_path: &Path, source: &str) -> Option<DatabaseDiagnosticDto> {
-    let snapshot = crate::core::db_admission::ProfileDbAdmission::snapshot(db_path).ok()?;
-    (snapshot.active_holders >= snapshot.configured_holder_limit).then(|| DatabaseDiagnosticDto {
-        path: db_path.display().to_string(),
-        source: source.to_string(),
-        failure_kind: "holder_budget_exceeded".to_string(),
-        summary: format!(
-            "profile database holder budget exceeded: active_holders={}/{}",
-            snapshot.active_holders, snapshot.configured_holder_limit
-        ),
-        hint: status_db_failure_hint("holder_budget_exceeded").to_string(),
-    })
-}
-
 fn mcp_query_only_pool_admission_error(
     db_path: &Path,
     operation: &'static str,
@@ -18455,6 +18444,41 @@ prototypes = ["keep"]
         let error_text = error.to_string();
         assert!(error_text.contains("failed to open database"));
         assert!(error_text.contains("permission denied"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_context_preserves_non_admission_query_open_error_when_holders_saturated() {
+        let (_tempdir, db_path, server) = setup_server();
+        let server = server.with_query_only_async_db_open_error_for_test("permission denied");
+        let _holders = (0..15)
+            .map(|_| {
+                ProfileDbAdmission::acquire(
+                    &db_path,
+                    DbAdmissionRequest::new(DbHolderClass::Mcp, 1, 1),
+                )
+                .expect("saturate MCP holder budget")
+            })
+            .collect::<Vec<_>>();
+        let snapshot =
+            ProfileDbAdmission::snapshot(&db_path).expect("read saturated holder snapshot");
+        assert_eq!(snapshot.active_holders, snapshot.configured_holder_limit);
+
+        let error = match server
+            .context_json_for_test(serde_json::json!({
+                "query": "permission under holder saturation",
+                "max_items": 3
+            }))
+            .await
+        {
+            Ok(_) => panic!("context should preserve non-admission database open failures"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("permission denied"));
+        assert!(
+            error.data.is_none(),
+            "non-admission open error must not become an admission receipt: {error:?}"
+        );
     }
 
     #[tokio::test]

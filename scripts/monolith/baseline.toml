@@ -357,10 +357,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 177470
-baseline_lines = 22386
+baseline_tokens = 177616
+baseline_lines = 22410
 issue = "824"
-rationale = "#824 adds bounded query-only pool admission diagnostics plus a saturated-holder MCP context regression; exact no-growth ratchet until the MCP server split lands."
+rationale = "#824 preserves original query-only open-error causes under holder saturation and adds the saturated permission-denied regression; exact no-growth ratchet until the MCP server split lands."
 
 [[files]]
 path = "src/mcp/tools.rs"
