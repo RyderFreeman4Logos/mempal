@@ -341,8 +341,8 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/main.rs"
 kind = "source"
-baseline_tokens = 258784
-baseline_lines = 33516
+baseline_tokens = 258476
+baseline_lines = 33477
 issue = "833"
 rationale = "#833 reserves a CLI BM25 fallback budget and adds bounded hybrid-timeout regression coverage; exact no-growth ratchet until the main CLI split lands."
 
