@@ -39,6 +39,7 @@ mod queue_queries;
 pub mod reindex;
 pub mod remote_calls;
 pub mod skills;
+pub mod sqlite_retry;
 pub mod strata;
 pub mod timeline;
 pub mod types;

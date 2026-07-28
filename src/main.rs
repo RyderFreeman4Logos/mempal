@@ -5059,28 +5059,11 @@ fn classify_cli_content_write_result<T>(
     }
 }
 
-const CLI_CONTENT_WRITE_SQLITE_LOCK_RETRY_DEADLINE: std::time::Duration =
-    std::time::Duration::from_secs(10);
-
-fn execute_cli_content_write_with_retry<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
-    let retry_deadline = std::time::Instant::now() + CLI_CONTENT_WRITE_SQLITE_LOCK_RETRY_DEADLINE;
-    let mut attempt = 0;
-    loop {
-        match operation() {
-            Ok(value) => return Ok(value),
-            Err(error) if is_transient_sqlite_lock_error(&error) => {
-                let remaining = retry_deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    return Err(error);
-                }
-                std::thread::sleep(
-                    historical_rejudge_sqlite_lock_retry_delay(attempt).min(remaining),
-                );
-                attempt = attempt.saturating_add(1);
-            }
-            Err(error) => return Err(error),
-        }
-    }
+fn execute_cli_content_write_with_retry<T>(operation: impl FnMut() -> Result<T>) -> Result<T> {
+    mempal::core::sqlite_retry::retry_content_mutation_sqlite_lock(
+        operation,
+        is_transient_sqlite_lock_error,
+    )
 }
 
 fn open_historical_rejudge_startup_database_with_retry(
