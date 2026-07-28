@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8351
-baseline_lines = 591
-issue = "836"
-rationale = "#836 adds the changelog entry the changelog-check hook requires; append-only growth is unavoidable, exact no-growth ratchet."
+baseline_tokens = 8404
+baseline_lines = 592
+issue = "838"
+rationale = "#838 adds the changelog entry the changelog-check hook requires; append-only growth is unavoidable, exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"

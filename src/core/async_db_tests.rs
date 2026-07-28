@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 fn short_tempdir() -> tempfile::TempDir {
     tempfile::TempDir::new_in("/tmp").expect("short tempdir")
@@ -83,6 +83,37 @@ async fn writer_is_writable() {
         .await
         .expect("read writer pragma");
     assert_eq!(query_only, 0);
+}
+
+#[tokio::test]
+async fn deadline_write_does_not_dispatch_closure_after_expiry() {
+    let tmp = short_tempdir();
+    let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1)
+        .expect("open async db")
+        .with_write_delay(Duration::from_millis(200));
+    let closure_called = Arc::new(AtomicBool::new(false));
+    let closure_called_by_write = Arc::clone(&closure_called);
+    let deadline = Instant::now() + Duration::from_millis(100);
+
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        adb.run_write_until(deadline, move |_db| {
+            closure_called_by_write.store(true, Ordering::SeqCst);
+            Ok::<(), DbError>(())
+        }),
+    )
+    .await
+    .expect("write deadline must bound blocking dispatch")
+    .expect_err("expired write must return a retryable SQLite lock error");
+
+    assert!(crate::core::db::db_error_is_sqlite_lock(&error));
+    assert!(
+        !closure_called.load(Ordering::SeqCst),
+        "expired write must not start its closure"
+    );
+    adb.run_write(|_db| Ok::<(), DbError>(()))
+        .await
+        .expect("expired write must release the writer permit");
 }
 
 #[test]

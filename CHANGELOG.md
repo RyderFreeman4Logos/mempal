@@ -42,6 +42,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **SQLite mutation retries**: make the shared 10-second CLI/MCP lock retry budget an authoritative wall-clock bound across backoff, pooled writer admission, and SQLite busy waits; expired MCP deletes return structured retryable lock errors without a late soft-delete (#838).
 - **MCP delete**: retry cached async-pool SQLite busy/locked soft deletes for 10 seconds, matching CLI content mutations (#836).
 - **MCP ingest**: preserve queued `wait=true` recovery when daemon hook IPC and
   REST are unavailable, retaining an operation receipt for reconciliation (#834).

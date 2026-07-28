@@ -4,12 +4,12 @@ use crate::core::sqlite_retry::retry_content_mutation_sqlite_lock_async;
 
 pub(super) async fn run(async_db: AsyncDb, drawer_id: String) -> Result<bool, DbError> {
     retry_content_mutation_sqlite_lock_async(
-        move || {
+        move |retry_deadline| {
             let async_db = async_db.clone();
             let drawer_id = drawer_id.clone();
             async move {
                 async_db
-                    .run_write(move |db| db.soft_delete_drawer(&drawer_id))
+                    .run_write_until(retry_deadline, move |db| db.soft_delete_drawer(&drawer_id))
                     .await
             }
         },
