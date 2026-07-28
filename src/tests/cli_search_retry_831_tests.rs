@@ -80,7 +80,7 @@ fn block_on_result_bounds_runtime_shutdown_after_search_deadline() {
                 initialization_started_tx
                     .send(())
                     .expect("report that blocking initialization started");
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                std::thread::sleep(std::time::Duration::from_secs(3));
                 initialization_finished_tx
                     .send(())
                     .expect("report that blocking initialization finished");
@@ -98,11 +98,11 @@ fn block_on_result_bounds_runtime_shutdown_after_search_deadline() {
 
     assert!(format!("{error:#}").contains("CLI search total deadline exceeded"));
     assert!(
-        started_at.elapsed() < std::time::Duration::from_millis(750),
+        started_at.elapsed() < std::time::Duration::from_millis(1500),
         "runtime teardown must not wait for a blocking initializer after the search deadline"
     );
     initialization_finished_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
+        .recv_timeout(std::time::Duration::from_secs(4))
         .expect("the detached blocking initializer should finish independently");
 }
 

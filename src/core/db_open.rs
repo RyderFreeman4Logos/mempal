@@ -59,8 +59,24 @@ impl Database {
         Self::open_with_mode(path, OpenMode::ReadWrite, false)
     }
 
+    /// Open an unadmitted read-write connection with a bounded SQLite busy wait.
+    pub(crate) fn open_unadmitted_with_busy_timeout(
+        path: &Path,
+        busy_timeout: Duration,
+    ) -> Result<Self, DbError> {
+        Self::open_with_mode_and_busy_timeout(path, OpenMode::ReadWrite, busy_timeout, false)
+    }
+
     pub(crate) fn open_query_only_unadmitted(path: &Path) -> Result<Self, DbError> {
         Self::open_with_mode(path, OpenMode::QueryOnly, false)
+    }
+
+    /// Open an unadmitted query-only connection with a bounded SQLite busy wait.
+    pub(crate) fn open_query_only_unadmitted_with_busy_timeout(
+        path: &Path,
+        busy_timeout: Duration,
+    ) -> Result<Self, DbError> {
+        Self::open_with_mode_and_busy_timeout(path, OpenMode::QueryOnly, busy_timeout, false)
     }
 
     fn open_with_mode(path: &Path, mode: OpenMode, admitted: bool) -> Result<Self, DbError> {

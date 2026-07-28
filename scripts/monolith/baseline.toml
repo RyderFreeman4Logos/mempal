@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8351
-baseline_lines = 591
-issue = "836"
-rationale = "#836 adds the changelog entry the changelog-check hook requires; append-only growth is unavoidable, exact no-growth ratchet."
+baseline_tokens = 8404
+baseline_lines = 592
+issue = "838"
+rationale = "#838 adds the changelog entry the changelog-check hook requires; append-only growth is unavoidable, exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -357,10 +357,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 177982
-baseline_lines = 22445
-issue = "834"
-rationale = "#834 preserves recoverable wait=true MCP queue admission when daemon REST is unavailable and adds regression coverage; exact no-growth ratchet until the MCP server split lands."
+baseline_tokens = 178019
+baseline_lines = 22447
+issue = "838"
+rationale = "#838 hardens the load-sensitive MCP queue-admission receipt fixture outer client budget only; product admission deadline unchanged. Exact no-growth ratchet until the MCP server split lands."
 
 [[files]]
 path = "src/mcp/tools.rs"
@@ -437,10 +437,10 @@ rationale = "xurl store drift reconciled for #783 to exact formatter/tokenizer o
 [[files]]
 path = "tests/cli_dashboard.rs"
 kind = "test"
-baseline_tokens = 10551
-baseline_lines = 1450
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 10804
+baseline_lines = 1476
+issue = "838"
+rationale = "#838 hardens the load-sensitive observability readonly dashboard fixture under full-suite contention (disable hot-reload watcher + bounded bootstrap-only retries); exact no-growth ratchet."
 
 [[files]]
 path = "tests/config_hot_reload.rs"
