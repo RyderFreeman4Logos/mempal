@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8404
-baseline_lines = 592
-issue = "838"
-rationale = "#838 adds the changelog entry the changelog-check hook requires; append-only growth is unavoidable, exact no-growth ratchet."
+baseline_tokens = 8447
+baseline_lines = 593
+issue = "840"
+rationale = "#840 adds the changelog entry the changelog-check hook requires; append-only growth is unavoidable, exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -357,10 +357,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 178019
-baseline_lines = 22447
-issue = "838"
-rationale = "#838 hardens the load-sensitive MCP queue-admission receipt fixture outer client budget only; product admission deadline unchanged. Exact no-growth ratchet until the MCP server split lands."
+baseline_tokens = 178830
+baseline_lines = 22533
+issue = "840"
+rationale = "#840 adds bounded SQLite BUSY/LOCKED retry to the query-only read path so MCP reads survive transient lock contention; growth is the retry wiring, an ErrorData-aware lock predicate, and a regression test."
 
 [[files]]
 path = "src/mcp/tools.rs"

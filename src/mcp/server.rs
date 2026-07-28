@@ -41,6 +41,7 @@ use crate::core::{
         RemoteCallService, endpoint_policy_diagnostic_label, endpoint_policy_global_runtime_error,
         endpoint_policy_runtime_error,
     },
+    sqlite_retry::retry_query_only_read_sqlite_lock_async,
     strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
         AnchorKind, BootstrapIdentityParts, Drawer, DrawerSummary, ExplicitTunnel,
@@ -2043,15 +2044,26 @@ impl MempalMcpServer {
         f: F,
     ) -> std::result::Result<R, ErrorData>
     where
-        F: FnOnce(&Database) -> std::result::Result<R, ErrorData> + Send + 'static,
+        F: Fn(&Database) -> std::result::Result<R, ErrorData> + Send + Sync + 'static,
         R: Send + 'static,
     {
+        // #840: wrap the caller closure so a transient SQLite BUSY/LOCKED error
+        // surfaced as an `ErrorData` propagates as an anyhow error for the retry
+        // loop (which inspects the anyhow error chain). Non-lock `ErrorData`
+        // values pass through as inner results so the caller sees them unchanged.
+        let f = Arc::new(f);
         let read = self
             .run_query_only_read_anyhow_bounded(
                 stage,
                 deadline,
                 self.query_only_read_delay_for_current_build(),
-                move |db| Ok(f(db)),
+                move |db| match f(db) {
+                    Ok(result) => Ok(Ok(result)),
+                    Err(error) if mcp_error_data_is_transient_database_lock(&error) => {
+                        Err(anyhow::Error::new(error))
+                    }
+                    Err(error) => Ok(Err(error)),
+                },
             )
             .await
             .map_err(|error| {
@@ -2096,7 +2108,7 @@ impl MempalMcpServer {
         f: F,
     ) -> anyhow::Result<Option<R>>
     where
-        F: FnOnce(&Database) -> anyhow::Result<R> + Send + 'static,
+        F: Fn(&Database) -> anyhow::Result<R> + Send + Sync + 'static,
         R: Send + 'static,
     {
         let async_db = self
@@ -2104,24 +2116,48 @@ impl MempalMcpServer {
             .await
             .map_err(|error| error.context(format!("{stage} failed to open database")))?;
         let sqlite_deadline = Instant::now() + deadline;
-        let read = async_db.run_read_anyhow_until(sqlite_deadline, move |db| {
-            if let Some(delay) = delay {
-                std::thread::sleep(delay);
-            }
-            f(db)
-        });
 
-        match tokio::time::timeout(deadline + MCP_SQLITE_INTERRUPT_GRACE, read).await {
-            Ok(Ok(_)) if Instant::now() >= sqlite_deadline => Ok(None),
-            Ok(Ok(result)) => Ok(Some(result)),
-            Ok(Err(error))
-                if anyhow_error_is_read_deadline_exceeded(&error)
+        // #840: query-only reads previously had no application-level retry on
+        // transient SQLite BUSY/LOCKED errors, so under daemon/ingest contention
+        // a read surfaced as an opaque JSON-RPC -32603. Wrap the read in the
+        // shared bounded lock retry under the existing wall-clock deadline, the
+        // same pattern the mutation path uses (#836/#838). The closure must be
+        // re-callable (`Fn`) so each retry reissues the read; a returned success
+        // is never reinterpreted as a lock error.
+        let f = Arc::new(f);
+        let read = retry_query_only_read_sqlite_lock_async(
+            sqlite_deadline,
+            move |attempt_deadline| {
+                let async_db = async_db.clone();
+                let f = Arc::clone(&f);
+                async move {
+                    async_db
+                        .run_read_anyhow_until(attempt_deadline, move |db| {
+                            if let Some(delay) = delay {
+                                std::thread::sleep(delay);
+                            }
+                            f(db)
+                        })
+                        .await
+                }
+            },
+            anyhow_chain_contains_sqlite_lock,
+        )
+        .await;
+
+        match read {
+            Ok(_) if Instant::now() >= sqlite_deadline => Ok(None),
+            Ok(result) => Ok(Some(result)),
+            // A transient lock error here means the deadline elapsed mid-retry;
+            // map to a timeout rather than a hard failure (#840).
+            Err(error)
+                if anyhow_chain_contains_sqlite_lock(&error)
+                    || anyhow_error_is_read_deadline_exceeded(&error)
                     || Instant::now() >= sqlite_deadline =>
             {
                 Ok(None)
             }
-            Ok(Err(error)) => Err(error),
-            Err(_) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -3383,6 +3419,11 @@ fn anyhow_chain_contains_sqlite_lock(error: &anyhow::Error) -> bool {
                 .is_some_and(|db_error| {
                     matches!(db_error, crate::core::db::DbError::Sqlite(error) if rusqlite_error_is_lock(error))
                 })
+            // #840: MCP read handlers convert DbError to ErrorData before the
+            // retry boundary, so also detect lock errors by their message text.
+            || cause
+                .downcast_ref::<ErrorData>()
+                .is_some_and(mcp_error_data_is_transient_database_lock)
     })
 }
 
@@ -6059,7 +6100,7 @@ impl MempalMcpServer {
         };
         let pack = self
             .run_query_only_read_bounded("mempal_context", self.search_db_deadline, move |db| {
-                assemble_context_with_vector(db, context_request, &query_vector)
+                assemble_context_with_vector(db, context_request.clone(), &query_vector)
                     .map_err(context_error)
             })
             .await?;
@@ -9222,14 +9263,14 @@ impl MempalMcpServer {
         };
         let brief = self
             .run_query_only_read_bounded("mempal_brief", self.search_db_deadline, move |db| {
-                match retrieval_plan {
+                match retrieval_plan.clone() {
                     BriefRetrievalPlan::Hybrid { query_vector } => assemble_brief_with_plan(
                         db,
-                        core_request,
+                        core_request.clone(),
                         BriefRetrievalPlan::Hybrid { query_vector },
                     ),
                     BriefRetrievalPlan::Bm25Only { warning } => {
-                        assemble_brief_from_bm25(db, core_request, warning)
+                        assemble_brief_from_bm25(db, core_request.clone(), warning)
                     }
                 }
                 .map_err(|error| ErrorData::internal_error(format!("brief failed: {error}"), None))
@@ -13099,6 +13140,51 @@ mod tests {
             .expect("query-only read should not open writer-capable async db");
 
         assert_eq!(query_only, 1);
+    }
+
+    #[tokio::test]
+    async fn test_query_only_read_retries_transient_sqlite_lock() {
+        // #840: a query-only read must survive a transient SQLite BUSY/LOCKED
+        // error by retrying under the existing deadline, instead of surfacing
+        // an opaque JSON-RPC -32603. The closure simulates one transient lock
+        // failure before succeeding on the second attempt.
+        let (_tempdir, _db_path, server) = setup_server();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_closure = Arc::clone(&attempts);
+
+        let value = server
+            .run_query_only_read_bounded(
+                "test_query_only_read_lock_retry",
+                Duration::from_secs(5),
+                move |db| {
+                    let count = attempts_for_closure.fetch_add(1, Ordering::SeqCst);
+                    if count == 0 {
+                        // First attempt: simulate a transient SQLite lock error.
+                        return Err(ErrorData::internal_error(
+                            rusqlite::Error::SqliteFailure(
+                                rusqlite::ffi::Error {
+                                    code: rusqlite::ErrorCode::DatabaseBusy,
+                                    extended_code: rusqlite::ffi::SQLITE_BUSY,
+                                },
+                                Some("database is locked".to_string()),
+                            )
+                            .to_string(),
+                            None,
+                        ));
+                    }
+                    db.conn()
+                        .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                        .map_err(db_error)
+                },
+            )
+            .await
+            .expect("query-only read should retry past transient lock");
+
+        assert_eq!(value, 1, "read must succeed after retry");
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "transient lock must trigger at least one retry"
+        );
     }
 
     #[tokio::test]

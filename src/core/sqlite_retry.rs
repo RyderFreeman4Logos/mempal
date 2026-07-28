@@ -108,6 +108,28 @@ where
         .await
 }
 
+/// Retry a query-only read closure on transient SQLite BUSY/LOCKED errors under
+/// a caller-supplied deadline (#840).
+///
+/// Unlike [`retry_content_mutation_sqlite_lock_async`], this does not impose a
+/// fresh 10-second budget: the read must honor the wall-clock deadline the
+/// caller already granted (for example the MCP search deadline), so the retry
+/// loop reuses that deadline directly. A returned success is always passed
+/// through unchanged, even if it arrives after the deadline has elapsed.
+pub async fn retry_query_only_read_sqlite_lock_async<T, E, F, Fut>(
+    retry_deadline: Instant,
+    operation: F,
+    is_transient_lock: impl Fn(&E) -> bool,
+) -> Result<T, E>
+where
+    E: From<rusqlite::Error>,
+    F: FnMut(Instant) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    retry_content_mutation_sqlite_lock_async_until(retry_deadline, operation, is_transient_lock)
+        .await
+}
+
 async fn retry_content_mutation_sqlite_lock_async_until<T, E, F, Fut>(
     retry_deadline: Instant,
     mut operation: F,
@@ -151,6 +173,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[test]
@@ -190,5 +215,39 @@ mod tests {
             Instant::now() >= deadline,
             "fixture must return after expiry"
         );
+    }
+
+    #[tokio::test]
+    async fn read_retry_retries_transient_lock_then_succeeds() {
+        // #840: the query-only read retry variant honors a caller-supplied
+        // deadline and retries on transient lock errors until success.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_op = Arc::clone(&attempts);
+        let result = retry_query_only_read_sqlite_lock_async(
+            deadline,
+            move |_| {
+                let attempts = Arc::clone(&attempts_for_op);
+                async move {
+                    let n = attempts.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        Err(rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error {
+                                code: rusqlite::ErrorCode::DatabaseBusy,
+                                extended_code: rusqlite::ffi::SQLITE_BUSY,
+                            },
+                            None,
+                        ))
+                    } else {
+                        Ok(42)
+                    }
+                }
+            },
+            |error: &rusqlite::Error| matches!(error, rusqlite::Error::SqliteFailure(sqlite, _) if sqlite.code == rusqlite::ErrorCode::DatabaseBusy),
+        )
+        .await;
+
+        assert_eq!(result.expect("retry must succeed"), 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 }

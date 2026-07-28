@@ -97,16 +97,17 @@ pub(super) async fn handle(
                 build_timeline_report(
                     db,
                     TimelineQuery {
-                        project_id,
-                        scope,
+                        project_id: project_id.clone(),
+                        scope: scope.clone(),
                         since: request
                             .since
+                            .clone()
                             .unwrap_or_else(|| DEFAULT_TIMELINE_SINCE.to_string()),
-                        until: request.until,
+                        until: request.until.clone(),
                         top_k,
                         min_importance,
-                        wing: request.wing,
-                        room: request.room,
+                        wing: request.wing.clone(),
+                        room: request.room.clone(),
                     },
                 )
                 .map_err(timeline_error)
