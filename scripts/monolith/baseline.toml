@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8267
-baseline_lines = 587
-issue = "831"
-rationale = "#831 adds the changelog entry required by the changelog-check hook; append-only growth is unavoidable, exact no-growth ratchet."
+baseline_tokens = 8322
+baseline_lines = 590
+issue = "834"
+rationale = "#833/#834 add required Unreleased Fixed changelog entries; append-only growth is unavoidable, exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -341,10 +341,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/main.rs"
 kind = "source"
-baseline_tokens = 258130
-baseline_lines = 33440
-issue = "831"
-rationale = "#831 extends the total CLI search deadline through embedder initialization; regression tests live in a sibling module, and the refreshed cap remains a no-growth ratchet."
+baseline_tokens = 258476
+baseline_lines = 33477
+issue = "833"
+rationale = "#833 reserves a CLI BM25 fallback budget and adds bounded hybrid-timeout regression coverage; exact no-growth ratchet until the main CLI split lands."
 
 [[files]]
 path = "src/markdown_export.rs"
@@ -357,10 +357,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 177616
-baseline_lines = 22410
-issue = "824"
-rationale = "#824 preserves original query-only open-error causes under holder saturation and adds the saturated permission-denied regression; exact no-growth ratchet until the MCP server split lands."
+baseline_tokens = 177982
+baseline_lines = 22445
+issue = "834"
+rationale = "#834 preserves recoverable wait=true MCP queue admission when daemon REST is unavailable and adds regression coverage; exact no-growth ratchet until the MCP server split lands."
 
 [[files]]
 path = "src/mcp/tools.rs"
@@ -537,6 +537,14 @@ baseline_tokens = 6331
 baseline_lines = 831
 issue = "695"
 rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+
+[[files]]
+path = "tests/local_gate_receipt_scripts.rs"
+kind = "test"
+baseline_tokens = 7371
+baseline_lines = 823
+issue = "833"
+rationale = "#833/#834 gate fixture hardening adds process-group kill/reap and bounded wait budgets for cold-target flake resistance; exact no-growth ratchet."
 
 [[files]]
 path = "tests/mind_model_bootstrap.rs"

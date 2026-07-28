@@ -1,7 +1,7 @@
 use super::{
     GateFixture, configure_fixture_git_environment, fixture, fixture_git_command, receipt_files,
-    repo_root, run_fixture, successful_aggregate, symlink_path_command_to_stable_proxy,
-    wait_with_timeout,
+    repo_root, run_fixture, spawn_waited_child, successful_aggregate,
+    symlink_path_command_to_stable_proxy, wait_with_timeout,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,6 +12,7 @@ const FAULT_KIND_ENV: &str = "LOCAL_GATE_RECEIPT_FAULT_KIND";
 const FAULT_LOG_ENV: &str = "LOCAL_GATE_RECEIPT_FAULT_LOG";
 const FAULT_ARM_ENV: &str = "LOCAL_GATE_RECEIPT_FAULT_ARM";
 const REAL_GIT_ENV: &str = "LOCAL_GATE_RECEIPT_REAL_GIT";
+const FAULT_FIXTURE_WAIT_TIMEOUT: Duration = super::FIXTURE_CHILD_WAIT_TIMEOUT;
 
 #[derive(Clone, Copy)]
 enum FaultKind {
@@ -97,12 +98,11 @@ fn configure_fault(command: &mut Command, shim: &FaultShim) {
 fn run_faulted_git(fixture: &GateFixture, shim: &FaultShim, args: &[&str]) -> Output {
     let mut command = fixture_git_command(&fixture.root, args);
     configure_fault(&mut command, shim);
-    let child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn bounded faulted git command");
-    wait_with_timeout(child, Duration::from_secs(5)).expect("wait for faulted git command")
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = spawn_waited_child(&mut command).expect("spawn bounded faulted git command");
+    // Faulted git itself is a direct git shim; keep the short git budget so intentionally
+    // stalled children still self-timeout under the stalled-git reaper contract.
+    wait_with_timeout(child, super::FIXTURE_GIT_WAIT_TIMEOUT).expect("wait for faulted git command")
 }
 
 fn assert_fault_shim_is_selective(fixture: &GateFixture, shim: &FaultShim) {
@@ -138,8 +138,8 @@ fn run_fixture_with_fault(fixture: &GateFixture, action: &str, shim: &FaultShim)
         .stderr(Stdio::piped());
     configure_fixture_git_environment(&mut command, &fixture.root);
     configure_fault(&mut command, shim);
-    let child = command.spawn().expect("spawn bounded faulted fixture");
-    wait_with_timeout(child, Duration::from_secs(5)).expect("wait for faulted fixture")
+    let child = spawn_waited_child(&mut command).expect("spawn bounded faulted fixture");
+    wait_with_timeout(child, FAULT_FIXTURE_WAIT_TIMEOUT).expect("wait for faulted fixture")
 }
 
 fn receipt_artifacts(fixture: &GateFixture) -> Vec<PathBuf> {
@@ -324,10 +324,8 @@ fn review_check_rejects_missing_csa_before_publication_sentinel() {
         .env_remove("CSA_SKIP_REVIEW_CHECK")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = command
-        .spawn()
-        .expect("spawn bounded missing-csa review check");
-    let output = wait_with_timeout(child, Duration::from_secs(5))
+    let child = spawn_waited_child(&mut command).expect("spawn bounded missing-csa review check");
+    let output = wait_with_timeout(child, FAULT_FIXTURE_WAIT_TIMEOUT)
         .expect("wait for missing-csa review check");
 
     assert!(
@@ -364,15 +362,15 @@ fn push_reviewed_has_a_fixed_main_base_without_parameters() {
         "push-reviewed must not interpolate a base"
     );
 
-    let child = Command::new("just")
+    let mut command = Command::new("just");
+    command
         .args(["--dry-run", "push-reviewed"])
         .current_dir(repo_root())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn bounded push-reviewed dry run");
-    let output =
-        wait_with_timeout(child, Duration::from_secs(5)).expect("wait for push-reviewed dry run");
+        .stderr(Stdio::piped());
+    let child = spawn_waited_child(&mut command).expect("spawn bounded push-reviewed dry run");
+    let output = wait_with_timeout(child, FAULT_FIXTURE_WAIT_TIMEOUT)
+        .expect("wait for push-reviewed dry run");
     assert!(
         output.status.success(),
         "push-reviewed dry run failed: stderr={}",

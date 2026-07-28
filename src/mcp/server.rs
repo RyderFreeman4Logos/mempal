@@ -6678,7 +6678,11 @@ impl MempalMcpServer {
                 payload,
                 &daemon_rest_request,
                 &request_system_warnings,
-                matches!(worker_mode, IngestWaitWorkerMode::Background),
+                // A wait=true caller needs an operation receipt it can reconcile.
+                // If hook IPC is unavailable, admit its idempotent local queue entry
+                // before considering REST so a dead REST listener cannot erase that
+                // recovery path (#834).
+                matches!(worker_mode, IngestWaitWorkerMode::Background) && !wait,
             )
             .await
         {
@@ -14380,6 +14384,37 @@ quality_policy = "llm_required_for_keep"
             stats.pending, 0,
             "failed fallback must not strand a local op"
         );
+        release_test_ingest_writer_lease(&db_path, &daemon_lease);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_mcp_wait_ingest_admits_local_queue_before_dead_rest_fallback() {
+        let rest_server = mockito::Server::new_async().await;
+        let (_tempdir, db_path, server) = setup_server_with_api_addr(&rest_server.url());
+        let daemon_lease = hold_daemon_writer_lease(&db_path);
+
+        let response = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "wait ingest must retain a recoverable queue receipt".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("busy".to_string()),
+                wait: Some(true),
+                wait_timeout_secs: Some(0),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("wait=true must admit locally instead of failing through dead REST")
+            .0;
+
+        let operation_id = response.operation_id.expect("recoverable operation id");
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(response.timed_out);
+        let record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(&operation_id)
+            .expect("query locally admitted operation")
+            .expect("queued operation");
+        assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
         release_test_ingest_writer_lease(&db_path, &daemon_lease);
     }
 

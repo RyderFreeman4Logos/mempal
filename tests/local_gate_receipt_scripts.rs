@@ -8,6 +8,13 @@ use std::time::{Duration, Instant};
 #[path = "local_gate_receipt_scripts/failure_modes.rs"]
 mod failure_modes;
 
+/// Bounded wait for local-gate fixture *script* children under load / cold `target` rebuilds.
+/// Keep well under cargo test timeouts while remaining larger than the old 5s flake budget.
+const FIXTURE_CHILD_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Direct fixture `git` commands stay short: they should finish quickly unless intentionally
+/// stalled, and the stalled-git reaper test outer RED bound assumes a ~5s self-timeout.
+const FIXTURE_GIT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -19,8 +26,15 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> io::Result<Output> 
             return child.wait_with_output();
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            // Always attempt kill, then always reap. ESRCH (already exited between
+            // try_wait and kill) is a normal race and must not skip wait_with_output.
+            let kill_error = kill_waited_child_process_group(&mut child).err();
             let output = child.wait_with_output()?;
+            if let Some(error) = kill_error {
+                if error.kind() != io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+            }
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
@@ -31,6 +45,65 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> io::Result<Output> 
             ));
         }
         thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+fn spawn_waited_child(command: &mut Command) -> io::Result<Child> {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0).spawn()
+}
+
+#[cfg(unix)]
+fn kill_waited_child_process_group(child: &mut Child) -> io::Result<()> {
+    let pid = i32::try_from(child.id()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "waited child PID exceeds i32 range",
+        )
+    })?;
+    // SAFETY:
+    // - `pid` is the live child PID returned by `Child::id` and converted to i32.
+    // - Every caller of this helper spawns via `spawn_waited_child`, which sets
+    //   `process_group(0)` so the child's PGID equals its PID.
+    // - Negative PID means "signal the process group", so only that child-owned
+    //   group is targeted (no other processes share this PGID).
+    // - The PID is reaped immediately after this call via `wait_with_output`, so
+    //   it cannot be reused for an unrelated process before reaping.
+    // - ESRCH (no such process) is a normal race when the child exits between
+    //   poll and kill; callers treat NotFound as non-fatal after reaping.
+    if unsafe { libc::kill(-pid, libc::SIGKILL) } == -1 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "waited child process group already exited",
+            ));
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn spawn_waited_child(command: &mut Command) -> io::Result<Child> {
+    command.spawn()
+}
+
+#[cfg(not(unix))]
+fn kill_waited_child_process_group(child: &mut Child) -> io::Result<()> {
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            // Already exited on some platforms; treat as NotFound for the
+            // shared always-reap timeout path.
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "waited child already exited",
+            ))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -107,8 +180,8 @@ fn run_bash_script(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_fixture_git_environment(&mut command, working_dir);
-    let child = command.spawn().expect("spawn fixture gate script");
-    wait_with_timeout(child, Duration::from_secs(5)).expect("wait for fixture gate script")
+    let child = spawn_waited_child(&mut command).expect("spawn fixture gate script");
+    wait_with_timeout(child, FIXTURE_CHILD_WAIT_TIMEOUT).expect("wait for fixture gate script")
 }
 
 fn fixture_git_command(working_dir: &Path, args: &[&str]) -> Command {
@@ -119,11 +192,10 @@ fn fixture_git_command(working_dir: &Path, args: &[&str]) -> Command {
 }
 
 fn run_fixture_git_with_timeout(working_dir: &Path, args: &[&str]) -> io::Result<Output> {
-    let child = fixture_git_command(working_dir, args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    wait_with_timeout(child, Duration::from_secs(5))
+    let mut command = fixture_git_command(working_dir, args);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = spawn_waited_child(&mut command)?;
+    wait_with_timeout(child, FIXTURE_GIT_WAIT_TIMEOUT)
 }
 
 fn fixture_git_output(working_dir: &Path, args: &[&str]) -> Output {
@@ -302,8 +374,8 @@ fn run_review_check(fake_bin_dir: &Path, log: &Path, csa_context: (&str, &str)) 
         .env(csa_context.0, csa_context.1)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = command.spawn().expect("spawn review-check fixture");
-    wait_with_timeout(child, Duration::from_secs(5)).expect("wait for review-check fixture")
+    let child = spawn_waited_child(&mut command).expect("spawn review-check fixture");
+    wait_with_timeout(child, FIXTURE_CHILD_WAIT_TIMEOUT).expect("wait for review-check fixture")
 }
 
 #[test]
