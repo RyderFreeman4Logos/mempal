@@ -1939,9 +1939,7 @@ impl MempalMcpServer {
         let system_warnings = current_system_warnings();
         match self.async_db().await {
             Ok(async_db) => {
-                let drawer_id_for_write = drawer_id.clone();
-                let deleted = async_db
-                    .run_write(move |db| db.soft_delete_drawer(&drawer_id_for_write))
+                let deleted = super::delete_retry::run(async_db, drawer_id)
                     .await
                     .map_err(|error| mcp_write_db_error(&self.db_path, "mempal_delete", error))?;
                 Ok((deleted, system_warnings))
@@ -12713,6 +12711,7 @@ mod tests {
     use crate::mcp::tools::INGEST_SOURCE_TYPE_SCHEMA_DESCRIPTION;
 
     mod context_scope_schema_tests;
+    mod delete_busy_retry_836_tests;
 
     #[derive(Clone)]
     struct StubEmbedderFactory {
