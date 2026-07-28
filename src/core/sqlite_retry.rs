@@ -45,13 +45,24 @@ fn content_mutation_sqlite_lock_retry_delay(attempt: usize) -> Duration {
 }
 
 pub fn retry_content_mutation_sqlite_lock<T, E>(
-    mut operation: impl FnMut() -> Result<T, E>,
+    operation: impl FnMut() -> Result<T, E>,
     is_transient_lock: impl Fn(&E) -> bool,
 ) -> Result<T, E>
 where
     E: From<rusqlite::Error>,
 {
     let retry_deadline = Instant::now() + CONTENT_MUTATION_SQLITE_LOCK_RETRY_DEADLINE;
+    retry_content_mutation_sqlite_lock_until(retry_deadline, operation, is_transient_lock)
+}
+
+fn retry_content_mutation_sqlite_lock_until<T, E>(
+    retry_deadline: Instant,
+    mut operation: impl FnMut() -> Result<T, E>,
+    is_transient_lock: impl Fn(&E) -> bool,
+) -> Result<T, E>
+where
+    E: From<rusqlite::Error>,
+{
     let mut attempt = 0;
     let mut last_transient_error = None;
     loop {
@@ -62,12 +73,9 @@ where
         }
 
         match operation() {
-            Ok(value) if Instant::now() < retry_deadline => return Ok(value),
-            Ok(_) => {
-                return Err(take_last_transient_error_or_deadline_error(
-                    &mut last_transient_error,
-                ));
-            }
+            // A returned success can represent a committed SQLite mutation;
+            // elapsed retry budget cannot safely reinterpret it as a lock error.
+            Ok(value) => return Ok(value),
             Err(error) if is_transient_lock(&error) => {
                 last_transient_error = Some(error);
                 let remaining = retry_deadline.saturating_duration_since(Instant::now());
@@ -87,7 +95,7 @@ where
 }
 
 pub async fn retry_content_mutation_sqlite_lock_async<T, E, F, Fut>(
-    mut operation: F,
+    operation: F,
     is_transient_lock: impl Fn(&E) -> bool,
 ) -> Result<T, E>
 where
@@ -96,6 +104,20 @@ where
     Fut: Future<Output = Result<T, E>>,
 {
     let retry_deadline = Instant::now() + CONTENT_MUTATION_SQLITE_LOCK_RETRY_DEADLINE;
+    retry_content_mutation_sqlite_lock_async_until(retry_deadline, operation, is_transient_lock)
+        .await
+}
+
+async fn retry_content_mutation_sqlite_lock_async_until<T, E, F, Fut>(
+    retry_deadline: Instant,
+    mut operation: F,
+    is_transient_lock: impl Fn(&E) -> bool,
+) -> Result<T, E>
+where
+    E: From<rusqlite::Error>,
+    F: FnMut(Instant) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
     let mut attempt = 0;
     let mut last_transient_error = None;
     loop {
@@ -106,12 +128,8 @@ where
         }
 
         match operation(retry_deadline).await {
-            Ok(value) if Instant::now() < retry_deadline => return Ok(value),
-            Ok(_) => {
-                return Err(take_last_transient_error_or_deadline_error(
-                    &mut last_transient_error,
-                ));
-            }
+            // See the synchronous helper: a successful mutation is definitive.
+            Ok(value) => return Ok(value),
             Err(error) if is_transient_lock(&error) => {
                 last_transient_error = Some(error);
                 let remaining = retry_deadline.saturating_duration_since(Instant::now());
@@ -128,5 +146,49 @@ where
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_retry_preserves_success_returned_after_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let result = retry_content_mutation_sqlite_lock_until(
+            deadline,
+            || {
+                std::thread::sleep(Duration::from_millis(50));
+                Ok::<_, rusqlite::Error>(7)
+            },
+            |_| false,
+        );
+
+        assert_eq!(result.expect("late successful mutation"), 7);
+        assert!(
+            Instant::now() >= deadline,
+            "fixture must return after expiry"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_retry_preserves_success_returned_after_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let result = retry_content_mutation_sqlite_lock_async_until(
+            deadline,
+            |_| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok::<_, rusqlite::Error>(7)
+            },
+            |_| false,
+        )
+        .await;
+
+        assert_eq!(result.expect("late successful mutation"), 7);
+        assert!(
+            Instant::now() >= deadline,
+            "fixture must return after expiry"
+        );
     }
 }

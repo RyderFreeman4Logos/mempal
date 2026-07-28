@@ -340,3 +340,178 @@ async fn async_db_symlink_retarget_does_not_divert_admitted_identity() {
         "pools must stay bound to admitted identity a, not retargeted b"
     );
 }
+
+#[tokio::test]
+async fn deadline_write_reports_committed_success_when_closure_returns_after_deadline() {
+    let tmp = short_tempdir();
+    let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1).expect("open async db");
+    adb.run_write(|db| {
+        db.conn().execute_batch(
+            "CREATE TABLE deadline_committed_success (
+                value INTEGER NOT NULL
+            )",
+        )?;
+        Ok::<(), DbError>(())
+    })
+    .await
+    .expect("create fixture table");
+
+    let deadline = Instant::now() + Duration::from_millis(300);
+    adb.run_write_until(deadline, |db| {
+        db.conn().execute(
+            "INSERT INTO deadline_committed_success (value) VALUES (1)",
+            [],
+        )?;
+        // The mutation has already committed. Returning after the deadline must
+        // not turn that durable success into a retryable lock error.
+        std::thread::sleep(Duration::from_millis(350));
+        Ok::<(), DbError>(())
+    })
+    .await
+    .expect("a committed write must report success even after its deadline");
+
+    assert!(
+        Instant::now() >= deadline,
+        "fixture closure must return after the deadline"
+    );
+    let count: i64 = adb
+        .run_read(|db| {
+            Ok(db.conn().query_row(
+                "SELECT COUNT(*) FROM deadline_committed_success",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .expect("read committed fixture state");
+    assert_eq!(count, 1, "reported success must match durable state");
+}
+
+#[tokio::test]
+async fn deadline_write_preserves_committed_success_after_real_lock_releases() {
+    let tmp = short_tempdir();
+    let db_path = tmp.path().join("palace.db");
+    let adb = AsyncDb::open(&db_path, 1).expect("open async db");
+    adb.run_write(|db| {
+        db.conn().execute_batch(
+            "CREATE TABLE deadline_lock_boundary_success (
+                value INTEGER NOT NULL
+            )",
+        )?;
+        Ok::<(), DbError>(())
+    })
+    .await
+    .expect("create fixture table and warm writer pool");
+
+    let lock_path = db_path.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(lock_path).expect("open SQLite lock holder");
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .expect("acquire SQLite write lock");
+        ready_tx.send(()).expect("signal SQLite lock holder");
+        std::thread::sleep(Duration::from_millis(850));
+        conn.execute_batch("ROLLBACK;")
+            .expect("release SQLite write lock");
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("SQLite lock holder ready");
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        adb.run_write_until(deadline, |db| {
+            db.conn().execute(
+                "INSERT INTO deadline_lock_boundary_success (value) VALUES (1)",
+                [],
+            )?;
+            // The lock release lets this insert commit before expiry. The
+            // closure returns later, so its durable success must remain success.
+            std::thread::sleep(Duration::from_millis(300));
+            Ok::<(), DbError>(())
+        }),
+    )
+    .await;
+    holder.join().expect("join SQLite lock holder");
+
+    result
+        .expect("write must resolve after its started mutation finishes")
+        .expect("committed write after lock release must report success");
+    assert!(
+        Instant::now() >= deadline,
+        "fixture closure must return after its deadline"
+    );
+
+    let count: i64 = adb
+        .run_read(|db| {
+            Ok(db.conn().query_row(
+                "SELECT COUNT(*) FROM deadline_lock_boundary_success",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .expect("read committed fixture state");
+    assert_eq!(count, 1, "reported success must match durable state");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn deadline_write_self_heal_is_off_runtime_and_bounded() {
+    let tmp = short_tempdir();
+    let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1)
+        .expect("open async db")
+        .with_writer_reopen_delay(Duration::from_millis(400));
+
+    let panicked = adb
+        .run_write(|_db| -> Result<(), DbError> {
+            panic!("drop the checked-out writer to exercise self-healing")
+        })
+        .await;
+    assert!(
+        matches!(panicked, Err(DbError::BlockingTaskFailed(_))),
+        "panic must drain the idle writer connection"
+    );
+
+    let ticks = Arc::new(AtomicU64::new(0));
+    let ticks_bg = Arc::clone(&ticks);
+    let ticker = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ticks_bg.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let closure_called = Arc::new(AtomicBool::new(false));
+    let closure_called_by_write = Arc::clone(&closure_called);
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(120);
+    let error = tokio::time::timeout(
+        Duration::from_millis(700),
+        adb.run_write_until(deadline, move |_db| {
+            closure_called_by_write.store(true, Ordering::SeqCst);
+            Ok::<(), DbError>(())
+        }),
+    )
+    .await
+    .expect("self-heal must respect the mutation deadline")
+    .expect_err("expired self-heal must report a retryable lock error");
+    ticker.abort();
+
+    assert!(
+        matches!(error, DbError::Sqlite(_)),
+        "deadline expiry must preserve the typed SQLite lock contract: {error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "self-heal exceeded its wall-clock budget"
+    );
+    let observed = ticks.load(Ordering::SeqCst);
+    assert!(
+        observed >= 3,
+        "self-heal blocked the current-thread runtime; ticker advanced {observed} times"
+    );
+    assert!(
+        !closure_called.load(Ordering::SeqCst),
+        "an expired self-heal must not dispatch the mutation closure"
+    );
+}

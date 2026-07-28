@@ -40,7 +40,7 @@
 //! * `mmap_size` stays `0`.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
@@ -48,6 +48,9 @@ use tokio::sync::Semaphore;
 use super::db::{Database, DbError, SQLITE_CACHE_SIZE_KIB_DEFAULT};
 use super::db_admission::{DbAdmissionRequest, DbHolderClass, ProfileDbAdmission};
 use super::sqlite_retry::content_mutation_sqlite_lock_retry_deadline_error;
+
+#[path = "async_db_conn_pool.rs"]
+mod conn_pool;
 
 /// Hard cap on the aggregate SQLite page cache across all pooled connections.
 ///
@@ -91,53 +94,8 @@ struct ConnPool {
     path: PathBuf,
     query_only: bool,
     count: usize,
-}
-
-impl ConnPool {
-    /// Pre-open `count` connections at `path`. Readers (`query_only == true`)
-    /// are opened read-write-capable then flipped to `PRAGMA query_only=ON`.
-    fn open(path: &Path, count: usize, query_only: bool) -> Result<Self, DbError> {
-        let mut idle = Vec::with_capacity(count);
-        for _ in 0..count {
-            idle.push(Self::open_one(path, query_only)?);
-        }
-        Ok(Self {
-            sem: Arc::new(Semaphore::new(count)),
-            idle: Mutex::new(idle),
-            path: path.to_path_buf(),
-            query_only,
-            count,
-        })
-    }
-
-    fn open_one(path: &Path, query_only: bool) -> Result<Database, DbError> {
-        if query_only {
-            Database::open_query_only_unadmitted(path)
-        } else {
-            Database::open_unadmitted(path)
-        }
-    }
-
-    /// Pop an idle connection; reopen a fresh one if the pool was transiently
-    /// drained by a cancelled checkout (self-heal — the pool never shrinks).
-    fn take_or_open(&self) -> Result<Database, DbError> {
-        let popped = self
-            .idle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop();
-        match popped {
-            Some(db) => Ok(db),
-            None => Self::open_one(&self.path, self.query_only),
-        }
-    }
-
-    fn checkin(&self, db: Database) {
-        self.idle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(db);
-    }
+    #[cfg(any(test, feature = "db-test-seam"))]
+    reopen_delay: Mutex<Option<Duration>>,
 }
 
 /// Off-runtime async facade over the sync [`Database`]. Cheap to clone (the
@@ -252,6 +210,13 @@ impl AsyncDb {
         self
     }
 
+    /// Delay a writer-pool self-heal open (tests only).
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_writer_reopen_delay(self, delay: Duration) -> Self {
+        self.writer.set_reopen_delay(delay);
+        self
+    }
+
     /// Run a read-only closure against a pooled reader connection off the
     /// runtime.
     ///
@@ -352,11 +317,11 @@ impl AsyncDb {
 
     /// Run a read-write closure that cannot outlive `deadline`.
     ///
-    /// The deadline covers writer-permit acquisition, test delay, SQLite's busy
-    /// wait, and the closure result. The blocking task owns the permit and
-    /// checks the deadline itself. The outer await is deadline-bound too, so a
-    /// saturated blocking pool cannot make the caller wait past it; any task
-    /// detached by that timeout re-checks the deadline before invoking `f`.
+    /// The deadline covers writer-permit acquisition, pool self-healing, test
+    /// delay, and SQLite's busy wait. A blocking worker must receive explicit
+    /// pre-deadline approval before it can invoke the closure; once it starts,
+    /// this method awaits its definitive result so a committed mutation cannot
+    /// be reported as a late lock failure.
     pub(crate) async fn run_write_until<F, R>(&self, deadline: Instant, f: F) -> Result<R, DbError>
     where
         F: FnOnce(&Database) -> Result<R, DbError> + Send + 'static,
@@ -586,12 +551,21 @@ where
     }
 }
 
+async fn await_write_join<R>(
+    join: tokio::task::JoinHandle<Result<R, DbError>>,
+) -> Result<R, DbError> {
+    match join.await {
+        Ok(out) => out,
+        Err(join_err) => Err(DbError::BlockingTaskFailed(join_err.to_string())),
+    }
+}
+
 /// Execute a deadline-bound write without cancelling its owned blocking task.
 ///
-/// The deadline is checked before waiting for the sole writer permit and again
-/// on the blocking thread. The join itself is deadline-bound; if it times out,
-/// the task retains its permit and connection until it runs, then refuses to
-/// invoke `f` after the same deadline before checking the connection back in.
+/// The deadline bounds permit acquisition, blocking-pool dispatch, connection
+/// self-healing, and authorization to invoke `f`. A worker can only start `f`
+/// after the caller approves it before expiry; after that point the worker is
+/// joined for its definitive SQLite result instead of being timed out mid-write.
 async fn exec_with_deadline<F, R>(
     pool: Arc<ConnPool>,
     _admission: Arc<ProfileDbAdmission>,
@@ -617,32 +591,47 @@ where
         return Err(write_deadline_exceeded_error());
     }
 
-    let conn = pool.take_or_open()?;
-    if Instant::now() >= deadline {
-        pool.checkin(conn);
-        return Err(write_deadline_exceeded_error());
-    }
-
     let checkin_pool = Arc::clone(&pool);
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
-    let join = tokio::time::timeout_at(
-        tokio::time::Instant::from_std(deadline),
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let _admission = _admission; // keep admission alive until closure ends
-            tracing::dispatcher::with_default(&dispatch, || {
-                let out = execute_write_until(&conn, delay, deadline, f);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<tokio::sync::oneshot::Sender<()>>();
+    let join = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _admission = _admission; // keep admission alive until closure ends
+        tracing::dispatcher::with_default(&dispatch, || {
+            let conn = checkin_pool.take_or_open_until(deadline)?;
+            if Instant::now() >= deadline {
                 checkin_pool.checkin(conn);
-                out
-            })
-        }),
-    )
-    .await;
-    match join {
-        Ok(Ok(out)) => out,
-        Ok(Err(join_err)) => Err(DbError::BlockingTaskFailed(join_err.to_string())),
-        Err(_) => Err(write_deadline_exceeded_error()),
+                return Err(write_deadline_exceeded_error());
+            }
+
+            let (approval_tx, approval_rx) = tokio::sync::oneshot::channel::<()>();
+            if ready_tx.send(approval_tx).is_err() {
+                checkin_pool.checkin(conn);
+                return Err(write_deadline_exceeded_error());
+            }
+            if approval_rx.blocking_recv().is_err() {
+                checkin_pool.checkin(conn);
+                return Err(write_deadline_exceeded_error());
+            }
+
+            let out = execute_write_until(&conn, delay, deadline, f);
+            checkin_pool.checkin(conn);
+            out
+        })
+    });
+    let approval_tx =
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), ready_rx).await {
+            Ok(Ok(approval_tx)) => approval_tx,
+            Ok(Err(_)) => return await_write_join(join).await,
+            Err(_) => return Err(write_deadline_exceeded_error()),
+        };
+    if Instant::now() >= deadline {
+        return Err(write_deadline_exceeded_error());
     }
+    if approval_tx.send(()).is_err() {
+        return await_write_join(join).await;
+    }
+    await_write_join(join).await
 }
 
 fn execute_write_until<F, R>(
@@ -685,7 +674,6 @@ where
     conn.conn().busy_timeout(Duration::from_secs(5))?;
 
     match out {
-        Ok(_) if Instant::now() >= deadline => Err(write_deadline_exceeded_error()),
         Err(DbError::Sqlite(error)) if rusqlite_error_is_sqlite_interrupt(&error) => {
             Err(write_deadline_exceeded_error())
         }
