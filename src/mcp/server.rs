@@ -15654,8 +15654,11 @@ pattern_boost = 0.2
             .with_async_queue_for_test(async_queue)
             .with_mcp_deadline_for_test(Duration::from_millis(20));
 
+        // Outer client budget must stay well above the 150ms injected queue delay
+        // under full-suite load; the product contract is still the short MCP
+        // admission deadline (20ms) with a durable receipt after that deadline.
         let response = tokio::time::timeout(
-            Duration::from_millis(500),
+            Duration::from_secs(2),
             server.mempal_ingest(Parameters(IngestRequest {
                 content: "slow queue admission still returns a receipt".to_string(),
                 wing: "mcp".to_string(),

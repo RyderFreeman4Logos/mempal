@@ -357,10 +357,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 177982
-baseline_lines = 22445
-issue = "834"
-rationale = "#834 preserves recoverable wait=true MCP queue admission when daemon REST is unavailable and adds regression coverage; exact no-growth ratchet until the MCP server split lands."
+baseline_tokens = 178019
+baseline_lines = 22447
+issue = "838"
+rationale = "#838 hardens the load-sensitive MCP queue-admission receipt fixture outer client budget only; product admission deadline unchanged. Exact no-growth ratchet until the MCP server split lands."
 
 [[files]]
 path = "src/mcp/tools.rs"
