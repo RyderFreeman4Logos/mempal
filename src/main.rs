@@ -3822,6 +3822,71 @@ fn run() -> Result<()> {
     }
 
     let db_path = expand_home(&config.db_path);
+    if stdin_wait_json_ingest(&cli.command) {
+        let Commands::Ingest {
+            dir,
+            stdin,
+            wing,
+            room,
+            format,
+            project,
+            no_gate,
+            dry_run,
+            json,
+            wait,
+            wait_timeout_secs,
+            no_strip_noise,
+            parser,
+            no_llm,
+            allow_llm,
+            diary_rollup,
+            source_type,
+            memory_kind,
+            domain,
+            field,
+            is_pinned,
+            confidence,
+            supersedes,
+            replace_text,
+            valid_from,
+            valid_until,
+        } = &cli.command
+        else {
+            unreachable!("stdin wait JSON preflight matched")
+        };
+        return block_on_result(ingest_stdin_wait_json_queue_first(
+            &db_path,
+            config.as_ref(),
+            IngestCommandOptions {
+                dir: dir.as_deref(),
+                stdin: *stdin,
+                wing: wing.as_deref(),
+                room: room.as_deref(),
+                format: format.clone(),
+                project: project.as_deref(),
+                no_gate: *no_gate,
+                dry_run: *dry_run,
+                json: *json,
+                no_strip_noise: *no_strip_noise,
+                parser: (*parser).into(),
+                no_llm: *no_llm,
+                allow_llm: *allow_llm,
+                diary_rollup: *diary_rollup,
+                wait: *wait,
+                wait_timeout_secs: *wait_timeout_secs,
+                source_type: source_type.as_deref(),
+                memory_kind: memory_kind.as_deref(),
+                domain: domain.as_deref(),
+                field: field.as_deref(),
+                is_pinned: *is_pinned,
+                confidence: *confidence,
+                supersedes: supersedes.as_deref(),
+                replace_text: replace_text.as_deref(),
+                valid_from: valid_from.as_deref(),
+                valid_until: valid_until.as_deref(),
+            },
+        ));
+    }
     if matches!(&cli.command, Commands::Operation { .. }) {
         let Commands::Operation { command } = cli.command else {
             unreachable!("operation command preflight matched")
@@ -6359,31 +6424,34 @@ fn resolve_confidence_bound(
 }
 
 async fn run_stdin_wait_ingest_queue(
-    db: &Database,
+    db_path: &Path,
     config: &Config,
     record: &StdinIngestRecord,
     resolved: &ResolvedStdinIngest,
     wait_timeout_secs: u64,
     json: bool,
 ) -> Result<()> {
+    preflight_stdin_wait_queue_admission(db_path, json)?;
+
     let wait_request = resolved.wait_request(wait_timeout_secs);
     let controls = IngestControls {
         no_gate: resolved.no_gate,
         bypass_novelty: resolved.bypass_novelty,
     };
-    let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone())?;
+    let server = MempalMcpServer::new(db_path.to_path_buf(), config.clone())?;
     let response = match server
         .mempal_ingest_with_controls_scoped_worker(wait_request, controls)
         .await
     {
         Ok(response) => response.0,
         Err(error) => {
-            if json
-                && let Some(data) = error.data.as_ref()
-                && data.get("reason").and_then(serde_json::Value::as_str)
-                    == Some("holder_budget_exceeded")
+            if let Some(data) = error.data.as_ref()
+                && stdin_ingest_no_write_receipt(data)
             {
-                print_stdin_ingest_admission_blocked_json(data.clone())?;
+                if json {
+                    print_stdin_ingest_admission_blocked_json(data.clone())?;
+                }
+                return Err(IngestWaitAdmissionBlocked::new(error.to_string()).into());
             }
             return Err(anyhow::anyhow!(error.to_string()));
         }
@@ -6399,7 +6467,7 @@ async fn run_stdin_wait_ingest_queue(
     let mut wait_stats = ingest_stdin_wait_stats_from_response(&response);
     match response.state {
         Some(IngestOperationState::Completed) => {
-            append_ingest_stdin_audit_log(db, &resolved.wing, false, record, &wait_stats)
+            append_stdin_wait_ingest_audit_log(db_path, &resolved.wing, record, &wait_stats)
                 .context("failed to append ingest audit log")?;
             print_stdin_ingest_output_with_created_ids(
                 json,
@@ -6411,7 +6479,7 @@ async fn run_stdin_wait_ingest_queue(
         }
         Some(IngestOperationState::Rejected) => {
             wait_stats.drawer_ids.clear();
-            append_ingest_stdin_audit_log(db, &resolved.wing, false, record, &wait_stats)
+            append_stdin_wait_ingest_audit_log(db_path, &resolved.wing, record, &wait_stats)
                 .context("failed to append ingest audit log")?;
             print_stdin_ingest_output(json, false, &wait_stats)?;
             Ok(())
@@ -6429,6 +6497,115 @@ async fn run_stdin_wait_ingest_queue(
             Ok(())
         }
     }
+}
+
+fn preflight_stdin_wait_queue_admission(db_path: &Path, json: bool) -> Result<()> {
+    let error = match mempal::core::queue::queue_write_admission_preflight(db_path) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+
+    if let mempal::core::queue::QueueError::Admission(
+        admission_error @ DbAdmissionError::BudgetExceeded { .. },
+    ) = &error
+    {
+        if json {
+            print_stdin_ingest_admission_blocked_json(startup_admission_blocked_json(
+                admission_error,
+            ))?;
+        }
+        return Err(IngestWaitAdmissionBlocked::new(error.to_string()).into());
+    }
+
+    if error.is_sqlite_lock() {
+        if json {
+            print_stdin_ingest_admission_blocked_json(stdin_ingest_queue_locked_admission_json())?;
+        }
+        return Err(IngestWaitAdmissionBlocked::new(error.to_string()).into());
+    }
+
+    Err(anyhow::Error::new(error).context("failed queue-first stdin ingest admission preflight"))
+}
+
+fn append_stdin_wait_ingest_audit_log(
+    db_path: &Path,
+    wing: &str,
+    record: &StdinIngestRecord,
+    stats: &IngestStats,
+) -> Result<()> {
+    let db = Database::open(db_path).context("failed to open database for ingest audit log")?;
+    append_ingest_stdin_audit_log(&db, wing, false, record, stats)
+}
+
+async fn ingest_stdin_wait_json_queue_first(
+    db_path: &Path,
+    config: &Config,
+    options: IngestCommandOptions<'_>,
+) -> Result<()> {
+    if options.format.is_some() {
+        bail!("--format is only supported for directory ingest");
+    }
+    if options.diary_rollup {
+        bail!("--diary-rollup is only supported for directory ingest");
+    }
+    if !options.parser.is_auto() {
+        bail!("--parser is only supported for path ingest");
+    }
+    if options.allow_llm {
+        bail!("--allow-llm is only supported for path ingest");
+    }
+    let mut input = Vec::new();
+    std::io::stdin()
+        .take(MAX_STDIN_INGEST_BYTES as u64 + 1)
+        .read_to_end(&mut input)
+        .context("failed to read stdin")?;
+    if input.len() > MAX_STDIN_INGEST_BYTES {
+        bail!(
+            "stdin payload exceeds {} byte limit",
+            MAX_STDIN_INGEST_BYTES
+        );
+    }
+    let input = String::from_utf8(input).context("stdin payload is not valid UTF-8")?;
+    let record: StdinIngestRecord =
+        serde_json::from_str(&input).context("failed to parse stdin JSON object")?;
+    let raw_content = record
+        .content
+        .as_deref()
+        .context("stdin JSON object is missing required `content` field")?;
+    if raw_content.trim().is_empty() {
+        bail!("stdin JSON `content` field must not be empty");
+    }
+    let content = normalize_stdin_content(raw_content, options.no_strip_noise)?;
+    let wing = options
+        .wing
+        .or(record.wing.as_deref())
+        .context("stdin ingest requires --wing or JSON `wing`")?
+        .to_string();
+    let room = options
+        .room
+        .or(record.room.as_deref())
+        .map(ToOwned::to_owned);
+    let resolved = resolve_stdin_ingest(config, &options, &record, content, wing, room)?;
+    if resolved.raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
+        return print_stdin_ingest_output(
+            true,
+            false,
+            &IngestStats {
+                files: 1,
+                skipped: 1,
+                ..IngestStats::default()
+            },
+        );
+    }
+    run_stdin_wait_ingest_queue(
+        db_path,
+        config,
+        &record,
+        &resolved,
+        options.wait_timeout_secs.unwrap_or(30),
+        true,
+    )
+    .await
 }
 
 async fn ingest_stdin_command(
@@ -6500,7 +6677,7 @@ async fn ingest_stdin_command(
             .context("failed to inspect stdin wait queue admission ownership")?
     {
         return run_stdin_wait_ingest_queue(
-            db,
+            db.path(),
             config,
             &record,
             &resolved,
@@ -6582,7 +6759,7 @@ async fn ingest_stdin_command(
 
     if options.wait {
         return run_stdin_wait_ingest_queue(
-            db,
+            db.path(),
             config,
             &record,
             &resolved,
@@ -6847,6 +7024,20 @@ fn startup_admission_blocked_json(error: &DbAdmissionError) -> serde_json::Value
     })
 }
 
+fn stdin_ingest_queue_locked_admission_json() -> serde_json::Value {
+    serde_json::json!({
+        "reason": "database_locked",
+        "action": "write_refused",
+    })
+}
+
+fn stdin_ingest_no_write_receipt(data: &serde_json::Value) -> bool {
+    matches!(
+        data.get("reason").and_then(serde_json::Value::as_str),
+        Some("holder_budget_exceeded" | "database_locked" | "database_degraded")
+    )
+}
+
 fn print_stdin_ingest_admission_blocked_json(mut output: serde_json::Value) -> Result<()> {
     let object = output
         .as_object_mut()
@@ -6862,6 +7053,9 @@ fn print_stdin_ingest_admission_blocked_json(mut output: serde_json::Value) -> R
         serde_json::to_string_pretty(&output)
             .context("failed to serialize admission-blocked stdin ingest JSON output")?
     );
+    std::io::stdout()
+        .flush()
+        .context("failed to flush admission-blocked stdin ingest JSON output")?;
     Ok(())
 }
 
@@ -6983,13 +7177,18 @@ fn print_operation_response_format(json: bool, response: &IngestResponse) -> Res
 }
 
 fn ingest_stdin_wait_stats_from_response(response: &IngestResponse) -> IngestStats {
+    let exact_duplicate = matches!(response.state, Some(IngestOperationState::Completed))
+        && !response.dropped
+        && response.created_drawer_ids.is_empty()
+        && !response.drawer_ids.is_empty();
     let mut stats = IngestStats {
         files: 1,
-        chunks: if response.dropped {
+        chunks: if response.dropped || exact_duplicate {
             0
         } else {
             response.chunk_count
         },
+        skipped: usize::from(exact_duplicate),
         dropped_by_gate: if response.dropped { 1 } else { 0 },
         ..IngestStats::default()
     };
@@ -16230,6 +16429,8 @@ mod daemon_reap_tests {
     }
 }
 
+const DAEMON_STATUS_QUEUE_STATS_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+
 fn run_daemon_status(db_path: &Path) -> Result<()> {
     // Enumerate ALL live `mempal daemon` siblings so status reports the true
     // process count and can warn on duplicates the single pidfile PID hides
@@ -16264,8 +16465,11 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
                         }
                     }
                 }
-                if let Ok(store) = mempal::core::queue::PendingMessageStore::new(db_path) {
-                    if let Ok(stats) = store.stats() {
+                match mempal::core::queue::queue_stats_readonly_with_busy_timeout(
+                    db_path,
+                    DAEMON_STATUS_QUEUE_STATS_BUSY_TIMEOUT,
+                ) {
+                    Ok(stats) => {
                         println!("queue.pending: {}", stats.pending);
                         println!("queue.claimed: {}", stats.claimed);
                         println!("queue.failed: {}", stats.failed);
@@ -16276,6 +16480,7 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
                             stats.failed_retryable_embed, stats.failed_retryable_llm
                         );
                     }
+                    Err(error) => println!("queue stats unavailable: {error}"),
                 }
             } else if siblings.is_empty() {
                 println!("status: stopped (stale pid file, pid {pid} not running)");
@@ -26186,6 +26391,25 @@ struct IngestWaitTimedOut {
     operation_id: String,
 }
 
+#[derive(Debug)]
+struct IngestWaitAdmissionBlocked {
+    detail: String,
+}
+
+impl IngestWaitAdmissionBlocked {
+    fn new(detail: String) -> Self {
+        Self { detail }
+    }
+}
+
+impl std::fmt::Display for IngestWaitAdmissionBlocked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for IngestWaitAdmissionBlocked {}
+
 impl IngestWaitTimedOut {
     fn new(operation_id: Option<&str>) -> Self {
         Self {
@@ -26216,8 +26440,18 @@ fn is_ingest_wait_timed_out(error: &anyhow::Error) -> bool {
         .any(|source| source.downcast_ref::<IngestWaitTimedOut>().is_some())
 }
 
+fn is_ingest_wait_admission_blocked(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        source
+            .downcast_ref::<IngestWaitAdmissionBlocked>()
+            .is_some()
+    })
+}
+
 fn needs_bounded(error: &anyhow::Error) -> bool {
-    is_ingest_wait_timed_out(error) || deadline::is(error)
+    is_ingest_wait_timed_out(error)
+        || is_ingest_wait_admission_blocked(error)
+        || deadline::is(error)
 }
 #[cfg(test)]
 mod ingest_wait_timeout_error_tests {
