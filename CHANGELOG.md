@@ -42,6 +42,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **MCP reads**: retry transient SQLite busy/locked errors on all query-only MCP reads (read_drawer, search, timeline, context, brief) under the existing search deadline, preventing opaque -32603 under daemon contention (#840).
 - **SQLite mutation retries**: bound shared 10-second CLI/MCP retry backoff, writer admission, and SQLite busy waits; a mutation that commits reports success, while unstarted expired MCP deletes return structured retryable lock errors (#838).
 - **MCP delete**: retry cached async-pool SQLite busy/locked soft deletes for 10 seconds, matching CLI content mutations (#836).
 - **MCP ingest**: preserve queued `wait=true` recovery when daemon hook IPC and
