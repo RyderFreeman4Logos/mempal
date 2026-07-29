@@ -242,7 +242,8 @@ fn scoped_process_remaining(started: Instant, budget: Duration) -> Option<Durati
 
 fn ingest_request_deadline(started: Instant, wait: bool, wait_timeout_secs: u64) -> Instant {
     let budget = if wait {
-        Duration::from_secs(wait_timeout_secs).saturating_sub(MCP_INGEST_RESPONSE_RESERVE)
+        clamp_wait_timeout(Duration::from_secs(wait_timeout_secs))
+            .saturating_sub(MCP_INGEST_RESPONSE_RESERVE)
     } else {
         MCP_INGEST_ADMISSION_DEADLINE.saturating_sub(MCP_INGEST_RESPONSE_RESERVE)
     };
@@ -14459,7 +14460,7 @@ quality_policy = "llm_required_for_keep"
                     wing: "mcp".to_string(),
                     room: Some("daemon-complete".to_string()),
                     wait: Some(true),
-                    wait_timeout_secs: Some(u64::MAX),
+                    wait_timeout_secs: Some(60),
                     ..IngestRequest::default()
                 },
                 IngestControls {

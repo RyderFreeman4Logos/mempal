@@ -357,8 +357,8 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 180415
-baseline_lines = 22733
+baseline_tokens = 180418
+baseline_lines = 22734
 issue = "843"
 rationale = "#843 preserves deterministic MCP ingest receipts after uncertain daemon delivery and bounds recovery by the request deadline; exact no-growth ratchet."
 
