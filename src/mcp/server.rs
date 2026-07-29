@@ -15803,7 +15803,7 @@ pattern_boost = 0.2
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_ingest_admission_warning_timeout_still_returns_receipt() {
+    async fn test_mcp_ingest_admission_warning_uses_request_budget_and_returns_receipt() {
         let (_tempdir, _db_path, server) = setup_server();
         let server = server
             .with_ingest_warning_snapshot_delay_for_test(Duration::from_millis(150))
@@ -15822,12 +15822,12 @@ pattern_boost = 0.2
         )
         .await
         .expect("MCP ingest should return before client timeout")
-        .expect("stale-index warning timeout must not reject a durable queue receipt")
+        .expect("stale-index warning snapshot must preserve a durable queue receipt")
         .0;
 
         assert_eq!(result.state, Some(IngestOperationState::Queued));
         assert!(result.operation_id.is_some());
-        assert!(result.system_warnings.iter().any(|warning| {
+        assert!(!result.system_warnings.iter().any(|warning| {
             warning.source == "mcp_timeout"
                 && warning
                     .message
@@ -15838,7 +15838,7 @@ pattern_boost = 0.2
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_ingest_replacement_target_timeout_rejects_admission() {
+    async fn test_mcp_ingest_replacement_target_uses_request_budget_for_admission() {
         let (_tempdir, db_path, server) = setup_server();
         insert_drawer(
             &db_path,
@@ -15856,10 +15856,10 @@ pattern_boost = 0.2
             .with_async_db_for_test(async_db)
             .with_mcp_deadline_for_test(Duration::from_millis(20));
 
-        let result = tokio::time::timeout(
+        let response = tokio::time::timeout(
             Duration::from_millis(500),
             server.mempal_ingest(Parameters(IngestRequest {
-                content: "replacement target timeout should reject admission".to_string(),
+                content: "replacement target should use request-wide admission budget".to_string(),
                 wing: "mcp".to_string(),
                 room: Some("deadline".to_string()),
                 replace_text: Some("replacement target before timeout".to_string()),
@@ -15869,18 +15869,12 @@ pattern_boost = 0.2
             })),
         )
         .await
-        .expect("MCP ingest should return before client timeout");
-        let error = match result {
-            Ok(_) => panic!("slow replacement target resolution should reject admission"),
-            Err(error) => error,
-        };
+        .expect("MCP ingest should return before client timeout")
+        .expect("slow replacement target resolution should use the request-wide budget")
+        .0;
 
-        assert!(
-            error
-                .to_string()
-                .contains("mempal_ingest admission preparation exceeded"),
-            "unexpected error: {error}"
-        );
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(response.operation_id.is_some());
 
         tokio::time::sleep(Duration::from_millis(180)).await;
     }
