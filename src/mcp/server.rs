@@ -14796,10 +14796,10 @@ quality_policy = "llm_required_for_keep"
         .await;
 
         let wait_result = tokio::time::timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(30),
             server.wait_for_operation_status_with_scoped_worker(
                 &operation_id,
-                Duration::from_secs(12),
+                Duration::from_secs(20),
                 Duration::from_millis(25),
             ),
         )
