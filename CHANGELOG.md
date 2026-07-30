@@ -43,10 +43,11 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ### Fixed
 
 - **Daemon restart recovery**: keep the persisted restart cooldown anchored to
-  its original deadline when a supervisor races replacement generations, and
-  replenish the rolling restart budget only after a daemon generation finishes
-  startup successfully; cooldown-blocked retries can no longer extend an outage
-  indefinitely (#844).
+  its original deadline when a supervisor races replacement generations, freeze
+  fault history for the full cooldown (including after the rolling window ages
+  out), and replenish the rolling restart budget only after a daemon generation
+  finishes startup successfully; cooldown-blocked retries can no longer extend
+  an outage indefinitely (#844).
 
 - **Daemon/MCP/CLI ingest liveness**: make daemon status queue diagnostics read-only and short-bounded; preserve followable deterministic MCP operation receipts when daemon delivery is uncertain; route `ingest --stdin --wait --json` through queue admission before a write-capable database open, with structured no-write receipts; skip local write-lock preflight when daemon hook IPC is live so zero-budget waits still return followable timed-out receipts; and bound daemon SIGTERM scoped ingest-worker drain by residual `DAEMON_DRAIN_BUDGET` so that path cannot hang on mid-claim embed I/O (#843).
 

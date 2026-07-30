@@ -102,6 +102,51 @@ fn faults_reported_during_cooldown_do_not_extend_the_cooldown() {
 }
 
 #[test]
+fn late_cooldown_fault_reports_do_not_prune_or_rewrite_frozen_fault_state() {
+    let mut state = DaemonRecoveryState::default();
+    for now in [100, 200, 300] {
+        state.record_fault(RecoveryFault::DatabaseLocked, now);
+    }
+    let entered = state.snapshot(300);
+    assert_eq!(entered.phase, RecoveryPhase::Cooldown);
+    assert_eq!(entered.recent_fault_count, MAX_RESTARTS);
+    assert_eq!(entered.cooldown_remaining_secs, COOLDOWN_SECS);
+    assert_eq!(entered.last_fault, Some(RecoveryFault::DatabaseLocked));
+
+    // After the rolling window has elapsed (600s) but before the fixed 900s
+    // cooldown deadline, a fault report must not prune or rewrite state.
+    let late = 300 + WINDOW_SECS + 1; // 901; cooldown ends at 1200
+    assert!(late < 300 + COOLDOWN_SECS);
+    assert_eq!(
+        state.record_fault(RecoveryFault::WriteStall, late),
+        RestartDecision::CooldownRequired
+    );
+    let frozen = state.snapshot(late);
+    assert_eq!(frozen.phase, RecoveryPhase::Cooldown);
+    assert_eq!(
+        frozen.recent_fault_count, MAX_RESTARTS,
+        "active cooldown must freeze fault history even after the rolling window elapses"
+    );
+    assert_eq!(
+        frozen.cooldown_remaining_secs,
+        (300 + COOLDOWN_SECS).saturating_sub(late)
+    );
+    assert_eq!(
+        frozen.last_fault,
+        Some(RecoveryFault::DatabaseLocked),
+        "a late cooldown-blocked report must not overwrite the root-cause diagnostic"
+    );
+    assert_eq!(
+        state.admit_start(300 + COOLDOWN_SECS - 1),
+        RestartDecision::CooldownRequired
+    );
+    assert_eq!(
+        state.admit_start(300 + COOLDOWN_SECS),
+        RestartDecision::RestartAllowed
+    );
+}
+
+#[test]
 fn old_faults_leave_the_rolling_window_without_resetting_active_recovery() {
     let mut state = DaemonRecoveryState::default();
     assert_eq!(

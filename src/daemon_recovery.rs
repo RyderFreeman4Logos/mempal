@@ -93,14 +93,15 @@ struct FaultRecord {
 
 impl DaemonRecoveryState {
     pub fn record_fault(&mut self, fault: RecoveryFault, now_secs: u64) -> RestartDecision {
-        self.prune(now_secs);
         // A supervisor may attempt to start several replacement generations while
         // the prior cooldown is still active. Those attempts must not turn the
         // cooldown into a sliding window, or they can keep the daemon down
-        // indefinitely.
+        // indefinitely. Return before any prune/mutation so a late report cannot
+        // rewrite the frozen fault history while the deadline remains authoritative.
         if self.phase == RecoveryPhase::Cooldown && now_secs < self.cooldown_until_unix_secs {
             return RestartDecision::CooldownRequired;
         }
+        self.prune(now_secs);
         self.last_fault = Some(fault);
         self.faults.push(FaultRecord {
             fault,
@@ -159,14 +160,20 @@ impl DaemonRecoveryState {
     }
 
     fn prune(&mut self, now_secs: u64) {
+        // While cooldown is still authoritative, freeze the fault history used for
+        // diagnostics and budget accounting. Only expire the whole cooldown once
+        // the fixed deadline elapses; do not age individual entries underneath it.
+        if self.phase == RecoveryPhase::Cooldown {
+            if now_secs >= self.cooldown_until_unix_secs {
+                self.phase = RecoveryPhase::Healthy;
+                self.cooldown_until_unix_secs = 0;
+                self.faults.clear();
+            }
+            return;
+        }
         self.faults.retain(|fault| {
             now_secs.saturating_sub(fault.occurred_at_unix_secs) <= RESTART_WINDOW_SECS
         });
-        if self.phase == RecoveryPhase::Cooldown && now_secs >= self.cooldown_until_unix_secs {
-            self.phase = RecoveryPhase::Healthy;
-            self.cooldown_until_unix_secs = 0;
-            self.faults.clear();
-        }
     }
 }
 

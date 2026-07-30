@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8631
-baseline_lines = 601
+baseline_tokens = 8649
+baseline_lines = 602
 issue = "844"
-rationale = "#844 adds the required Unreleased daemon restart-recovery entry; append-only changelog growth is unavoidable, exact no-growth ratchet."
+rationale = "#844 freezes cooldown fault history and extends the Unreleased restart-recovery entry; append-only changelog growth is unavoidable, exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
