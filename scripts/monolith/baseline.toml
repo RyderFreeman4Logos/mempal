@@ -357,10 +357,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 180758
-baseline_lines = 22771
+baseline_tokens = 181227
+baseline_lines = 22824
 issue = "843"
-rationale = "#843 preserves deterministic MCP ingest receipts after uncertain daemon delivery, adds budgeted scoped ingest-worker drain so daemon SIGTERM cannot hang on in-flight claims, and retries transient admission-sidecar lock contention so the daemon worker cannot exit during concurrent startup; exact no-growth ratchet."
+rationale = "#843 preserves deterministic MCP ingest receipts after uncertain daemon delivery, adds budgeted scoped ingest-worker drain so daemon SIGTERM cannot hang on in-flight claims, and retries transient admission-sidecar lock contention so an admitted drain claim is not released before the lock holder exits; exact no-growth ratchet."
 
 [[files]]
 path = "src/mcp/tools.rs"

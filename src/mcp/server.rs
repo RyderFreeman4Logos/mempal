@@ -216,6 +216,12 @@ const MCP_INGEST_CLAIM_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(50)
 const MCP_INGEST_CLAIM_RELEASE_BUSY_TIMEOUT: Duration = Duration::ZERO;
 const MCP_INGEST_RESULT_RETRY_DEADLINE: Duration = Duration::from_secs(300);
 const MCP_INGEST_RESULT_RETRY_DELAY: Duration = Duration::from_millis(50);
+// An admitted async ingest can race a short-lived sidecar admission lock held
+// by another daemon task. Keep that claim active across a few short retries so
+// graceful SIGTERM drain does not release an in-flight write solely because the
+// lock holder has not yet exited.
+const MCP_SYNC_INGEST_OPEN_ADMISSION_RETRY_ATTEMPTS: u8 = 3;
+const MCP_SYNC_INGEST_OPEN_ADMISSION_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MCP_SCOPED_INGEST_CLAIM_CLEANUP_MARGIN: Duration = Duration::from_millis(250);
 // Caller-bounded scoped waits may claim only when this much budget remains. The
 // cleanup margin is reserved for releasing the claim if processing hits the
@@ -4058,6 +4064,12 @@ fn status_error_summary(error: &(dyn std::error::Error + 'static)) -> String {
 fn status_db_failure_kind(error: &(dyn std::error::Error + 'static)) -> &'static str {
     let mut current = Some(error);
     while let Some(error) = current {
+        if matches!(
+            error.downcast_ref::<crate::core::db_admission::DbAdmissionError>(),
+            Some(crate::core::db_admission::DbAdmissionError::Busy { .. })
+        ) {
+            return "locked_or_busy";
+        }
         if let Some(sqlite) = error.downcast_ref::<rusqlite::Error>()
             && let Some(kind) = status_rusqlite_failure_kind(sqlite)
         {
@@ -7511,6 +7523,40 @@ impl MempalMcpServer {
         .await
     }
 
+    async fn open_sync_ingest_db_with_admission_retry(
+        &self,
+    ) -> std::result::Result<Database, ErrorData> {
+        let mut retry_attempt = 0;
+        loop {
+            match Database::open(&self.db_path) {
+                Ok(db) => return Ok(db),
+                Err(error)
+                    if matches!(
+                        error,
+                        crate::core::db::DbError::Admission(
+                            crate::core::db_admission::DbAdmissionError::Busy { .. }
+                        )
+                    ) && retry_attempt < MCP_SYNC_INGEST_OPEN_ADMISSION_RETRY_ATTEMPTS =>
+                {
+                    retry_attempt = retry_attempt.saturating_add(1);
+                    tracing::debug!(
+                        retry_attempt,
+                        max_retry_attempts = MCP_SYNC_INGEST_OPEN_ADMISSION_RETRY_ATTEMPTS,
+                        "sync ingest database admission state was busy; retrying before releasing claim"
+                    );
+                    tokio::time::sleep(MCP_SYNC_INGEST_OPEN_ADMISSION_RETRY_DELAY).await;
+                }
+                Err(error) => {
+                    return Err(database_write_refused_error(
+                        &self.db_path,
+                        "sync_ingest_open_db",
+                        &error,
+                    ));
+                }
+            }
+        }
+    }
+
     async fn mempal_ingest_sync_with_superseded_override(
         &self,
         request: IngestRequest,
@@ -7550,9 +7596,7 @@ impl MempalMcpServer {
                 ),
             ));
         }
-        let db = Database::open(&self.db_path).map_err(|error| {
-            database_write_refused_error(&self.db_path, "sync_ingest_open_db", &error)
-        })?;
+        let db = self.open_sync_ingest_db_with_admission_retry().await?;
         // Snapshot the request-wide warnings once so every early-return path reports a
         // consistent set from a single `sqlite_master` read. A mid-request embed transition
         // to degraded is not lost: the degraded-write guard above rejects before any
@@ -16425,6 +16469,15 @@ pattern_boost = 0.2
             },
         ));
         assert!(!ingest_worker_error_is_terminal(&admission_busy));
+    }
+
+    #[test]
+    fn test_database_admission_busy_is_a_transient_write_lock() {
+        let admission_busy = crate::core::db_admission::DbAdmissionError::Busy {
+            path: std::path::PathBuf::from("/tmp/mempal-test-admission.lock"),
+            timeout_ms: 250,
+        };
+        assert_eq!(status_db_failure_kind(&admission_busy), "locked_or_busy");
     }
 
     #[tokio::test(flavor = "current_thread")]
