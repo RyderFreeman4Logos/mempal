@@ -339,7 +339,10 @@ fn terminate_daemon(daemon: &mut ForegroundDaemon) {
         "failed to send SIGTERM to daemon\n{}",
         daemon.diagnostics()
     );
-    if !wait_for_child_exit(&mut daemon.child, Duration::from_secs(20)) {
+    // Match product daemon stop grace (drain budget + cleanup buffer). A
+    // claimed zero-budget wait op may still be mid-embed when SIGTERM lands.
+    let sigterm_grace = mempal::daemon::DAEMON_DRAIN_BUDGET + Duration::from_secs(5);
+    if !wait_for_child_exit(&mut daemon.child, sigterm_grace) {
         let sigterm_elapsed = sigterm_sent_at.elapsed();
         let _ = daemon.child.kill();
         let kill_wait_start = Instant::now();

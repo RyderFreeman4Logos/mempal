@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8514
+baseline_tokens = 8548
 baseline_lines = 595
 issue = "843"
-rationale = "#843 adds the required Unreleased liveness-fix entry; append-only changelog growth is unavoidable, exact no-growth ratchet."
+rationale = "#843 adds the required Unreleased liveness-fix entry including budgeted daemon SIGTERM ingest-worker drain; append-only changelog growth is unavoidable, exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -269,10 +269,10 @@ rationale = "Writer-lease fenced crystallization writes; #680 correctness fix"
 [[files]]
 path = "src/daemon.rs"
 kind = "source"
-baseline_tokens = 52563
-baseline_lines = 6651
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt recalibrated after #721 payload handling; no-growth ratchet."
+baseline_tokens = 52651
+baseline_lines = 6634
+issue = "843"
+rationale = "Bound daemon SIGTERM ingest-worker drain by residual DAEMON_DRAIN_BUDGET so zero-budget wait tests cannot hang on mid-claim embed I/O; exact no-growth ratchet."
 
 [[files]]
 path = "src/daemon_bootstrap.rs"
@@ -357,10 +357,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 180418
-baseline_lines = 22734
+baseline_tokens = 180610
+baseline_lines = 22755
 issue = "843"
-rationale = "#843 preserves deterministic MCP ingest receipts after uncertain daemon delivery and bounds recovery by the request deadline; exact no-growth ratchet."
+rationale = "#843 preserves deterministic MCP ingest receipts after uncertain daemon delivery and adds budgeted scoped ingest-worker drain so daemon SIGTERM cannot hang on in-flight claims; exact no-growth ratchet."
 
 [[files]]
 path = "src/mcp/tools.rs"
@@ -645,10 +645,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/write_wait_cli.rs"
 kind = "test"
-baseline_tokens = 16137
-baseline_lines = 2027
+baseline_tokens = 16197
+baseline_lines = 2030
 issue = "843"
-rationale = "#843 adds locked and holder-budget stdin wait JSON no-write receipt regressions; exact no-growth ratchet."
+rationale = "#843 adds locked and holder-budget stdin wait JSON no-write receipt regressions and aligns foreground-daemon SIGTERM wait with product drain grace; exact no-growth ratchet."
 
 [[files]]
 path = "tests/xurl_embed.rs"

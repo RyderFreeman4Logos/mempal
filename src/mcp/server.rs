@@ -3916,8 +3916,35 @@ impl IngestDrainWorkerHandle {
 
     #[doc(hidden)]
     pub async fn shutdown_and_drain(self) {
+        // Keep the historical unbounded drain for tests and call sites that own
+        // the worker lifecycle directly. Daemon graceful shutdown must pass an
+        // explicit residual budget so SIGTERM cannot hang on an in-flight claim.
+        self.shutdown_and_drain_with_budget(None).await;
+    }
+
+    #[doc(hidden)]
+    pub async fn shutdown_and_drain_with_budget(self, budget: Option<Duration>) {
         self.request_shutdown();
-        if let Err(error) = self.handle.await {
+        let mut handle = self.handle;
+        let join_result = match budget {
+            Some(budget) if budget.is_zero() => {
+                handle.abort();
+                handle.await
+            }
+            Some(budget) => match tokio::time::timeout(budget, &mut handle).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        budget_ms = budget.as_millis(),
+                        "scoped async ingest worker did not exit within drain deadline; aborting"
+                    );
+                    handle.abort();
+                    handle.await
+                }
+            },
+            None => handle.await,
+        };
+        if let Err(error) = join_result {
             tracing::warn!(error = %error, "scoped async ingest worker did not shut down cleanly");
         }
     }
