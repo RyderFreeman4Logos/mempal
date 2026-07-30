@@ -94,6 +94,13 @@ struct FaultRecord {
 impl DaemonRecoveryState {
     pub fn record_fault(&mut self, fault: RecoveryFault, now_secs: u64) -> RestartDecision {
         self.prune(now_secs);
+        // A supervisor may attempt to start several replacement generations while
+        // the prior cooldown is still active. Those attempts must not turn the
+        // cooldown into a sliding window, or they can keep the daemon down
+        // indefinitely.
+        if self.phase == RecoveryPhase::Cooldown && now_secs < self.cooldown_until_unix_secs {
+            return RestartDecision::CooldownRequired;
+        }
         self.last_fault = Some(fault);
         self.faults.push(FaultRecord {
             fault,
@@ -126,6 +133,10 @@ impl DaemonRecoveryState {
         // Never clear an active Cooldown — the fault budget must be honored
         // even if background workers briefly appear healthy.
         if self.phase != RecoveryPhase::Cooldown {
+            // A fully initialized generation has proven the previous restart
+            // sequence recovered. Do not carry transient pre-start faults into
+            // its next failure window.
+            self.faults.clear();
             self.phase = RecoveryPhase::Healthy;
             self.cooldown_until_unix_secs = 0;
         }

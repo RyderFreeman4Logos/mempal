@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8570
-baseline_lines = 595
-issue = "843"
-rationale = "#843 adds the required Unreleased liveness-fix entry including budgeted daemon SIGTERM ingest-worker drain and daemon-IPC preflight skip; append-only changelog growth is unavoidable, exact no-growth ratchet."
+baseline_tokens = 8631
+baseline_lines = 601
+issue = "844"
+rationale = "#844 adds the required Unreleased daemon restart-recovery entry; append-only changelog growth is unavoidable, exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"

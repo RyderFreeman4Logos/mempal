@@ -19,7 +19,6 @@ fn repeated_faults_exhaust_restart_budget_until_cooldown_ends() {
             state.record_fault(RecoveryFault::WriterLeaseLost, now),
             RestartDecision::RestartAllowed
         );
-        state.record_recovered(now + 1);
     }
     assert_eq!(state.snapshot(250).restart_budget_remaining, 1);
 
@@ -46,6 +45,59 @@ fn repeated_faults_exhaust_restart_budget_until_cooldown_ends() {
     assert_eq!(
         state.admit_start(300 + COOLDOWN_SECS),
         RestartDecision::RestartAllowed
+    );
+}
+
+#[test]
+fn healthy_generation_replenishes_restart_budget() {
+    let mut state = DaemonRecoveryState::default();
+    for now in [100, 200] {
+        assert_eq!(
+            state.record_fault(RecoveryFault::WriterLeaseLost, now),
+            RestartDecision::RestartAllowed
+        );
+        state.record_recovered(now + 1);
+    }
+
+    let recovered = state.snapshot(250);
+    assert_eq!(recovered.phase, RecoveryPhase::Healthy);
+    assert_eq!(recovered.recent_fault_count, 0);
+    assert_eq!(recovered.restart_budget_remaining, MAX_RESTARTS);
+    assert_eq!(
+        state.record_fault(RecoveryFault::DatabaseLocked, 300),
+        RestartDecision::RestartAllowed,
+        "the next transient fault starts a fresh recovery window"
+    );
+}
+
+#[test]
+fn faults_reported_during_cooldown_do_not_extend_the_cooldown() {
+    let mut state = DaemonRecoveryState::default();
+    for now in [100, 200, 300] {
+        state.record_fault(RecoveryFault::DatabaseLocked, now);
+    }
+    let initial = state.snapshot(300);
+    assert_eq!(initial.phase, RecoveryPhase::Cooldown);
+    assert_eq!(initial.cooldown_remaining_secs, COOLDOWN_SECS);
+    assert_eq!(initial.last_fault, Some(RecoveryFault::DatabaseLocked));
+
+    assert_eq!(
+        state.record_fault(RecoveryFault::WriteStall, 301),
+        RestartDecision::CooldownRequired
+    );
+    let during_cooldown = state.snapshot(301);
+    assert_eq!(during_cooldown.recent_fault_count, MAX_RESTARTS);
+    assert_eq!(during_cooldown.cooldown_remaining_secs, COOLDOWN_SECS - 1);
+    assert_eq!(
+        during_cooldown.last_fault,
+        Some(RecoveryFault::DatabaseLocked),
+        "a cooldown-blocked generation must not overwrite the root-cause diagnostic"
+    );
+
+    assert_eq!(
+        state.admit_start(300 + COOLDOWN_SECS),
+        RestartDecision::RestartAllowed,
+        "the original cooldown deadline admits the next daemon generation"
     );
 }
 
