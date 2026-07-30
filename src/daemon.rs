@@ -429,7 +429,14 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     sleep_scheduler::drain(sleep_scheduler_handle).await;
     endpoint_requeue_handle.abort();
     let _ = endpoint_requeue_handle.await;
-    ingest_drain_worker.shutdown_and_drain().await;
+    // Bound the final ingest-worker join like hooks/LLM workers. A claimed
+    // op can block on embed/network I/O against a dead endpoint; unbounded
+    // await here previously prevented SIGTERM from completing within the
+    // daemon stop grace used by CLI/tests (#843 write_wait_cli).
+    let ingest_drain_remaining = DAEMON_DRAIN_BUDGET.saturating_sub(drain_start.elapsed());
+    ingest_drain_worker
+        .shutdown_and_drain_with_budget(Some(ingest_drain_remaining))
+        .await;
 
     // Release any tasks still claimed by workers that were aborted or did not finish.
     let released = context

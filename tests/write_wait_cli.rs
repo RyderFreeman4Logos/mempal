@@ -159,6 +159,8 @@ fn run_cli_with_stdin_bounded(
             panic!("stdin write failed: {e}");
         }
     }
+    // Queue-first stdin ingestion reads to EOF before probing admission.
+    drop(child.stdin.take());
     // Bounded wait: poll then reap; static-only panic (no stdout/stderr).
     let deadline = Instant::now() + timeout;
     loop {
@@ -337,7 +339,10 @@ fn terminate_daemon(daemon: &mut ForegroundDaemon) {
         "failed to send SIGTERM to daemon\n{}",
         daemon.diagnostics()
     );
-    if !wait_for_child_exit(&mut daemon.child, Duration::from_secs(20)) {
+    // Match product daemon stop grace (drain budget + cleanup buffer). A
+    // claimed zero-budget wait op may still be mid-embed when SIGTERM lands.
+    let sigterm_grace = mempal::daemon::DAEMON_DRAIN_BUDGET + Duration::from_secs(5);
+    if !wait_for_child_exit(&mut daemon.child, sigterm_grace) {
         let sigterm_elapsed = sigterm_sent_at.elapsed();
         let _ = daemon.child.kill();
         let kill_wait_start = Instant::now();
@@ -523,6 +528,54 @@ fn test_ingest_wait_json_admission_blocked_output_is_cleanup_safe_at_14_of_16_se
     assert!(
         cleanup_ids_from_ingest_json(&stdout).is_empty(),
         "blocked receipt exposed cleanup IDs"
+    );
+}
+
+#[test]
+fn test_ingest_wait_json_locked_queue_emits_structured_no_write_receipt() {
+    let home = setup_home();
+    let db_path = home.path().join(".mempal/palace.db");
+    let _config = write_config(home.path(), "http://127.0.0.1:9/v1");
+    let lock = Connection::open(&db_path).expect("open SQLite lock connection");
+    lock.execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold SQLite write lock");
+
+    let output = run_cli_with_stdin_bounded(
+        home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--wing",
+            "smoke",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+            "--wait",
+            "--wait-timeout-secs",
+            "1",
+            "--json",
+        ],
+        br#"{"content":"locked queue must emit a machine-readable no-write receipt"}"#,
+        Duration::from_secs(4),
+    );
+    lock.execute_batch("ROLLBACK;")
+        .expect("release SQLite write lock");
+
+    assert!(
+        !output.status.success(),
+        "locked admission must fail closed"
+    );
+    let stdout: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+        panic!(
+            "locked admission must not fail with empty or opaque stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(stdout["outcome"], "admission_blocked");
+    assert_eq!(stdout["reason"], "database_locked");
+    assert!(
+        cleanup_ids_from_ingest_json(&stdout).is_empty(),
+        "no-write receipt exposed cleanup IDs: {stdout}"
     );
 }
 

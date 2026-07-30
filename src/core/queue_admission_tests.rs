@@ -1,11 +1,15 @@
 use crate::core::db::Database;
 use crate::core::db_admission::ProfileDbAdmission;
 use crate::core::queue::{PendingMessageStore, QueueError};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use rusqlite::{Connection, OpenFlags};
 
-use super::{QUEUE_CONNECTION_CACHE_BYTES, QUEUE_CONNECTIONS_PER_CACHE, queue_stats_readonly};
+use super::{
+    QUEUE_CONNECTION_CACHE_BYTES, QUEUE_CONNECTIONS_PER_CACHE, queue_stats_readonly,
+    queue_stats_readonly_with_busy_timeout, queue_write_admission_preflight,
+};
 
 #[test]
 fn readonly_stats_missing_database_has_no_filesystem_side_effects() {
@@ -97,4 +101,61 @@ fn readonly_stats_open_the_admitted_target_after_symlink_retarget() {
     .expect("readonly stats must retain the first target");
 
     assert_eq!(stats.pending, 0);
+}
+
+#[test]
+fn readonly_stats_with_diagnostic_busy_timeout_returns_without_default_busy_wait() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("palace.db");
+    drop(Database::open(&db_path).expect("initialize database"));
+
+    let lock = Connection::open(&db_path).expect("open SQLite lock connection");
+    lock.pragma_update(None, "journal_mode", "DELETE")
+        .expect("disable WAL for exclusive diagnostic lock");
+    lock.execute_batch("BEGIN EXCLUSIVE;")
+        .expect("hold SQLite exclusive lock");
+
+    let started = Instant::now();
+    let error = queue_stats_readonly_with_busy_timeout(&db_path, Duration::from_millis(25))
+        .expect_err("diagnostic queue stats must report the held writer lock");
+    let elapsed = started.elapsed();
+
+    lock.execute_batch("ROLLBACK;")
+        .expect("release SQLite write lock");
+    assert!(
+        error.is_sqlite_lock(),
+        "expected SQLite lock diagnostic, got {error}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "diagnostic stats inherited a long SQLite busy wait: {elapsed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_admission_preflight_returns_without_default_busy_wait() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("palace.db");
+    drop(Database::open(&db_path).expect("initialize database"));
+
+    let lock = Connection::open(&db_path).expect("open SQLite lock connection");
+    lock.execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold SQLite write lock");
+
+    let started = Instant::now();
+    let error = queue_write_admission_preflight(&db_path)
+        .expect_err("queue preflight must report the held writer lock");
+    let elapsed = started.elapsed();
+
+    lock.execute_batch("ROLLBACK;")
+        .expect("release SQLite write lock");
+    assert!(
+        error.is_sqlite_lock(),
+        "expected SQLite lock preflight error, got {error}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "queue preflight inherited a long SQLite busy wait: {elapsed:?}"
+    );
 }

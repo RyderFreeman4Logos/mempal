@@ -162,8 +162,16 @@ fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool
     }
 }
 
-fn should_continue_ingest_heartbeat_after_error(error: &QueueError) -> bool {
+fn is_transient_ingest_claim_error(error: &QueueError) -> bool {
     error.is_sqlite_lock()
+        || matches!(
+            error,
+            QueueError::Admission(crate::core::db_admission::DbAdmissionError::Busy { .. })
+        )
+}
+
+fn should_continue_ingest_heartbeat_after_error(error: &QueueError) -> bool {
+    is_transient_ingest_claim_error(error)
 }
 
 #[cfg(target_os = "linux")]
@@ -200,11 +208,20 @@ const MCP_DAEMON_INGEST_ENQUEUE_IPC_TIMEOUT: Duration = Duration::from_secs(2);
 const MCP_INGEST_QUEUE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 const MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
+// Leave enough time to render an operation receipt before a caller's hard
+// request deadline closes the transport.
+const MCP_INGEST_RESPONSE_RESERVE: Duration = Duration::from_millis(250);
 const MCP_INGEST_CLAIM_RELEASE_RETRY_DEADLINE: Duration = Duration::from_secs(300);
 const MCP_INGEST_CLAIM_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MCP_INGEST_CLAIM_RELEASE_BUSY_TIMEOUT: Duration = Duration::ZERO;
 const MCP_INGEST_RESULT_RETRY_DEADLINE: Duration = Duration::from_secs(300);
 const MCP_INGEST_RESULT_RETRY_DELAY: Duration = Duration::from_millis(50);
+// An admitted async ingest can race a short-lived sidecar admission lock held
+// by another daemon task. Keep that claim active across a few short retries so
+// graceful SIGTERM drain does not release an in-flight write solely because the
+// lock holder has not yet exited.
+const MCP_SYNC_INGEST_OPEN_ADMISSION_RETRY_ATTEMPTS: u8 = 3;
+const MCP_SYNC_INGEST_OPEN_ADMISSION_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MCP_SCOPED_INGEST_CLAIM_CLEANUP_MARGIN: Duration = Duration::from_millis(250);
 // Caller-bounded scoped waits may claim only when this much budget remains. The
 // cleanup margin is reserved for releasing the claim if processing hits the
@@ -235,6 +252,23 @@ fn scoped_ingest_processing_budget(remaining: Duration) -> Option<Duration> {
 fn scoped_process_remaining(started: Instant, budget: Duration) -> Option<Duration> {
     let remaining = budget.saturating_sub(started.elapsed());
     (!remaining.is_zero()).then_some(remaining)
+}
+
+fn ingest_request_deadline(started: Instant, wait: bool, wait_timeout_secs: u64) -> Instant {
+    let budget = if wait {
+        clamp_wait_timeout(Duration::from_secs(wait_timeout_secs))
+            .saturating_sub(MCP_INGEST_RESPONSE_RESERVE)
+    } else {
+        MCP_INGEST_ADMISSION_DEADLINE.saturating_sub(MCP_INGEST_RESPONSE_RESERVE)
+    };
+    started.checked_add(budget).unwrap_or(started)
+}
+
+fn ingest_retry_deadline(request_deadline: Option<Instant>, cap: Duration) -> Instant {
+    let cap_deadline = Instant::now().checked_add(cap).unwrap_or_else(Instant::now);
+    request_deadline
+        .map(|deadline| deadline.min(cap_deadline))
+        .unwrap_or(cap_deadline)
 }
 
 fn mcp_ingest_idempotency_key(payload: &str) -> String {
@@ -1026,7 +1060,7 @@ impl MempalMcpServer {
                         break;
                     }
                 }
-                Err(error) if error.is_sqlite_lock() => {
+                Err(error) if is_transient_ingest_claim_error(&error) => {
                     idle_count = 0;
                     retry_count = retry_count.saturating_add(1);
                     let next_delay = ingest_worker_backoff_delay(retry_count);
@@ -3839,7 +3873,7 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 fn ingest_worker_error_is_terminal(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<crate::core::queue::QueueError>()
-        .is_some_and(|queue_error| !queue_error.is_sqlite_lock())
+        .is_some_and(|queue_error| !is_transient_ingest_claim_error(queue_error))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3896,8 +3930,35 @@ impl IngestDrainWorkerHandle {
 
     #[doc(hidden)]
     pub async fn shutdown_and_drain(self) {
+        // Keep the historical unbounded drain for tests and call sites that own
+        // the worker lifecycle directly. Daemon graceful shutdown must pass an
+        // explicit residual budget so SIGTERM cannot hang on an in-flight claim.
+        self.shutdown_and_drain_with_budget(None).await;
+    }
+
+    #[doc(hidden)]
+    pub async fn shutdown_and_drain_with_budget(self, budget: Option<Duration>) {
         self.request_shutdown();
-        if let Err(error) = self.handle.await {
+        let mut handle = self.handle;
+        let join_result = match budget {
+            Some(budget) if budget.is_zero() => {
+                handle.abort();
+                handle.await
+            }
+            Some(budget) => match tokio::time::timeout(budget, &mut handle).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        budget_ms = budget.as_millis(),
+                        "scoped async ingest worker did not exit within drain deadline; aborting"
+                    );
+                    handle.abort();
+                    handle.await
+                }
+            },
+            None => handle.await,
+        };
+        if let Err(error) = join_result {
             tracing::warn!(error = %error, "scoped async ingest worker did not shut down cleanly");
         }
     }
@@ -4003,6 +4064,12 @@ fn status_error_summary(error: &(dyn std::error::Error + 'static)) -> String {
 fn status_db_failure_kind(error: &(dyn std::error::Error + 'static)) -> &'static str {
     let mut current = Some(error);
     while let Some(error) = current {
+        if matches!(
+            error.downcast_ref::<crate::core::db_admission::DbAdmissionError>(),
+            Some(crate::core::db_admission::DbAdmissionError::Busy { .. })
+        ) {
+            return "locked_or_busy";
+        }
         if let Some(sqlite) = error.downcast_ref::<rusqlite::Error>()
             && let Some(kind) = status_rusqlite_failure_kind(sqlite)
         {
@@ -6606,7 +6673,7 @@ impl MempalMcpServer {
         }
         let dry_run = request.dry_run.unwrap_or(false);
         let controls = resolve_mcp_ingest_controls(&request, controls)?;
-        if !dry_run {
+        if !dry_run && matches!(worker_mode, IngestWaitWorkerMode::Background) {
             super::stale_daemon::guard_write(&self.db_path)?;
         }
         if !dry_run && global_embed_status().should_block_writes() {
@@ -6614,15 +6681,21 @@ impl MempalMcpServer {
         }
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let room = request.room.as_deref();
+        let wait = request.wait.unwrap_or(false);
+        let wait_timeout_secs = request.wait_timeout_secs.unwrap_or(30);
+        let request_deadline = ingest_request_deadline(request_started_at, wait, wait_timeout_secs);
         // Snapshot the request-wide warnings once so every early-return path reports a
         // consistent set from a single `sqlite_master` read. A mid-request embed transition
         // to degraded is not lost: the degraded-write guards above reject before any
         // success response that would carry this snapshot is built.
-        let request_system_warnings = self
-            .ingest_system_warnings_with_stale_index_bounded(self.ingest_admission_deadline)
-            .await?;
-        let wait = request.wait.unwrap_or(false);
-        let wait_timeout_secs = request.wait_timeout_secs.unwrap_or(30);
+        let request_system_warnings = if matches!(worker_mode, IngestWaitWorkerMode::Scoped) {
+            current_system_warnings()
+        } else {
+            self.ingest_system_warnings_with_stale_index_bounded(
+                request_deadline.saturating_duration_since(Instant::now()),
+            )
+            .await?
+        };
         let memory_kind = parse_memory_kind(request.memory_kind.as_deref())?;
         let raw_turn = is_raw_turn(&request.wing, room, memory_kind.as_ref(), &config.turns);
         if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
@@ -6684,11 +6757,11 @@ impl MempalMcpServer {
         daemon_rest_request.project_id = project_id.clone();
         // wait=true callers expect a durable terminal result (or explicit refusal).
         // Do not enqueue work the current MCP process cannot admit/run (#809).
-        if wait {
+        if wait && matches!(worker_mode, IngestWaitWorkerMode::Background) {
             self.ensure_async_pool_for_wait_ingest().await?;
         }
         let prepared = match tokio::time::timeout(
-            self.ingest_admission_deadline,
+            request_deadline.saturating_duration_since(Instant::now()),
             self.prepare_async_ingest_operation(
                 &request,
                 controls,
@@ -6717,6 +6790,7 @@ impl MempalMcpServer {
                 payload,
                 &daemon_rest_request,
                 &request_system_warnings,
+                request_deadline,
                 // A wait=true caller needs an operation receipt it can reconcile.
                 // If hook IPC is unavailable, admit its idempotent local queue entry
                 // before considering REST so a dead REST listener cannot erase that
@@ -6744,6 +6818,7 @@ impl MempalMcpServer {
                             prepared,
                             request_system_warnings,
                             diagnostic,
+                            request_deadline,
                         )
                         .await?;
                     return Ok(Json(response));
@@ -6902,6 +6977,7 @@ impl MempalMcpServer {
         prepared: PreparedIngestOperation,
         mut system_warnings: Vec<SystemWarning>,
         diagnostic: DatabaseDiagnosticDto,
+        request_deadline: Instant,
     ) -> std::result::Result<IngestResponse, ErrorData> {
         let mut database_diagnostic = None;
         record_status_database_diagnostic(
@@ -6911,48 +6987,66 @@ impl MempalMcpServer {
         );
         tracing::warn!("recovering MCP ingest synchronously after self-held queue admission lock");
 
-        let started = Instant::now();
+        let recovery_deadline = ingest_retry_deadline(
+            Some(request_deadline),
+            MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE,
+        );
         loop {
-            let outcome = self
-                .run_queued_write_off_runtime(
+            let remaining = recovery_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(mcp_stage_timeout_error(
+                    "mempal_ingest",
+                    "self-held queue-lock recovery",
+                    MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE,
+                ));
+            }
+            let outcome = tokio::time::timeout(
+                remaining,
+                self.run_queued_write_off_runtime(
                     QueuedWriteOperation::ingest(
                         prepared.request.clone(),
                         prepared.controls,
                         prepared.superseded_drawer_id.clone(),
                     ),
                     None,
-                )
-                .await;
+                ),
+            )
+            .await;
             match outcome {
-                Ok(Ok(response)) => {
+                Ok(Ok(Ok(response))) => {
                     return Ok(finalize_self_recovered_ingest_response(
                         response,
                         system_warnings,
                     ));
                 }
-                Ok(Err(error))
+                Ok(Ok(Err(error)))
                     if mcp_error_data_is_transient_database_lock(&error)
-                        && started.elapsed() < MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE
+                        && Instant::now() < recovery_deadline
                         && self.ingest_admission_current_mcp_server_holder_visible() =>
                 {
-                    let remaining =
-                        MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE.saturating_sub(started.elapsed());
+                    let remaining = recovery_deadline.saturating_duration_since(Instant::now());
                     tokio::time::sleep(MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DELAY.min(remaining)).await;
                 }
-                Ok(Err(error)) => return Err(error),
-                Err(error)
+                Ok(Ok(Err(error))) => return Err(error),
+                Ok(Err(error))
                     if anyhow_chain_contains_sqlite_lock(&error)
-                        && started.elapsed() < MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE
+                        && Instant::now() < recovery_deadline
                         && self.ingest_admission_current_mcp_server_holder_visible() =>
                 {
-                    let remaining =
-                        MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE.saturating_sub(started.elapsed());
+                    let remaining = recovery_deadline.saturating_duration_since(Instant::now());
                     tokio::time::sleep(MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DELAY.min(remaining)).await;
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     return Err(ErrorData::internal_error(
                         format!("self-held MCP ingest recovery failed: {error}"),
                         None,
+                    ));
+                }
+                Err(_) => {
+                    return Err(mcp_stage_timeout_error(
+                        "mempal_ingest",
+                        "self-held queue-lock recovery",
+                        MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE,
                     ));
                 }
             }
@@ -6964,11 +7058,16 @@ impl MempalMcpServer {
         payload: String,
         daemon_rest_request: &IngestRequest,
         request_system_warnings: &[SystemWarning],
+        request_deadline: Instant,
         allow_daemon_rest_fallback: bool,
     ) -> std::result::Result<IngestAdmissionOutcome, IngestAdmissionError> {
         let idempotency_key = mcp_ingest_idempotency_key(&payload);
         let daemon_enqueue = self
-            .try_enqueue_ingest_operation_via_daemon(payload.clone(), idempotency_key.clone())
+            .try_enqueue_ingest_operation_via_daemon(
+                payload.clone(),
+                idempotency_key.clone(),
+                request_deadline,
+            )
             .await?;
         let daemon_enqueue_may_have_reached = match daemon_enqueue {
             DaemonIngestEnqueue::Accepted { operation_id } => {
@@ -6987,7 +7086,7 @@ impl MempalMcpServer {
             let operation_id =
                 PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &idempotency_key);
             if self
-                .daemon_admitted_operation_is_visible(&operation_id)
+                .daemon_admitted_operation_is_visible(&operation_id, request_deadline)
                 .await?
             {
                 return Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
@@ -6999,7 +7098,11 @@ impl MempalMcpServer {
             }
 
             return match self
-                .enqueue_ingest_operation_locally_with_retry(payload, idempotency_key)
+                .enqueue_ingest_operation_locally_with_retry(
+                    payload,
+                    idempotency_key,
+                    request_deadline,
+                )
                 .await
             {
                 Ok(operation_id) => Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
@@ -7009,20 +7112,40 @@ impl MempalMcpServer {
                     local_fallback_persisted_after_daemon_uncertainty: true,
                 })),
                 Err(error) if anyhow_chain_contains_sqlite_lock(&error) => {
-                    if self
-                        .daemon_admitted_operation_is_visible(&operation_id)
-                        .await?
+                    match self
+                        .daemon_admitted_operation_is_visible(&operation_id, request_deadline)
+                        .await
                     {
-                        return Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
-                            operation_id,
-                            processor: IngestQueueProcessor::Daemon,
-                            daemon_enqueue_may_have_reached,
-                            local_fallback_persisted_after_daemon_uncertainty: false,
-                        }));
+                        Ok(true) => {
+                            return Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
+                                operation_id,
+                                processor: IngestQueueProcessor::Daemon,
+                                daemon_enqueue_may_have_reached,
+                                local_fallback_persisted_after_daemon_uncertainty: false,
+                            }));
+                        }
+                        Ok(false) => {
+                            tracing::warn!(
+                                operation_id,
+                                ?error,
+                                "daemon IPC delivery is uncertain and the local queue remains locked; returning a followable receipt"
+                            );
+                        }
+                        Err(visibility_error) => {
+                            tracing::warn!(
+                                operation_id,
+                                ?error,
+                                ?visibility_error,
+                                "daemon IPC delivery is uncertain and operation visibility could not be checked; returning a followable receipt"
+                            );
+                        }
                     }
-                    Err(IngestAdmissionError::Queue(error.context(
-                        "SQLite queue admission remained locked and no durable daemon operation row became visible",
-                    )))
+                    Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
+                        operation_id,
+                        processor: IngestQueueProcessor::Daemon,
+                        daemon_enqueue_may_have_reached,
+                        local_fallback_persisted_after_daemon_uncertainty: false,
+                    }))
                 }
                 Err(error) => Err(IngestAdmissionError::Queue(error)),
             };
@@ -7055,7 +7178,11 @@ impl MempalMcpServer {
         }
 
         let operation_id = self
-            .enqueue_ingest_operation_locally_with_retry(payload, idempotency_key.clone())
+            .enqueue_ingest_operation_locally_with_retry(
+                payload,
+                idempotency_key.clone(),
+                request_deadline,
+            )
             .await?;
         Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
             operation_id,
@@ -7069,12 +7196,13 @@ impl MempalMcpServer {
         &self,
         payload: String,
         idempotency_key: String,
+        request_deadline: Instant,
     ) -> anyhow::Result<String> {
         let last_lock_error = match self
             .retry_enqueue_ingest_operation_locally_until(
                 payload.clone(),
                 idempotency_key.clone(),
-                Instant::now() + MCP_INGEST_QUEUE_LOCK_RETRY_DEADLINE,
+                ingest_retry_deadline(Some(request_deadline), MCP_INGEST_QUEUE_LOCK_RETRY_DEADLINE),
             )
             .await
         {
@@ -7088,7 +7216,10 @@ impl MempalMcpServer {
                 .retry_enqueue_ingest_operation_locally_until(
                     payload,
                     idempotency_key,
-                    Instant::now() + MCP_INGEST_SELF_HOLDER_QUEUE_LOCK_RETRY_DEADLINE,
+                    ingest_retry_deadline(
+                        Some(request_deadline),
+                        MCP_INGEST_SELF_HOLDER_QUEUE_LOCK_RETRY_DEADLINE,
+                    ),
                 )
                 .await
             {
@@ -7141,6 +7272,7 @@ impl MempalMcpServer {
         &self,
         payload: String,
         idempotency_key: String,
+        request_deadline: Instant,
     ) -> anyhow::Result<DaemonIngestEnqueue> {
         let Some(mempal_home) = self.db_path.parent().map(Path::to_path_buf) else {
             return Ok(DaemonIngestEnqueue::Fallback {
@@ -7152,12 +7284,15 @@ impl MempalMcpServer {
             payload,
             idempotency_key: idempotency_key.clone(),
         };
+        let ipc_timeout = MCP_DAEMON_INGEST_ENQUEUE_IPC_TIMEOUT
+            .min(request_deadline.saturating_duration_since(Instant::now()));
+        if ipc_timeout.is_zero() {
+            return Ok(DaemonIngestEnqueue::Fallback {
+                may_have_reached_daemon: false,
+            });
+        }
         let outcome = tokio::task::spawn_blocking(move || {
-            crate::hook_ipc::enqueue_with_timeout(
-                &mempal_home,
-                request,
-                MCP_DAEMON_INGEST_ENQUEUE_IPC_TIMEOUT,
-            )
+            crate::hook_ipc::enqueue_with_timeout(&mempal_home, request, ipc_timeout)
         })
         .await
         .context("blocking daemon ingest enqueue IPC failed")?;
@@ -7167,7 +7302,7 @@ impl MempalMcpServer {
                 let operation_id =
                     PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &idempotency_key);
                 if self
-                    .daemon_admitted_operation_is_visible(&operation_id)
+                    .daemon_admitted_operation_is_visible(&operation_id, request_deadline)
                     .await?
                 {
                     Ok(DaemonIngestEnqueue::Accepted { operation_id })
@@ -7198,8 +7333,10 @@ impl MempalMcpServer {
     async fn daemon_admitted_operation_is_visible(
         &self,
         operation_id: &str,
+        request_deadline: Instant,
     ) -> anyhow::Result<bool> {
-        let deadline = Instant::now() + self.operation_status_deadline;
+        let deadline =
+            ingest_retry_deadline(Some(request_deadline), self.operation_status_deadline);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -7386,6 +7523,40 @@ impl MempalMcpServer {
         .await
     }
 
+    async fn open_sync_ingest_db_with_admission_retry(
+        &self,
+    ) -> std::result::Result<Database, ErrorData> {
+        let mut retry_attempt = 0;
+        loop {
+            match Database::open(&self.db_path) {
+                Ok(db) => return Ok(db),
+                Err(error)
+                    if matches!(
+                        error,
+                        crate::core::db::DbError::Admission(
+                            crate::core::db_admission::DbAdmissionError::Busy { .. }
+                        )
+                    ) && retry_attempt < MCP_SYNC_INGEST_OPEN_ADMISSION_RETRY_ATTEMPTS =>
+                {
+                    retry_attempt = retry_attempt.saturating_add(1);
+                    tracing::debug!(
+                        retry_attempt,
+                        max_retry_attempts = MCP_SYNC_INGEST_OPEN_ADMISSION_RETRY_ATTEMPTS,
+                        "sync ingest database admission state was busy; retrying before releasing claim"
+                    );
+                    tokio::time::sleep(MCP_SYNC_INGEST_OPEN_ADMISSION_RETRY_DELAY).await;
+                }
+                Err(error) => {
+                    return Err(database_write_refused_error(
+                        &self.db_path,
+                        "sync_ingest_open_db",
+                        &error,
+                    ));
+                }
+            }
+        }
+    }
+
     async fn mempal_ingest_sync_with_superseded_override(
         &self,
         request: IngestRequest,
@@ -7425,9 +7596,7 @@ impl MempalMcpServer {
                 ),
             ));
         }
-        let db = Database::open(&self.db_path).map_err(|error| {
-            database_write_refused_error(&self.db_path, "sync_ingest_open_db", &error)
-        })?;
+        let db = self.open_sync_ingest_db_with_admission_retry().await?;
         // Snapshot the request-wide warnings once so every early-return path reports a
         // consistent set from a single `sqlite_master` read. A mid-request embed transition
         // to degraded is not lost: the degraded-write guard above rejects before any
@@ -7509,32 +7678,52 @@ impl MempalMcpServer {
         let superseded_drawer_id_ref = superseded_drawer_id.as_deref();
         let mut superseded_response_id: Option<String> = None;
 
-        let mut chunk_drawer_ids: Vec<(usize, String, bool)> = Vec::with_capacity(chunks.len());
-        for (idx, chunk) in chunks.iter().enumerate() {
-            if let Some(existing_id) = exact_duplicate_drawer_id(
+        // Trusted local CLI callers bypass novelty because the legacy stdin path
+        // treats an exact request-wide content match as a no-op before chunking.
+        // Preserve that behavior for queue-first waits, including when the
+        // pre-existing drawer was written by the direct stdin path.
+        let direct_exact_duplicate = if bypass_novelty {
+            exact_content_duplicate_drawer_id(
                 &db,
-                chunk,
+                &scrubbed_content,
                 &request.wing,
                 room,
                 project_id.as_deref(),
                 superseded_drawer_id_ref,
-                &metadata,
-            )? {
-                chunk_drawer_ids.push((idx, existing_id, true));
-                continue;
-            }
+            )?
+        } else {
+            None
+        };
+        let mut chunk_drawer_ids: Vec<(usize, String, bool)> = Vec::with_capacity(chunks.len());
+        if let Some(existing_id) = direct_exact_duplicate {
+            chunk_drawer_ids.push((0, existing_id, true));
+        } else {
+            for (idx, chunk) in chunks.iter().enumerate() {
+                if let Some(existing_id) = exact_duplicate_drawer_id(
+                    &db,
+                    chunk,
+                    &request.wing,
+                    room,
+                    project_id.as_deref(),
+                    superseded_drawer_id_ref,
+                    &metadata,
+                )? {
+                    chunk_drawer_ids.push((idx, existing_id, true));
+                    continue;
+                }
 
-            let preferred_id = build_bootstrap_drawer_id_from_parts(
-                &request.wing,
-                room,
-                chunk,
-                metadata.identity_parts(),
-            );
-            let did = db
-                .resolve_available_drawer_id(&preferred_id)
-                .map_err(db_error)?;
-            let exists = db.drawer_exists(&did).map_err(db_error)?;
-            chunk_drawer_ids.push((idx, did, exists));
+                let preferred_id = build_bootstrap_drawer_id_from_parts(
+                    &request.wing,
+                    room,
+                    chunk,
+                    metadata.identity_parts(),
+                );
+                let did = db
+                    .resolve_available_drawer_id(&preferred_id)
+                    .map_err(db_error)?;
+                let exists = db.drawer_exists(&did).map_err(db_error)?;
+                chunk_drawer_ids.push((idx, did, exists));
+            }
         }
         let drawer_id = chunk_drawer_ids
             .first()
@@ -11439,6 +11628,22 @@ fn exact_duplicate_drawer_id(
     Ok(None)
 }
 
+fn exact_content_duplicate_drawer_id(
+    db: &Database,
+    content: &str,
+    wing: &str,
+    room: Option<&str>,
+    project_id: Option<&str>,
+    excluded_drawer_id: Option<&str>,
+) -> std::result::Result<Option<String>, ErrorData> {
+    Ok(db
+        .find_active_drawers_by_content(content, wing, room, project_id)
+        .map_err(db_error)?
+        .into_iter()
+        .find(|summary| Some(summary.id.as_str()) != excluded_drawer_id)
+        .map(|summary| summary.id))
+}
+
 fn drawer_matches_ingest_metadata(drawer: &Drawer, metadata: &ValidatedIngestMetadata) -> bool {
     drawer.memory_kind == metadata.memory_kind
         && drawer.domain == metadata.domain
@@ -14147,6 +14352,78 @@ quality_policy = "llm_required_for_keep"
         assert_eq!(record.op_state, IngestOperationState::Completed.as_str());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_mcp_ingest_uncertain_daemon_delivery_returns_followable_timeout_receipt() {
+        let (tempdir, db_path, server) = setup_server();
+        let queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+            .with_enqueue_lock_failures_for_test(100);
+        let server = server.with_async_queue_for_test(queue);
+        let (listener, _socket_guard) =
+            crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
+        let daemon = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept daemon IPC");
+            let request = crate::hook_ipc::read_enqueue_request(&mut stream)
+                .await
+                .expect("read daemon IPC request");
+            drop(stream);
+            request
+        });
+
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            server.mempal_ingest_with_controls(
+                IngestRequest {
+                    content: "uncertain daemon delivery must keep a followable receipt".to_string(),
+                    wing: "mcp".to_string(),
+                    room: Some("receipt".to_string()),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(1),
+                    ..IngestRequest::default()
+                },
+                IngestControls {
+                    no_gate: true,
+                    bypass_novelty: true,
+                },
+            ),
+        )
+        .await
+        .expect("uncertain daemon admission must return before the caller budget")
+        .expect("uncertain daemon delivery must return a followable receipt")
+        .0;
+
+        let request = daemon.await.expect("daemon IPC task");
+        let operation_id = response
+            .operation_id
+            .as_deref()
+            .expect("uncertain receipt must preserve an operation id");
+        assert_eq!(
+            operation_id,
+            PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &request.idempotency_key)
+        );
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(response.timed_out);
+        assert!(response.created_drawer_ids.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "uncertain delivery exceeded the caller budget"
+        );
+    }
+
+    #[test]
+    fn self_held_recovery_deadline_never_exceeds_remaining_request_budget() {
+        let started = Instant::now();
+        let request_deadline = started + Duration::from_millis(25);
+        let recovery_deadline =
+            ingest_retry_deadline(Some(request_deadline), Duration::from_secs(30));
+
+        assert!(
+            recovery_deadline <= request_deadline,
+            "self-held recovery must use the request's remaining budget"
+        );
+    }
+
     #[tokio::test]
     async fn test_daemon_admitted_operation_visibility_uses_status_deadline() {
         let (_tempdir, db_path, server) = setup_server();
@@ -14159,7 +14436,10 @@ quality_policy = "llm_required_for_keep"
         let started = tokio::time::Instant::now();
         let visible = tokio::time::timeout(
             Duration::from_millis(200),
-            server.daemon_admitted_operation_is_visible("missing-operation"),
+            server.daemon_admitted_operation_is_visible(
+                "missing-operation",
+                Instant::now() + Duration::from_secs(30),
+            ),
         )
         .await
         .expect("visibility check must not inherit the queue busy/blocking budget")
@@ -14259,7 +14539,7 @@ quality_policy = "llm_required_for_keep"
                     wing: "mcp".to_string(),
                     room: Some("daemon-complete".to_string()),
                     wait: Some(true),
-                    wait_timeout_secs: Some(u64::MAX),
+                    wait_timeout_secs: Some(60),
                     ..IngestRequest::default()
                 },
                 IngestControls {
@@ -14595,10 +14875,10 @@ quality_policy = "llm_required_for_keep"
         .await;
 
         let wait_result = tokio::time::timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(30),
             server.wait_for_operation_status_with_scoped_worker(
                 &operation_id,
-                Duration::from_secs(12),
+                Duration::from_secs(20),
                 Duration::from_millis(25),
             ),
         )
@@ -15602,7 +15882,7 @@ pattern_boost = 0.2
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_ingest_admission_warning_timeout_still_returns_receipt() {
+    async fn test_mcp_ingest_admission_warning_uses_request_budget_and_returns_receipt() {
         let (_tempdir, _db_path, server) = setup_server();
         let server = server
             .with_ingest_warning_snapshot_delay_for_test(Duration::from_millis(150))
@@ -15621,12 +15901,12 @@ pattern_boost = 0.2
         )
         .await
         .expect("MCP ingest should return before client timeout")
-        .expect("stale-index warning timeout must not reject a durable queue receipt")
+        .expect("stale-index warning snapshot must preserve a durable queue receipt")
         .0;
 
         assert_eq!(result.state, Some(IngestOperationState::Queued));
         assert!(result.operation_id.is_some());
-        assert!(result.system_warnings.iter().any(|warning| {
+        assert!(!result.system_warnings.iter().any(|warning| {
             warning.source == "mcp_timeout"
                 && warning
                     .message
@@ -15637,7 +15917,7 @@ pattern_boost = 0.2
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_ingest_replacement_target_timeout_rejects_admission() {
+    async fn test_mcp_ingest_replacement_target_uses_request_budget_for_admission() {
         let (_tempdir, db_path, server) = setup_server();
         insert_drawer(
             &db_path,
@@ -15655,10 +15935,10 @@ pattern_boost = 0.2
             .with_async_db_for_test(async_db)
             .with_mcp_deadline_for_test(Duration::from_millis(20));
 
-        let result = tokio::time::timeout(
+        let response = tokio::time::timeout(
             Duration::from_millis(500),
             server.mempal_ingest(Parameters(IngestRequest {
-                content: "replacement target timeout should reject admission".to_string(),
+                content: "replacement target should use request-wide admission budget".to_string(),
                 wing: "mcp".to_string(),
                 room: Some("deadline".to_string()),
                 replace_text: Some("replacement target before timeout".to_string()),
@@ -15668,18 +15948,12 @@ pattern_boost = 0.2
             })),
         )
         .await
-        .expect("MCP ingest should return before client timeout");
-        let error = match result {
-            Ok(_) => panic!("slow replacement target resolution should reject admission"),
-            Err(error) => error,
-        };
+        .expect("MCP ingest should return before client timeout")
+        .expect("slow replacement target resolution should use the request-wide budget")
+        .0;
 
-        assert!(
-            error
-                .to_string()
-                .contains("mempal_ingest admission preparation exceeded"),
-            "unexpected error: {error}"
-        );
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(response.operation_id.is_some());
 
         tokio::time::sleep(Duration::from_millis(180)).await;
     }
@@ -16187,6 +16461,23 @@ pattern_boost = 0.2
             ),
         ));
         assert!(!ingest_worker_error_is_terminal(&retryable));
+
+        let admission_busy = anyhow::Error::new(crate::core::queue::QueueError::Admission(
+            crate::core::db_admission::DbAdmissionError::Busy {
+                path: std::path::PathBuf::from("/tmp/mempal-test-admission.lock"),
+                timeout_ms: 250,
+            },
+        ));
+        assert!(!ingest_worker_error_is_terminal(&admission_busy));
+    }
+
+    #[test]
+    fn test_database_admission_busy_is_a_transient_write_lock() {
+        let admission_busy = crate::core::db_admission::DbAdmissionError::Busy {
+            path: std::path::PathBuf::from("/tmp/mempal-test-admission.lock"),
+            timeout_ms: 250,
+        };
+        assert_eq!(status_db_failure_kind(&admission_busy), "locked_or_busy");
     }
 
     #[tokio::test(flavor = "current_thread")]

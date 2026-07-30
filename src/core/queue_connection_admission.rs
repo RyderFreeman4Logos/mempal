@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -62,9 +63,23 @@ impl QueueConnectionAdmission {
     }
 }
 
+/// Verify that a fresh queue cache can be admitted and obtain a write lock
+/// without changing queue state.
+///
+/// The zero SQLite busy timeout is intentional: callers use this before
+/// dispatching work that must return a no-write receipt instead of waiting
+/// behind an unknown writer.
+pub fn queue_write_admission_preflight(path: &Path) -> Result<()> {
+    let admission = QueueConnectionAdmission::new();
+    let connection = admission.open_read_write(path)?;
+    connection.busy_timeout(Duration::ZERO)?;
+    connection.execute_batch("BEGIN IMMEDIATE; ROLLBACK;")?;
+    Ok(())
+}
+
 /// Read queue statistics without startup reclamation or a writable connection.
 pub fn queue_stats_readonly(path: &Path) -> Result<QueueStats> {
-    queue_stats_readonly_with_opener(path, |resolved_path| {
+    queue_stats_readonly_with_optional_busy_timeout(path, None, |resolved_path| {
         Connection::open_with_flags(
             resolved_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -72,8 +87,30 @@ pub fn queue_stats_readonly(path: &Path) -> Result<QueueStats> {
     })
 }
 
+/// Read queue statistics with a bounded SQLite busy wait for diagnostics.
+pub fn queue_stats_readonly_with_busy_timeout(
+    path: &Path,
+    busy_timeout: Duration,
+) -> Result<QueueStats> {
+    queue_stats_readonly_with_optional_busy_timeout(path, Some(busy_timeout), |resolved_path| {
+        Connection::open_with_flags(
+            resolved_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+    })
+}
+
+#[cfg(test)]
 fn queue_stats_readonly_with_opener(
     path: &Path,
+    open: impl FnOnce(&Path) -> rusqlite::Result<Connection>,
+) -> Result<QueueStats> {
+    queue_stats_readonly_with_optional_busy_timeout(path, None, open)
+}
+
+fn queue_stats_readonly_with_optional_busy_timeout(
+    path: &Path,
+    busy_timeout: Option<Duration>,
     open: impl FnOnce(&Path) -> rusqlite::Result<Connection>,
 ) -> Result<QueueStats> {
     if !path.exists() {
@@ -84,6 +121,9 @@ fn queue_stats_readonly_with_opener(
         DbAdmissionRequest::new(DbHolderClass::current_process(), 1, 2 * 1024 * 1024),
     )?;
     let connection = open(admission.database_path())?;
+    if let Some(busy_timeout) = busy_timeout {
+        connection.busy_timeout(busy_timeout)?;
+    }
     connection.pragma_update(None, "cache_size", QUEUE_SQLITE_CACHE_SIZE_KIB)?;
     compute_queue_stats(&connection, DEFAULT_MAX_INGEST_ACTIVE_BYTES)
 }

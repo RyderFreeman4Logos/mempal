@@ -62,10 +62,17 @@ trait DaemonCommandExt {
 
 impl DaemonCommandExt for Command {
     fn daemon_home(&mut self, home: &Path) -> &mut Self {
-        self.env("HOME", home).env(
-            mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
-            daemon_runtime_dir(home),
-        )
+        // Isolate daemon children from host/dotenv MEMPAL_EMBED_* overrides so
+        // fixture configs (especially paused openai_compat mocks) are honored.
+        self.env("HOME", home)
+            .env(
+                mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
+                daemon_runtime_dir(home),
+            )
+            .env_remove("MEMPAL_EMBED_BACKEND")
+            .env_remove("MEMPAL_EMBED_BASE_URL")
+            .env_remove("MEMPAL_EMBED_MODEL")
+            .env_remove("MEMPAL_EMBED_DIM")
     }
 }
 
@@ -788,9 +795,16 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
         .expect("enqueue async ingest");
 
     let mut child = spawn_foreground_daemon(tmp.path(), "drain-running-ingest-async");
-    // Poll with the existing store.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Full-suite / local-gates load can delay bootstrap past 10s; product drain
+    // budget stays 30s. Widen only this readiness probe before SIGTERM.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let running = loop {
+        if let Ok(Some(_)) = child.try_wait() {
+            panic!(
+                "daemon exited before paused embed request\n{}",
+                child.diagnostics()
+            );
+        }
         let record = store
             .operation_status(&operation_id)
             .expect("load operation status")
@@ -800,7 +814,12 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
         }
         assert!(
             Instant::now() < deadline,
-            "daemon did not reach the paused embed request before SIGTERM"
+            "daemon did not reach the paused embed request before SIGTERM: op_state={}, request_count={}, failure_detail={:.160}, rejected_reason={:.160}\n{}",
+            record.op_state,
+            handle.request_count(),
+            record.failure_detail.as_deref().unwrap_or("none"),
+            record.rejected_reason.as_deref().unwrap_or("none"),
+            child.diagnostics()
         );
         std::thread::sleep(Duration::from_millis(100));
     };

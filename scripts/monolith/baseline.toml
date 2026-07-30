@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8447
-baseline_lines = 593
-issue = "840"
-rationale = "#840 adds the changelog entry the changelog-check hook requires; append-only growth is unavoidable, exact no-growth ratchet."
+baseline_tokens = 8570
+baseline_lines = 595
+issue = "843"
+rationale = "#843 adds the required Unreleased liveness-fix entry including budgeted daemon SIGTERM ingest-worker drain and daemon-IPC preflight skip; append-only changelog growth is unavoidable, exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -229,10 +229,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/core/queue.rs"
 kind = "source"
-baseline_tokens = 23930
-baseline_lines = 3148
-issue = "680"
-rationale = "Transaction-aware queue helpers for writer-lease fenced writes; #680 correctness fix"
+baseline_tokens = 23943
+baseline_lines = 3151
+issue = "843"
+rationale = "#843 exports bounded read-only queue statistics for daemon status diagnostics; exact no-growth ratchet."
 
 [[files]]
 path = "src/core/types.rs"
@@ -269,10 +269,10 @@ rationale = "Writer-lease fenced crystallization writes; #680 correctness fix"
 [[files]]
 path = "src/daemon.rs"
 kind = "source"
-baseline_tokens = 52563
-baseline_lines = 6651
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt recalibrated after #721 payload handling; no-growth ratchet."
+baseline_tokens = 52651
+baseline_lines = 6634
+issue = "843"
+rationale = "Bound daemon SIGTERM ingest-worker drain by residual DAEMON_DRAIN_BUDGET so zero-budget wait tests cannot hang on mid-claim embed I/O; exact no-growth ratchet."
 
 [[files]]
 path = "src/daemon_bootstrap.rs"
@@ -341,10 +341,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/main.rs"
 kind = "source"
-baseline_tokens = 258476
-baseline_lines = 33477
-issue = "833"
-rationale = "#833 reserves a CLI BM25 fallback budget and adds bounded hybrid-timeout regression coverage; exact no-growth ratchet until the main CLI split lands."
+baseline_tokens = 260166
+baseline_lines = 33710
+issue = "843"
+rationale = "#843 dispatches stdin wait JSON to queue admission before a write-capable DB open, emits structured no-write receipts, and skips local write preflight when daemon hook IPC is live; exact no-growth ratchet until the main CLI split lands."
 
 [[files]]
 path = "src/markdown_export.rs"
@@ -357,10 +357,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 178830
-baseline_lines = 22533
-issue = "840"
-rationale = "#840 adds bounded SQLite BUSY/LOCKED retry to the query-only read path so MCP reads survive transient lock contention; growth is the retry wiring, an ErrorData-aware lock predicate, and a regression test."
+baseline_tokens = 181227
+baseline_lines = 22824
+issue = "843"
+rationale = "#843 preserves deterministic MCP ingest receipts after uncertain daemon delivery, adds budgeted scoped ingest-worker drain so daemon SIGTERM cannot hang on in-flight claims, and retries transient admission-sidecar lock contention so an admitted drain claim is not released before the lock holder exits; exact no-growth ratchet."
 
 [[files]]
 path = "src/mcp/tools.rs"
@@ -477,10 +477,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/daemon_lifecycle.rs"
 kind = "test"
-baseline_tokens = 7450
-baseline_lines = 947
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 7665
+baseline_lines = 966
+issue = "843"
+rationale = "Readiness-probe hardening for SIGTERM drain under local-gates load (#843); no-growth ratchet after env isolation + diagnostics."
 
 [[files]]
 path = "tests/embedder_reindex_scenarios.rs"
@@ -645,10 +645,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/write_wait_cli.rs"
 kind = "test"
-baseline_tokens = 15760
-baseline_lines = 1977
-issue = "825"
-rationale = "#825 adds deadline-bounded IPC connect readiness regression for non-accepting listeners; exact no-growth ratchet."
+baseline_tokens = 16197
+baseline_lines = 2030
+issue = "843"
+rationale = "#843 adds locked and holder-budget stdin wait JSON no-write receipt regressions and aligns foreground-daemon SIGTERM wait with product drain grace; exact no-growth ratchet."
 
 [[files]]
 path = "tests/xurl_embed.rs"
