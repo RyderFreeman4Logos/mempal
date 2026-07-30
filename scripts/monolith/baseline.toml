@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8672
-baseline_lines = 603
+baseline_tokens = 8686
+baseline_lines = 604
 issue = "844"
-rationale = "#844 keeps same-generation post-admission faults charged and extends the Unreleased restart-recovery entry; append-only changelog growth is unavoidable, exact no-growth ratchet."
+rationale = "#844 uses a monotonic admission epoch so same-second prior faults do not stick to healthy replacements; append-only changelog growth is unavoidable, exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"

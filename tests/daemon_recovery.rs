@@ -112,6 +112,24 @@ fn record_recovered_does_not_clear_faults_charged_to_the_current_generation() {
 }
 
 #[test]
+fn healthy_generation_replenishes_budget_when_prior_fault_shares_admit_unix_second() {
+    let mut state = DaemonRecoveryState::default();
+    // Prior generation charges a fault, then a replacement admits in the same
+    // wall-clock second. Epoch tracking must still treat the fault as prior.
+    assert_eq!(
+        state.record_fault(RecoveryFault::WriteStall, 100),
+        RestartDecision::RestartAllowed
+    );
+    assert_eq!(state.admit_start(100), RestartDecision::RestartAllowed);
+    state.record_recovered(101);
+    let recovered = state.snapshot(101);
+    assert_eq!(recovered.phase, RecoveryPhase::Healthy);
+    assert_eq!(recovered.recent_fault_count, 0);
+    assert_eq!(recovered.restart_budget_remaining, MAX_RESTARTS);
+    assert_eq!(recovered.last_fault, None);
+}
+
+#[test]
 fn faults_reported_during_cooldown_do_not_extend_the_cooldown() {
     let mut state = DaemonRecoveryState::default();
     for now in [100, 200, 300] {

@@ -45,8 +45,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - **Daemon restart recovery**: keep the persisted restart cooldown anchored to
   its original deadline when a supervisor races replacement generations, freeze
   fault history for the full cooldown (including after the rolling window ages
-  out), clear only pre-admission faults on successful recovery so same-generation
-  faults still charge the rolling restart budget, and replenish that budget only
+  out), attribute faults to a monotonic admission epoch so same-second prior
+  faults do not stick to a healthy replacement, keep same-generation
+  post-admission faults charged, and replenish the rolling restart budget only
   after a daemon generation finishes startup without post-admission faults;
   cooldown-blocked retries can no longer extend an outage indefinitely (#844).
 

@@ -83,17 +83,24 @@ pub struct DaemonRecoveryState {
     faults: Vec<FaultRecord>,
     cooldown_until_unix_secs: u64,
     last_fault: Option<RecoveryFault>,
-    /// Unix seconds when the current generation was admitted. Used so
-    /// `record_recovered` only clears pre-admission faults from prior failed
-    /// generations, never faults charged to the still-running generation.
+    /// Monotonic admission epoch for the currently admitted generation.
+    /// Incremented on every successful `admit_start` so recovery can distinguish
+    /// prior-generation faults from post-admission faults without relying on
+    /// whole-second wall-clock equality (fast supervisor restarts can share a
+    /// Unix second).
     #[serde(default)]
-    generation_started_at_unix_secs: u64,
+    generation_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FaultRecord {
     fault: RecoveryFault,
     occurred_at_unix_secs: u64,
+    /// Generation epoch active when this fault was charged. `0` means the fault
+    /// was recorded before any successful admission (or loaded from legacy
+    /// state without a generation field).
+    #[serde(default)]
+    generation: u64,
 }
 
 impl DaemonRecoveryState {
@@ -111,6 +118,7 @@ impl DaemonRecoveryState {
         self.faults.push(FaultRecord {
             fault,
             occurred_at_unix_secs: now_secs,
+            generation: self.generation_id,
         });
         if self.faults.len() >= MAX_RESTARTS_PER_WINDOW {
             self.phase = RecoveryPhase::Cooldown;
@@ -131,9 +139,9 @@ impl DaemonRecoveryState {
             self.cooldown_until_unix_secs = 0;
         }
         self.phase = RecoveryPhase::Recovering;
-        // Mark this generation's admission so later recovery can distinguish
-        // prior-generation pre-start faults from faults charged after admit.
-        self.generation_started_at_unix_secs = now_secs;
+        // Bump the admission epoch so later recovery can drop prior-generation
+        // faults even when they share the same Unix second as this admit.
+        self.generation_id = self.generation_id.saturating_add(1).max(1);
         RestartDecision::RestartAllowed
     }
 
@@ -145,14 +153,14 @@ impl DaemonRecoveryState {
             return;
         }
         // A fully initialized generation has proven *prior* restart attempts
-        // recovered. Drop only faults from before this generation was admitted.
-        // Faults charged after admit_start (same generation) must remain so the
-        // rolling restart budget accumulates across supervisor-driven restarts
-        // and cannot be wiped by a late record_recovered on the exit path.
-        let generation_started = self.generation_started_at_unix_secs;
-        if generation_started > 0 {
+        // recovered. Drop faults that are not charged to this generation epoch.
+        // Same-generation post-admission faults must remain so the rolling
+        // restart budget accumulates across supervisor-driven restarts and
+        // cannot be wiped by a late record_recovered on the exit path.
+        let current_generation = self.generation_id;
+        if current_generation > 0 {
             self.faults
-                .retain(|fault| fault.occurred_at_unix_secs >= generation_started);
+                .retain(|fault| fault.generation == current_generation);
         } else {
             // Legacy state without a generation marker: keep prior behavior of
             // clearing only when no post-start faults can be attributed.
