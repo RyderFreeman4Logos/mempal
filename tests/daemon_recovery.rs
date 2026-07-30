@@ -52,10 +52,15 @@ fn repeated_faults_exhaust_restart_budget_until_cooldown_ends() {
 fn healthy_generation_replenishes_restart_budget() {
     let mut state = DaemonRecoveryState::default();
     for now in [100, 200] {
+        assert_eq!(state.admit_start(now), RestartDecision::RestartAllowed);
+        // Pre-admission faults from a prior failed attempt must be dropped once
+        // this generation reaches a successful recovery mark.
         assert_eq!(
-            state.record_fault(RecoveryFault::WriterLeaseLost, now),
+            state.record_fault(RecoveryFault::WriterLeaseLost, now.saturating_sub(1).max(1)),
             RestartDecision::RestartAllowed
         );
+        // Re-admit so the fault above is treated as prior-generation.
+        assert_eq!(state.admit_start(now), RestartDecision::RestartAllowed);
         state.record_recovered(now + 1);
     }
 
@@ -68,6 +73,42 @@ fn healthy_generation_replenishes_restart_budget() {
         RestartDecision::RestartAllowed,
         "the next transient fault starts a fresh recovery window"
     );
+}
+
+#[test]
+fn record_recovered_does_not_clear_faults_charged_to_the_current_generation() {
+    let mut state = DaemonRecoveryState::default();
+    assert_eq!(state.admit_start(100), RestartDecision::RestartAllowed);
+    assert_eq!(
+        state.record_fault(RecoveryFault::WriteStall, 150),
+        RestartDecision::RestartAllowed
+    );
+    // Startup can still call record_recovered after a same-generation fault
+    // (for example on the hooks-disabled early-return path after a lease
+    // fault already requested shutdown). The fault must remain charged so
+    // the rolling restart budget accumulates across supervisor restarts.
+    state.record_recovered(160);
+    let after = state.snapshot(160);
+    assert_eq!(after.phase, RecoveryPhase::Recovering);
+    assert_eq!(after.recent_fault_count, 1);
+    assert_eq!(after.restart_budget_remaining, MAX_RESTARTS - 1);
+    assert_eq!(after.last_fault, Some(RecoveryFault::WriteStall));
+
+    // Next generation admits: prior-generation faults remain until this
+    // generation recovers *without* charging a post-admission fault.
+    assert_eq!(state.admit_start(200), RestartDecision::RestartAllowed);
+    assert_eq!(
+        state.snapshot(200).recent_fault_count,
+        1,
+        "admitting a replacement generation must not wipe prior charged faults"
+    );
+    // Successful recovery on the replacement generation clears only
+    // pre-admission faults (the prior generation's charges).
+    state.record_recovered(210);
+    let replenished = state.snapshot(210);
+    assert_eq!(replenished.phase, RecoveryPhase::Healthy);
+    assert_eq!(replenished.recent_fault_count, 0);
+    assert_eq!(replenished.restart_budget_remaining, MAX_RESTARTS);
 }
 
 #[test]

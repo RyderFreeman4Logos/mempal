@@ -83,6 +83,11 @@ pub struct DaemonRecoveryState {
     faults: Vec<FaultRecord>,
     cooldown_until_unix_secs: u64,
     last_fault: Option<RecoveryFault>,
+    /// Unix seconds when the current generation was admitted. Used so
+    /// `record_recovered` only clears pre-admission faults from prior failed
+    /// generations, never faults charged to the still-running generation.
+    #[serde(default)]
+    generation_started_at_unix_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +131,9 @@ impl DaemonRecoveryState {
             self.cooldown_until_unix_secs = 0;
         }
         self.phase = RecoveryPhase::Recovering;
+        // Mark this generation's admission so later recovery can distinguish
+        // prior-generation pre-start faults from faults charged after admit.
+        self.generation_started_at_unix_secs = now_secs;
         RestartDecision::RestartAllowed
     }
 
@@ -133,13 +141,30 @@ impl DaemonRecoveryState {
         self.prune(now_secs);
         // Never clear an active Cooldown — the fault budget must be honored
         // even if background workers briefly appear healthy.
-        if self.phase != RecoveryPhase::Cooldown {
-            // A fully initialized generation has proven the previous restart
-            // sequence recovered. Do not carry transient pre-start faults into
-            // its next failure window.
+        if self.phase == RecoveryPhase::Cooldown {
+            return;
+        }
+        // A fully initialized generation has proven *prior* restart attempts
+        // recovered. Drop only faults from before this generation was admitted.
+        // Faults charged after admit_start (same generation) must remain so the
+        // rolling restart budget accumulates across supervisor-driven restarts
+        // and cannot be wiped by a late record_recovered on the exit path.
+        let generation_started = self.generation_started_at_unix_secs;
+        if generation_started > 0 {
+            self.faults
+                .retain(|fault| fault.occurred_at_unix_secs >= generation_started);
+        } else {
+            // Legacy state without a generation marker: keep prior behavior of
+            // clearing only when no post-start faults can be attributed.
             self.faults.clear();
+        }
+        if self.faults.is_empty() {
             self.phase = RecoveryPhase::Healthy;
             self.cooldown_until_unix_secs = 0;
+            self.last_fault = None;
+        } else {
+            self.phase = RecoveryPhase::Recovering;
+            self.last_fault = self.faults.last().map(|fault| fault.fault);
         }
     }
 
