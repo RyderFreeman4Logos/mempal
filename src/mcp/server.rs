@@ -162,8 +162,16 @@ fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool
     }
 }
 
-fn should_continue_ingest_heartbeat_after_error(error: &QueueError) -> bool {
+fn is_transient_ingest_claim_error(error: &QueueError) -> bool {
     error.is_sqlite_lock()
+        || matches!(
+            error,
+            QueueError::Admission(crate::core::db_admission::DbAdmissionError::Busy { .. })
+        )
+}
+
+fn should_continue_ingest_heartbeat_after_error(error: &QueueError) -> bool {
+    is_transient_ingest_claim_error(error)
 }
 
 #[cfg(target_os = "linux")]
@@ -1046,7 +1054,7 @@ impl MempalMcpServer {
                         break;
                     }
                 }
-                Err(error) if error.is_sqlite_lock() => {
+                Err(error) if is_transient_ingest_claim_error(&error) => {
                     idle_count = 0;
                     retry_count = retry_count.saturating_add(1);
                     let next_delay = ingest_worker_backoff_delay(retry_count);
@@ -3859,7 +3867,7 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 fn ingest_worker_error_is_terminal(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<crate::core::queue::QueueError>()
-        .is_some_and(|queue_error| !queue_error.is_sqlite_lock())
+        .is_some_and(|queue_error| !is_transient_ingest_claim_error(queue_error))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16409,6 +16417,14 @@ pattern_boost = 0.2
             ),
         ));
         assert!(!ingest_worker_error_is_terminal(&retryable));
+
+        let admission_busy = anyhow::Error::new(crate::core::queue::QueueError::Admission(
+            crate::core::db_admission::DbAdmissionError::Busy {
+                path: std::path::PathBuf::from("/tmp/mempal-test-admission.lock"),
+                timeout_ms: 250,
+            },
+        ));
+        assert!(!ingest_worker_error_is_terminal(&admission_busy));
     }
 
     #[tokio::test(flavor = "current_thread")]
