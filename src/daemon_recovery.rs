@@ -83,21 +83,42 @@ pub struct DaemonRecoveryState {
     faults: Vec<FaultRecord>,
     cooldown_until_unix_secs: u64,
     last_fault: Option<RecoveryFault>,
+    /// Monotonic admission epoch for the currently admitted generation.
+    /// Incremented on every successful `admit_start` so recovery can distinguish
+    /// prior-generation faults from post-admission faults without relying on
+    /// whole-second wall-clock equality (fast supervisor restarts can share a
+    /// Unix second).
+    #[serde(default)]
+    generation_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FaultRecord {
     fault: RecoveryFault,
     occurred_at_unix_secs: u64,
+    /// Generation epoch active when this fault was charged. `0` means the fault
+    /// was recorded before any successful admission (or loaded from legacy
+    /// state without a generation field).
+    #[serde(default)]
+    generation: u64,
 }
 
 impl DaemonRecoveryState {
     pub fn record_fault(&mut self, fault: RecoveryFault, now_secs: u64) -> RestartDecision {
+        // A supervisor may attempt to start several replacement generations while
+        // the prior cooldown is still active. Those attempts must not turn the
+        // cooldown into a sliding window, or they can keep the daemon down
+        // indefinitely. Return before any prune/mutation so a late report cannot
+        // rewrite the frozen fault history while the deadline remains authoritative.
+        if self.phase == RecoveryPhase::Cooldown && now_secs < self.cooldown_until_unix_secs {
+            return RestartDecision::CooldownRequired;
+        }
         self.prune(now_secs);
         self.last_fault = Some(fault);
         self.faults.push(FaultRecord {
             fault,
             occurred_at_unix_secs: now_secs,
+            generation: self.generation_id,
         });
         if self.faults.len() >= MAX_RESTARTS_PER_WINDOW {
             self.phase = RecoveryPhase::Cooldown;
@@ -118,6 +139,9 @@ impl DaemonRecoveryState {
             self.cooldown_until_unix_secs = 0;
         }
         self.phase = RecoveryPhase::Recovering;
+        // Bump the admission epoch so later recovery can drop prior-generation
+        // faults even when they share the same Unix second as this admit.
+        self.generation_id = self.generation_id.saturating_add(1).max(1);
         RestartDecision::RestartAllowed
     }
 
@@ -125,9 +149,30 @@ impl DaemonRecoveryState {
         self.prune(now_secs);
         // Never clear an active Cooldown — the fault budget must be honored
         // even if background workers briefly appear healthy.
-        if self.phase != RecoveryPhase::Cooldown {
+        if self.phase == RecoveryPhase::Cooldown {
+            return;
+        }
+        // A fully initialized generation has proven *prior* restart attempts
+        // recovered. Drop faults that are not charged to this generation epoch.
+        // Same-generation post-admission faults must remain so the rolling
+        // restart budget accumulates across supervisor-driven restarts and
+        // cannot be wiped by a late record_recovered on the exit path.
+        let current_generation = self.generation_id;
+        if current_generation > 0 {
+            self.faults
+                .retain(|fault| fault.generation == current_generation);
+        } else {
+            // Legacy state without a generation marker: keep prior behavior of
+            // clearing only when no post-start faults can be attributed.
+            self.faults.clear();
+        }
+        if self.faults.is_empty() {
             self.phase = RecoveryPhase::Healthy;
             self.cooldown_until_unix_secs = 0;
+            self.last_fault = None;
+        } else {
+            self.phase = RecoveryPhase::Recovering;
+            self.last_fault = self.faults.last().map(|fault| fault.fault);
         }
     }
 
@@ -148,14 +193,20 @@ impl DaemonRecoveryState {
     }
 
     fn prune(&mut self, now_secs: u64) {
+        // While cooldown is still authoritative, freeze the fault history used for
+        // diagnostics and budget accounting. Only expire the whole cooldown once
+        // the fixed deadline elapses; do not age individual entries underneath it.
+        if self.phase == RecoveryPhase::Cooldown {
+            if now_secs >= self.cooldown_until_unix_secs {
+                self.phase = RecoveryPhase::Healthy;
+                self.cooldown_until_unix_secs = 0;
+                self.faults.clear();
+            }
+            return;
+        }
         self.faults.retain(|fault| {
             now_secs.saturating_sub(fault.occurred_at_unix_secs) <= RESTART_WINDOW_SECS
         });
-        if self.phase == RecoveryPhase::Cooldown && now_secs >= self.cooldown_until_unix_secs {
-            self.phase = RecoveryPhase::Healthy;
-            self.cooldown_until_unix_secs = 0;
-            self.faults.clear();
-        }
     }
 }
 
