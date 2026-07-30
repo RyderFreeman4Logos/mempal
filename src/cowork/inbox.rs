@@ -63,23 +63,22 @@ pub fn mempal_home() -> PathBuf {
     }
 }
 
-/// Resolve the given cwd to a canonical "project identity" path. Walks the
-/// directory tree looking for a `.git` entry (git repo root); falls back to
-/// the raw cwd if no `.git` ancestor is found.
-///
-/// This normalizes the "Claude in repo root, Codex in src/cowork" scenario —
-/// both resolve to the same project identity, so push and drain see the same
-/// inbox file.
+/// Resolve the cwd to a canonical project identity by walking ancestors for `.git`;
+/// falls back to the raw cwd when no Git ancestor exists.
+/// This makes repo-root and nested clients share the same inbox file.
 pub fn project_identity(cwd: &Path) -> PathBuf {
+    project_identity_with(cwd, &|candidate| candidate.join(".git").exists())
+}
+fn project_identity_with(cwd: &Path, is_git_root: &dyn Fn(&Path) -> bool) -> PathBuf {
     let mut current = cwd.to_path_buf();
     loop {
-        if current.join(".git").exists() {
+        if is_git_root(&current) {
             return current;
         }
-        match current.parent() {
-            Some(parent) => current = parent.to_path_buf(),
-            None => return cwd.to_path_buf(),
-        }
+        let Some(parent) = current.parent() else {
+            return cwd.to_path_buf();
+        };
+        current = parent.to_path_buf();
     }
 }
 
@@ -96,6 +95,8 @@ pub fn encode_project_identity(identity: &Path) -> Result<String, InboxError> {
 
 /// Return `<mempal_home>/cowork-inbox/<target>/<encoded_project_identity>.jsonl`.
 pub fn inbox_path(mempal_home: &Path, target: Tool, cwd: &Path) -> Result<PathBuf, InboxError> {
+    // Validate the raw input before ancestor discovery can discard a `..` segment.
+    encode_project_identity(cwd)?;
     let identity = project_identity(cwd);
     let encoded = encode_project_identity(&identity)?;
     Ok(mempal_home
@@ -272,11 +273,9 @@ mod tests {
 
     #[test]
     fn project_identity_falls_back_to_raw_cwd_without_git() {
-        let tmp = TempDir::new_in("/tmp").expect("external tempdir");
-        let plain = tmp.path().join("no-git-dir");
-        fs::create_dir_all(&plain).unwrap();
+        let plain = PathBuf::from("/controlled/no-git-dir");
 
-        assert_eq!(project_identity(&plain), plain);
+        assert_eq!(project_identity_with(&plain, &|_| false), plain);
     }
 
     #[test]
@@ -354,7 +353,7 @@ mod tests {
     #[test]
     fn push_rejects_cwd_with_parent_traversal() {
         let tmp = TempDir::new().unwrap();
-        let weird = Path::new("/tmp/../etc");
+        let weird = Path::new("/controlled/../elsewhere");
         let err = push(
             tmp.path(),
             Tool::Claude,
