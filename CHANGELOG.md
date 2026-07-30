@@ -42,7 +42,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
-- **Daemon/MCP/CLI ingest liveness**: make daemon status queue diagnostics read-only and short-bounded; preserve followable deterministic MCP operation receipts when daemon delivery is uncertain; route `ingest --stdin --wait --json` through queue admission before a write-capable database open, with structured no-write receipts; and bound daemon SIGTERM scoped ingest-worker drain by residual `DAEMON_DRAIN_BUDGET` so zero-budget wait paths cannot hang on mid-claim embed I/O (#843).
+- **Daemon/MCP/CLI ingest liveness**: make daemon status queue diagnostics read-only and short-bounded; preserve followable deterministic MCP operation receipts when daemon delivery is uncertain; route `ingest --stdin --wait --json` through queue admission before a write-capable database open, with structured no-write receipts; skip local write-lock preflight when daemon hook IPC is live so zero-budget waits still return followable timed-out receipts; and bound daemon SIGTERM scoped ingest-worker drain by residual `DAEMON_DRAIN_BUDGET` so that path cannot hang on mid-claim embed I/O (#843).
 
 - **MCP reads**: retry transient SQLite busy/locked errors on all query-only MCP reads (read_drawer, search, timeline, context, brief) under the existing search deadline, preventing opaque -32603 under daemon contention (#840).
 - **SQLite mutation retries**: bound shared 10-second CLI/MCP retry backoff, writer admission, and SQLite busy waits; a mutation that commits reports success, while unstarted expired MCP deletes return structured retryable lock errors (#838).

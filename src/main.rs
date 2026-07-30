@@ -6500,6 +6500,15 @@ async fn run_stdin_wait_ingest_queue(
 }
 
 fn preflight_stdin_wait_queue_admission(db_path: &Path, json: bool) -> Result<()> {
+    // When the daemon owns the writer and hook IPC is live, queue-first stdin
+    // wait must enqueue via daemon IPC and return a followable timed-out
+    // receipt under a zero wait budget. Local write-lock preflight would
+    // race the daemon's admission/writer seats and surface empty non-JSON
+    // failures instead of that receipt (#843).
+    if daemon_ingest_ipc_available_for_path(db_path) {
+        return Ok(());
+    }
+
     let error = match mempal::core::queue::queue_write_admission_preflight(db_path) {
         Ok(()) => return Ok(()),
         Err(error) => error,
@@ -6517,7 +6526,14 @@ fn preflight_stdin_wait_queue_admission(db_path: &Path, json: bool) -> Result<()
         return Err(IngestWaitAdmissionBlocked::new(error.to_string()).into());
     }
 
-    if error.is_sqlite_lock() {
+    // Admission Busy and SQLite lock are both no-write paths: emit the same
+    // structured receipt so JSON callers never see empty stdout.
+    if error.is_sqlite_lock()
+        || matches!(
+            error,
+            mempal::core::queue::QueueError::Admission(DbAdmissionError::Busy { .. })
+        )
+    {
         if json {
             print_stdin_ingest_admission_blocked_json(stdin_ingest_queue_locked_admission_json())?;
         }

@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8548
+baseline_tokens = 8570
 baseline_lines = 595
 issue = "843"
-rationale = "#843 adds the required Unreleased liveness-fix entry including budgeted daemon SIGTERM ingest-worker drain; append-only changelog growth is unavoidable, exact no-growth ratchet."
+rationale = "#843 adds the required Unreleased liveness-fix entry including budgeted daemon SIGTERM ingest-worker drain and daemon-IPC preflight skip; append-only changelog growth is unavoidable, exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -341,10 +341,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/main.rs"
 kind = "source"
-baseline_tokens = 260008
-baseline_lines = 33694
+baseline_tokens = 260166
+baseline_lines = 33710
 issue = "843"
-rationale = "#843 dispatches stdin wait JSON to queue admission before a write-capable DB open and emits structured no-write receipts; exact no-growth ratchet until the main CLI split lands."
+rationale = "#843 dispatches stdin wait JSON to queue admission before a write-capable DB open, emits structured no-write receipts, and skips local write preflight when daemon hook IPC is live; exact no-growth ratchet until the main CLI split lands."
 
 [[files]]
 path = "src/markdown_export.rs"
