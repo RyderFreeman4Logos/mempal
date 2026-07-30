@@ -3481,11 +3481,13 @@ struct HistoricalRejudgeRestoreItemOutcome {
 
 fn main() {
     if let Err(error) = run() {
+        let exit_status =
+            mempal::daemon_bootstrap::temporary_refusal_exit_status(&error).unwrap_or(1);
         eprintln!("error: {error}");
         for cause in error.chain().skip(1) {
             eprintln!("  caused by: {cause}");
         }
-        std::process::exit(1);
+        std::process::exit(exit_status);
     }
 }
 

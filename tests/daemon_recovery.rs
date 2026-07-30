@@ -1,6 +1,6 @@
 use std::fs;
 
-use mempal::daemon_bootstrap::DaemonContext;
+use mempal::daemon_bootstrap::{DaemonContext, temporary_refusal_exit_status};
 use mempal::daemon_recovery::{
     DaemonRecovery, DaemonRecoveryFaultReporter, DaemonRecoveryState, RecoveryFault, RecoveryPhase,
     RestartDecision,
@@ -289,6 +289,8 @@ log_path = "{}"
             .expect("record recovery fault");
     }
     assert_eq!(final_decision, RestartDecision::CooldownRequired);
+    let recovery_state_path = mempal_home.join("daemon-recovery.json");
+    let frozen_recovery_state = fs::read(&recovery_state_path).expect("read frozen recovery state");
 
     let runtime_root = tempdir.path().join("runtime");
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -310,6 +312,22 @@ log_path = "{}"
             .to_string()
             .contains("daemon restart budget exhausted"),
         "unexpected bootstrap error: {error:#}"
+    );
+    assert_eq!(
+        temporary_refusal_exit_status(&error),
+        Some(75),
+        "cooldown-only bootstrap refusal must use the stable EX_TEMPFAIL status"
+    );
+    let generic_bootstrap_error = anyhow::anyhow!("unrelated bootstrap failure");
+    assert_eq!(
+        temporary_refusal_exit_status(&generic_bootstrap_error),
+        None,
+        "only cooldown refusals may use the temporary-refusal status"
+    );
+    assert_eq!(
+        fs::read(&recovery_state_path).expect("read recovery state after refusal"),
+        frozen_recovery_state,
+        "cooldown refusal must not rearm or mutate frozen recovery state"
     );
     assert!(
         rx.blocking_recv().is_none(),

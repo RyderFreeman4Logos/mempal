@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8686
-baseline_lines = 604
-issue = "844"
-rationale = "#844 uses a monotonic admission epoch so same-second prior faults do not stick to healthy replacements; append-only changelog growth is unavoidable, exact no-growth ratchet."
+baseline_tokens = 8747
+baseline_lines = 609
+issue = "847"
+rationale = "#847 documents the stable daemon restart-budget cooldown temporary-refusal exit status and its canonical systemd restart suppression; append-only changelog growth is unavoidable, exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -341,10 +341,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/main.rs"
 kind = "source"
-baseline_tokens = 260166
-baseline_lines = 33710
-issue = "843"
-rationale = "#843 dispatches stdin wait JSON to queue admission before a write-capable DB open, emits structured no-write receipts, and skips local write preflight when daemon hook IPC is live; exact no-growth ratchet until the main CLI split lands."
+baseline_tokens = 260191
+baseline_lines = 33712
+issue = "847"
+rationale = "#847 maps only typed daemon restart-budget cooldown refusals to the documented EX_TEMPFAIL process status while preserving generic failures; exact no-growth ratchet until the main CLI split lands."
 
 [[files]]
 path = "src/markdown_export.rs"
