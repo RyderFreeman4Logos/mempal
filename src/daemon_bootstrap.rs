@@ -28,6 +28,47 @@ use crate::process_diagnostics::{
 
 const DAEMON_STALL_SECONDS: u64 = 5 * 60;
 const DAEMON_STALL_LOG_THROTTLE_SECONDS: u64 = 60;
+
+/// Stable process exit status for a daemon start refused by an active restart
+/// budget cooldown. This is sysexits `EX_TEMPFAIL` and is intentionally
+/// reserved for the cooldown-only admission path.
+pub const DAEMON_COOLDOWN_TEMPFAIL_EXIT_STATUS: i32 = 75;
+
+/// A daemon start was refused solely because its restart budget is cooling down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonCooldownRequired {
+    cooldown_remaining_secs: u64,
+}
+
+impl DaemonCooldownRequired {
+    fn new(cooldown_remaining_secs: u64) -> Self {
+        Self {
+            cooldown_remaining_secs,
+        }
+    }
+}
+
+impl std::fmt::Display for DaemonCooldownRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "daemon restart budget exhausted; cooldown_remaining_secs={}",
+            self.cooldown_remaining_secs
+        )
+    }
+}
+
+impl std::error::Error for DaemonCooldownRequired {}
+
+/// Returns the stable temporary-refusal process exit status when `error` was
+/// caused by a cooldown-only daemon admission refusal.
+pub fn temporary_refusal_exit_status(error: &anyhow::Error) -> Option<i32> {
+    error
+        .chain()
+        .any(|cause| cause.is::<DaemonCooldownRequired>())
+        .then_some(DAEMON_COOLDOWN_TEMPFAIL_EXIT_STATUS)
+}
+
 #[cfg(not(test))]
 const DAEMONIZE_READY_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(not(test))]
@@ -272,10 +313,9 @@ fn bootstrap_inner(
         let snapshot = recovery
             .snapshot()
             .context("failed to read exhausted daemon restart budget")?;
-        anyhow::bail!(
-            "daemon restart budget exhausted; cooldown_remaining_secs={}",
-            snapshot.cooldown_remaining_secs
-        );
+        return Err(anyhow::Error::new(DaemonCooldownRequired::new(
+            snapshot.cooldown_remaining_secs,
+        )));
     }
     let recovery_faults = DaemonRecoveryFaultReporter::new(recovery.clone());
     emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::RecoveryAdmitted);
