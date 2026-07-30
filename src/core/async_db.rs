@@ -271,6 +271,7 @@ impl AsyncDb {
     /// The deadline is installed on the checked-out reader connection via
     /// SQLite's progress handler, so long-running SQL is interrupted inside the
     /// blocking thread instead of continuing after the async caller times out.
+    #[cfg(any(feature = "rest", test))]
     pub(crate) async fn run_read_anyhow_until<F, R>(
         &self,
         deadline: Instant,

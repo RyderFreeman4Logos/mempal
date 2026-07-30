@@ -2145,8 +2145,8 @@ impl MempalMcpServer {
         F: Fn(&Database) -> anyhow::Result<R> + Send + Sync + 'static,
         R: Send + 'static,
     {
-        let async_db = self
-            .query_only_async_db()
+        let reader = self
+            .reader_db()
             .await
             .map_err(|error| error.context(format!("{stage} failed to open database")))?;
         let sqlite_deadline = Instant::now() + deadline;
@@ -2162,10 +2162,10 @@ impl MempalMcpServer {
         let read = retry_query_only_read_sqlite_lock_async(
             sqlite_deadline,
             move |attempt_deadline| {
-                let async_db = async_db.clone();
+                let reader = reader.clone();
                 let f = Arc::clone(&f);
                 async move {
-                    async_db
+                    reader
                         .run_read_anyhow_until(attempt_deadline, move |db| {
                             if let Some(delay) = delay {
                                 std::thread::sleep(delay);
@@ -2228,7 +2228,7 @@ impl MempalMcpServer {
         }
     }
 
-    async fn query_only_async_db(&self) -> anyhow::Result<QueryOnlyAsyncDb> {
+    async fn reader_db(&self) -> anyhow::Result<QueryOnlyAsyncDb> {
         #[cfg(any(test, feature = "db-test-seam"))]
         if let Some(error) = self.query_only_async_db_open_error.as_deref() {
             anyhow::bail!("{error}");
@@ -2326,8 +2326,8 @@ impl MempalMcpServer {
         project_scope: ProjectSearchScope,
         turns_config: crate::core::config::TurnsConfig,
     ) -> anyhow::Result<StatusDbSnapshot> {
-        let async_db = self.async_db().await?;
-        async_db
+        let reader = self.reader_db().await?;
+        reader
             .run_read_anyhow(move |db| {
                 let schema_version = db.schema_version()?;
                 let fork_ext_version = read_fork_ext_version(db.conn())?;
@@ -2938,11 +2938,11 @@ impl MempalMcpServer {
         F: FnOnce(&Database) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
-        let async_db = self.async_db().await?;
+        let reader = self.reader_db().await?;
         let sqlite_deadline = Instant::now() + deadline;
         match tokio::time::timeout(
             deadline + MCP_SQLITE_INTERRUPT_GRACE,
-            async_db.run_read_anyhow_until(sqlite_deadline, f),
+            reader.run_read_anyhow_until(sqlite_deadline, f),
         )
         .await
         {
@@ -5136,8 +5136,8 @@ impl MempalMcpServer {
             crate::core::queue::failure_headline_count(embed_snapshot.fail_count, &queue_stats);
         let config_for_gating_status = Arc::clone(&config);
         let restart_required_config_changes = ConfigHandle::restart_required_pending();
-        let ingest_gating_status = match self.async_db().await {
-            Ok(async_db) => match async_db
+        let ingest_gating_status = match self.reader_db().await {
+            Ok(reader) => match reader
                 .run_read_anyhow(move |db| {
                     let gating_drop_counts = db
                         .gating_drop_counts()
@@ -5171,7 +5171,7 @@ impl MempalMcpServer {
             },
             Err(error) => {
                 let diagnostic =
-                    status_database_diagnostic(&self.db_path, "async_db", error.as_ref());
+                    status_database_diagnostic(&self.db_path, "query_db", error.as_ref());
                 record_status_database_diagnostic(
                     &mut system_warnings,
                     &mut database_diagnostic,
@@ -12958,7 +12958,7 @@ mod tests {
 
     mod context_scope_schema_tests;
     mod delete_busy_retry_836_tests;
-
+    mod read_tests;
     #[derive(Clone)]
     struct StubEmbedderFactory {
         vector: Vec<f32>,

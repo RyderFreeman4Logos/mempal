@@ -103,6 +103,7 @@ log_path = "{}"
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
+        command.kill_on_drop(true);
 
         let mut child = command.spawn().context("spawn mempal MCP child")?;
         let stdin = child.stdin.take().context("missing child stdin")?;

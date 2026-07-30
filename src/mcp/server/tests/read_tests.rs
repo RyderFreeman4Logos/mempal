@@ -1,0 +1,82 @@
+use std::time::Duration;
+
+use tempfile::TempDir;
+
+use super::setup_server;
+use crate::core::async_db::RESOURCE_BOUNDED_READERS;
+use crate::core::config::Config;
+use crate::core::db::{CURRENT_SCHEMA_VERSION, Database, SQLITE_CACHE_SIZE_KIB_DEFAULT};
+use crate::core::db_admission::{DbHolderClass, ProfileDbAdmission};
+use crate::mcp::MempalMcpServer;
+
+#[tokio::test]
+async fn test_status_read_survives_writer_pool_open_failure() {
+    let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+    let db_path = tempdir.path().join("palace.db");
+    drop(Database::open(&db_path).expect("initialize status database"));
+    let config = Config {
+        db_path: db_path.display().to_string(),
+        ..Config::default()
+    };
+    let server = MempalMcpServer::new(db_path.clone(), config)
+        .expect("create MCP server")
+        .with_async_db_open_error_for_test(
+            "failed to open MCP async database pool: database is locked",
+        );
+
+    let status = server
+        .mempal_status()
+        .await
+        .expect("status should not open the writer-capable pool")
+        .0;
+
+    assert_eq!(status.schema_version, CURRENT_SCHEMA_VERSION);
+    assert!(
+        status.database_diagnostic.is_none(),
+        "query-only status must not inherit writer-pool failure: {:?}",
+        status.database_diagnostic
+    );
+    assert!(!status.resource_usage.sqlite.async_pool_loaded);
+    let admission = ProfileDbAdmission::snapshot(&db_path).expect("status holder snapshot");
+    let writer_pool_cache_bytes =
+        (RESOURCE_BOUNDED_READERS as u64 + 1) * SQLITE_CACHE_SIZE_KIB_DEFAULT.unsigned_abs() * 1024;
+    assert!(
+        admission.holders.iter().any(|holder| {
+            holder.holder_class == DbHolderClass::Mcp
+                && holder.connection_count == RESOURCE_BOUNDED_READERS
+        }),
+        "status must load the MCP query-only pool: {:?}",
+        admission.holders
+    );
+    assert!(
+        admission.holders.iter().all(|holder| {
+            holder.holder_class != DbHolderClass::Mcp
+                || holder.connection_count != RESOURCE_BOUNDED_READERS + 1
+                || holder.configured_cache_bytes != writer_pool_cache_bytes
+        }),
+        "status must not load an MCP writer-capable pool: {:?}",
+        admission.holders
+    );
+}
+
+#[tokio::test]
+async fn test_bounded_mcp_read_bypasses_writer_capable_async_db_open_failure() {
+    let (_tempdir, _db_path, server) = setup_server();
+    let server = server.with_async_db_open_error_for_test(
+        "failed to open MCP async database pool: database is locked",
+    );
+
+    let query_only = server
+        .run_read_anyhow_bounded(
+            |db| {
+                db.conn()
+                    .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                    .map_err(anyhow::Error::from)
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("bounded MCP reads should not open the writer-capable pool");
+
+    assert_eq!(query_only, Some(1));
+}
