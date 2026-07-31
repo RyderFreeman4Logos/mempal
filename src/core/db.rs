@@ -408,6 +408,10 @@ pub enum DbError {
         "database schema version {current} is newer than supported version {supported}; update the mempal binary that opens this database (for example, run `cargo install mempal` or reinstall from this source checkout). If this error comes from an MCP server, check the MCP client configuration and ensure its command/path points at the updated mempal binary."
     )]
     UnsupportedSchemaVersion { current: u32, supported: u32 },
+    #[error(
+        "fork extension schema version {current} is newer than supported version {supported}; update the mempal binary that opens this database"
+    )]
+    UnsupportedForkExtVersion { current: u32, supported: u32 },
     #[error("supersedes and replace_text are mutually exclusive")]
     ReplacementTargetConflict,
     #[error("superseded drawer {drawer_id} was not found or is already deleted")]
