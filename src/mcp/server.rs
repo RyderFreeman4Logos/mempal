@@ -6611,7 +6611,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_ingest",
-        description = "Persist a decision, bug fix, design insight, profile fact, or typed memory drawer. By default mempal_ingest writes a raw EVIDENCE drawer: pass content plus wing/room/importance/source metadata. Knowledge-only fields (`statement`, `tier`, knowledge lifecycle `status`, `supporting_refs`, `counterexample_refs`, `teaching_refs`, `verification_refs`, `scope_constraints`, `trigger_hints`) are rejected on evidence drawers; use mempal_knowledge_distill to turn existing evidence into governed typed knowledge instead. Call this when a durable fact is reached in conversation and include the rationale, not just the outcome. Wing is required; room is optional. Supports typed metadata params (`memory_kind`, `domain`, `field`, anchors), pinned facts (`is_pinned`), supersession (`supersedes`/`replace_text`), validity windows, confidence/source_type, dry_run preview, and receipt-based waiting via `wait`/`wait_timeout_secs` (wait=true blocks to a terminal state or returns a timed_out receipt you can poll with `mempal_operation_status`). A timed_out receipt is not a failed write: poll its operation_id instead of replaying mempal_ingest. Constrained smoke writes may set `smoke=true` only for small synthetic `wing=\"smoke\"`, `room=\"mcp\"` payloads."
+        description = "Persist a decision, bug fix, design insight, profile fact, or typed memory drawer. By default mempal_ingest writes a raw EVIDENCE drawer: pass content plus wing/room/importance/source metadata. Knowledge-only fields (`statement`, `tier`, knowledge lifecycle `status`, `supporting_refs`, `counterexample_refs`, `teaching_refs`, `verification_refs`, `scope_constraints`, `trigger_hints`) are rejected on evidence drawers; use mempal_knowledge_distill to turn existing evidence into governed typed knowledge instead. Call this when a durable fact is reached in conversation and include the rationale, not just the outcome. Wing is required; room is optional. Supports typed metadata params (`memory_kind`, `domain`, `field`, anchors), pinned facts (`is_pinned`), supersession (`supersedes`/`replace_text`), validity windows, confidence/source_type, dry_run preview, and receipt-based waiting via `wait`/`wait_timeout_secs` (wait=true blocks to a terminal state or returns a timed_out receipt you can poll with `mempal_operation_status`). A timed_out receipt confirms durable queue admission, not final completion; poll its operation_id to learn whether it completed, was rejected, or failed instead of replaying mempal_ingest. Constrained smoke writes may set `smoke=true` only for small synthetic `wing=\"smoke\"`, `room=\"mcp\"` payloads."
     )]
     pub async fn mempal_ingest(
         &self,
@@ -7034,7 +7034,7 @@ impl MempalMcpServer {
                             tracing::warn!(
                                 operation_id,
                                 ?error,
-                                "daemon IPC delivery is uncertain and the local queue remains locked; returning a followable receipt"
+                                "daemon IPC delivery is uncertain and the local queue remains locked; refusing an unconfirmed receipt"
                             );
                         }
                         Err(visibility_error) => {
@@ -7042,16 +7042,11 @@ impl MempalMcpServer {
                                 operation_id,
                                 ?error,
                                 ?visibility_error,
-                                "daemon IPC delivery is uncertain and operation visibility could not be checked; returning a followable receipt"
+                                "daemon IPC delivery is uncertain and operation visibility could not be checked; refusing an unconfirmed receipt"
                             );
                         }
                     }
-                    Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
-                        operation_id,
-                        processor: IngestQueueProcessor::Daemon,
-                        daemon_enqueue_may_have_reached,
-                        local_fallback_persisted_after_daemon_uncertainty: false,
-                    }))
+                    Err(IngestAdmissionError::Queue(error))
                 }
                 Err(error) => Err(IngestAdmissionError::Queue(error)),
             };
@@ -8537,7 +8532,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_operation_status",
-        description = "Return the current status of an asynchronous ingest operation, including the durable queue state, informational drawer_id/drawer_ids, cleanup-safe created_drawer_ids, rejection reason, failure detail, and persisted per-stage timings. Poll the same operation_id after a timed_out ingest receipt; status polling never replays the write. Use created_drawer_ids, not drawer_id/drawer_ids, as delete authority for receipt-backed cleanup."
+        description = "Return the current status of a durably admitted asynchronous ingest operation, including its queue state, informational drawer_id/drawer_ids, cleanup-safe created_drawer_ids, rejection reason, failure detail, and persisted per-stage timings. Poll the same operation_id after a timed_out ingest receipt; timed_out does not promise final completion, and status polling never replays the write. Use created_drawer_ids, not drawer_id/drawer_ids, as delete authority for receipt-backed cleanup."
     )]
     pub async fn mempal_operation_status(
         &self,
@@ -14247,7 +14242,7 @@ quality_policy = "llm_required_for_keep"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_mcp_ingest_uncertain_daemon_delivery_returns_followable_timeout_receipt() {
+    async fn test_mcp_ingest_uncertain_daemon_delivery_fails_without_durable_receipt() {
         let (tempdir, db_path, server) = setup_server();
         let queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
             .with_enqueue_lock_failures_for_test(100);
@@ -14264,11 +14259,11 @@ quality_policy = "llm_required_for_keep"
         });
 
         let started = Instant::now();
-        let response = tokio::time::timeout(
+        let result = tokio::time::timeout(
             Duration::from_secs(2),
             server.mempal_ingest_with_controls(
                 IngestRequest {
-                    content: "uncertain daemon delivery must keep a followable receipt".to_string(),
+                    content: "uncertain daemon delivery must not invent a receipt".to_string(),
                     wing: "mcp".to_string(),
                     room: Some("receipt".to_string()),
                     wait: Some(true),
@@ -14282,22 +14277,37 @@ quality_policy = "llm_required_for_keep"
             ),
         )
         .await
-        .expect("uncertain daemon admission must return before the caller budget")
-        .expect("uncertain daemon delivery must return a followable receipt")
-        .0;
+        .expect("uncertain daemon admission must return before the caller budget");
+        let error = match result {
+            Ok(_) => panic!("uncertain daemon delivery without a durable row must fail"),
+            Err(error) => error,
+        };
 
         let request = daemon.await.expect("daemon IPC task");
-        let operation_id = response
-            .operation_id
-            .as_deref()
-            .expect("uncertain receipt must preserve an operation id");
+        let operation_id =
+            PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &request.idempotency_key);
         assert_eq!(
-            operation_id,
-            PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &request.idempotency_key)
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("action"))
+                .and_then(|action| action.as_str()),
+            Some("retry_after_transient_lock")
         );
-        assert_eq!(response.state, Some(IngestOperationState::Queued));
-        assert!(response.timed_out);
-        assert!(response.created_drawer_ids.is_empty());
+        let status_error = server
+            .mempal_operation_status(Parameters(OperationStatusRequest {
+                operation_id: operation_id.clone(),
+            }))
+            .await;
+        let status_error = match status_error {
+            Ok(_) => panic!("unconfirmed operation must not be status-queryable"),
+            Err(error) => error,
+        };
+        assert!(
+            status_error
+                .message
+                .contains(&format!("operation not found: {operation_id}"))
+        );
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "uncertain delivery exceeded the caller budget"
@@ -18933,11 +18943,25 @@ prototypes = ["keep"]
                 .unwrap_or_default()
                 .contains("cleanup-safe created_drawer_ids")
         );
+        assert!(
+            operation_tool
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("timed_out does not promise final completion")
+        );
 
         let ingest_tool = tools
             .iter()
             .find(|tool| tool.name == "mempal_ingest")
             .expect("mempal_ingest tool exists");
+        assert!(
+            ingest_tool
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("confirms durable queue admission, not final completion")
+        );
         let props = ingest_tool
             .input_schema
             .get("properties")
