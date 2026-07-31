@@ -104,21 +104,46 @@ async fn call_status(client: &mut McpStdio) -> Result<Value> {
     .context("mempal_status timed out")?
 }
 
-fn spawn_hostile_mcp(respond_to_initialize: bool) -> Result<McpStdio> {
+fn spawn_hostile_mcp(respond_to_initialize: bool, descendant_pid_path: &Path) -> Result<McpStdio> {
     let script = if respond_to_initialize {
         r#"trap '' TERM
+sleep 60 &
+printf '%s\n' "$!" > "$MEMPAL_DESCENDANT_PID_FILE"
 printf 'hostile shutdown fixture\n' >&2
 IFS= read -r _
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"hostile-fixture","version":"0.0.0"}}}'
 while IFS= read -r _; do :; done"#
     } else {
         r#"trap '' TERM
+sleep 60 &
+printf '%s\n' "$!" > "$MEMPAL_DESCENDANT_PID_FILE"
 printf 'hostile initialize fixture\n' >&2
 while IFS= read -r _; do :; done"#
     };
     let mut command = tokio::process::Command::new("/bin/sh");
-    command.args(["-c", script]);
+    command
+        .args(["-c", script])
+        .env("MEMPAL_DESCENDANT_PID_FILE", descendant_pid_path);
     McpStdio::spawn_command(&mut command)
+}
+
+async fn assert_process_exited(pid_path: &Path) -> Result<()> {
+    let pid = fs::read_to_string(pid_path)
+        .with_context(|| format!("read descendant PID from {}", pid_path.display()))?
+        .trim()
+        .parse::<i32>()
+        .context("parse descendant PID")?;
+    let proc_path = PathBuf::from("/proc").join(pid.to_string());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while proc_path.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if proc_path.exists() {
+        // SAFETY: this fixture created the recorded descendant PID and owns its cleanup.
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        bail!("MCP descendant {pid} survived lifecycle cleanup");
+    }
+    Ok(())
 }
 
 async fn wait_for_daemon_writer_lease(
@@ -269,7 +294,9 @@ async fn daemon_coexists_with_one_and_multiple_healthy_mcp_servers() -> Result<(
 
 #[tokio::test]
 async fn mcp_lifecycle_timeouts_reap_hostile_children() -> Result<()> {
-    let mut initializing = spawn_hostile_mcp(false)?;
+    let tempdir = TempDir::new_in("/tmp").context("create hostile MCP test directory")?;
+    let initialize_descendant = tempdir.path().join("initialize-descendant.pid");
+    let mut initializing = spawn_hostile_mcp(false, &initialize_descendant)?;
     let initializing_pid = initializing.id();
     let started = Instant::now();
     let initialize_error = initializing
@@ -284,8 +311,10 @@ async fn mcp_lifecycle_timeouts_reap_hostile_children() -> Result<()> {
     let initialize_diagnostic = format!("{initialize_error:#}");
     assert!(initialize_diagnostic.contains("MCP initialize timed out"));
     assert!(initialize_diagnostic.contains("hostile initialize fixture"));
+    assert_process_exited(&initialize_descendant).await?;
 
-    let mut shutting_down = spawn_hostile_mcp(true)?;
+    let shutdown_descendant = tempdir.path().join("shutdown-descendant.pid");
+    let mut shutting_down = spawn_hostile_mcp(true, &shutdown_descendant)?;
     shutting_down.initialize().await?;
     let shutting_down_pid = shutting_down.id();
     let started = Instant::now();
@@ -301,6 +330,7 @@ async fn mcp_lifecycle_timeouts_reap_hostile_children() -> Result<()> {
     let shutdown_diagnostic = format!("{shutdown_error:#}");
     assert!(shutdown_diagnostic.contains("MCP shutdown response timed out"));
     assert!(shutdown_diagnostic.contains("hostile shutdown fixture"));
+    assert_process_exited(&shutdown_descendant).await?;
     Ok(())
 }
 

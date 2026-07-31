@@ -117,6 +117,15 @@ log_path = "{}"
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         command.kill_on_drop(true);
+        // SAFETY: the post-fork closure calls only the async-signal-safe `setsid` before exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         let mut child = command.spawn().context("spawn MCP child")?;
         let pid = child.id().context("missing MCP child PID")?;
@@ -285,30 +294,40 @@ log_path = "{}"
             return Ok(());
         }
 
-        if let Some(pid) = self.child.id() {
-            // SAFETY: the unreaped PID belongs to the child handle owned by this client.
-            let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-        }
+        let term_error = self.signal_process_group(libc::SIGTERM).err();
         let term_deadline = (Instant::now() + TERM_GRACE).min(deadline);
-        let reap_error = if matches!(
+        if matches!(
             tokio::time::timeout_at(term_deadline, self.child.wait()).await,
             Ok(Ok(_))
         ) {
             self.reaped = true;
-            None
+        }
+
+        let kill_error = self.signal_process_group(libc::SIGKILL).err();
+        let reap_error = if self.reaped {
+            kill_error.map(|error| {
+                format!(
+                    "kill MCP process group {} after child exit: {error}; term={term_error:?}",
+                    self.pid
+                )
+            })
         } else {
-            let kill_error = self.child.start_kill().err();
             match tokio::time::timeout_at(deadline, self.child.wait()).await {
                 Ok(Ok(_)) => {
                     self.reaped = true;
-                    None
+                    kill_error.map(|error| {
+                        format!(
+                            "kill MCP process group {}: {error}; term={term_error:?}",
+                            self.pid
+                        )
+                    })
                 }
                 Ok(Err(error)) => Some(format!(
-                    "reap MCP child {} after forced kill: {error}; kill={kill_error:?}",
+                    "reap MCP child {} after group kill: {error}; term={term_error:?}; kill={kill_error:?}",
                     self.pid
                 )),
                 Err(_) => Some(format!(
-                    "reap MCP child {} after forced kill timed out; kill={kill_error:?}",
+                    "reap MCP child {} after group kill timed out; term={term_error:?}; kill={kill_error:?}",
                     self.pid
                 )),
             }
@@ -318,6 +337,18 @@ log_path = "{}"
             bail!(error);
         }
         Ok(())
+    }
+
+    fn signal_process_group(&self, signal: i32) -> std::io::Result<()> {
+        // SAFETY: `spawn_command` placed this owned child in a dedicated process group.
+        if unsafe { libc::kill(-(self.pid as i32), signal) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        Err(error)
     }
 
     async fn finish_stderr(&mut self, deadline: Instant) {
