@@ -12,6 +12,12 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
+
+const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(3);
+const CLEANUP_RESERVE: Duration = Duration::from_secs(1);
+const TERM_GRACE: Duration = Duration::from_millis(250);
+const DIAGNOSTIC_TAIL_LINES: usize = 20;
 
 pub struct McpStdio {
     child: Child,
@@ -21,6 +27,8 @@ pub struct McpStdio {
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     next_id: u64,
     roots: Vec<String>,
+    pid: u32,
+    reaped: bool,
 }
 
 impl McpStdio {
@@ -100,12 +108,18 @@ log_path = "{}"
         command.args(["serve", "--mcp"]);
         command.env("HOME", home);
         command.envs(extra_env);
+
+        Self::spawn_command(&mut command)
+    }
+
+    pub fn spawn_command(command: &mut Command) -> Result<Self> {
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         command.kill_on_drop(true);
 
-        let mut child = command.spawn().context("spawn mempal MCP child")?;
+        let mut child = command.spawn().context("spawn MCP child")?;
+        let pid = child.id().context("missing MCP child PID")?;
         let stdin = child.stdin.take().context("missing child stdin")?;
         let stdout = child.stdout.take().context("missing child stdout")?;
         let stderr = child.stderr.take().context("missing child stderr")?;
@@ -126,7 +140,17 @@ log_path = "{}"
             stderr_task: Some(stderr_task),
             next_id: 1,
             roots: Vec::new(),
+            pid,
+            reaped: false,
         })
+    }
+
+    pub fn id(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn is_reaped(&self) -> bool {
+        self.reaped
     }
 
     pub async fn initialize(&mut self) -> Result<ServerInfo> {
@@ -134,30 +158,47 @@ log_path = "{}"
     }
 
     pub async fn initialize_with_roots(&mut self, roots: &[&str]) -> Result<ServerInfo> {
-        self.roots = roots.iter().map(|root| root.to_string()).collect();
-        let result = self
-            .call(
-                "initialize",
-                json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": if roots.is_empty() {
-                        json!({})
-                    } else {
-                        json!({"roots": {"listChanged": true}})
-                    },
-                    "clientInfo": {
-                        "name": "pr0-harness",
-                        "version": "0.0.0"
-                    }
-                }),
-            )
+        let deadline = Instant::now() + LIFECYCLE_TIMEOUT;
+        let request_deadline = deadline - CLEANUP_RESERVE;
+        let initialized = tokio::time::timeout_at(request_deadline, async {
+            self.roots = roots.iter().map(|root| root.to_string()).collect();
+            let result = self
+                .call(
+                    "initialize",
+                    json!({
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": if roots.is_empty() {
+                            json!({})
+                        } else {
+                            json!({"roots": {"listChanged": true}})
+                        },
+                        "clientInfo": {
+                            "name": "pr0-harness",
+                            "version": "0.0.0"
+                        }
+                    }),
+                )
+                .await?;
+            self.send(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }))
             .await?;
-        self.send(json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        }))
-        .await?;
-        serde_json::from_value(result).context("decode MCP initialize result")
+            serde_json::from_value(result).context("decode MCP initialize result")
+        })
+        .await;
+
+        match initialized {
+            Ok(result) => result,
+            Err(_) => {
+                let cleanup = self.terminate_and_reap(deadline).await;
+                let diagnostics = self.diagnostics();
+                cleanup.with_context(|| {
+                    format!("MCP initialize timed out and cleanup failed\n{diagnostics}")
+                })?;
+                bail!("MCP initialize timed out; child terminated and reaped\n{diagnostics}")
+            }
+        }
     }
 
     pub fn set_roots(&mut self, roots: &[&str]) {
@@ -194,23 +235,109 @@ log_path = "{}"
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
-        let _ = self.call("shutdown", json!({})).await;
-        let _ = self
-            .send(json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/exit"
-            }))
-            .await;
-        let _ = tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await;
-        let _ = self.child.kill().await;
-        if let Some(task) = self.stderr_task.take() {
-            let _ = task.await;
+        let deadline = Instant::now() + LIFECYCLE_TIMEOUT;
+        let request_deadline = deadline - CLEANUP_RESERVE;
+        let response_timed_out = tokio::time::timeout_at(request_deadline, async {
+            let _ = self.call("shutdown", json!({})).await;
+            let _ = self
+                .send(json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/exit"
+                }))
+                .await;
+        })
+        .await
+        .is_err();
+
+        if !response_timed_out {
+            match tokio::time::timeout_at(request_deadline, self.child.wait()).await {
+                Ok(Ok(_)) => {
+                    self.reaped = true;
+                    self.finish_stderr(deadline).await;
+                    return Ok(());
+                }
+                Ok(Err(error)) => {
+                    self.terminate_and_reap(deadline).await?;
+                    return Err(error).context("wait for MCP child exit");
+                }
+                Err(_) => {
+                    self.terminate_and_reap(deadline).await?;
+                    return Ok(());
+                }
+            }
         }
-        Ok(())
+
+        let cleanup = self.terminate_and_reap(deadline).await;
+        let diagnostics = self.diagnostics();
+        cleanup.with_context(|| {
+            format!("MCP shutdown response timed out and cleanup failed\n{diagnostics}")
+        })?;
+        bail!("MCP shutdown response timed out; child terminated and reaped\n{diagnostics}")
     }
 
     pub async fn stderr_lines(&self) -> Vec<String> {
         self.stderr_lines.lock().await.clone()
+    }
+
+    async fn terminate_and_reap(&mut self, deadline: Instant) -> Result<()> {
+        if self.reaped {
+            self.finish_stderr(deadline).await;
+            return Ok(());
+        }
+
+        if let Some(pid) = self.child.id() {
+            // SAFETY: the unreaped PID belongs to the child handle owned by this client.
+            let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        }
+        let term_deadline = (Instant::now() + TERM_GRACE).min(deadline);
+        let reap_error = if matches!(
+            tokio::time::timeout_at(term_deadline, self.child.wait()).await,
+            Ok(Ok(_))
+        ) {
+            self.reaped = true;
+            None
+        } else {
+            let kill_error = self.child.start_kill().err();
+            match tokio::time::timeout_at(deadline, self.child.wait()).await {
+                Ok(Ok(_)) => {
+                    self.reaped = true;
+                    None
+                }
+                Ok(Err(error)) => Some(format!(
+                    "reap MCP child {} after forced kill: {error}; kill={kill_error:?}",
+                    self.pid
+                )),
+                Err(_) => Some(format!(
+                    "reap MCP child {} after forced kill timed out; kill={kill_error:?}",
+                    self.pid
+                )),
+            }
+        };
+        self.finish_stderr(deadline).await;
+        if let Some(error) = reap_error {
+            bail!(error);
+        }
+        Ok(())
+    }
+
+    async fn finish_stderr(&mut self, deadline: Instant) {
+        if let Some(mut task) = self.stderr_task.take()
+            && tokio::time::timeout_at(deadline, &mut task).await.is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    fn diagnostics(&self) -> String {
+        let stderr = self.stderr_lines.try_lock().map_or_else(
+            |_| "<stderr unavailable>".to_string(),
+            |lines| {
+                let start = lines.len().saturating_sub(DIAGNOSTIC_TAIL_LINES);
+                lines[start..].join("\n")
+            },
+        );
+        format!("pid={}\nstderr tail:\n{stderr}", self.pid)
     }
 
     async fn send(&mut self, message: Value) -> Result<()> {

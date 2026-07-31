@@ -84,7 +84,7 @@ async fn mcp_stdio_initializes() -> Result<()> {
         )]),
     )
     .await?;
-    let server_info = tokio::time::timeout(Duration::from_secs(5), client.initialize()).await??;
+    let server_info = client.initialize().await?;
     assert!(!server_info.server_info.name.trim().is_empty());
     client.shutdown().await?;
     handle.shutdown().await;
@@ -113,7 +113,7 @@ async fn mcp_stdio_initialize_does_not_wait_for_busy_db_or_noop_llm() -> Result<
         ]),
     )
     .await?;
-    let server_info = tokio::time::timeout(Duration::from_secs(2), client.initialize()).await??;
+    let server_info = client.initialize().await?;
     assert!(!server_info.server_info.name.trim().is_empty());
     client.shutdown().await?;
     lock_conn.execute_batch("ROLLBACK;")?;
@@ -132,7 +132,7 @@ async fn mcp_stdio_ingest_busy_after_status_keeps_transport_alive() -> Result<()
     lock_conn.execute_batch("BEGIN EXCLUSIVE;")?;
 
     let mut client = McpStdio::start(&db_path, HashMap::new()).await?;
-    let server_info = tokio::time::timeout(Duration::from_secs(5), client.initialize()).await??;
+    let server_info = client.initialize().await?;
     assert!(!server_info.server_info.name.trim().is_empty());
 
     let status = tokio::time::timeout(
@@ -289,8 +289,7 @@ async fn mcp_stdio_wait_ingest_under_durable_writer_lease_returns_queued_receipt
             .expect("durable writer lease");
 
         let mut client = McpStdio::start(&db_path, HashMap::new()).await?;
-        let server_info =
-            tokio::time::timeout(Duration::from_secs(5), client.initialize()).await??;
+        let server_info = client.initialize().await?;
         assert!(!server_info.server_info.name.trim().is_empty());
 
         let started = Instant::now();

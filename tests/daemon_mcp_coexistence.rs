@@ -104,6 +104,23 @@ async fn call_status(client: &mut McpStdio) -> Result<Value> {
     .context("mempal_status timed out")?
 }
 
+fn spawn_hostile_mcp(respond_to_initialize: bool) -> Result<McpStdio> {
+    let script = if respond_to_initialize {
+        r#"trap '' TERM
+printf 'hostile shutdown fixture\n' >&2
+IFS= read -r _
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"hostile-fixture","version":"0.0.0"}}}'
+while IFS= read -r _; do :; done"#
+    } else {
+        r#"trap '' TERM
+printf 'hostile initialize fixture\n' >&2
+while IFS= read -r _; do :; done"#
+    };
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command.args(["-c", script]);
+    McpStdio::spawn_command(&mut command)
+}
+
 async fn wait_for_daemon_writer_lease(
     db_path: &Path,
     pid_path: &Path,
@@ -248,6 +265,43 @@ async fn assert_daemon_coexists_with_mcp_count(mcp_count: usize) -> Result<()> {
 async fn daemon_coexists_with_one_and_multiple_healthy_mcp_servers() -> Result<()> {
     assert_daemon_coexists_with_mcp_count(1).await?;
     assert_daemon_coexists_with_mcp_count(2).await
+}
+
+#[tokio::test]
+async fn mcp_lifecycle_timeouts_reap_hostile_children() -> Result<()> {
+    let mut initializing = spawn_hostile_mcp(false)?;
+    let initializing_pid = initializing.id();
+    let started = Instant::now();
+    let initialize_error = initializing
+        .initialize()
+        .await
+        .expect_err("hostile child must time out during initialize");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(
+        initializing.is_reaped(),
+        "child {initializing_pid} not reaped"
+    );
+    let initialize_diagnostic = format!("{initialize_error:#}");
+    assert!(initialize_diagnostic.contains("MCP initialize timed out"));
+    assert!(initialize_diagnostic.contains("hostile initialize fixture"));
+
+    let mut shutting_down = spawn_hostile_mcp(true)?;
+    shutting_down.initialize().await?;
+    let shutting_down_pid = shutting_down.id();
+    let started = Instant::now();
+    let shutdown_error = shutting_down
+        .shutdown()
+        .await
+        .expect_err("hostile child must time out during shutdown");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(
+        shutting_down.is_reaped(),
+        "child {shutting_down_pid} not reaped"
+    );
+    let shutdown_diagnostic = format!("{shutdown_error:#}");
+    assert!(shutdown_diagnostic.contains("MCP shutdown response timed out"));
+    assert!(shutdown_diagnostic.contains("hostile shutdown fixture"));
+    Ok(())
 }
 
 #[test]
