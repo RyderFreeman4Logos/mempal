@@ -1,6 +1,8 @@
 #![cfg(target_os = "linux")]
 
 mod common;
+#[path = "support/local_gate_child.rs"]
+mod local_gate_child;
 
 use std::collections::HashMap;
 use std::fs;
@@ -10,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use common::harness::{CapturedChild, McpStdio};
+use local_gate_child::{RecordedProcessIdentity, capture_recorded_process};
 use mempal::core::async_db::RESOURCE_BOUNDED_READERS;
 use mempal::core::db::Database;
 use mempal::core::db_admission::{DbHolderClass, ProfileDbAdmission};
@@ -108,7 +111,9 @@ fn spawn_hostile_mcp(respond_to_initialize: bool, descendant_pid_path: &Path) ->
     let script = if respond_to_initialize {
         r#"trap '' TERM
 sleep 60 &
-printf '%s\n' "$!" > "$MEMPAL_DESCENDANT_PID_FILE"
+descendant_pid="$!"
+descendant_start="$(awk '{print $22}' "/proc/${descendant_pid}/stat")"
+printf '%s %s\n' "${descendant_pid}" "${descendant_start}" > "$MEMPAL_DESCENDANT_PID_FILE"
 printf 'hostile shutdown fixture\n' >&2
 IFS= read -r _
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"hostile-fixture","version":"0.0.0"}}}'
@@ -116,7 +121,9 @@ while IFS= read -r _; do :; done"#
     } else {
         r#"trap '' TERM
 sleep 60 &
-printf '%s\n' "$!" > "$MEMPAL_DESCENDANT_PID_FILE"
+descendant_pid="$!"
+descendant_start="$(awk '{print $22}' "/proc/${descendant_pid}/stat")"
+printf '%s %s\n' "${descendant_pid}" "${descendant_start}" > "$MEMPAL_DESCENDANT_PID_FILE"
 printf 'hostile initialize fixture\n' >&2
 while IFS= read -r _; do :; done"#
     };
@@ -127,21 +134,60 @@ while IFS= read -r _; do :; done"#
     McpStdio::spawn_command(&mut command)
 }
 
+fn spawn_graceful_mcp_with_descendant(descendant_pid_path: &Path) -> Result<McpStdio> {
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            r#"sleep 60 &
+descendant_pid="$!"
+descendant_start="$(awk '{print $22}' "/proc/${descendant_pid}/stat")"
+printf '%s %s\n' "${descendant_pid}" "${descendant_start}" > "$MEMPAL_DESCENDANT_PID_FILE"
+IFS= read -r _
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"graceful-fixture","version":"0.0.0"}}}'
+IFS= read -r _
+IFS= read -r _
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+IFS= read -r _"#,
+        ])
+        .env("MEMPAL_DESCENDANT_PID_FILE", descendant_pid_path);
+    McpStdio::spawn_command(&mut command)
+}
+
+fn read_recorded_process_identity(path: &Path) -> Result<RecordedProcessIdentity> {
+    let record = fs::read_to_string(path)
+        .with_context(|| format!("read descendant identity from {}", path.display()))?;
+    let mut fields = record.split_ascii_whitespace();
+    let identity = RecordedProcessIdentity {
+        pid: fields
+            .next()
+            .context("missing descendant PID")?
+            .parse()
+            .context("parse descendant PID")?,
+        start_time_ticks: fields
+            .next()
+            .context("missing descendant start time")?
+            .parse()
+            .context("parse descendant start time")?,
+    };
+    if fields.next().is_some() {
+        bail!("descendant identity contains unexpected fields");
+    }
+    Ok(identity)
+}
+
 async fn assert_process_exited(pid_path: &Path) -> Result<()> {
-    let pid = fs::read_to_string(pid_path)
-        .with_context(|| format!("read descendant PID from {}", pid_path.display()))?
-        .trim()
-        .parse::<i32>()
-        .context("parse descendant PID")?;
-    let proc_path = PathBuf::from("/proc").join(pid.to_string());
+    let identity = read_recorded_process_identity(pid_path)?;
+    let Some(process) = capture_recorded_process(identity)? else {
+        return Ok(());
+    };
     let deadline = Instant::now() + Duration::from_secs(1);
-    while proc_path.exists() && Instant::now() < deadline {
+    while process.is_running()? && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    if proc_path.exists() {
-        // SAFETY: this fixture created the recorded descendant PID and owns its cleanup.
-        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
-        bail!("MCP descendant {pid} survived lifecycle cleanup");
+    if process.is_running()? {
+        process.send_signal(libc::SIGKILL)?;
+        bail!("MCP descendant {} survived lifecycle cleanup", identity.pid);
     }
     Ok(())
 }
@@ -331,6 +377,48 @@ async fn mcp_lifecycle_timeouts_reap_hostile_children() -> Result<()> {
     assert!(shutdown_diagnostic.contains("MCP shutdown response timed out"));
     assert!(shutdown_diagnostic.contains("hostile shutdown fixture"));
     assert_process_exited(&shutdown_descendant).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_graceful_shutdown_fences_surviving_descendant_before_reap() -> Result<()> {
+    let tempdir = TempDir::new_in("/tmp").context("create graceful MCP test directory")?;
+    let descendant = tempdir.path().join("graceful-descendant.pid");
+    let mut client = spawn_graceful_mcp_with_descendant(&descendant)?;
+
+    client.initialize().await?;
+    client.shutdown().await?;
+
+    assert!(client.is_reaped(), "graceful MCP leader was not reaped");
+    assert_process_exited(&descendant).await
+}
+
+#[tokio::test]
+async fn process_exit_check_never_signals_reused_pid() -> Result<()> {
+    let tempdir = TempDir::new_in("/tmp").context("create reused PID test directory")?;
+    let identity_path = tempdir.path().join("reused.identity");
+    let pid = std::process::id() as i32;
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let (_, fields) = stat.rsplit_once(") ").context("current process stat")?;
+    let actual_start = fields
+        .split_ascii_whitespace()
+        .nth(19)
+        .context("current process start time")?
+        .parse::<u64>()?;
+    let stale_start = actual_start.checked_add(1).context("start time headroom")?;
+    fs::write(&identity_path, format!("{pid} {stale_start}\n"))?;
+
+    assert_process_exited(&identity_path).await?;
+
+    let current = capture_recorded_process(RecordedProcessIdentity {
+        pid,
+        start_time_ticks: actual_start,
+    })?
+    .context("capture current process by exact identity")?;
+    assert!(
+        current.is_running()?,
+        "mismatched start time must not authorize signaling the reused PID"
+    );
     Ok(())
 }
 

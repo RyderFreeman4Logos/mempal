@@ -1,6 +1,7 @@
 //! JSON-RPC 2.0 client for `mempal serve --mcp` over stdio.
 
 use std::collections::HashMap;
+use std::io;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -200,7 +201,7 @@ log_path = "{}"
         match initialized {
             Ok(result) => result,
             Err(_) => {
-                let cleanup = self.terminate_and_reap(deadline).await;
+                let cleanup = self.fence_process_group_and_reap(deadline, None).await;
                 let diagnostics = self.diagnostics();
                 cleanup.with_context(|| {
                     format!("MCP initialize timed out and cleanup failed\n{diagnostics}")
@@ -258,79 +259,79 @@ log_path = "{}"
         .await
         .is_err();
 
-        if !response_timed_out {
-            match tokio::time::timeout_at(request_deadline, self.child.wait()).await {
-                Ok(Ok(_)) => {
-                    self.reaped = true;
-                    self.finish_stderr(deadline).await;
-                    return Ok(());
-                }
-                Ok(Err(error)) => {
-                    self.terminate_and_reap(deadline).await?;
-                    return Err(error).context("wait for MCP child exit");
-                }
-                Err(_) => {
-                    self.terminate_and_reap(deadline).await?;
-                    return Ok(());
-                }
-            }
-        }
-
-        let cleanup = self.terminate_and_reap(deadline).await;
+        let graceful_exit_deadline = (!response_timed_out).then_some(request_deadline);
+        let cleanup = self
+            .fence_process_group_and_reap(deadline, graceful_exit_deadline)
+            .await;
         let diagnostics = self.diagnostics();
-        cleanup.with_context(|| {
-            format!("MCP shutdown response timed out and cleanup failed\n{diagnostics}")
-        })?;
-        bail!("MCP shutdown response timed out; child terminated and reaped\n{diagnostics}")
+        if response_timed_out {
+            cleanup.with_context(|| {
+                format!("MCP shutdown response timed out and cleanup failed\n{diagnostics}")
+            })?;
+            bail!("MCP shutdown response timed out; child terminated and reaped\n{diagnostics}");
+        }
+        cleanup.with_context(|| format!("MCP shutdown cleanup failed\n{diagnostics}"))
     }
 
     pub async fn stderr_lines(&self) -> Vec<String> {
         self.stderr_lines.lock().await.clone()
     }
 
-    async fn terminate_and_reap(&mut self, deadline: Instant) -> Result<()> {
+    async fn fence_process_group_and_reap(
+        &mut self,
+        deadline: Instant,
+        graceful_exit_deadline: Option<Instant>,
+    ) -> Result<()> {
         if self.reaped {
             self.finish_stderr(deadline).await;
             return Ok(());
         }
 
-        let term_error = self.signal_process_group(libc::SIGTERM).err();
-        let term_deadline = (Instant::now() + TERM_GRACE).min(deadline);
-        if matches!(
-            tokio::time::timeout_at(term_deadline, self.child.wait()).await,
-            Ok(Ok(_))
-        ) {
-            self.reaped = true;
-        }
-
-        let kill_error = self.signal_process_group(libc::SIGKILL).err();
-        let reap_error = if self.reaped {
-            kill_error.map(|error| {
-                format!(
-                    "kill MCP process group {} after child exit: {error}; term={term_error:?}",
-                    self.pid
-                )
-            })
-        } else {
-            match tokio::time::timeout_at(deadline, self.child.wait()).await {
-                Ok(Ok(_)) => {
-                    self.reaped = true;
-                    kill_error.map(|error| {
-                        format!(
-                            "kill MCP process group {}: {error}; term={term_error:?}",
-                            self.pid
-                        )
-                    })
+        let (mut leader_exited, mut observe_error) = match graceful_exit_deadline {
+            Some(graceful_exit_deadline) => {
+                match self
+                    .wait_for_leader_exit_unreaped(graceful_exit_deadline)
+                    .await
+                {
+                    Ok(exited) => (exited, None),
+                    Err(error) => (false, Some(error)),
                 }
-                Ok(Err(error)) => Some(format!(
-                    "reap MCP child {} after group kill: {error}; term={term_error:?}; kill={kill_error:?}",
-                    self.pid
-                )),
-                Err(_) => Some(format!(
-                    "reap MCP child {} after group kill timed out; term={term_error:?}; kill={kill_error:?}",
-                    self.pid
-                )),
             }
+            None => (false, None),
+        };
+        let term_error = if leader_exited {
+            None
+        } else {
+            let error = self.signal_process_group(libc::SIGTERM).err();
+            let term_deadline = (Instant::now() + TERM_GRACE).min(deadline);
+            match self.wait_for_leader_exit_unreaped(term_deadline).await {
+                Ok(exited) => leader_exited = exited,
+                Err(error) => observe_error = Some(error),
+            }
+            error
+        };
+
+        // The unreaped leader still owns its numeric PID, so its dedicated PGID cannot be reused
+        // between this final fence and the one-and-only reap below.
+        let kill_error = self.signal_process_group(libc::SIGKILL).err();
+        let reap_error = match tokio::time::timeout_at(deadline, self.child.wait()).await {
+            Ok(Ok(_)) => {
+                self.reaped = true;
+                kill_error.map(|error| {
+                    format!(
+                        "kill MCP process group {}: {error}; leader_exited={leader_exited}; term={term_error:?}; observe={observe_error:?}",
+                        self.pid
+                    )
+                })
+            }
+            Ok(Err(error)) => Some(format!(
+                "reap MCP child {} after group kill: {error}; leader_exited={leader_exited}; term={term_error:?}; kill={kill_error:?}; observe={observe_error:?}",
+                self.pid
+            )),
+            Err(_) => Some(format!(
+                "reap MCP child {} after group kill timed out; leader_exited={leader_exited}; term={term_error:?}; kill={kill_error:?}; observe={observe_error:?}",
+                self.pid
+            )),
         };
         self.finish_stderr(deadline).await;
         if let Some(error) = reap_error {
@@ -339,12 +340,56 @@ log_path = "{}"
         Ok(())
     }
 
-    fn signal_process_group(&self, signal: i32) -> std::io::Result<()> {
-        // SAFETY: `spawn_command` placed this owned child in a dedicated process group.
+    async fn wait_for_leader_exit_unreaped(&self, deadline: Instant) -> io::Result<bool> {
+        loop {
+            if self.leader_exited_unreaped()? {
+                return Ok(true);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(10).min(remaining)).await;
+        }
+    }
+
+    fn leader_exited_unreaped(&self) -> io::Result<bool> {
+        // SAFETY: all-zero is a valid initial representation for the waitid output record.
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        loop {
+            // SAFETY: `pid` names our direct, unreaped child; WNOWAIT observes its exit record
+            // without releasing the PID that anchors the process-group identity.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                // SAFETY: successful waitid initialized `info`; zero means no exit event yet.
+                return Ok(unsafe { info.si_pid() } != 0);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    fn signal_process_group(&self, signal: i32) -> io::Result<()> {
+        if self.reaped {
+            return Err(io::Error::other(
+                "refusing to signal an MCP process group after leader reap",
+            ));
+        }
+        // SAFETY: `spawn_command` placed this owned child in a dedicated process group, and the
+        // leader remains unreaped so the kernel cannot reuse its numeric PID as another PGID.
         if unsafe { libc::kill(-(self.pid as i32), signal) } == 0 {
             return Ok(());
         }
-        let error = std::io::Error::last_os_error();
+        let error = io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::ESRCH) {
             return Ok(());
         }
