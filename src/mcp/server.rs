@@ -15620,10 +15620,10 @@ pattern_boost = 0.2
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_status_db_work_runs_off_runtime() {
         let (_tempdir, db_path, server) = setup_server();
-        let async_db = AsyncDb::open(&db_path, 4)
-            .expect("open async db")
+        let async_db = QueryOnlyAsyncDb::open(&db_path, 4)
+            .expect("open query-only async db")
             .with_read_delay(Duration::from_millis(300));
-        let server = server.with_async_db_for_test(async_db);
+        let server = server.with_query_only_async_db_for_test(async_db);
         let (ticks, ticker) = spawn_runtime_ticker();
 
         let status = server.mempal_status().await.expect("status").0;
@@ -15645,10 +15645,10 @@ pattern_boost = 0.2
             "offruntime-search.md",
             3,
         );
-        let async_db = AsyncDb::open(&db_path, 4)
-            .expect("open async db")
+        let async_db = QueryOnlyAsyncDb::open(&db_path, 4)
+            .expect("open query-only async db")
             .with_read_delay(Duration::from_millis(300));
-        let server = server.with_async_db_for_test(async_db);
+        let server = server.with_query_only_async_db_for_test(async_db);
         let (ticks, ticker) = spawn_runtime_ticker();
 
         let response = server
@@ -15680,11 +15680,11 @@ pattern_boost = 0.2
             "bounded-search.md",
             3,
         );
-        let async_db = AsyncDb::open(&db_path, 4)
-            .expect("open async db")
+        let async_db = QueryOnlyAsyncDb::open(&db_path, 4)
+            .expect("open query-only async db")
             .with_read_delay(Duration::from_millis(150));
         let server = server
-            .with_async_db_for_test(async_db)
+            .with_query_only_async_db_for_test(async_db)
             .with_mcp_deadline_for_test(Duration::from_millis(20));
 
         let response = tokio::time::timeout(
