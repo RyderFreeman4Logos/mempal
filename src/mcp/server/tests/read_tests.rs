@@ -5,9 +5,81 @@ use tempfile::TempDir;
 use super::setup_server;
 use crate::core::async_db::{AsyncDb, QueryOnlyAsyncDb, RESOURCE_BOUNDED_READERS};
 use crate::core::config::Config;
-use crate::core::db::{CURRENT_SCHEMA_VERSION, Database, SQLITE_CACHE_SIZE_KIB_DEFAULT};
+use crate::core::db::{
+    CURRENT_FORK_EXT_VERSION, CURRENT_SCHEMA_VERSION, Database, SQLITE_CACHE_SIZE_KIB_DEFAULT,
+    read_fork_ext_version, set_fork_ext_version,
+};
 use crate::core::db_admission::{DbHolderClass, ProfileDbAdmission};
 use crate::mcp::MempalMcpServer;
+
+#[tokio::test]
+async fn test_schema_ready_gate_migrates_fresh_database() {
+    let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+    let db_path = tempdir.path().join("palace.db");
+    let config = Config {
+        db_path: db_path.display().to_string(),
+        ..Config::default()
+    };
+    let server = MempalMcpServer::new(db_path.clone(), config).expect("create MCP server");
+
+    server
+        .ensure_schema_ready()
+        .await
+        .expect("prepare fresh MCP database");
+
+    let db = Database::open_query_only(&db_path).expect("open prepared database");
+    assert_eq!(
+        db.schema_version().expect("schema version"),
+        CURRENT_SCHEMA_VERSION
+    );
+    assert_eq!(
+        read_fork_ext_version(db.conn()).expect("fork-ext version"),
+        CURRENT_FORK_EXT_VERSION
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_schema_ready_gate_rejects_stale_schema_with_live_daemon_writer() {
+    let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+    let db_path = tempdir.path().join("palace.db");
+    let db = Database::open(&db_path).expect("initialize database");
+    let lease = db
+        .runtime_writer_lease_acquire(
+            "sqlite-writer",
+            &crate::core::process_identity::current_daemon_owner(),
+            "daemon",
+            300,
+            None,
+        )
+        .expect("acquire daemon writer lease")
+        .expect("daemon writer lease available");
+    set_fork_ext_version(db.conn(), CURRENT_FORK_EXT_VERSION - 1)
+        .expect("downgrade fork-ext version");
+    let config = Config {
+        db_path: db_path.display().to_string(),
+        ..Config::default()
+    };
+    let server = MempalMcpServer::new(db_path.clone(), config).expect("create MCP server");
+
+    let error = server
+        .ensure_schema_ready()
+        .await
+        .expect_err("live daemon must own schema migration");
+
+    assert!(
+        error.to_string().contains("live daemon writer"),
+        "{error:#}"
+    );
+    assert_eq!(
+        read_fork_ext_version(db.conn()).expect("fork-ext version after refusal"),
+        CURRENT_FORK_EXT_VERSION - 1
+    );
+    assert!(
+        db.runtime_writer_lease_release(&lease)
+            .expect("release daemon writer lease")
+    );
+}
 
 #[tokio::test]
 async fn test_status_read_survives_writer_pool_open_failure() {

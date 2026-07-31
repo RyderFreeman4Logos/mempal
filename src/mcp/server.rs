@@ -151,6 +151,8 @@ use super::tools::{
     TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
+mod schema_ready;
+
 fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool {
     let config_db_path = expand_home(&config.db_path);
     if config_db_path == server_db_path {
@@ -804,6 +806,9 @@ impl MempalMcpServer {
         self.gating_runtime
             .validate_config_shape()
             .context("failed to validate ingest gating config")?;
+        self.ensure_schema_ready()
+            .await
+            .context("failed to prepare MCP database schema")?;
         let background = self.clone();
         let service = self
             .serve(rmcp::transport::stdio())
