@@ -3916,6 +3916,19 @@ fn daemon_rest_ingest_fallback_error(
     )
 }
 
+fn ambiguous_ingest_admission_error() -> ErrorData {
+    ErrorData::internal_error(
+        "mempal ingest outcome is ambiguous: daemon delivery may have durably queued the write, but neither its ACK nor a local fallback receipt was confirmed. Automatic retry is unsafe because it may duplicate the write.",
+        Some(serde_json::json!({
+            "reason": "ambiguous_ingest_outcome",
+            "action": "manual_reconciliation_required",
+            "retry_safe": false,
+            "operation_status_available": false,
+            "safe_next_step": "Do not replay mempal_ingest automatically. Check mempal_status until daemon and database health recover, then use mempal_search to reconcile the requested memory manually.",
+        })),
+    )
+}
+
 #[doc(hidden)]
 pub struct IngestDrainWorkerHandle {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -6974,7 +6987,14 @@ impl MempalMcpServer {
                 idempotency_key.clone(),
                 request_deadline,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    "daemon ingest IPC task failed with an uncertain delivery outcome"
+                );
+                IngestAdmissionError::Mcp(ambiguous_ingest_admission_error())
+            })?;
         let daemon_enqueue_may_have_reached = match daemon_enqueue {
             DaemonIngestEnqueue::Accepted { operation_id } => {
                 return Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
@@ -6991,10 +7011,21 @@ impl MempalMcpServer {
         if daemon_enqueue_may_have_reached {
             let operation_id =
                 PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &idempotency_key);
-            if self
+            let daemon_operation_visible = match self
                 .daemon_admitted_operation_is_visible(&operation_id, request_deadline)
-                .await?
+                .await
             {
+                Ok(visible) => visible,
+                Err(error) => {
+                    tracing::warn!(
+                        operation_id,
+                        ?error,
+                        "daemon IPC delivery is uncertain and operation visibility could not be checked"
+                    );
+                    return Err(IngestAdmissionError::Mcp(ambiguous_ingest_admission_error()));
+                }
+            };
+            if daemon_operation_visible {
                 return Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
                     operation_id,
                     processor: IngestQueueProcessor::Daemon,
@@ -7046,9 +7077,16 @@ impl MempalMcpServer {
                             );
                         }
                     }
-                    Err(IngestAdmissionError::Queue(error))
+                    Err(IngestAdmissionError::Mcp(ambiguous_ingest_admission_error()))
                 }
-                Err(error) => Err(IngestAdmissionError::Queue(error)),
+                Err(error) => {
+                    tracing::warn!(
+                        operation_id,
+                        ?error,
+                        "daemon IPC delivery is uncertain and local fallback admission failed"
+                    );
+                    Err(IngestAdmissionError::Mcp(ambiguous_ingest_admission_error()))
+                }
             };
         }
 
@@ -14242,20 +14280,31 @@ quality_policy = "llm_required_for_keep"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_mcp_ingest_uncertain_daemon_delivery_fails_without_durable_receipt() {
+    async fn test_mcp_ingest_persisted_ack_lost_fails_closed_without_replay_advice() {
         let (tempdir, db_path, server) = setup_server();
         let queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
-            .with_enqueue_lock_failures_for_test(100);
-        let server = server.with_async_queue_for_test(queue);
+            .with_enqueue_lock_failures_for_test(100)
+            .with_blocking_delay(Duration::from_millis(500));
+        let server = server
+            .with_async_queue_for_test(queue)
+            .with_mcp_deadline_for_test(Duration::from_millis(200));
         let (listener, _socket_guard) =
             crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
+        let daemon_db_path = db_path.clone();
         let daemon = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept daemon IPC");
             let request = crate::hook_ipc::read_enqueue_request(&mut stream)
                 .await
                 .expect("read daemon IPC request");
+            let operation_id = PendingMessageStore::new_without_reclaim(&daemon_db_path)
+                .enqueue_idempotent_with_key(
+                    &request.kind,
+                    &request.payload,
+                    &request.idempotency_key,
+                )
+                .expect("persist daemon-admitted operation before losing ACK");
             drop(stream);
-            request
+            (request, operation_id)
         });
 
         let started = Instant::now();
@@ -14283,30 +14332,44 @@ quality_policy = "llm_required_for_keep"
             Err(error) => error,
         };
 
-        let request = daemon.await.expect("daemon IPC task");
-        let operation_id =
-            PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &request.idempotency_key);
+        let (request, operation_id) = daemon.await.expect("daemon IPC task");
         assert_eq!(
-            error
-                .data
-                .as_ref()
-                .and_then(|data| data.get("action"))
-                .and_then(|action| action.as_str()),
+            operation_id,
+            PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &request.idempotency_key)
+        );
+        let data = error.data.as_ref().expect("structured ambiguous outcome");
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("ambiguous_ingest_outcome")
+        );
+        assert_eq!(
+            data.get("action").and_then(Value::as_str),
+            Some("manual_reconciliation_required")
+        );
+        assert_eq!(data.get("retry_safe").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            data.get("operation_status_available")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(data.get("operation_id").is_none());
+        assert_ne!(
+            data.get("action").and_then(Value::as_str),
             Some("retry_after_transient_lock")
         );
-        let status_error = server
-            .mempal_operation_status(Parameters(OperationStatusRequest {
-                operation_id: operation_id.clone(),
-            }))
-            .await;
-        let status_error = match status_error {
-            Ok(_) => panic!("unconfirmed operation must not be status-queryable"),
-            Err(error) => error,
-        };
         assert!(
-            status_error
-                .message
-                .contains(&format!("operation not found: {operation_id}"))
+            data.get("safe_next_step")
+                .and_then(Value::as_str)
+                .is_some_and(
+                    |next| next.contains("mempal_status") && next.contains("mempal_search")
+                )
+        );
+        assert!(
+            PendingMessageStore::new_without_reclaim(&db_path)
+                .operation_status(&operation_id)
+                .expect("query persisted daemon operation")
+                .is_some(),
+            "daemon write must exist even though its ACK and receipt were lost"
         );
         assert!(
             started.elapsed() < Duration::from_secs(2),
