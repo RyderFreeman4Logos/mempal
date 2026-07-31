@@ -3921,6 +3921,10 @@ fn daemon_rest_ingest_fallback_error(
     )
 }
 
+/// Report uncertain daemon delivery without turning its deterministic queue key into a receipt.
+///
+/// Until the daemon ACK or a database lookup confirms admission, callers have no authority to
+/// poll an operation ID or infer whether the write exists.
 fn ambiguous_ingest_admission_error() -> ErrorData {
     ErrorData::internal_error(
         "mempal ingest outcome is ambiguous: daemon delivery may have durably queued the write, but neither its ACK nor a local fallback receipt was confirmed. Automatic retry is unsafe because it may duplicate the write.",
@@ -3928,8 +3932,8 @@ fn ambiguous_ingest_admission_error() -> ErrorData {
             "reason": "ambiguous_ingest_outcome",
             "action": "manual_reconciliation_required",
             "retry_safe": false,
-            "operation_status_available": false,
-            "safe_next_step": "Do not replay mempal_ingest automatically. Check mempal_status until daemon and database health recover, then use mempal_search to reconcile the requested memory manually.",
+            "operation_receipt_confirmed": false,
+            "operation_status_confirmed": false,
         })),
     )
 }
@@ -14367,21 +14371,25 @@ quality_policy = "llm_required_for_keep"
         );
         assert_eq!(data.get("retry_safe").and_then(Value::as_bool), Some(false));
         assert_eq!(
-            data.get("operation_status_available")
+            data.get("operation_receipt_confirmed")
                 .and_then(Value::as_bool),
             Some(false)
         );
+        assert_eq!(
+            data.get("operation_status_confirmed")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(data.get("operation_status_available").is_none());
         assert!(data.get("operation_id").is_none());
+        assert!(data.get("candidate_operation_id").is_none());
         assert_ne!(
             data.get("action").and_then(Value::as_str),
             Some("retry_after_transient_lock")
         );
         assert!(
-            data.get("safe_next_step")
-                .and_then(Value::as_str)
-                .is_some_and(
-                    |next| next.contains("mempal_status") && next.contains("mempal_search")
-                )
+            !format!("{error:?}").to_ascii_lowercase().contains("replay"),
+            "an unconfirmed operation must not include replay guidance"
         );
         assert!(
             PendingMessageStore::new_without_reclaim(&db_path)
