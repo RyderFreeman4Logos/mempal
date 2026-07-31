@@ -151,6 +151,7 @@ impl Database {
         register_math_functions(&conn)?;
         if !mode.allows_write() {
             conn.pragma_update(None, "query_only", "ON")?;
+            ensure_supported_schema_version(&conn)?;
         }
         if mode.allows_write() {
             ensure_wal_journal_mode(&conn)?;

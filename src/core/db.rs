@@ -5970,13 +5970,7 @@ impl UnionFind {
 }
 
 fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
-    let current_version = read_user_version(conn)?;
-    if current_version > CURRENT_SCHEMA_VERSION {
-        return Err(DbError::UnsupportedSchemaVersion {
-            current: current_version,
-            supported: CURRENT_SCHEMA_VERSION,
-        });
-    }
+    let current_version = ensure_supported_schema_version(conn)?;
 
     for migration in migrations()
         .iter()
@@ -6531,6 +6525,17 @@ fn backfill_content_hash(conn: &Connection) -> Result<(), DbError> {
 fn read_user_version(conn: &Connection) -> Result<u32, DbError> {
     let version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?;
     Ok(version)
+}
+
+fn ensure_supported_schema_version(conn: &Connection) -> Result<u32, DbError> {
+    let current_version = read_user_version(conn)?;
+    if current_version > CURRENT_SCHEMA_VERSION {
+        return Err(DbError::UnsupportedSchemaVersion {
+            current: current_version,
+            supported: CURRENT_SCHEMA_VERSION,
+        });
+    }
+    Ok(current_version)
 }
 
 fn set_user_version(conn: &Connection, version: u32) -> Result<(), DbError> {

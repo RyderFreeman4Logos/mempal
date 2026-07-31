@@ -5207,7 +5207,21 @@ impl MempalMcpServer {
         };
         let resource_usage = tokio::task::spawn_blocking({
             let db_path = self.db_path.clone();
-            let snapshot = self.async_db.get().map(|db| db.resource_snapshot());
+            let snapshot = [
+                self.async_db.get().map(AsyncDb::resource_snapshot),
+                self.query_only_async_db
+                    .get()
+                    .map(QueryOnlyAsyncDb::resource_snapshot),
+            ]
+            .into_iter()
+            .flatten()
+            .reduce(|mut total, pool| {
+                total.reader_connections += pool.reader_connections;
+                total.writer_connections += pool.writer_connections;
+                total.total_connections += pool.total_connections;
+                total.configured_page_cache_bytes += pool.configured_page_cache_bytes;
+                total
+            });
             move || resource_usage::build_resource_usage(&db_path, snapshot)
         })
         .await

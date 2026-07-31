@@ -3,7 +3,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use super::setup_server;
-use crate::core::async_db::RESOURCE_BOUNDED_READERS;
+use crate::core::async_db::{AsyncDb, QueryOnlyAsyncDb, RESOURCE_BOUNDED_READERS};
 use crate::core::config::Config;
 use crate::core::db::{CURRENT_SCHEMA_VERSION, Database, SQLITE_CACHE_SIZE_KIB_DEFAULT};
 use crate::core::db_admission::{DbHolderClass, ProfileDbAdmission};
@@ -36,7 +36,16 @@ async fn test_status_read_survives_writer_pool_open_failure() {
         "query-only status must not inherit writer-pool failure: {:?}",
         status.database_diagnostic
     );
-    assert!(!status.resource_usage.sqlite.async_pool_loaded);
+    assert!(status.resource_usage.sqlite.async_pool_loaded);
+    assert_eq!(
+        status.resource_usage.sqlite.async_reader_connections,
+        RESOURCE_BOUNDED_READERS
+    );
+    assert_eq!(status.resource_usage.sqlite.async_writer_connections, 0);
+    assert_eq!(
+        status.resource_usage.sqlite.async_total_connections,
+        RESOURCE_BOUNDED_READERS
+    );
     let admission = ProfileDbAdmission::snapshot(&db_path).expect("status holder snapshot");
     let writer_pool_cache_bytes =
         (RESOURCE_BOUNDED_READERS as u64 + 1) * SQLITE_CACHE_SIZE_KIB_DEFAULT.unsigned_abs() * 1024;
@@ -56,6 +65,43 @@ async fn test_status_read_survives_writer_pool_open_failure() {
         }),
         "status must not load an MCP writer-capable pool: {:?}",
         admission.holders
+    );
+}
+
+#[tokio::test]
+async fn test_status_aggregates_writer_and_query_only_pool_resources() {
+    let (_tempdir, db_path, server) = setup_server();
+    let writer_pool =
+        AsyncDb::open(&db_path, RESOURCE_BOUNDED_READERS).expect("open writer-capable pool");
+    let reader_pool =
+        QueryOnlyAsyncDb::open(&db_path, RESOURCE_BOUNDED_READERS).expect("open query-only pool");
+    let server = server
+        .with_async_db_for_test(writer_pool)
+        .with_query_only_async_db_for_test(reader_pool);
+
+    let sqlite = server
+        .mempal_status()
+        .await
+        .expect("status")
+        .0
+        .resource_usage
+        .sqlite;
+
+    assert!(sqlite.async_pool_loaded);
+    assert_eq!(
+        sqlite.async_reader_connections,
+        RESOURCE_BOUNDED_READERS * 2
+    );
+    assert_eq!(sqlite.async_writer_connections, 1);
+    assert_eq!(
+        sqlite.async_total_connections,
+        RESOURCE_BOUNDED_READERS * 2 + 1
+    );
+    assert_eq!(
+        sqlite.configured_page_cache_bytes,
+        (RESOURCE_BOUNDED_READERS as u64 * 2 + 1)
+            * SQLITE_CACHE_SIZE_KIB_DEFAULT.unsigned_abs()
+            * 1024
     );
 }
 
