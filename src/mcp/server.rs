@@ -1,5 +1,3 @@
-mod ingest_receipt;
-
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "db-test-seam"))]
@@ -115,7 +113,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
-use self::ingest_receipt::PendingIngestAdmission;
 use super::ingest_payload::{
     PreparedIngestOperation, QueuedWriteOperation, decode_queued_ingest_operation,
     run_durable_delete,
@@ -308,9 +305,6 @@ pub struct MempalMcpServer {
     /// Per-session drawer IDs that were returned by `mempal_search`.
     /// Flushed and boosted on the next `mempal_ingest` call (P13).
     session_hit_drawers: Arc<Mutex<HashSet<String>>>,
-    /// Receipts whose stable queue identity is known but whose SQLite row is
-    /// still waiting for a self-held admission lock to clear.
-    pending_ingest_admissions: Arc<Mutex<BTreeMap<String, PendingIngestAdmission>>>,
     ingest_worker_started: Arc<AtomicBool>,
     search_route_deadline: Duration,
     search_db_deadline: Duration,
@@ -604,7 +598,6 @@ impl MempalMcpServer {
             client_project_id: Arc::new(Mutex::new(None)),
             client_peer: Arc::new(Mutex::new(None)),
             session_hit_drawers: Arc::new(Mutex::new(HashSet::new())),
-            pending_ingest_admissions: Arc::new(Mutex::new(BTreeMap::new())),
             ingest_worker_started: Arc::new(AtomicBool::new(false)),
             search_route_deadline: MCP_SEARCH_ROUTE_DEADLINE,
             search_db_deadline: MCP_SEARCH_DB_DEADLINE,
@@ -2499,11 +2492,6 @@ impl MempalMcpServer {
         if timeout.is_zero() {
             return Ok(None);
         }
-        if let Some(response) =
-            self.pending_ingest_admission_response(operation_id, current_system_warnings())
-        {
-            return Ok(Some(response));
-        }
         #[cfg(test)]
         self.operation_status_json_within_probe_attempts
             .fetch_add(1, Ordering::Relaxed);
@@ -3894,7 +3882,6 @@ struct IngestQueueAdmission {
     processor: IngestQueueProcessor,
     daemon_enqueue_may_have_reached: bool,
     local_fallback_persisted_after_daemon_uncertainty: bool,
-    allow_pending_admission_lookup: bool,
 }
 
 enum IngestAdmissionOutcome {
@@ -6624,7 +6611,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_ingest",
-        description = "Persist a decision, bug fix, design insight, profile fact, or typed memory drawer. By default mempal_ingest writes a raw EVIDENCE drawer: pass content plus wing/room/importance/source metadata. Knowledge-only fields (`statement`, `tier`, knowledge lifecycle `status`, `supporting_refs`, `counterexample_refs`, `teaching_refs`, `verification_refs`, `scope_constraints`, `trigger_hints`) are rejected on evidence drawers; use mempal_knowledge_distill to turn existing evidence into governed typed knowledge instead. Call this when a durable fact is reached in conversation and include the rationale, not just the outcome. Wing is required; room is optional. Supports typed metadata params (`memory_kind`, `domain`, `field`, anchors), pinned facts (`is_pinned`), supersession (`supersedes`/`replace_text`), validity windows, confidence/source_type, dry_run preview, and receipt-based waiting via `wait`/`wait_timeout_secs` (wait=true blocks to a terminal state or returns a timed_out receipt you can poll with `mempal_operation_status`). A timed_out receipt is not a failed write: poll its operation_id instead of replaying mempal_ingest; internal recovery reuses that identity and admits it at most once. Constrained smoke writes may set `smoke=true` only for small synthetic `wing=\"smoke\"`, `room=\"mcp\"` payloads."
+        description = "Persist a decision, bug fix, design insight, profile fact, or typed memory drawer. By default mempal_ingest writes a raw EVIDENCE drawer: pass content plus wing/room/importance/source metadata. Knowledge-only fields (`statement`, `tier`, knowledge lifecycle `status`, `supporting_refs`, `counterexample_refs`, `teaching_refs`, `verification_refs`, `scope_constraints`, `trigger_hints`) are rejected on evidence drawers; use mempal_knowledge_distill to turn existing evidence into governed typed knowledge instead. Call this when a durable fact is reached in conversation and include the rationale, not just the outcome. Wing is required; room is optional. Supports typed metadata params (`memory_kind`, `domain`, `field`, anchors), pinned facts (`is_pinned`), supersession (`supersedes`/`replace_text`), validity windows, confidence/source_type, dry_run preview, and receipt-based waiting via `wait`/`wait_timeout_secs` (wait=true blocks to a terminal state or returns a timed_out receipt you can poll with `mempal_operation_status`). A timed_out receipt is not a failed write: poll its operation_id instead of replaying mempal_ingest. Constrained smoke writes may set `smoke=true` only for small synthetic `wing=\"smoke\"`, `room=\"mcp\"` payloads."
     )]
     pub async fn mempal_ingest(
         &self,
@@ -6895,7 +6882,7 @@ impl MempalMcpServer {
                     operation_id,
                     Duration::ZERO,
                     Duration::from_millis(150),
-                    queue_admission.allow_pending_admission_lookup,
+                    queue_admission.daemon_enqueue_may_have_reached,
                 )
                 .await
             } else if should_use_scoped_ingest_wait_worker(
@@ -6915,7 +6902,7 @@ impl MempalMcpServer {
                 self.wait_for_operation_status_unbounded_with_lookup_policy(
                     operation_id,
                     Duration::from_millis(150),
-                    queue_admission.allow_pending_admission_lookup,
+                    queue_admission.daemon_enqueue_may_have_reached,
                 )
                 .await
             } else if wait_remaining.is_zero() {
@@ -6925,7 +6912,7 @@ impl MempalMcpServer {
                     operation_id,
                     wait_remaining,
                     Duration::from_millis(150),
-                    queue_admission.allow_pending_admission_lookup,
+                    queue_admission.daemon_enqueue_may_have_reached,
                 )
                 .await
             };
@@ -6955,7 +6942,7 @@ impl MempalMcpServer {
                     Err(error)
                         if mcp_operation_wait_error_is_ignorable_during_wait(
                             &error,
-                            queue_admission.allow_pending_admission_lookup,
+                            queue_admission.daemon_enqueue_may_have_reached,
                         ) =>
                     {
                         queued_response
@@ -6995,7 +6982,6 @@ impl MempalMcpServer {
                     processor: IngestQueueProcessor::Daemon,
                     daemon_enqueue_may_have_reached: true,
                     local_fallback_persisted_after_daemon_uncertainty: false,
-                    allow_pending_admission_lookup: true,
                 }));
             }
             DaemonIngestEnqueue::Fallback {
@@ -7014,7 +7000,6 @@ impl MempalMcpServer {
                     processor: IngestQueueProcessor::Daemon,
                     daemon_enqueue_may_have_reached,
                     local_fallback_persisted_after_daemon_uncertainty: false,
-                    allow_pending_admission_lookup: true,
                 }));
             }
 
@@ -7026,17 +7011,12 @@ impl MempalMcpServer {
                 )
                 .await
             {
-                Ok(operation_id) => {
-                    let allow_pending_admission_lookup = daemon_enqueue_may_have_reached
-                        || self.ingest_admission_current_mcp_server_holder_visible();
-                    Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
-                        operation_id,
-                        processor: IngestQueueProcessor::Local,
-                        daemon_enqueue_may_have_reached,
-                        local_fallback_persisted_after_daemon_uncertainty: true,
-                        allow_pending_admission_lookup,
-                    }))
-                }
+                Ok(operation_id) => Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
+                    operation_id,
+                    processor: IngestQueueProcessor::Local,
+                    daemon_enqueue_may_have_reached,
+                    local_fallback_persisted_after_daemon_uncertainty: true,
+                })),
                 Err(error) if anyhow_chain_contains_sqlite_lock(&error) => {
                     match self
                         .daemon_admitted_operation_is_visible(&operation_id, request_deadline)
@@ -7048,7 +7028,6 @@ impl MempalMcpServer {
                                 processor: IngestQueueProcessor::Daemon,
                                 daemon_enqueue_may_have_reached,
                                 local_fallback_persisted_after_daemon_uncertainty: false,
-                                allow_pending_admission_lookup: true,
                             }));
                         }
                         Ok(false) => {
@@ -7072,7 +7051,6 @@ impl MempalMcpServer {
                         processor: IngestQueueProcessor::Daemon,
                         daemon_enqueue_may_have_reached,
                         local_fallback_persisted_after_daemon_uncertainty: false,
-                        allow_pending_admission_lookup: true,
                     }))
                 }
                 Err(error) => Err(IngestAdmissionError::Queue(error)),
@@ -7112,14 +7090,11 @@ impl MempalMcpServer {
                 request_deadline,
             )
             .await?;
-        let allow_pending_admission_lookup =
-            self.ingest_admission_current_mcp_server_holder_visible();
         Ok(IngestAdmissionOutcome::Queued(IngestQueueAdmission {
             operation_id,
             processor: IngestQueueProcessor::Local,
             daemon_enqueue_may_have_reached,
             local_fallback_persisted_after_daemon_uncertainty: false,
-            allow_pending_admission_lookup,
         }))
     }
 
@@ -7141,10 +7116,6 @@ impl MempalMcpServer {
             Err(error) if error.is_sqlite_lock() => error,
             Err(error) => return Err(error.into()),
         };
-
-        if self.ingest_admission_current_mcp_server_holder_visible() {
-            return self.spawn_self_held_queue_admission_recovery(payload, idempotency_key);
-        }
 
         if should_extend_ingest_admission_for_known_runtime_holder(&self.db_path) {
             match self
@@ -8566,17 +8537,12 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_operation_status",
-        description = "Return the current status of an asynchronous ingest operation, including a pending self-held queue admission, the durable queue state, informational drawer_id/drawer_ids, cleanup-safe created_drawer_ids, rejection reason, failure detail, and persisted per-stage timings. Poll the same operation_id after a timed_out ingest receipt; status polling never replays the write. Use created_drawer_ids, not drawer_id/drawer_ids, as delete authority for receipt-backed cleanup."
+        description = "Return the current status of an asynchronous ingest operation, including the durable queue state, informational drawer_id/drawer_ids, cleanup-safe created_drawer_ids, rejection reason, failure detail, and persisted per-stage timings. Poll the same operation_id after a timed_out ingest receipt; status polling never replays the write. Use created_drawer_ids, not drawer_id/drawer_ids, as delete authority for receipt-backed cleanup."
     )]
     pub async fn mempal_operation_status(
         &self,
         Parameters(request): Parameters<OperationStatusRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
-        if let Some(response) =
-            self.pending_ingest_admission_response(&request.operation_id, current_system_warnings())
-        {
-            return Ok(Json(response));
-        }
         let system_warnings = self
             .system_warnings_with_stale_index_bounded(self.operation_status_deadline)
             .await?;
