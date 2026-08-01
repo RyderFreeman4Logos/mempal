@@ -2,7 +2,6 @@ use std::fs;
 use std::io;
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output};
 use std::sync::mpsc;
@@ -15,6 +14,7 @@ const TERMINATION_GRACE_PERIOD: Duration = Duration::from_millis(50);
 const TERMINATION_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const POST_KILL_DISCOVERY_RESERVE: Duration = Duration::from_millis(25);
 const OUTPUT_DRAIN_RESERVE: Duration = Duration::from_millis(50);
+const OWNERSHIP_TOKEN_ENV: &str = "MEMPAL_LOCAL_GATE_OWNER";
 
 fn cleanup_deadline() -> Instant {
     Instant::now() + CLEANUP_TIMEOUT_MARGIN
@@ -57,11 +57,11 @@ struct ProcessHandle {
 
 #[path = "local_gate_direct_child.rs"]
 mod local_gate_direct_child;
-pub(crate) use local_gate_direct_child::OwnedGateChild;
 use local_gate_direct_child::{
     ChildExitState, CleanupDiagnostics, capture_owned_child, child_exit_state, timeout_error,
     wait_for_child_exit, wait_for_child_exit_unreaped_until,
 };
+pub(crate) use local_gate_direct_child::{OwnedGateChild, spawn_in_own_session};
 
 #[path = "local_gate_recorded_process.rs"]
 mod local_gate_recorded_process;
@@ -71,7 +71,7 @@ pub(crate) use local_gate_recorded_process::{RecordedProcessIdentity, capture_re
 mod local_gate_discovery;
 use local_gate_discovery::{
     DescendantMonitor, capture_live_children, output_pipe_targets, process_holds_writable_pipe,
-    refresh_after_leader_reap, refresh_owned_processes,
+    refresh_after_leader_reap, refresh_owned_processes, refresh_owned_processes_with_token,
 };
 
 enum TrackedProcessSource {
@@ -193,19 +193,6 @@ pub(crate) struct GateChild {
     descendant_monitor: DescendantMonitor,
 }
 
-pub(crate) fn spawn_in_own_session(command: &mut Command) -> io::Result<OwnedGateChild> {
-    // SAFETY: The post-fork closure invokes only async-signal-safe `setsid` before exec.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    command.spawn().map(OwnedGateChild::new)
-}
-
 impl GateChild {
     pub(crate) fn new(child: OwnedGateChild) -> io::Result<Self> {
         let root = capture_owned_child(child.child())?;
@@ -270,8 +257,9 @@ impl GateChild {
     fn refresh_tracked_processes_until(&mut self, deadline: Instant) -> io::Result<()> {
         self.descendant_monitor
             .drain_discovered(&mut self.tracked_processes, deadline);
-        refresh_owned_processes(
+        refresh_owned_processes_with_token(
             self.child.child(),
+            self.child.ownership_token(),
             &self.root,
             &mut self.tracked_processes,
             deadline,
@@ -336,8 +324,10 @@ fn terminate_and_collect_until(
     deadline: Instant,
 ) -> io::Result<Output> {
     let mut diagnostics = CleanupDiagnostics::default();
+    let ownership_token = child.ownership_token().map(str::to_owned);
     if let Err(error) = terminate_owned_process_tree(
         child.child_mut(),
+        ownership_token.as_deref(),
         root,
         tracked_processes,
         descendant_monitor,
@@ -382,6 +372,7 @@ fn terminate_and_collect_until(
 
 fn terminate_owned_process_tree(
     child: &mut Child,
+    ownership_token: Option<&str>,
     root: &ProcessHandle,
     tracked_processes: &mut Vec<TrackedProcess>,
     descendant_monitor: &mut DescendantMonitor,
@@ -417,9 +408,7 @@ fn terminate_owned_process_tree(
     // synchronous discovery receives the grace deadline itself, never the monitor's 10ms
     // polling slice. Pipe-holder discovery remains outside this loop because its whole-/proc
     // scan can consume the grace period before a TERM handler creates its escaped child.
-    let mut retry_without_progress = true;
     while Instant::now() < term_deadline {
-        let tracked_before = tracked_processes.len();
         descendant_monitor.discover_and_drain(tracked_processes, term_deadline);
         descendant_monitor.drain_discovered(tracked_processes, term_deadline);
         if !child_exited {
@@ -438,13 +427,8 @@ fn terminate_owned_process_tree(
                 libc::SIGTERM,
                 term_deadline,
             ));
-        }
-
-        let made_progress = tracked_processes.len() > tracked_before;
-        if !made_progress && !retry_without_progress {
             break;
         }
-        retry_without_progress = false;
 
         let remaining = term_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -462,8 +446,9 @@ fn terminate_owned_process_tree(
         };
     }
     descendant_monitor.drain_discovered(tracked_processes, deadline);
-    let _ = diagnostics.capture(refresh_owned_processes(
+    let _ = diagnostics.capture(refresh_owned_processes_with_token(
         child,
+        ownership_token,
         root,
         tracked_processes,
         pre_kill_discovery_deadline,
@@ -480,8 +465,9 @@ fn terminate_owned_process_tree(
         return diagnostics.finish();
     }
 
-    let _ = diagnostics.capture(refresh_owned_processes(
+    let _ = diagnostics.capture(refresh_owned_processes_with_token(
         child,
+        ownership_token,
         root,
         tracked_processes,
         pre_kill_discovery_deadline,
@@ -497,8 +483,9 @@ fn terminate_owned_process_tree(
     // one final discovery pass before the final pidfd sweep so that child is not stranded when
     // its parent is reaped.
     descendant_monitor.discover_and_drain(tracked_processes, deadline);
-    let _ = diagnostics.capture(refresh_owned_processes(
+    let _ = diagnostics.capture(refresh_owned_processes_with_token(
         child,
+        ownership_token,
         root,
         tracked_processes,
         discovery_deadline,

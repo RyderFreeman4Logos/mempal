@@ -192,6 +192,13 @@ mod regression_tests {
         ))
         .expect("capture non-pipe escape leader");
 
+        gate.descendant_monitor
+            .stop_and_drain(
+                &mut gate.tracked_processes,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("stop descendant monitor before exercising ownership fallback");
+
         fs::write(&release_file, "release\n").expect("release escaped descendant creation");
         wait_for_file(
             &ready_file,
@@ -227,7 +234,7 @@ mod regression_tests {
     }
 
     #[test]
-    fn gate_child_reports_leaked_closed_pipe_descendant_after_leader_reap() {
+    fn gate_child_reaps_closed_pipe_descendant_by_ownership_token() {
         let fixture = tempfile::tempdir().expect("create closed-pipe descendant fixture");
         let release_file = fixture.path().join("release");
         let ready_file = fixture.path().join("ready");
@@ -248,7 +255,7 @@ mod regression_tests {
                 &mut gate.tracked_processes,
                 Instant::now() + Duration::from_secs(1),
             )
-            .expect("stop descendant monitor before exercising pipe fallback");
+            .expect("stop descendant monitor before exercising ownership fallback");
         fs::write(&release_file, "release\n").expect("release escaped descendant creation");
         wait_for_file(
             &ready_file,
@@ -262,7 +269,7 @@ mod regression_tests {
             "leader did not exit after creating its closing-pipe descendant"
         );
         gate.refresh_tracked_processes()
-            .expect("capture escaped descendant from its inherited output pipe");
+            .expect("capture escaped descendant from its inherited ownership token");
         fs::write(&close_file, "close\n").expect("release descendant pipe closure");
         wait_for_file(
             &closed_file,
@@ -270,33 +277,24 @@ mod regression_tests {
             "escaped descendant pipe closure",
         );
 
-        let cleanup = gate.wait_with_timeout(Duration::from_millis(50));
+        let output = gate
+            .wait_with_timeout(Duration::from_millis(50))
+            .expect("reap escaped descendant after it closes output pipes");
+        let escaped_survived = capture_recorded_process(escaped)
+            .expect("re-verify escaped descendant identity")
+            .is_some();
         if let Some(process) = capture_recorded_process(escaped)
-            .expect("capture leaked descendant only if its identity still matches")
+            .expect("capture escaped descendant only if its identity still matches")
         {
             process
                 .send_signal(libc::SIGKILL)
-                .expect("pidfd-safe fallback cleanup for leaked descendant");
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while process
-                .is_running()
-                .expect("inspect leaked descendant after fallback cleanup")
-                && Instant::now() < deadline
-            {
-                thread::sleep(Duration::from_millis(10));
-            }
-            assert!(
-                !process
-                    .is_running()
-                    .expect("confirm leaked descendant fallback cleanup"),
-                "pidfd fallback cleanup did not stop leaked descendant"
-            );
+                .expect("pidfd-safe fallback cleanup for failed assertion");
         }
 
-        let error = cleanup.expect_err("a live fallback that lost its pipe must be reported");
+        assert!(output.status.success(), "leader status: {}", output.status);
         assert!(
-            error.to_string().contains("no longer holds the gate output pipe"),
-            "unexpected cleanup diagnostic: {error}"
+            !escaped_survived,
+            "the inherited ownership token must outlive output-pipe closure"
         );
     }
 

@@ -1,4 +1,8 @@
 use super::*;
+use std::os::unix::process::CommandExt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_OWNERSHIP_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Owns a direct test child from spawn until it has been reaped.
 ///
@@ -6,14 +10,46 @@ use super::*;
 /// Dropping a `std::process::Child` alone neither terminates nor reaps it.
 pub(crate) struct OwnedGateChild {
     child: Child,
+    ownership_token: Option<String>,
     first_cleanup_error: Option<io::Error>,
     cleanup_deadline: Option<Instant>,
+}
+
+pub(crate) fn spawn_in_own_session(command: &mut Command) -> io::Result<OwnedGateChild> {
+    let ownership_token = format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT_OWNERSHIP_TOKEN.fetch_add(1, Ordering::Relaxed)
+    );
+    command.env(OWNERSHIP_TOKEN_ENV, &ownership_token);
+    // SAFETY: The post-fork closure invokes only async-signal-safe `setsid` before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+        .spawn()
+        .map(|child| OwnedGateChild::with_ownership_token(child, ownership_token))
 }
 
 impl OwnedGateChild {
     pub(crate) fn new(child: Child) -> Self {
         Self {
             child,
+            ownership_token: None,
+            first_cleanup_error: None,
+            cleanup_deadline: None,
+        }
+    }
+
+    fn with_ownership_token(child: Child, ownership_token: String) -> Self {
+        Self {
+            child,
+            ownership_token: Some(ownership_token),
             first_cleanup_error: None,
             cleanup_deadline: None,
         }
@@ -25,6 +61,10 @@ impl OwnedGateChild {
 
     pub(super) fn child_mut(&mut self) -> &mut Child {
         &mut self.child
+    }
+
+    pub(super) fn ownership_token(&self) -> Option<&str> {
+        self.ownership_token.as_deref()
     }
 
     fn record_cleanup_error(&mut self, error: io::Error) {
