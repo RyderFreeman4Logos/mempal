@@ -14619,7 +14619,7 @@ fn detect_daemon_status(
     let pidfile = read_daemon_pid_for_status(db_path);
     let pidfile_pid = pidfile.pid;
     if let Some(pid) = pidfile_pid
-        && process_is_running(pid).context("failed to probe daemon pid liveness")?
+        && process_is_live(pid).context("failed to probe daemon pid liveness")?
     {
         return Ok((Some(pid), true, pidfile.warning));
     }
@@ -14628,7 +14628,7 @@ fn detect_daemon_status(
         collect_daemon_candidates_with_pidfile(db_path, pidfile_pid)?;
     let plan = mempal::daemon_singleton::plan_daemon_reap(&candidates, live_pidfile_pid);
     if let Some(pid) = plan.keeper
-        && process_is_running(pid).context("failed to probe daemon singleton liveness")?
+        && process_is_live(pid).context("failed to probe daemon singleton liveness")?
     {
         return Ok((Some(pid), true, pidfile.warning));
     }
@@ -14647,7 +14647,7 @@ fn detect_daemon_status(
     let pidfile = read_daemon_pid_for_status(db_path);
     let daemon_pid = pidfile.pid;
     let daemon_running = daemon_pid
-        .map(process_is_running)
+        .map(process_is_live)
         .transpose()
         .context("failed to probe daemon pid liveness")?
         .unwrap_or(false);
@@ -14655,10 +14655,10 @@ fn detect_daemon_status(
 }
 
 #[cfg(unix)]
-fn process_is_running(pid: i32) -> Result<bool> {
+fn process_is_live(pid: i32) -> Result<bool> {
     let rc = unsafe { libc::kill(pid, 0) };
     if rc == 0 {
-        return Ok(true);
+        return Ok(mempal::process_is_live(pid));
     }
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() {
@@ -14668,7 +14668,7 @@ fn process_is_running(pid: i32) -> Result<bool> {
     }
 }
 #[cfg(not(unix))]
-fn process_is_running(_pid: i32) -> Result<bool> {
+fn process_is_live(_pid: i32) -> Result<bool> {
     Ok(false)
 }
 
@@ -15953,7 +15953,7 @@ fn daemon_pid_path(db_path: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn write_daemon_pid_file(db_path: &Path, pid: i32) -> Result<()> {
-    if !process_is_running(pid)? {
+    if !process_is_live(pid)? {
         bail!("cannot repair daemon pid file: pid {pid} is not running");
     }
     let mempal_home = daemon_home_from_db_path(db_path);
@@ -16025,7 +16025,7 @@ impl DaemonProcessOps for RealDaemonProcessOps {
     }
 
     fn is_running(&mut self, pid: i32) -> Result<bool> {
-        process_is_running(pid)
+        process_is_live(pid)
     }
 
     fn sleep(&mut self, duration: std::time::Duration) {
@@ -16075,7 +16075,7 @@ fn collect_daemon_candidates_with_scan_and_pidfile(
     let mut candidates = enumerate_daemon_pids(&binary, db_path);
 
     let live_pidfile_pid = match pidfile_pid {
-        Some(pid) if process_is_running(pid)? => {
+        Some(pid) if process_is_live(pid)? => {
             if !candidates.contains(&pid) {
                 candidates.push(pid);
             }
@@ -16234,7 +16234,7 @@ fn run_daemon_start(config_path: PathBuf, foreground: bool) -> Result<()> {
         }
     }
     if let Some(pid) = read_daemon_pid(&db_path)? {
-        if process_is_running(pid)? {
+        if process_is_live(pid)? {
             bail!("daemon already running (pid {pid}); stop with `mempal daemon stop`");
         }
         // Stale pidfile: remove so bootstrap can write a fresh one.
@@ -16450,9 +16450,7 @@ mod daemon_reap_tests {
 const DAEMON_STATUS_QUEUE_STATS_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 
 fn run_daemon_status(db_path: &Path) -> Result<()> {
-    // Enumerate ALL live `mempal daemon` siblings so status reports the true
-    // process count and can warn on duplicates the single pidfile PID hides
-    // (#257). The scan excludes this `daemon status` process itself.
+    // Report matching daemon siblings, not only the pidfile PID.
     let binary =
         mempal::daemon_singleton::current_binary_name().unwrap_or_else(|| "mempal".to_string());
     let mempal_home = daemon_home_from_db_path(db_path);
@@ -16471,7 +16469,7 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
             }
         }
         Some(pid) => {
-            if process_is_running(pid)? {
+            if process_is_live(pid)? {
                 println!("status: running");
                 println!("pid: {pid}");
                 print_daemon_process_report(pid, "");

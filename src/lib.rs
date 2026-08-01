@@ -16,6 +16,7 @@ pub mod crystallize;
 pub mod daemon;
 pub mod daemon_bootstrap;
 pub(crate) mod daemon_process;
+pub use daemon_process::process_is_live;
 pub mod daemon_readiness;
 pub mod daemon_recovery;
 pub mod daemon_singleton;
