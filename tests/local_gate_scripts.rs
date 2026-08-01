@@ -380,18 +380,24 @@ fn rest_gate_children_cannot_retain_the_parent_lock() {
         "closed\n",
         "the simulated Cargo descendant must not inherit the REST lock descriptor"
     );
-    let holder_survived = capture_recorded_process(holder_identity)
+    let holder_is_running = match capture_recorded_process(holder_identity)
         .expect("re-verify recorded holder identity after gate cleanup")
-        .is_some();
-    if let Some(holder) = capture_recorded_process(holder_identity)
-        .expect("capture the recorded holder only when its identity still matches")
     {
-        holder
-            .send_signal(libc::SIGKILL)
-            .expect("pidfd-safe fallback cleanup for a leaked recorded holder");
-    }
+        Some(holder) => {
+            let is_running = holder
+                .is_running()
+                .expect("inspect recorded holder running state");
+            if is_running {
+                holder
+                    .send_signal(libc::SIGKILL)
+                    .expect("pidfd-safe fallback cleanup for a running recorded holder");
+            }
+            is_running
+        }
+        None => false,
+    };
     assert!(
-        !holder_survived,
+        !holder_is_running,
         "the recorded descriptor holder must terminate with the gate process tree"
     );
 

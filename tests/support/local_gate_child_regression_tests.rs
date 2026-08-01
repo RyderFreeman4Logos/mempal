@@ -180,7 +180,7 @@ mod regression_tests {
     }
 
     #[test]
-    fn gate_child_reaps_post_reap_non_pipe_setsid_descendant() {
+    fn gate_child_terminates_post_reap_non_pipe_setsid_descendant() {
         let fixture = tempfile::tempdir().expect("create non-pipe escaped-descendant fixture");
         let release_file = fixture.path().join("release");
         let ready_file = fixture.path().join("ready");
@@ -214,27 +214,33 @@ mod regression_tests {
 
         let output = gate
             .wait_with_timeout(Duration::from_millis(50))
-            .expect("reap reparented non-pipe descendant");
-        let escaped_survived = capture_recorded_process(escaped)
+            .expect("finish cleanup for reparented non-pipe descendant");
+        let escaped_is_running = match capture_recorded_process(escaped)
             .expect("re-verify escaped descendant identity")
-            .is_some();
-        if let Some(process) = capture_recorded_process(escaped)
-            .expect("capture escaped descendant only if its identity still matches")
         {
-            process
-                .send_signal(libc::SIGKILL)
-                .expect("pidfd-safe fallback cleanup for failed assertion");
-        }
+            Some(process) => {
+                let is_running = process
+                    .is_running()
+                    .expect("inspect escaped descendant running state");
+                if is_running {
+                    process
+                        .send_signal(libc::SIGKILL)
+                        .expect("pidfd-safe fallback cleanup for a running escaped descendant");
+                }
+                is_running
+            }
+            None => false,
+        };
 
         assert!(output.status.success(), "leader status: {}", output.status);
         assert!(
-            !escaped_survived,
-            "a post-reap setsid descendant without output pipes must be reaped"
+            !escaped_is_running,
+            "a post-reap setsid descendant without output pipes must terminate"
         );
     }
 
     #[test]
-    fn gate_child_reaps_closed_pipe_descendant_by_ownership_token() {
+    fn gate_child_terminates_closed_pipe_descendant_by_ownership_token() {
         let fixture = tempfile::tempdir().expect("create closed-pipe descendant fixture");
         let release_file = fixture.path().join("release");
         let ready_file = fixture.path().join("ready");
@@ -268,33 +274,39 @@ mod regression_tests {
                 .expect("reap closing-pipe leader"),
             "leader did not exit after creating its closing-pipe descendant"
         );
-        gate.refresh_tracked_processes()
-            .expect("capture escaped descendant from its inherited ownership token");
         fs::write(&close_file, "close\n").expect("release descendant pipe closure");
         wait_for_file(
             &closed_file,
             Duration::from_secs(2),
             "escaped descendant pipe closure",
         );
+        gate.refresh_tracked_processes()
+            .expect("capture escaped descendant from its inherited ownership token after pipe closure");
 
         let output = gate
             .wait_with_timeout(Duration::from_millis(50))
-            .expect("reap escaped descendant after it closes output pipes");
-        let escaped_survived = capture_recorded_process(escaped)
+            .expect("finish cleanup for escaped descendant after output-pipe closure");
+        let escaped_is_running = match capture_recorded_process(escaped)
             .expect("re-verify escaped descendant identity")
-            .is_some();
-        if let Some(process) = capture_recorded_process(escaped)
-            .expect("capture escaped descendant only if its identity still matches")
         {
-            process
-                .send_signal(libc::SIGKILL)
-                .expect("pidfd-safe fallback cleanup for failed assertion");
-        }
+            Some(process) => {
+                let is_running = process
+                    .is_running()
+                    .expect("inspect escaped descendant running state");
+                if is_running {
+                    process
+                        .send_signal(libc::SIGKILL)
+                        .expect("pidfd-safe fallback cleanup for a running escaped descendant");
+                }
+                is_running
+            }
+            None => false,
+        };
 
         assert!(output.status.success(), "leader status: {}", output.status);
         assert!(
-            !escaped_survived,
-            "the inherited ownership token must outlive output-pipe closure"
+            !escaped_is_running,
+            "the escaped descendant discovered by its inherited ownership token must terminate after output-pipe closure"
         );
     }
 
@@ -383,7 +395,7 @@ mod regression_tests {
     }
 
     #[test]
-    fn gate_child_reaps_setsid_descendant_created_by_term_handler() {
+    fn gate_child_terminates_setsid_descendant_created_by_term_handler() {
         let fixture = tempfile::tempdir().expect("create TERM-handler escape fixture");
         let pid_file = fixture.path().join("escaped.pid");
         let ready_file = fixture.path().join("escaped-ready");
@@ -400,16 +412,22 @@ mod regression_tests {
             "TERM-handler setsid descendant",
         );
         let escaped = escaped_identity(&pid_file);
-        let escaped_survived = capture_recorded_process(escaped)
+        let escaped_is_running = match capture_recorded_process(escaped)
             .expect("re-verify TERM-handler descendant identity")
-            .is_some();
-        if let Some(process) = capture_recorded_process(escaped)
-            .expect("capture TERM-handler descendant only if its identity still matches")
         {
-            process
-                .send_signal(libc::SIGKILL)
-                .expect("pidfd-safe fallback cleanup for failed containment assertion");
-        }
+            Some(process) => {
+                let is_running = process
+                    .is_running()
+                    .expect("inspect TERM-handler descendant running state");
+                if is_running {
+                    process
+                        .send_signal(libc::SIGKILL)
+                        .expect("pidfd-safe fallback cleanup for a running TERM-handler descendant");
+                }
+                is_running
+            }
+            None => false,
+        };
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(
@@ -417,8 +435,8 @@ mod regression_tests {
             "TERM-handler descendant cleanup exceeded its deadline"
         );
         assert!(
-            !escaped_survived,
-            "a setsid descendant created by a TERM handler must be reaped during cleanup"
+            !escaped_is_running,
+            "a setsid descendant created by a TERM handler must terminate during cleanup"
         );
     }
 }
