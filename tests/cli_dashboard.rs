@@ -561,46 +561,46 @@ fn test_readonly_cli_probes_tolerate_active_db_holder() {
         .execute_batch("BEGIN EXCLUSIVE;")
         .expect("hold controlled write transaction");
 
-    let old_style_open = Database::open_with_busy_timeout(&env.db_path, Duration::ZERO);
+    let contender = rusqlite::Connection::open(&env.db_path).expect("open write contender");
+    contender
+        .busy_timeout(Duration::ZERO)
+        .expect("contender fail-fast timeout");
     assert!(
-        old_style_open.is_err(),
-        "controlled holder must block write-mode startup so the regression is meaningful"
+        contender.execute_batch("BEGIN IMMEDIATE;").is_err(),
+        "holder must block a competing write transaction"
     );
 
-    let probes: [(&str, &[&str]); 12] = [
-        ("status", &["status"]),
-        ("pinned", &["pinned", "--json"]),
-        ("kg_stats", &["kg", "stats"]),
-        (
-            "knowledge_card_list",
-            &["knowledge-card", "list", "--format", "json"],
-        ),
-        ("cards_pending", &["cards", "--pending", "--format", "json"]),
-        ("wake_up", &["wake-up", "--format", "protocol"]),
-        ("field_taxonomy", &["field-taxonomy", "--format", "json"]),
-        ("checkpoint_status", &["checkpoint", "status"]),
-        ("repair_list", &["repair", "list", "--json"]),
-        ("xurl_stats", &["xurl", "stats", "--json"]),
-        ("bench_matrix", &["bench", "matrix", "--format", "json"]),
-        (
-            "search",
-            &["search", "lock probe", "--top-k", "3", "--json"],
-        ),
+    Database::open_with_busy_timeout(&env.db_path, Duration::ZERO)
+        .expect("current-schema open must not write under an active DB holder");
+
+    let probes: [&[&str]; 12] = [
+        &["status"],
+        &["pinned", "--json"],
+        &["kg", "stats"],
+        &["knowledge-card", "list", "--format", "json"],
+        &["cards", "--pending", "--format", "json"],
+        &["wake-up", "--format", "protocol"],
+        &["field-taxonomy", "--format", "json"],
+        &["checkpoint", "status"],
+        &["repair", "list", "--json"],
+        &["xurl", "stats", "--json"],
+        &["bench", "matrix", "--format", "json"],
+        &["search", "lock probe", "--top-k", "3", "--json"],
     ];
 
-    for (label, args) in probes {
+    for args in probes {
         let output = run_mempal(&env.home, env.cwd(), args);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let lock_error =
             stderr.contains("database is locked") || stderr.contains("database file is locked");
         assert!(
             output.status.success(),
-            "read-only probe {label} failed under active DB holder; lock_error={lock_error}; status={}",
+            "read-only probe {args:?} failed under active DB holder; lock_error={lock_error}; status={}",
             output.status
         );
         assert!(
             !lock_error,
-            "read-only probe {label} reported a SQLite lock under active DB holder"
+            "read-only probe {args:?} reported a SQLite lock under active DB holder"
         );
     }
 
