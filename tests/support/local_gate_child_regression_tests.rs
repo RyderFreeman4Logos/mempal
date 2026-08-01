@@ -140,6 +140,45 @@ mod regression_tests {
         spawn_in_own_session(&mut command).expect("spawn TERM-handler escape fixture")
     }
 
+    fn spawn_closing_pipe_escape_after_release(
+        release_file: &Path,
+        ready_file: &Path,
+        close_file: &Path,
+        closed_file: &Path,
+        pid_file: &Path,
+    ) -> OwnedGateChild {
+        let mut command = Command::new("/bin/bash");
+        command
+            .args([
+                "-c",
+                r#"
+                    while [[ ! -e "${RELEASE_FILE:?}" ]]; do /bin/sleep 0.01; done
+                    setsid /bin/bash -c '
+                        trap "" TERM
+                        pid="${BASHPID}"
+                        start_time="$(awk "{print \$22}" "/proc/${pid}/stat")"
+                        printf "%s %s\n" "${pid}" "${start_time}" >"${PID_FILE:?}"
+                        : >"${READY_FILE:?}"
+                        while [[ ! -e "${CLOSE_FILE:?}" ]]; do /bin/sleep 0.01; done
+                        exec </dev/null >/dev/null 2>&1
+                        : >"${CLOSED_FILE:?}"
+                        while true; do /bin/sleep 60; done
+                    ' &
+                    while [[ ! -e "${READY_FILE:?}" ]]; do /bin/sleep 0.01; done
+                    exit 0
+                "#,
+            ])
+            .env("RELEASE_FILE", release_file)
+            .env("READY_FILE", ready_file)
+            .env("CLOSE_FILE", close_file)
+            .env("CLOSED_FILE", closed_file)
+            .env("PID_FILE", pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        spawn_in_own_session(&mut command).expect("spawn closing-pipe escape fixture")
+    }
+
     #[test]
     fn gate_child_reaps_post_reap_non_pipe_setsid_descendant() {
         let fixture = tempfile::tempdir().expect("create non-pipe escaped-descendant fixture");
@@ -184,6 +223,80 @@ mod regression_tests {
         assert!(
             !escaped_survived,
             "a post-reap setsid descendant without output pipes must be reaped"
+        );
+    }
+
+    #[test]
+    fn gate_child_reports_leaked_closed_pipe_descendant_after_leader_reap() {
+        let fixture = tempfile::tempdir().expect("create closed-pipe descendant fixture");
+        let release_file = fixture.path().join("release");
+        let ready_file = fixture.path().join("ready");
+        let close_file = fixture.path().join("close");
+        let closed_file = fixture.path().join("closed");
+        let pid_file = fixture.path().join("pid");
+        let mut gate = GateChild::new(spawn_closing_pipe_escape_after_release(
+            &release_file,
+            &ready_file,
+            &close_file,
+            &closed_file,
+            &pid_file,
+        ))
+        .expect("capture closing-pipe escape leader");
+
+        gate.descendant_monitor
+            .stop_and_drain(
+                &mut gate.tracked_processes,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("stop descendant monitor before exercising pipe fallback");
+        fs::write(&release_file, "release\n").expect("release escaped descendant creation");
+        wait_for_file(
+            &ready_file,
+            Duration::from_secs(2),
+            "closing-pipe escaped descendant",
+        );
+        let escaped = escaped_identity(&pid_file);
+        assert!(
+            wait_for_child_exit(gate.child.child_mut(), Duration::from_secs(2))
+                .expect("reap closing-pipe leader"),
+            "leader did not exit after creating its closing-pipe descendant"
+        );
+        gate.refresh_tracked_processes()
+            .expect("capture escaped descendant from its inherited output pipe");
+        fs::write(&close_file, "close\n").expect("release descendant pipe closure");
+        wait_for_file(
+            &closed_file,
+            Duration::from_secs(2),
+            "escaped descendant pipe closure",
+        );
+
+        let cleanup = gate.wait_with_timeout(Duration::from_millis(50));
+        if let Some(process) = capture_recorded_process(escaped)
+            .expect("capture leaked descendant only if its identity still matches")
+        {
+            process
+                .send_signal(libc::SIGKILL)
+                .expect("pidfd-safe fallback cleanup for leaked descendant");
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while process
+                .is_running()
+                .expect("inspect leaked descendant after fallback cleanup")
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                !process
+                    .is_running()
+                    .expect("confirm leaked descendant fallback cleanup"),
+                "pidfd fallback cleanup did not stop leaked descendant"
+            );
+        }
+
+        let error = cleanup.expect_err("a live fallback that lost its pipe must be reported");
+        assert!(
+            error.to_string().contains("no longer holds the gate output pipe"),
+            "unexpected cleanup diagnostic: {error}"
         );
     }
 
@@ -256,7 +369,7 @@ mod regression_tests {
             identity: unrelated_identity,
             pidfd: leader_root.pidfd,
         };
-        signal_root_process_tree(&recycled_root, false, libc::SIGTERM)
+        signal_root_process_tree(leader.child(), &recycled_root, libc::SIGTERM)
             .expect("reaped leader cleanup must not signal its recycled process group");
         thread::sleep(Duration::from_millis(50));
         let unrelated_survived = unrelated_identity

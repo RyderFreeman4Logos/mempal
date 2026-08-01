@@ -58,7 +58,10 @@ struct ProcessHandle {
 #[path = "local_gate_direct_child.rs"]
 mod local_gate_direct_child;
 pub(crate) use local_gate_direct_child::OwnedGateChild;
-use local_gate_direct_child::{CleanupDiagnostics, capture_owned_child, timeout_error};
+use local_gate_direct_child::{
+    ChildExitState, CleanupDiagnostics, capture_owned_child, child_exit_state, timeout_error,
+    wait_for_child_exit, wait_for_child_exit_unreaped_until,
+};
 
 #[path = "local_gate_recorded_process.rs"]
 mod local_gate_recorded_process;
@@ -104,7 +107,16 @@ impl TrackedProcess {
         match &self.source {
             TrackedProcessSource::Descendant => self.process.is_running(),
             TrackedProcessSource::PipeFallback { pipe_targets } => {
-                process_holds_writable_pipe(&self.process, pipe_targets, deadline)
+                if process_holds_writable_pipe(&self.process, pipe_targets, deadline)? {
+                    return Ok(true);
+                }
+                if self.process.is_running()? {
+                    return Err(io::Error::other(format!(
+                        "tracked gate process {} no longer holds the gate output pipe; refusing unverified PID cleanup",
+                        self.process.identity.pid
+                    )));
+                }
+                Ok(false)
             }
         }
     }
@@ -230,7 +242,7 @@ impl GateChild {
                     self.terminate_and_collect_until(cleanup_deadline()),
                 );
             }
-            if self.child.child_mut().try_wait()?.is_some() {
+            if child_exit_state(self.child.child())? != ChildExitState::Running {
                 return self.terminate_and_collect_until(cleanup_deadline());
             }
             self.refresh_tracked_processes_until(deadline)?;
@@ -240,7 +252,7 @@ impl GateChild {
                     self.terminate_and_collect_until(cleanup_deadline()),
                 );
             }
-            if self.child.child_mut().try_wait()?.is_some() {
+            if child_exit_state(self.child.child())? != ChildExitState::Running {
                 return self.terminate_and_collect_until(cleanup_deadline());
             }
             thread::sleep(
@@ -269,16 +281,13 @@ impl GateChild {
     fn terminate_and_collect_until(&mut self, deadline: Instant) -> io::Result<Output> {
         self.descendant_monitor
             .drain_discovered(&mut self.tracked_processes, deadline);
-        let result = terminate_and_collect_until(
+        terminate_and_collect_until(
             &mut self.child,
             &self.root,
             &mut self.tracked_processes,
             &mut self.descendant_monitor,
             deadline,
-        );
-        self.descendant_monitor
-            .stop_and_drain(&mut self.tracked_processes, deadline);
-        result
+        )
     }
 }
 
@@ -300,7 +309,6 @@ pub(crate) fn reap_owned_child(mut child: OwnedGateChild) -> io::Result<()> {
         &mut descendant_monitor,
         deadline,
     );
-    descendant_monitor.stop_and_drain(&mut tracked_processes, deadline);
     result.map(|_| ())
 }
 
@@ -318,7 +326,6 @@ fn terminate_and_collect(
         &mut descendant_monitor,
         deadline,
     );
-    descendant_monitor.stop_and_drain(tracked_processes, deadline);
     result
 }
 
@@ -338,6 +345,20 @@ fn terminate_and_collect_until(
         deadline,
     ) {
         diagnostics.record(error);
+    }
+    if let Err(error) = descendant_monitor.stop_and_drain(tracked_processes, deadline) {
+        diagnostics.record(error);
+    }
+    if let Err(error) = signal_tracked_processes(tracked_processes, libc::SIGKILL, deadline) {
+        diagnostics.record(error);
+    }
+    match wait_for_tracked_processes_exit(tracked_processes, deadline) {
+        Ok(true) => {}
+        Ok(false) => diagnostics.record(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "tracked gate descendants did not exit before cleanup deadline",
+        )),
+        Err(error) => diagnostics.record(error),
     }
     let output = match collect_bounded_output(child.child_mut(), deadline) {
         Ok(output) => Some(output),
@@ -375,9 +396,9 @@ fn terminate_owned_process_tree(
     let pre_kill_discovery_deadline = discovery_deadline
         .checked_sub(POST_KILL_DISCOVERY_RESERVE)
         .unwrap_or_else(Instant::now);
-    let leader_alive = match child.try_wait() {
-        Ok(Some(_)) => false,
-        Ok(None) => true,
+    let leader_alive = match child_exit_state(child) {
+        Ok(ChildExitState::Running) => true,
+        Ok(ChildExitState::ExitedUnreaped | ChildExitState::Reaped) => false,
         Err(error) => {
             diagnostics.record(error);
             false
@@ -388,11 +409,11 @@ fn terminate_owned_process_tree(
     // Capture an identity for a setsid escape before the leader receives SIGTERM. Once the
     // leader has exited, the escape can be reparented and no longer be discoverable from root.
     descendant_monitor.discover_and_drain(tracked_processes, term_deadline);
-    let _ = diagnostics.capture(signal_root_process_tree(root, !child_exited, libc::SIGTERM));
+    let _ = diagnostics.capture(signal_root_process_tree(child, root, libc::SIGTERM));
 
     // A SIGTERM handler can create a setsid escape after the first discovery pass. Repeatedly
     // drain the monitor and synchronously discover descendants while the leader may still be
-    // alive. Once the leader has been reaped, signal every tracked identity via pidfd; this
+    // alive. Once the leader has exited, signal every tracked identity via pidfd; this
     // avoids killing an escape while the leader's TERM handler is still publishing it. The
     // synchronous discovery receives the grace deadline itself, never the monitor's 10ms
     // polling slice. Pipe-holder discovery remains outside this loop because its whole-/proc
@@ -403,9 +424,9 @@ fn terminate_owned_process_tree(
         descendant_monitor.discover_and_drain(tracked_processes, term_deadline);
         descendant_monitor.drain_discovered(tracked_processes, term_deadline);
         if !child_exited {
-            child_exited = match child.try_wait() {
-                Ok(Some(_)) => true,
-                Ok(None) => false,
+            child_exited = match child_exit_state(child) {
+                Ok(ChildExitState::Running) => false,
+                Ok(ChildExitState::ExitedUnreaped | ChildExitState::Reaped) => true,
                 Err(error) => {
                     diagnostics.record(error);
                     true
@@ -433,7 +454,7 @@ fn terminate_owned_process_tree(
         thread::sleep(remaining.min(TERMINATION_DISCOVERY_POLL_INTERVAL));
     }
     if !child_exited {
-        child_exited = match wait_for_child_exit_until(child, term_deadline) {
+        child_exited = match wait_for_child_exit_unreaped_until(child, term_deadline) {
             Ok(exited) => exited,
             Err(error) => {
                 diagnostics.record(error);
@@ -467,7 +488,7 @@ fn terminate_owned_process_tree(
         pre_kill_discovery_deadline,
     ));
     descendant_monitor.drain_discovered(tracked_processes, deadline);
-    let _ = diagnostics.capture(signal_root_process_tree(root, !child_exited, libc::SIGKILL));
+    let _ = diagnostics.capture(signal_root_process_tree(child, root, libc::SIGKILL));
     let _ = diagnostics.capture(signal_tracked_processes(
         tracked_processes,
         libc::SIGKILL,
@@ -490,7 +511,7 @@ fn terminate_owned_process_tree(
         deadline,
     ));
     if !child_exited {
-        child_exited = match wait_for_child_exit_until(child, deadline) {
+        child_exited = match wait_for_child_exit_unreaped_until(child, deadline) {
             Ok(exited) => exited,
             Err(error) => {
                 diagnostics.record(error);
@@ -534,15 +555,15 @@ fn signal_process_group(process_group_id: i32, signal: i32) -> io::Result<()> {
     Ok(())
 }
 
-fn signal_root_process_tree(
-    root: &ProcessHandle,
-    leader_alive: bool,
-    signal: i32,
-) -> io::Result<()> {
+fn signal_root_process_tree(child: &Child, root: &ProcessHandle, signal: i32) -> io::Result<()> {
     let mut diagnostics = CleanupDiagnostics::default();
     let _ = diagnostics.capture(root.send_signal(signal));
-    if leader_alive {
-        let _ = diagnostics.capture(signal_process_group(root.identity.pid, signal));
+    match child_exit_state(child) {
+        Ok(ChildExitState::Running | ChildExitState::ExitedUnreaped) => {
+            let _ = diagnostics.capture(signal_process_group(root.identity.pid, signal));
+        }
+        Ok(ChildExitState::Reaped) => {}
+        Err(error) => diagnostics.record(error),
     }
     diagnostics.finish()
 }
@@ -578,26 +599,6 @@ fn wait_for_tracked_processes_exit(
             }
         }
         if !any_running {
-            return Ok(true);
-        }
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-        thread::sleep(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(10)),
-        );
-    }
-}
-
-fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> io::Result<bool> {
-    wait_for_child_exit_until(child, Instant::now() + timeout)
-}
-
-fn wait_for_child_exit_until(child: &mut Child, deadline: Instant) -> io::Result<bool> {
-    loop {
-        if child.try_wait()?.is_some() {
             return Ok(true);
         }
         if Instant::now() >= deadline {

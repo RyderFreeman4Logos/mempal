@@ -49,15 +49,17 @@ impl OwnedGateChild {
             }
         };
 
-        let already_reaped = match self.child.try_wait() {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
+        let child_state = match child_exit_state(&self.child) {
+            Ok(state) => Some(state),
             Err(error) => {
                 record(error);
-                false
+                None
             }
         };
-        if !already_reaped {
+        if matches!(
+            child_state,
+            Some(ChildExitState::Running | ChildExitState::ExitedUnreaped)
+        ) {
             match owned_child_pid(&self.child) {
                 Ok(process_group_id) => {
                     if let Err(error) = signal_process_group(process_group_id, libc::SIGKILL) {
@@ -110,6 +112,85 @@ pub(super) fn capture_owned_child(child: &Child) -> io::Result<ProcessHandle> {
             "owned gate child exited before its pidfd identity could be captured",
         )
     })
+}
+
+pub(super) fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> io::Result<bool> {
+    wait_for_child_exit_until(child, Instant::now() + timeout)
+}
+
+pub(super) fn wait_for_child_exit_until(child: &mut Child, deadline: Instant) -> io::Result<bool> {
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(10)),
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ChildExitState {
+    Running,
+    ExitedUnreaped,
+    Reaped,
+}
+
+pub(super) fn child_exit_state(child: &Child) -> io::Result<ChildExitState> {
+    // SAFETY: all-zero is a valid initial representation for the waitid output record.
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    loop {
+        // SAFETY: `child.id()` names our direct child. WNOWAIT observes an exit without
+        // releasing the PID that fences its dedicated process-group identity.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            // SAFETY: successful waitid initialized `info`; zero means no exit event yet.
+            return Ok(if unsafe { info.si_pid() } == 0 {
+                ChildExitState::Running
+            } else {
+                ChildExitState::ExitedUnreaped
+            });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            return Ok(ChildExitState::Reaped);
+        }
+        return Err(error);
+    }
+}
+
+pub(super) fn wait_for_child_exit_unreaped_until(
+    child: &Child,
+    deadline: Instant,
+) -> io::Result<bool> {
+    loop {
+        if child_exit_state(child)? != ChildExitState::Running {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(10)),
+        );
+    }
 }
 
 #[derive(Default)]

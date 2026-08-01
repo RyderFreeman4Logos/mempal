@@ -423,12 +423,12 @@ mod tests {
                 .expect("pipe reader remains visible for fallback recheck"),
             pipe_targets,
         );
-        signal_tracked_processes(
+        let fallback_error = signal_tracked_processes(
             &[fallback],
             libc::SIGTERM,
             Instant::now() + Duration::from_secs(1),
         )
-            .expect("recheck a pipe fallback before signaling");
+        .expect_err("a read-only pipe endpoint must fail fallback ownership revalidation");
         let reader_was_tracked = gate
             .tracked_processes
             .iter()
@@ -448,7 +448,7 @@ mod tests {
         );
         assert!(
             reader_survived_cleanup && !reader_received_term,
-            "a read-end-only sibling must not be signaled by pipe fallback cleanup"
+            "a read-end-only sibling must not be signaled by pipe fallback cleanup: {fallback_error}"
         );
     }
 
