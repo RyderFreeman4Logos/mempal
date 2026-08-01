@@ -359,20 +359,17 @@ mod tests {
         let (opened_tx, opened_rx) = std::sync::mpsc::channel();
         let open_path = db_path.clone();
         let opener = std::thread::spawn(move || {
-            opened_tx.send(Database::open_with_busy_timeout(
+            let _ = opened_tx.send(Database::open_with_busy_timeout(
                 &open_path,
                 Duration::from_millis(25),
-            ))
+            ));
         });
 
         let opened = opened_rx.recv_timeout(Duration::from_millis(250));
         blocker
             .execute_batch("COMMIT;")
             .expect("release schema lock");
-        opener
-            .join()
-            .expect("join database opener")
-            .expect("send database opener result");
+        opener.join().expect("join database opener");
         assert!(
             opened
                 .expect("caller-selected timeout must bound schema query")
