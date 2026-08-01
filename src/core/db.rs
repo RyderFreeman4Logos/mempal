@@ -408,6 +408,10 @@ pub enum DbError {
         "database schema version {current} is newer than supported version {supported}; update the mempal binary that opens this database (for example, run `cargo install mempal` or reinstall from this source checkout). If this error comes from an MCP server, check the MCP client configuration and ensure its command/path points at the updated mempal binary."
     )]
     UnsupportedSchemaVersion { current: u32, supported: u32 },
+    #[error(
+        "fork extension schema version {current} is newer than supported version {supported}; update the mempal binary that opens this database"
+    )]
+    UnsupportedForkExtVersion { current: u32, supported: u32 },
     #[error("supersedes and replace_text are mutually exclusive")]
     ReplacementTargetConflict,
     #[error("superseded drawer {drawer_id} was not found or is already deleted")]
@@ -5970,13 +5974,7 @@ impl UnionFind {
 }
 
 fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
-    let current_version = read_user_version(conn)?;
-    if current_version > CURRENT_SCHEMA_VERSION {
-        return Err(DbError::UnsupportedSchemaVersion {
-            current: current_version,
-            supported: CURRENT_SCHEMA_VERSION,
-        });
-    }
+    let current_version = ensure_supported_schema_version(conn)?;
 
     for migration in migrations()
         .iter()
@@ -6531,6 +6529,17 @@ fn backfill_content_hash(conn: &Connection) -> Result<(), DbError> {
 fn read_user_version(conn: &Connection) -> Result<u32, DbError> {
     let version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?;
     Ok(version)
+}
+
+fn ensure_supported_schema_version(conn: &Connection) -> Result<u32, DbError> {
+    let current_version = read_user_version(conn)?;
+    if current_version > CURRENT_SCHEMA_VERSION {
+        return Err(DbError::UnsupportedSchemaVersion {
+            current: current_version,
+            supported: CURRENT_SCHEMA_VERSION,
+        });
+    }
+    Ok(current_version)
 }
 
 fn set_user_version(conn: &Connection, version: u32) -> Result<(), DbError> {

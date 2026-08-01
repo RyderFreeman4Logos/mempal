@@ -74,12 +74,7 @@ impl DescendantMonitor {
             let Ok(process) = self.discovered_receiver.try_recv() else {
                 break;
             };
-            if !tracked_processes
-                .iter()
-                .any(|tracked| tracked.identity() == process.identity)
-            {
-                tracked_processes.push(TrackedProcess::descendant(process));
-            }
+            track_descendant(tracked_processes, process);
         }
     }
 
@@ -99,12 +94,7 @@ impl DescendantMonitor {
                 if Instant::now() >= deadline {
                     break;
                 }
-                if !tracked_processes
-                    .iter()
-                    .any(|tracked| tracked.identity() == process.identity)
-                {
-                    tracked_processes.push(TrackedProcess::descendant(process));
-                }
+                track_descendant(tracked_processes, process);
             }
         }
         self.drain_discovered(tracked_processes, deadline);
@@ -114,17 +104,20 @@ impl DescendantMonitor {
         &mut self,
         tracked_processes: &mut Vec<TrackedProcess>,
         deadline: Instant,
-    ) {
+    ) -> io::Result<()> {
         self.discover_and_drain(tracked_processes, deadline);
         let _ = self.stop_sender.send(());
         loop {
             if Instant::now() >= deadline {
                 let _ = self.worker.take();
-                return;
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "local gate descendant monitor did not stop before cleanup deadline",
+                ));
             }
             self.drain_discovered(tracked_processes, deadline);
             if self.worker.is_none() {
-                return;
+                return Ok(());
             }
             match self.finished_receiver.try_recv() {
                 Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
@@ -132,14 +125,17 @@ impl DescendantMonitor {
                         let _ = worker.join();
                     }
                     self.drain_discovered(tracked_processes, deadline);
-                    return;
+                    return Ok(());
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 let _ = self.worker.take();
-                return;
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "local gate descendant monitor did not stop before cleanup deadline",
+                ));
             }
             let _ = self
                 .finished_receiver
@@ -167,7 +163,22 @@ pub(super) fn refresh_owned_processes(
     tracked_processes: &mut Vec<TrackedProcess>,
     deadline: Instant,
 ) -> io::Result<()> {
-    track_output_pipe_holders(child, tracked_processes, deadline)?;
+    refresh_owned_processes_with_token(child, None, root, tracked_processes, deadline)
+}
+
+pub(super) fn refresh_owned_processes_with_token(
+    child: &Child,
+    ownership_token: Option<&str>,
+    root: &ProcessHandle,
+    tracked_processes: &mut Vec<TrackedProcess>,
+    deadline: Instant,
+) -> io::Result<()> {
+    if let Some(token) = ownership_token {
+        track_ownership_token_holders(token, tracked_processes, deadline)?;
+    }
+    if Instant::now() < deadline {
+        track_output_pipe_holders(child, tracked_processes, deadline)?;
+    }
     let mut pending = Vec::new();
     for process in tracked_processes.iter() {
         if Instant::now() >= deadline {
@@ -195,11 +206,73 @@ pub(super) fn refresh_owned_processes(
                 .any(|tracked| tracked.identity() == descendant.identity)
             {
                 pending.push(descendant.identity);
-                tracked_processes.push(TrackedProcess::descendant(descendant));
             }
+            track_descendant(tracked_processes, descendant);
         }
     }
     Ok(())
+}
+
+fn track_descendant(tracked_processes: &mut Vec<TrackedProcess>, process: ProcessHandle) {
+    if let Some(tracked) = tracked_processes
+        .iter_mut()
+        .find(|tracked| tracked.identity() == process.identity)
+    {
+        if matches!(tracked.source, TrackedProcessSource::PipeFallback { .. }) {
+            *tracked = TrackedProcess::descendant(process);
+        }
+        return;
+    }
+    tracked_processes.push(TrackedProcess::descendant(process));
+}
+
+fn track_ownership_token_holders(
+    token: &str,
+    tracked_processes: &mut Vec<TrackedProcess>,
+    deadline: Instant,
+) -> io::Result<()> {
+    for entry in fs::read_dir("/proc")? {
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
+        let entry = entry?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        if !environment_has_ownership_token(pid, token)? {
+            continue;
+        }
+        let process = match ProcessHandle::capture(pid) {
+            Ok(Some(process)) => process,
+            Ok(None) => continue,
+            Err(error) if process_scan_error(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if !process_has_ownership_token(&process, token)? {
+            continue;
+        }
+        track_descendant(tracked_processes, process);
+    }
+    Ok(())
+}
+
+fn process_has_ownership_token(process: &ProcessHandle, token: &str) -> io::Result<bool> {
+    if !process.is_running()? || !environment_has_ownership_token(process.identity.pid, token)? {
+        return Ok(false);
+    }
+    process.is_running()
+}
+
+fn environment_has_ownership_token(pid: i32, token: &str) -> io::Result<bool> {
+    let environment = match fs::read(format!("/proc/{pid}/environ")) {
+        Ok(environment) => environment,
+        Err(error) if process_scan_error(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let expected = format!("{OWNERSHIP_TOKEN_ENV}={token}");
+    Ok(environment
+        .split(|byte| *byte == 0)
+        .any(|entry| entry == expected.as_bytes()))
 }
 
 fn discover_live_descendants(

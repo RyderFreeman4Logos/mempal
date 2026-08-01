@@ -2,6 +2,17 @@
 
 use super::*;
 
+fn ensure_supported_fork_ext_version(conn: &Connection) -> Result<u32, DbError> {
+    let current_version = read_fork_ext_version(conn)?;
+    if current_version > CURRENT_FORK_EXT_VERSION {
+        return Err(DbError::UnsupportedForkExtVersion {
+            current: current_version,
+            supported: CURRENT_FORK_EXT_VERSION,
+        });
+    }
+    Ok(current_version)
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         Self::open_with_mode(path, OpenMode::ReadWrite, true)
@@ -147,6 +158,8 @@ impl Database {
             )?,
         };
         conn.busy_timeout(busy_timeout)?;
+        ensure_supported_schema_version(&conn)?;
+        ensure_supported_fork_ext_version(&conn)?;
         conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_DEFAULT)?;
         register_math_functions(&conn)?;
         if !mode.allows_write() {
@@ -327,5 +340,99 @@ mod tests {
 
         Database::open_lease_control(&canonical)
             .expect("lease-control must accept canonical path from Database::path()");
+    }
+
+    #[test]
+    fn db_open_applies_busy_timeout_before_schema_queries() {
+        let tempdir = short_tempdir();
+        let db_path = tempdir.path().join("palace.db");
+        drop(Database::open(&db_path).expect("initialize database"));
+
+        let blocker = Connection::open(&db_path).expect("open lock holder");
+        blocker
+            .pragma_update(None, "journal_mode", "DELETE")
+            .expect("select delete journal mode");
+        blocker
+            .execute_batch("BEGIN EXCLUSIVE;")
+            .expect("hold exclusive schema lock");
+
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let open_path = db_path.clone();
+        let opener = std::thread::spawn(move || {
+            let _ = opened_tx.send(Database::open_with_busy_timeout(
+                &open_path,
+                Duration::from_millis(25),
+            ));
+        });
+
+        let opened = opened_rx.recv_timeout(Duration::from_millis(250));
+        blocker
+            .execute_batch("COMMIT;")
+            .expect("release schema lock");
+        opener.join().expect("join database opener");
+        assert!(
+            opened
+                .expect("caller-selected timeout must bound schema query")
+                .is_err(),
+            "exclusive schema lock must outlast the caller-selected busy timeout"
+        );
+    }
+
+    #[test]
+    fn future_fork_ext_version_is_rejected_before_writable_pragmas() {
+        let tempdir = short_tempdir();
+        let db_path = tempdir.path().join("palace.db");
+        drop(Database::open(&db_path).expect("initialize database"));
+
+        let conn = Connection::open(&db_path).expect("open fixture database");
+        conn.pragma_update(None, "journal_mode", "DELETE")
+            .expect("select delete journal mode");
+        let future_version = CURRENT_FORK_EXT_VERSION + 1;
+        set_fork_ext_version(&conn, future_version).expect("set future fork extension version");
+        drop(conn);
+        let before = fs::read(&db_path).expect("snapshot database before rejected opens");
+
+        for (label, open) in [
+            (
+                "read-write",
+                Database::open as fn(&Path) -> Result<Database, DbError>,
+            ),
+            ("query-only", Database::open_query_only),
+        ] {
+            let error = match open(&db_path) {
+                Ok(_) => panic!("{label} open must reject a future fork extension schema"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    &error,
+                    DbError::UnsupportedForkExtVersion { current, supported }
+                        if *current == future_version
+                            && *supported == CURRENT_FORK_EXT_VERSION
+                ),
+                "{label} open returned the wrong error: {error}"
+            );
+            assert_eq!(
+                fs::read(&db_path).expect("snapshot database after rejected open"),
+                before,
+                "{label} rejection must not change the database"
+            );
+        }
+
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .expect("open rejected database read-only");
+        let journal_mode = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .expect("read journal mode");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "delete");
+        assert_eq!(
+            read_fork_ext_version(&conn).expect("read preserved fork extension version"),
+            future_version
+        );
+        assert!(!db_path.with_extension("db-wal").exists());
+        assert!(!db_path.with_extension("db-shm").exists());
     }
 }

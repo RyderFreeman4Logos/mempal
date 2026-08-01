@@ -112,6 +112,27 @@ fn process_start_ticks_in_proc(proc_root: &Path, pid: i32) -> Option<u64> {
     crate::core::process_identity::parse_start_ticks(&stat)
 }
 
+/// Return false for a confirmed dead or zombie process; fail closed otherwise.
+#[cfg(target_os = "linux")]
+pub fn process_is_live(pid: i32) -> bool {
+    process_is_live_in_proc(Path::new("/proc"), pid).unwrap_or(true)
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_live_in_proc(proc_root: &Path, pid: i32) -> Option<bool> {
+    let pid = u32::try_from(pid).ok()?;
+    match std::fs::read(proc_root.join(pid.to_string()).join("stat")) {
+        Ok(stat) => Some(crate::core::process_identity::parse_start_ticks(&stat).is_some()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_is_live(_pid: i32) -> bool {
+    true
+}
+
 #[cfg(target_os = "linux")]
 fn daemon_process_is_current_in_proc(process: &DaemonProcess, proc_root: &Path) -> bool {
     process_start_ticks_in_proc(proc_root, process.pid) == Some(process.start_time_ticks)

@@ -158,6 +158,33 @@ fn reader_only_async_pool_does_not_open_writer() {
     assert_eq!(snapshot.configured_page_cache_bytes, 32 * 1024 * 1024);
 }
 
+#[test]
+fn reader_only_async_pool_rejects_unsupported_schema() {
+    let tmp = short_tempdir();
+    let path = tmp.path().join("palace.db");
+    let db = Database::open(&path).expect("create database");
+    db.conn()
+        .pragma_update(
+            None,
+            "user_version",
+            crate::core::db::CURRENT_SCHEMA_VERSION + 1,
+        )
+        .expect("set future schema version");
+    drop(db);
+
+    let error = match QueryOnlyAsyncDb::open(&path, RESOURCE_BOUNDED_READERS) {
+        Ok(_) => panic!("query-only pool must reject an unsupported schema"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        DbError::UnsupportedSchemaVersion {
+            current,
+            supported: crate::core::db::CURRENT_SCHEMA_VERSION,
+        } if current == crate::core::db::CURRENT_SCHEMA_VERSION + 1
+    ));
+}
+
 #[tokio::test]
 async fn reader_only_async_pool_runs_bounded_read_without_writer() {
     let tmp = short_tempdir();

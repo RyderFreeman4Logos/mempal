@@ -597,10 +597,7 @@ async fn test_mcp_status_surfaces_endpoint_health() {
     )
     .await
     .expect("start mcp stdio");
-    tokio::time::timeout(Duration::from_secs(5), client.initialize())
-        .await
-        .expect("initialize timed out")
-        .expect("initialize mcp client");
+    client.initialize().await.expect("initialize mcp client");
     let response = call_mcp_status(&mut client).await;
     client.shutdown().await.expect("shutdown mcp client");
 

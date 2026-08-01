@@ -2384,13 +2384,10 @@ async fn test_mcp_search_threads_project_id_from_mcp_root() {
     )
     .await
     .expect("start mcp stdio");
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        client.initialize_with_roots(&[&format!("file://{}", project_dir.display())]),
-    )
-    .await
-    .expect("initialize_with_roots timed out")
-    .expect("initialize with roots");
+    client
+        .initialize_with_roots(&[&format!("file://{}", project_dir.display())])
+        .await
+        .expect("initialize with roots");
 
     let structured = call_mcp_search(&mut client, "mcp").await;
     assert_eq!(
@@ -2447,13 +2444,10 @@ async fn test_mcp_roots_list_changed_invalidates_cached_project_id() {
     .expect("start mcp stdio");
     let root_a_uri = format!("file://{}", project_a.display()).replace(' ', "%20");
     let root_b_uri = format!("file://{}", project_b.display());
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        client.initialize_with_roots(&[&root_a_uri]),
-    )
-    .await
-    .expect("initialize_with_roots timed out")
-    .expect("initialize with roots");
+    client
+        .initialize_with_roots(&[&root_a_uri])
+        .await
+        .expect("initialize with roots");
 
     let first = call_mcp_search(&mut client, "root change").await;
     assert_eq!(
