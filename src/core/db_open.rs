@@ -158,8 +158,8 @@ impl Database {
             )?,
         };
         conn.busy_timeout(busy_timeout)?;
-        ensure_supported_schema_version(&conn)?;
-        ensure_supported_fork_ext_version(&conn)?;
+        let schema_version = ensure_supported_schema_version(&conn)?;
+        let fork_ext_version = ensure_supported_fork_ext_version(&conn)?;
         conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_DEFAULT)?;
         register_math_functions(&conn)?;
         if !mode.allows_write() {
@@ -169,8 +169,12 @@ impl Database {
             ensure_wal_journal_mode(&conn)?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
             conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-            apply_migrations(&conn)?;
-            db_fork_ext::apply_fork_ext_migrations(&conn)?;
+            if schema_version < CURRENT_SCHEMA_VERSION {
+                apply_migrations(&conn)?;
+            }
+            if fork_ext_version < CURRENT_FORK_EXT_VERSION {
+                db_fork_ext::apply_fork_ext_migrations(&conn)?;
+            }
         }
         Ok(Self {
             conn,
@@ -376,6 +380,24 @@ mod tests {
                 .is_err(),
             "exclusive schema lock must outlast the caller-selected busy timeout"
         );
+    }
+
+    #[test]
+    fn current_schema_db_open_does_not_reapply_migrations_under_live_writer() {
+        let tempdir = short_tempdir();
+        let db_path = tempdir.path().join("palace.db");
+        drop(Database::open(&db_path).expect("initialize current database"));
+
+        let blocker = Connection::open(&db_path).expect("open same-version writer");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold same-version write transaction");
+        let opened = Database::open_with_busy_timeout(&db_path, Duration::from_millis(25));
+        blocker
+            .execute_batch("ROLLBACK;")
+            .expect("release same-version writer");
+
+        opened.expect("current schema open must not request a SQLite write lock");
     }
 
     #[test]
