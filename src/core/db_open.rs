@@ -157,9 +157,9 @@ impl Database {
                 OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
             )?,
         };
+        conn.busy_timeout(busy_timeout)?;
         ensure_supported_schema_version(&conn)?;
         ensure_supported_fork_ext_version(&conn)?;
-        conn.busy_timeout(busy_timeout)?;
         conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_DEFAULT)?;
         register_math_functions(&conn)?;
         if !mode.allows_write() {
@@ -340,6 +340,45 @@ mod tests {
 
         Database::open_lease_control(&canonical)
             .expect("lease-control must accept canonical path from Database::path()");
+    }
+
+    #[test]
+    fn db_open_applies_busy_timeout_before_schema_queries() {
+        let tempdir = short_tempdir();
+        let db_path = tempdir.path().join("palace.db");
+        drop(Database::open(&db_path).expect("initialize database"));
+
+        let blocker = Connection::open(&db_path).expect("open lock holder");
+        blocker
+            .pragma_update(None, "journal_mode", "DELETE")
+            .expect("select delete journal mode");
+        blocker
+            .execute_batch("BEGIN EXCLUSIVE;")
+            .expect("hold exclusive schema lock");
+
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let open_path = db_path.clone();
+        let opener = std::thread::spawn(move || {
+            opened_tx.send(Database::open_with_busy_timeout(
+                &open_path,
+                Duration::from_millis(25),
+            ))
+        });
+
+        let opened = opened_rx.recv_timeout(Duration::from_millis(250));
+        blocker
+            .execute_batch("COMMIT;")
+            .expect("release schema lock");
+        opener
+            .join()
+            .expect("join database opener")
+            .expect("send database opener result");
+        assert!(
+            opened
+                .expect("caller-selected timeout must bound schema query")
+                .is_err(),
+            "exclusive schema lock must outlast the caller-selected busy timeout"
+        );
     }
 
     #[test]

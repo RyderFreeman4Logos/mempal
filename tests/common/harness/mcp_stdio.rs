@@ -476,6 +476,19 @@ log_path = "{}"
     }
 }
 
+impl Drop for McpStdio {
+    fn drop(&mut self) {
+        // Fence descendants before `Child::drop` can kill the leader; an unreaped leader pins
+        // its PGID so the group number cannot be reused for an unrelated process.
+        if !self.reaped {
+            let _ = self.signal_process_group(libc::SIGKILL);
+        }
+        if let Some(task) = self.stderr_task.take() {
+            task.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

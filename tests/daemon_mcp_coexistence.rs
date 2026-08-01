@@ -134,6 +134,23 @@ while IFS= read -r _; do :; done"#
     McpStdio::spawn_command(&mut command)
 }
 
+fn spawn_malformed_initialize_mcp(descendant_pid_path: &Path) -> Result<McpStdio> {
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            r#"sleep 60 &
+descendant_pid="$!"
+descendant_start="$(awk '{print $22}' "/proc/${descendant_pid}/stat")"
+printf '%s %s\n' "${descendant_pid}" "${descendant_start}" > "$MEMPAL_DESCENDANT_PID_FILE"
+IFS= read -r _
+printf '%s\n' '{'
+while IFS= read -r _; do :; done"#,
+        ])
+        .env("MEMPAL_DESCENDANT_PID_FILE", descendant_pid_path);
+    McpStdio::spawn_command(&mut command)
+}
+
 fn spawn_graceful_mcp_with_descendant(descendant_pid_path: &Path) -> Result<McpStdio> {
     let mut command = tokio::process::Command::new("/bin/sh");
     command
@@ -378,6 +395,25 @@ async fn mcp_lifecycle_timeouts_reap_hostile_children() -> Result<()> {
     assert!(shutdown_diagnostic.contains("hostile shutdown fixture"));
     assert_process_exited(&shutdown_descendant).await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn mcp_drop_fences_descendant_after_malformed_initialize() -> Result<()> {
+    let tempdir = TempDir::new_in("/tmp").context("create malformed MCP test directory")?;
+    let descendant = tempdir.path().join("malformed-initialize-descendant.pid");
+    let mut client = spawn_malformed_initialize_mcp(&descendant)?;
+
+    client
+        .initialize()
+        .await
+        .expect_err("malformed initialize response must fail");
+    assert!(
+        !client.is_reaped(),
+        "early initialize error must use Drop fallback"
+    );
+    drop(client);
+
+    assert_process_exited(&descendant).await
 }
 
 #[tokio::test]
