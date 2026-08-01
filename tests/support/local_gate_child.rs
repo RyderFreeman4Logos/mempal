@@ -319,14 +319,13 @@ fn terminate_and_collect(
 ) -> io::Result<Output> {
     let deadline = cleanup_deadline();
     let mut descendant_monitor = DescendantMonitor::spawn(root.identity)?;
-    let result = terminate_and_collect_until(
+    terminate_and_collect_until(
         child,
         root,
         tracked_processes,
         &mut descendant_monitor,
         deadline,
-    );
-    result
+    )
 }
 
 fn terminate_and_collect_until(
