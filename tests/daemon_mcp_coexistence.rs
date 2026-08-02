@@ -242,8 +242,9 @@ async fn wait_for_daemon_writer_lease(
         if let Some(pid) = pid {
             let db_path = db_path.to_path_buf();
             let leases = tokio::task::spawn_blocking(move || {
-                let db = Database::open_query_only(&db_path)?;
-                db.runtime_writer_lease_status_read_only(Some(SQLITE_WRITER_LEASE_NAME))
+                Database::with_diagnostic_read_only(&db_path, |db| {
+                    db.runtime_writer_lease_status_read_only(Some(SQLITE_WRITER_LEASE_NAME))
+                })?
             })
             .await
             .context("join writer lease probe")??;
@@ -425,9 +426,9 @@ async fn assert_daemon_coexists_with_mcp_count(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_coexists_with_one_and_multiple_healthy_mcp_servers() -> Result<()> {
+async fn daemon_coexists_with_one_and_two_writer_capable_mcp_servers() -> Result<()> {
     assert_daemon_coexists_with_mcp_count(1, true).await?;
-    assert_daemon_coexists_with_mcp_count(2, false).await
+    assert_daemon_coexists_with_mcp_count(2, true).await
 }
 
 #[tokio::test]

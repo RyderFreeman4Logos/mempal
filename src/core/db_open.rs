@@ -494,53 +494,247 @@ mod tests {
 
     #[test]
     fn current_schema_db_open_repairs_all_legacy_structural_invariants() {
-        for (repair, damage_sql, invariant_sql) in [
-            (
-                "V5 drawer metadata",
-                "DROP INDEX idx_drawers_content_hash; ALTER TABLE drawers DROP COLUMN content_hash;",
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('drawers') WHERE name = 'content_hash')",
-            ),
-            (
-                "V11 source confidence",
-                "ALTER TABLE drawers DROP COLUMN confidence;",
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('drawers') WHERE name = 'confidence')",
-            ),
-            (
-                "V12 compaction",
-                "DROP TABLE consolidation_log;",
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'consolidation_log')",
-            ),
-            (
-                "V13 typed pinned",
-                "DROP INDEX idx_drawers_pinned;",
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_drawers_pinned')",
-            ),
-            (
-                "V14 sleep",
-                "DROP TABLE sleep_log;",
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sleep_log')",
-            ),
-            (
-                "V15 crystallization",
-                "ALTER TABLE knowledge_cards DROP COLUMN crystallization_score;",
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('knowledge_cards') WHERE name = 'crystallization_score')",
-            ),
-        ] {
+        let mut columns = V5_DRAWER_COLUMN_MIGRATIONS
+            .iter()
+            .map(|column| ("V5", "drawers", column.name))
+            .collect::<Vec<_>>();
+        columns.extend(
+            [
+                ("V11", "drawers", V11_DRAWER_COLUMNS),
+                ("V12", "drawers", V12_DRAWER_COLUMNS),
+                ("V13", "drawers", V13_DRAWER_COLUMNS),
+                ("V14", "drawers", V14_DRAWER_COLUMNS),
+                ("V15", "knowledge_cards", V15_KNOWLEDGE_CARD_COLUMNS),
+            ]
+            .into_iter()
+            .flat_map(|(version, table, columns)| {
+                columns.iter().map(move |&column| (version, table, column))
+            }),
+        );
+        let mut repairs = columns
+            .into_iter()
+            .map(|(version, table, column)| {
+                let dependent_indexes = match column {
+                    "content_hash" => "DROP INDEX idx_drawers_content_hash; ",
+                    "compacted_into" => {
+                        "DROP INDEX idx_drawers_compacted_into; DROP INDEX idx_drawers_consolidation_priority; "
+                    }
+                    "is_pinned" | "pin_order" => "DROP INDEX idx_drawers_pinned; ",
+                    "supersedes" => "DROP INDEX idx_drawers_supersedes; ",
+                    "consolidation_priority" => {
+                        "DROP INDEX idx_drawers_consolidation_priority; "
+                    }
+                    "last_sleep_at" => "DROP INDEX idx_drawers_last_sleep_at; ",
+                    "auto_generated" => "DROP INDEX idx_knowledge_cards_auto_pending; ",
+                    _ => "",
+                };
+                (
+                    format!("{version} {table}.{column}"),
+                    format!("{dependent_indexes}ALTER TABLE {table} DROP COLUMN {column};"),
+                )
+            })
+            .collect::<Vec<_>>();
+        repairs.extend(
+            [
+                ("V5", V5_REPAIR_SCHEMA_OBJECTS),
+                ("V12", V12_REPAIR_SCHEMA_OBJECTS),
+                ("V13", V13_REPAIR_SCHEMA_OBJECTS),
+                ("V14", V14_REPAIR_SCHEMA_OBJECTS),
+                ("V15", V15_REPAIR_SCHEMA_OBJECTS),
+            ]
+            .into_iter()
+            .flat_map(|(version, objects)| {
+                objects.iter().map(move |&object| {
+                    let kind = if matches!(
+                        object,
+                        "consolidation_log" | "sleep_log" | "sleep_resolution_log"
+                    ) {
+                        "TABLE"
+                    } else {
+                        "INDEX"
+                    };
+                    (
+                        format!("{version} schema object {object}"),
+                        format!("DROP {kind} {object};"),
+                    )
+                })
+            }),
+        );
+        assert_eq!(repairs.len(), 42);
+        for (repair, damage_sql) in repairs {
             let tempdir = short_tempdir();
             let db_path = tempdir.path().join("palace.db");
             drop(Database::open(&db_path).expect("initialize current database"));
             let conn = Connection::open(&db_path).expect("open fixture database");
-            conn.execute_batch(damage_sql)
-                .unwrap_or_else(|error| panic!("damage {repair} fixture: {error}"));
+            conn.execute_batch(&damage_sql)
+                .expect("damage structural repair fixture");
+            assert!(
+                schema_repairs_required(&conn).expect("inspect damaged structural fixture"),
+                "{repair} fixture must require repair"
+            );
             drop(conn);
-
             let repaired = Database::open(&db_path)
                 .unwrap_or_else(|error| panic!("repair {repair} fixture: {error}"));
-            let satisfied = repaired
-                .conn()
-                .query_row(invariant_sql, [], |row| row.get::<_, bool>(0))
-                .unwrap_or_else(|error| panic!("validate {repair} fixture: {error}"));
-            assert!(satisfied, "{repair} invariant was not repaired");
+            assert!(
+                !schema_repairs_required(repaired.conn()).expect("validate structural repair"),
+                "{repair} invariant was not repaired"
+            );
+        }
+
+        let mut check_repairs = vec![(
+            "V11 drawers source_type CHECK".to_owned(),
+            "drawers",
+            "source_type TEXT NOT NULL CHECK(source_type IN ('project', 'conversation', 'manual'))",
+            "source_type TEXT NOT NULL DEFAULT 'system_generated' CHECK(source_type IN ('user_explicit', 'agent_observation', 'agent_inference', 'system_generated'))",
+        )];
+        check_repairs.extend(V13_TYPED_INGEST_CHECK_REPLACEMENTS.iter().enumerate().map(
+            |(index, &(legacy, current))| {
+                let current = if legacy.starts_with("memory_kind ") {
+                    "memory_kind TEXT NOT NULL CHECK(memory_kind IN ('evidence', 'knowledge', 'atomic_fact', 'decision', 'case', 'skill', 'foresight', 'profile_fact', 'profile_trait')) DEFAULT 'evidence'"
+                } else {
+                    current
+                };
+                (
+                    format!("V13 drawers CHECK replacement {index}: {legacy}"),
+                    "drawers",
+                    legacy,
+                    current,
+                )
+            },
+        ));
+        check_repairs.extend(V15_STATUS_CHECK_REPLACEMENTS.iter().enumerate().map(
+            |(index, &(legacy, current))| {
+                (
+                    format!("V15 knowledge_cards CHECK replacement {index}: {legacy}"),
+                    "knowledge_cards",
+                    legacy,
+                    current,
+                )
+            },
+        ));
+        assert_eq!(check_repairs.len(), 13);
+        for (repair, table, legacy, current) in check_repairs {
+            let tempdir = short_tempdir();
+            let db_path = tempdir.path().join("palace.db");
+            drop(Database::open(&db_path).expect("initialize current database"));
+            let conn = Connection::open(&db_path).expect("open fixture database");
+            conn.pragma_update(None, "writable_schema", "ON")
+                .expect("enable writable schema");
+            conn.execute(
+                "UPDATE sqlite_master SET sql = replace(sql, ?1, ?2) WHERE type = 'table' AND name = ?3",
+                rusqlite::params![current, legacy, table],
+            )
+            .expect("damage table SQL fixture");
+            conn.pragma_update(None, "writable_schema", "OFF")
+                .expect("disable writable schema");
+            let damaged_table_sql = table_sql(&conn, table).expect("inspect damaged table SQL");
+            assert!(
+                damaged_table_sql.contains(legacy),
+                "{repair} fixture did not install the legacy SQL: {damaged_table_sql}"
+            );
+            assert!(
+                schema_repairs_required(&conn).expect("inspect damaged table SQL fixture"),
+                "{repair} fixture must require repair"
+            );
+            drop(conn);
+            let repaired = Database::open(&db_path)
+                .unwrap_or_else(|error| panic!("repair {repair} fixture: {error}"));
+            assert!(
+                !schema_repairs_required(repaired.conn()).expect("validate table SQL repair"),
+                "{repair} invariant was not repaired"
+            );
+        }
+    }
+
+    #[test]
+    fn repair_required_current_schema_open_fails_bounded_then_repairs_after_writer_release() {
+        let tempdir = short_tempdir();
+        let db_path = tempdir.path().join("palace.db");
+        drop(Database::open(&db_path).expect("initialize current database"));
+
+        let blocker = Connection::open(&db_path).expect("open migration blocker");
+        blocker
+            .execute_batch("DROP INDEX idx_drawers_supersedes; BEGIN IMMEDIATE;")
+            .expect("damage current schema and hold writer lock");
+        assert!(
+            schema_repairs_required(&blocker).expect("inspect repair-required fixture"),
+            "fixture must require structural repair"
+        );
+
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let open_path = db_path.clone();
+        let opener = std::thread::spawn(move || {
+            let _ = opened_tx.send(Database::open_with_busy_timeout(
+                &open_path,
+                Duration::from_millis(25),
+            ));
+        });
+        let opened = opened_rx.recv_timeout(Duration::from_millis(250));
+        blocker
+            .execute_batch("ROLLBACK;")
+            .expect("release migration blocker");
+        opener.join().expect("join blocked database opener");
+        let error = match opened.expect("busy timeout must bound repair-required open") {
+            Ok(_) => panic!("repair-required open must not bypass the live writer"),
+            Err(error) => error,
+        };
+        assert!(
+            db_error_is_sqlite_lock(&error),
+            "repair-required open returned the wrong error: {error}"
+        );
+        let repaired = Database::open(&db_path).expect("repair after writer release");
+        assert!(
+            !schema_repairs_required(repaired.conn()).expect("validate repair after release"),
+            "released fixture was not repaired"
+        );
+    }
+
+    #[test]
+    fn future_user_version_open_modes_fail_before_write_in_delete_mode() {
+        let tempdir = short_tempdir();
+        let db_path = tempdir.path().join("palace.db");
+        let wal_path = db_path.with_extension("db-wal");
+        drop(Database::open(&db_path).expect("initialize database"));
+        let conn = Connection::open(&db_path).expect("open fixture database");
+        conn.pragma_update(None, "journal_mode", "DELETE")
+            .expect("select delete journal mode");
+        let future_version = CURRENT_SCHEMA_VERSION + 1;
+        conn.pragma_update(None, "user_version", future_version)
+            .expect("set future user version");
+        drop(conn);
+        let before_db = fs::read(&db_path).expect("snapshot database before rejected opens");
+        let before_wal = fs::read(&wal_path).ok();
+        assert!(before_wal.is_none(), "DELETE mode must not retain a WAL");
+
+        for (label, open) in [
+            (
+                "read-write",
+                Database::open as fn(&Path) -> Result<Database, DbError>,
+            ),
+            ("query-only", Database::open_query_only),
+        ] {
+            let error = match open(&db_path) {
+                Ok(_) => panic!("{label} open must reject a future user version"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    &error,
+                    DbError::UnsupportedSchemaVersion { current, supported }
+                        if *current == future_version && *supported == CURRENT_SCHEMA_VERSION
+                ),
+                "{label} open returned the wrong error: {error}"
+            );
+            assert_eq!(
+                fs::read(&db_path).expect("snapshot database after rejected open"),
+                before_db,
+                "{label} rejection must not change the database"
+            );
+            assert_eq!(
+                fs::read(&wal_path).ok(),
+                before_wal,
+                "{label} rejection must not change WAL bytes"
+            );
         }
     }
 
