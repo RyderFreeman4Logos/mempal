@@ -134,14 +134,6 @@ fn spawn_runtime_writer_lease_heartbeat(
                 }
                 Ok(Err(error)) => {
                     tracing::warn!(error = %error, "failed to renew daemon writer lease");
-                    if anyhow_error_is_sqlite_lock(&error) {
-                        recovery_faults.record_fault_once(
-                            crate::daemon_recovery::RecoveryFault::DatabaseLocked,
-                        );
-                        #[cfg(unix)]
-                        super::request_shutdown_and_notify();
-                        break;
-                    }
                 }
                 Err(error) => {
                     tracing::warn!(error = %error, "writer lease heartbeat task failed");
@@ -207,4 +199,72 @@ fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ShutdownResetGuard;
+
+    impl Drop for ShutdownResetGuard {
+        fn drop(&mut self) {
+            super::super::reset_shutdown_request();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_writer_lease_heartbeat_survives_crud_lock_and_recovers() {
+        let _shutdown_lock = super::super::global_shutdown_test_lock().lock_owned().await;
+        super::super::reset_shutdown_request();
+        let _shutdown_reset = ShutdownResetGuard;
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open isolated database");
+        let lease = db
+            .runtime_writer_lease_acquire_for_daemon_start(
+                SQLITE_WRITER_LEASE_NAME,
+                DAEMON_WRITER_LEASE_TTL_SECS,
+                None,
+            )
+            .expect("acquire daemon writer lease")
+            .expect("daemon writer lease must be available");
+        let recovery = crate::daemon_recovery::DaemonRecovery::new(tempdir.path());
+        let recovery_faults =
+            crate::daemon_recovery::DaemonRecoveryFaultReporter::new(recovery.clone());
+
+        db.conn()
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold CRUD writer lock");
+        let heartbeat =
+            spawn_runtime_writer_lease_heartbeat(db_path.clone(), lease.clone(), recovery_faults);
+        tokio::time::sleep(DAEMON_WRITER_LEASE_RENEW_RETRY_DEADLINE + Duration::from_secs(1)).await;
+
+        assert!(
+            !super::super::shutdown_requested(),
+            "transient CRUD contention must not request daemon shutdown"
+        );
+        assert!(
+            !heartbeat.is_finished(),
+            "transient CRUD contention must not stop the daemon lease heartbeat"
+        );
+        let snapshot = recovery.snapshot().expect("read isolated recovery state");
+        assert_eq!(snapshot.recent_fault_count, 0);
+        assert_eq!(snapshot.last_fault, None);
+
+        db.conn()
+            .execute_batch("ROLLBACK;")
+            .expect("release CRUD writer lock");
+        let renewed = tokio::task::spawn_blocking(move || {
+            renew_daemon_writer_lease_with_retry(&db_path, &lease)
+        })
+        .await
+        .expect("join recovery renewal")
+        .expect("renew after CRUD pressure releases");
+        assert!(renewed, "the same live lease must recover after contention");
+
+        heartbeat.abort();
+        let _ = heartbeat.await;
+    }
 }
