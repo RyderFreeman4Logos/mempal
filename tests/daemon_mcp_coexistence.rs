@@ -14,14 +14,17 @@ use anyhow::{Context, Result, bail};
 use common::harness::{CapturedChild, McpStdio};
 use local_gate_child::{RecordedProcessIdentity, capture_recorded_process};
 use mempal::core::async_db::RESOURCE_BOUNDED_READERS;
+use mempal::core::config::Config;
 use mempal::core::db::Database;
 use mempal::core::db_admission::{DbHolderClass, ProfileDbAdmission};
+use mempal::core::types::{Drawer, SourceType};
 use mempal::daemon_recovery::{DaemonRecovery, MAX_RESTARTS_PER_WINDOW, RecoveryPhase};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
 const ASYNC_DB_CONNECTION_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+const COEXISTENCE_DRAWER_ID: &str = "issue-853-live-mcp";
 
 struct TestHome {
     _tempdir: TempDir,
@@ -37,7 +40,24 @@ impl TestHome {
         let mempal_home = home.join(".mempal");
         fs::create_dir_all(&mempal_home).context("create mempal home")?;
         let db_path = mempal_home.join("palace.db");
-        drop(Database::open(&db_path).context("initialize test database")?);
+        let db = Database::open(&db_path).context("initialize test database")?;
+        db.insert_drawer(&Drawer {
+            id: COEXISTENCE_DRAWER_ID.to_string(),
+            content: "same version MCP daemon bootstrap regression".to_string(),
+            wing: "mempal".to_string(),
+            room: Some("coexistence".to_string()),
+            source_file: Some("issue-853.md".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: "2026-08-01T00:00:00Z".to_string(),
+            ..Drawer::default()
+        })
+        .context("insert coexistence drawer")?;
+        db.insert_vector(
+            COEXISTENCE_DRAWER_ID,
+            &vec![0.0; Config::default().embed.resolved_openai_dim()],
+        )
+        .context("insert coexistence vector")?;
+        drop(db);
         fs::write(
             mempal_home.join("config.toml"),
             format!(
@@ -222,8 +242,9 @@ async fn wait_for_daemon_writer_lease(
         if let Some(pid) = pid {
             let db_path = db_path.to_path_buf();
             let leases = tokio::task::spawn_blocking(move || {
-                let db = Database::open_query_only(&db_path)?;
-                db.runtime_writer_lease_status_read_only(Some(SQLITE_WRITER_LEASE_NAME))
+                Database::with_diagnostic_read_only(&db_path, |db| {
+                    db.runtime_writer_lease_status_read_only(Some(SQLITE_WRITER_LEASE_NAME))
+                })?
             })
             .await
             .context("join writer lease probe")??;
@@ -257,7 +278,10 @@ async fn stop_daemon(daemon: &mut CapturedChild) -> Result<ExitStatus> {
     }
 }
 
-async fn assert_daemon_coexists_with_mcp_count(mcp_count: usize) -> Result<()> {
+async fn assert_daemon_coexists_with_mcp_count(
+    mcp_count: usize,
+    open_writer_pool: bool,
+) -> Result<()> {
     let test_home = TestHome::new()?;
     let mut clients = Vec::with_capacity(mcp_count);
     for _ in 0..mcp_count {
@@ -265,21 +289,40 @@ async fn assert_daemon_coexists_with_mcp_count(mcp_count: usize) -> Result<()> {
         client.initialize().await?;
         let status = call_status(&mut client).await?;
         assert!(status["structuredContent"].is_object());
+        if open_writer_pool {
+            let deleted = client
+                .call(
+                    "tools/call",
+                    json!({
+                        "name": "mempal_delete",
+                        "arguments": {"drawer_id": "issue-853-missing-drawer"},
+                    }),
+                )
+                .await?;
+            assert_eq!(
+                deleted["structuredContent"]["deleted"].as_bool(),
+                Some(false)
+            );
+        }
         clients.push(client);
     }
 
     let before_daemon =
         ProfileDbAdmission::snapshot(&test_home.db_path).context("snapshot MCP holders")?;
-    assert!(
-        before_daemon.holders.iter().all(|holder| {
-            holder.holder_class != DbHolderClass::Mcp
-                || holder.connection_count != RESOURCE_BOUNDED_READERS + 1
-                || holder.configured_cache_bytes
-                    != ASYNC_DB_CONNECTION_CACHE_BYTES
-                        .saturating_mul((RESOURCE_BOUNDED_READERS + 1) as u64)
-        }),
-        "healthy status MCPs must not own writer-capable pools: {:?}",
-        before_daemon.holders
+    assert_eq!(
+        before_daemon
+            .holders
+            .iter()
+            .filter(|holder| {
+                holder.holder_class == DbHolderClass::Mcp
+                    && holder.connection_count == RESOURCE_BOUNDED_READERS + 1
+                    && holder.configured_cache_bytes
+                        == ASYNC_DB_CONNECTION_CACHE_BYTES
+                            .saturating_mul((RESOURCE_BOUNDED_READERS + 1) as u64)
+            })
+            .count(),
+        usize::from(open_writer_pool) * mcp_count,
+        "unexpected MCP writer-capable pool count"
     );
     assert_eq!(
         before_daemon
@@ -309,6 +352,39 @@ async fn assert_daemon_coexists_with_mcp_count(mcp_count: usize) -> Result<()> {
         assert!(
             status["structuredContent"]["database_diagnostic"].is_null(),
             "status degraded while daemon owned the writer lease: {status}"
+        );
+        let read = client
+            .call(
+                "tools/call",
+                json!({
+                    "name": "mempal_read_drawer",
+                    "arguments": {"drawer_id": COEXISTENCE_DRAWER_ID},
+                }),
+            )
+            .await?;
+        assert_eq!(
+            read["structuredContent"]["drawer_id"].as_str(),
+            Some(COEXISTENCE_DRAWER_ID)
+        );
+        let search = client
+            .call(
+                "tools/call",
+                json!({
+                    "name": "mempal_search",
+                    "arguments": {
+                        "query": "bootstrap",
+                        "top_k": 5,
+                    },
+                }),
+            )
+            .await?;
+        assert!(
+            search["structuredContent"]["results"]
+                .as_array()
+                .is_some_and(|results| results
+                    .iter()
+                    .any(|result| { result["drawer_id"].as_str() == Some(COEXISTENCE_DRAWER_ID) })),
+            "search failed while daemon owned the writer lease: {search}"
         );
     }
 
@@ -350,9 +426,9 @@ async fn assert_daemon_coexists_with_mcp_count(mcp_count: usize) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_coexists_with_one_and_multiple_healthy_mcp_servers() -> Result<()> {
-    assert_daemon_coexists_with_mcp_count(1).await?;
-    assert_daemon_coexists_with_mcp_count(2).await
+async fn daemon_coexists_with_one_and_two_writer_capable_mcp_servers() -> Result<()> {
+    assert_daemon_coexists_with_mcp_count(1, true).await?;
+    assert_daemon_coexists_with_mcp_count(2, true).await
 }
 
 #[tokio::test]
