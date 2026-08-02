@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail};
 use common::harness::{CapturedChild, McpStdio};
 use local_gate_child::{RecordedProcessIdentity, capture_recorded_process};
 use mempal::core::async_db::RESOURCE_BOUNDED_READERS;
+use mempal::core::config::Config;
 use mempal::core::db::Database;
 use mempal::core::db_admission::{DbHolderClass, ProfileDbAdmission};
 use mempal::core::types::{Drawer, SourceType};
@@ -51,6 +52,11 @@ impl TestHome {
             ..Drawer::default()
         })
         .context("insert coexistence drawer")?;
+        db.insert_vector(
+            COEXISTENCE_DRAWER_ID,
+            &vec![0.0; Config::default().embed.resolved_openai_dim()],
+        )
+        .context("insert coexistence vector")?;
         drop(db);
         fs::write(
             mempal_home.join("config.toml"),
@@ -366,12 +372,19 @@ async fn assert_daemon_coexists_with_mcp_count(
                     "name": "mempal_search",
                     "arguments": {
                         "query": "bootstrap",
-                        "top_k": 0,
+                        "top_k": 5,
                     },
                 }),
             )
             .await?;
-        assert!(search["structuredContent"]["results"].is_array());
+        assert!(
+            search["structuredContent"]["results"]
+                .as_array()
+                .is_some_and(|results| results
+                    .iter()
+                    .any(|result| { result["drawer_id"].as_str() == Some(COEXISTENCE_DRAWER_ID) })),
+            "search failed while daemon owned the writer lease: {search}"
+        );
     }
 
     tokio::time::sleep(Duration::from_secs(2)).await;
