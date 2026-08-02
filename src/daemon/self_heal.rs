@@ -20,6 +20,7 @@ pub(super) const HOOK_IPC_HANDLER_LIMIT: usize = 32;
 #[derive(Debug, Default)]
 pub(super) struct ClaimBackoffState {
     pub(super) consecutive_sqlite_lock_errors: u64,
+    pub(super) write_observer: Option<crate::daemon_bootstrap::DaemonWriteObserver>,
 }
 
 impl ClaimBackoffState {
@@ -28,6 +29,9 @@ impl ClaimBackoffState {
     }
 
     pub(super) fn delay_after_error(&mut self, error: &QueueError) -> Duration {
+        if let Some(observer) = &self.write_observer {
+            observer.record_claim_error(error);
+        }
         if error.is_sqlite_lock() {
             self.consecutive_sqlite_lock_errors =
                 self.consecutive_sqlite_lock_errors.saturating_add(1);

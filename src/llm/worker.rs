@@ -286,6 +286,7 @@ async fn run_llm_worker_inner(
             Err(error) => {
                 idle_count = 0;
                 tracing::warn!(?error, "LLM worker claim_next failed");
+                write_observer.record_claim_error(&error);
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }

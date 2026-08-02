@@ -28,6 +28,7 @@ use crate::process_diagnostics::{
 
 const DAEMON_STALL_SECONDS: u64 = 5 * 60;
 const DAEMON_STALL_LOG_THROTTLE_SECONDS: u64 = 60;
+const DAEMON_SQLITE_CONTENTION_FRESHNESS_SECONDS: u64 = 60;
 
 /// Stable process exit status for a daemon start refused by an active restart
 /// budget cooldown. This is sysexits `EX_TEMPFAIL` and is intentionally
@@ -80,16 +81,17 @@ const DB_HOLDER_TERM_POLL: Duration = Duration::from_millis(100);
 
 pub type SharedDatabase = Arc<AsyncMutex<Database>>;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct DaemonWriteObserver {
     inner: Arc<DaemonWriteObserverInner>,
 }
 
+#[derive(Debug)]
 struct DaemonWriteObserverInner {
     started_at: Instant,
     last_successful_write_secs: AtomicU64,
     last_stall_log_secs: AtomicU64,
-    last_error: Mutex<Option<String>>,
+    last_error: Mutex<Option<(String, u64)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +99,7 @@ struct DaemonStallDiagnostic {
     queued_count: u64,
     seconds_since_successful_write: u64,
     last_error: String,
+    last_error_age_secs: Option<u64>,
     uptime_secs: u64,
 }
 
@@ -136,14 +139,23 @@ impl DaemonWriteObserver {
     }
 
     pub fn record_successful_write(&self) {
+        let last_error = self.inner.last_error.lock();
         self.inner
             .last_successful_write_secs
             .store(unix_secs(), Ordering::Relaxed);
+        if let Ok(mut last_error) = last_error {
+            *last_error = None;
+        }
+    }
+
+    pub fn record_claim_error(&self, error: impl std::fmt::Display) {
+        self.record_error(format!("claim_next failed: {error}"));
     }
 
     pub fn record_error(&self, error: impl Into<String>) {
+        let error = error.into();
         if let Ok(mut last_error) = self.inner.last_error.lock() {
-            *last_error = Some(error.into());
+            *last_error = Some((error, unix_secs()));
         }
     }
 
@@ -167,7 +179,11 @@ impl DaemonWriteObserver {
             return false;
         }
 
-        if is_sqlite_lock_message(&diagnostic.last_error) {
+        if is_sqlite_lock_message(&diagnostic.last_error)
+            && diagnostic
+                .last_error_age_secs
+                .is_some_and(|age| age < DAEMON_SQLITE_CONTENTION_FRESHNESS_SECONDS)
+        {
             tracing::warn!(
                 queued_count = diagnostic.queued_count,
                 seconds_since_successful_write = diagnostic.seconds_since_successful_write,
@@ -205,27 +221,32 @@ impl DaemonWriteObserver {
             return None;
         }
 
-        let last_successful_write = self
-            .inner
-            .last_successful_write_secs
-            .load(Ordering::Relaxed);
+        let (last_successful_write, last_error, last_error_age_secs) =
+            if let Ok(last_error) = self.inner.last_error.lock() {
+                let last_successful_write = self
+                    .inner
+                    .last_successful_write_secs
+                    .load(Ordering::Relaxed);
+                let (last_error, age) = last_error
+                    .as_ref()
+                    .map(|(error, observed_at)| {
+                        (error.clone(), Some(now_secs.saturating_sub(*observed_at)))
+                    })
+                    .unwrap_or_else(|| ("none recorded".to_string(), None));
+                (last_successful_write, last_error, age)
+            } else {
+                (now_secs, "none recorded".to_string(), None)
+            };
         let seconds_since_successful_write = now_secs.saturating_sub(last_successful_write);
         if seconds_since_successful_write < DAEMON_STALL_SECONDS {
             return None;
         }
 
-        let last_error = self
-            .inner
-            .last_error
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .unwrap_or_else(|| "none recorded".to_string());
-
         Some(DaemonStallDiagnostic {
             queued_count,
             seconds_since_successful_write,
             last_error,
+            last_error_age_secs,
             uptime_secs: self.inner.started_at.elapsed().as_secs(),
         })
     }
@@ -235,6 +256,15 @@ impl DaemonWriteObserver {
         self.inner
             .last_successful_write_secs
             .store(timestamp_secs, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn force_last_error_observed_at_for_test(&self, timestamp_secs: u64) {
+        if let Ok(mut last_error) = self.inner.last_error.lock()
+            && let Some((_, observed_at)) = last_error.as_mut()
+        {
+            *observed_at = timestamp_secs;
+        }
     }
 }
 

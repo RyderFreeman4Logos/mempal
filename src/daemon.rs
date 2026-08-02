@@ -603,7 +603,10 @@ fn spawn_hook_worker(
 
 async fn run_hook_worker(state: HookWorkerState, claim_ttl_secs: i64, poll_interval: Duration) {
     let mut idle_count = 0_u32;
-    let mut claim_backoff = ClaimBackoffState::default();
+    let mut claim_backoff = ClaimBackoffState {
+        write_observer: Some(state.write_observer.clone()),
+        ..Default::default()
+    };
     loop {
         if shutdown_requested() {
             break;

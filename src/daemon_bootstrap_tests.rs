@@ -32,6 +32,28 @@ async fn write_observer_reports_stall_when_queue_has_work_and_no_recent_writes()
 }
 
 #[tokio::test]
+async fn write_observer_requests_recovery_after_success_invalidates_lock_error() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    sync_store
+        .enqueue("hook:user-prompt-submit", "{}")
+        .expect("enqueue pending message");
+    let store = AsyncPendingMessageStore::from_store(sync_store);
+
+    let observer = DaemonWriteObserver::new();
+    observer.record_error("claim_next failed: sqlite error: database is locked");
+    observer.record_successful_write();
+    observer.force_last_successful_write_for_test(unix_secs().saturating_sub(DAEMON_STALL_SECONDS));
+
+    assert!(
+        observer.maybe_log_stall(&store).await,
+        "a successful write must invalidate historical SQLite contention"
+    );
+}
+
+#[tokio::test]
 async fn write_observer_does_not_restart_for_transient_sqlite_stall() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
@@ -44,11 +66,36 @@ async fn write_observer_does_not_restart_for_transient_sqlite_stall() {
 
     let observer = DaemonWriteObserver::new();
     observer.force_last_successful_write_for_test(unix_secs().saturating_sub(DAEMON_STALL_SECONDS));
-    observer.record_error("claim_next failed: sqlite error: database is locked");
+    observer.record_claim_error("sqlite error: database is locked");
 
     assert!(
         !observer.maybe_log_stall(&store).await,
         "transient SQLite pressure must keep the daemon alive so workers can recover"
+    );
+}
+
+#[tokio::test]
+async fn write_observer_requests_recovery_after_sqlite_contention_expires() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    sync_store
+        .enqueue("hook:user-prompt-submit", "{}")
+        .expect("enqueue pending message");
+    let store = AsyncPendingMessageStore::from_store(sync_store);
+
+    let observer = DaemonWriteObserver::new();
+    let now = unix_secs();
+    observer.force_last_successful_write_for_test(now.saturating_sub(DAEMON_STALL_SECONDS));
+    observer.record_claim_error("sqlite error: database is locked");
+    observer.force_last_error_observed_at_for_test(
+        now.saturating_sub(DAEMON_SQLITE_CONTENTION_FRESHNESS_SECONDS),
+    );
+
+    assert!(
+        observer.maybe_log_stall(&store).await,
+        "expired SQLite contention must not suppress recovery"
     );
 }
 
