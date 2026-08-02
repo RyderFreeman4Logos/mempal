@@ -74,6 +74,48 @@ async fn write_observer_does_not_restart_for_transient_sqlite_stall() {
     );
 }
 
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn daemon_ingest_claim_contention_suppresses_stall_restart() {
+    crate::observability::reset_ingest_worker_backoff_for_tests();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("initialize database");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    sync_store
+        .enqueue("ingest_async", "{}")
+        .expect("enqueue async ingest");
+    let store =
+        AsyncPendingMessageStore::from_store(sync_store).with_claim_lock_failures_for_test(1);
+    let observer = DaemonWriteObserver::new();
+    observer.force_last_successful_write_for_test(unix_secs().saturating_sub(DAEMON_STALL_SECONDS));
+    let server = crate::mcp::MempalMcpServer::new(db_path, crate::core::config::Config::default())
+        .expect("create daemon-scoped ingest server")
+        .with_async_queue_for_test(store.clone())
+        .with_daemon_write_observer(observer.clone());
+    let worker = server.spawn_scoped_ingest_drain_worker();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let snapshot = crate::observability::ingest_worker_backoff_snapshot();
+        if snapshot.retry_count == 1
+            && snapshot.last_error_class.as_deref() == Some("sqlite_locked")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for daemon ingest claim contention"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        !observer.maybe_log_stall(&store).await,
+        "current daemon ingest claim contention must keep retrying instead of restarting"
+    );
+    worker.shutdown_and_drain().await;
+}
+
 #[tokio::test]
 async fn write_observer_requests_recovery_after_sqlite_contention_expires() {
     let tmp = tempfile::TempDir::new().expect("tempdir");

@@ -314,6 +314,7 @@ pub struct MempalMcpServer {
     ingest_admission_deadline: Duration,
     operation_status_deadline: Duration,
     external_ingest_writer_lease: Option<RuntimeWriterLease>,
+    daemon_write_observer: Option<crate::daemon_bootstrap::DaemonWriteObserver>,
     #[cfg(any(test, feature = "db-test-seam"))]
     ingest_processing_delay: Option<Duration>,
     #[cfg(any(test, feature = "db-test-seam"))]
@@ -607,6 +608,7 @@ impl MempalMcpServer {
             ingest_admission_deadline: MCP_INGEST_ADMISSION_DEADLINE,
             operation_status_deadline: MCP_OPERATION_STATUS_DEADLINE,
             external_ingest_writer_lease: None,
+            daemon_write_observer: None,
             #[cfg(any(test, feature = "db-test-seam"))]
             ingest_processing_delay: None,
             #[cfg(any(test, feature = "db-test-seam"))]
@@ -644,6 +646,14 @@ impl MempalMcpServer {
 
     pub fn with_external_ingest_writer_lease(mut self, lease: RuntimeWriterLease) -> Self {
         self.external_ingest_writer_lease = Some(lease);
+        self
+    }
+
+    pub(crate) fn with_daemon_write_observer(
+        mut self,
+        observer: crate::daemon_bootstrap::DaemonWriteObserver,
+    ) -> Self {
+        self.daemon_write_observer = Some(observer);
         self
     }
 
@@ -1066,6 +1076,9 @@ impl MempalMcpServer {
                     }
                 }
                 Err(error) if is_transient_ingest_claim_error(&error) => {
+                    if let Some(observer) = &self.daemon_write_observer {
+                        observer.record_claim_error(&error);
+                    }
                     idle_count = 0;
                     retry_count = retry_count.saturating_add(1);
                     let next_delay = ingest_worker_backoff_delay(retry_count);

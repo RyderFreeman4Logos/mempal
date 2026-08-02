@@ -497,7 +497,8 @@ fn spawn_daemon_ingest_drain_worker(
             config,
         )),
     )?
-    .with_external_ingest_writer_lease(writer_lease.lease().clone());
+    .with_external_ingest_writer_lease(writer_lease.lease().clone())
+    .with_daemon_write_observer(context.write_observer.clone());
     let handle = server.spawn_scoped_ingest_drain_worker();
     tracing::info!("daemon async ingest worker started");
     Ok(handle)
