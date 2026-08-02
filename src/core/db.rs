@@ -6085,7 +6085,10 @@ fn ensure_v5_drawers_schema(conn: &Connection, current_version: u32) -> Result<(
         .copied()
         .collect::<Vec<_>>();
 
-    if missing_columns.is_empty() && current_version >= 5 {
+    if missing_columns.is_empty()
+        && current_version >= 5
+        && schema_object_names(conn)?.contains("idx_drawers_content_hash")
+    {
         return Ok(());
     }
 
@@ -6316,16 +6319,8 @@ fn ensure_v15_crystallize_schema(conn: &Connection, current_version: u32) -> Res
 }
 
 fn rewrite_drawers_source_type_check(conn: &Connection) -> Result<bool, DbError> {
-    let table_sql = conn.query_row(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'drawers'",
-        [],
-        |row| row.get::<_, String>(0),
-    )?;
-    if table_sql.contains("user_explicit")
-        && table_sql.contains("agent_observation")
-        && table_sql.contains("agent_inference")
-        && table_sql.contains("system_generated")
-    {
+    let table_sql = db_open::table_sql(conn, "drawers")?;
+    if db_open::drawers_source_type_check_is_current(&table_sql) {
         return Ok(false);
     }
 
@@ -6359,54 +6354,9 @@ fn rewrite_drawers_source_type_check(conn: &Connection) -> Result<bool, DbError>
 }
 
 fn rewrite_drawers_typed_ingest_checks(conn: &Connection) -> Result<bool, DbError> {
-    let table_sql = conn.query_row(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'drawers'",
-        [],
-        |row| row.get::<_, String>(0),
-    )?;
-
-    let replacements = [
-        (
-            "memory_kind TEXT NOT NULL CHECK(memory_kind IN ('evidence', 'knowledge')) DEFAULT 'evidence'",
-            "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge', 'atomic_fact', 'decision', 'case', 'skill', 'foresight', 'profile_fact', 'profile_trait'))",
-        ),
-        (
-            "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge'))",
-            "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge', 'atomic_fact', 'decision', 'case', 'skill', 'foresight', 'profile_fact', 'profile_trait'))",
-        ),
-        (
-            "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge', 'profile_fact'))",
-            "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge', 'atomic_fact', 'decision', 'case', 'skill', 'foresight', 'profile_fact', 'profile_trait'))",
-        ),
-        (
-            "domain TEXT NOT NULL CHECK(domain IN ('project', 'agent', 'skill', 'global')) DEFAULT 'project'",
-            "domain TEXT NOT NULL DEFAULT 'project' CHECK(domain IN ('user', 'agent', 'project', 'skill', 'global'))",
-        ),
-        (
-            "domain TEXT NOT NULL DEFAULT 'project' CHECK(domain IN ('project', 'agent', 'skill', 'global'))",
-            "domain TEXT NOT NULL DEFAULT 'project' CHECK(domain IN ('user', 'agent', 'project', 'skill', 'global'))",
-        ),
-        ("field TEXT NOT NULL DEFAULT 'general'", "field TEXT"),
-        (
-            "status TEXT CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
-            "status TEXT CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
-        ),
-        (
-            "status TEXT DEFAULT 'active' CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
-            "status TEXT CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
-        ),
-        (
-            "status TEXT DEFAULT 'active' CHECK(status IN ('active', 'superseded', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
-            "status TEXT CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
-        ),
-        (
-            "status TEXT DEFAULT 'active' CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
-            "status TEXT CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
-        ),
-    ];
-
+    let table_sql = db_open::table_sql(conn, "drawers")?;
     let mut new_sql = table_sql.clone();
-    for (old, new) in replacements {
+    for (old, new) in V13_TYPED_INGEST_CHECK_REPLACEMENTS {
         new_sql = new_sql.replace(old, new);
     }
     if new_sql == table_sql {
@@ -6424,27 +6374,13 @@ fn rewrite_drawers_typed_ingest_checks(conn: &Connection) -> Result<bool, DbErro
 }
 
 fn rewrite_knowledge_cards_status_check(conn: &Connection) -> Result<bool, DbError> {
-    let table_sql = conn.query_row(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_cards'",
-        [],
-        |row| row.get::<_, String>(0),
-    )?;
+    let table_sql = db_open::table_sql(conn, "knowledge_cards")?;
     if table_sql.contains("pending_review") {
         return Ok(false);
     }
 
-    let replacements = [
-        (
-            "status TEXT NOT NULL CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
-            "status TEXT NOT NULL CHECK(status IN ('pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
-        ),
-        (
-            "status TEXT NOT NULL CHECK(status IN ('candidate','promoted','canonical','demoted','retired'))",
-            "status TEXT NOT NULL CHECK(status IN ('pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
-        ),
-    ];
     let mut new_sql = table_sql.clone();
-    for (old, new) in replacements {
+    for (old, new) in V15_STATUS_CHECK_REPLACEMENTS {
         new_sql = new_sql.replace(old, new);
     }
     if new_sql == table_sql {
@@ -6481,6 +6417,15 @@ fn drawers_column_exists(conn: &Connection, column: &str) -> Result<bool, DbErro
 
 fn drawers_column_names(conn: &Connection) -> Result<HashSet<String>, DbError> {
     table_column_names(conn, "drawers")
+}
+
+fn schema_object_names(conn: &Connection) -> Result<HashSet<String>, DbError> {
+    let mut stmt =
+        conn.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'index')")?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<HashSet<_>, _>>()?;
+    Ok(names)
 }
 
 fn table_column_names(conn: &Connection, table_name: &str) -> Result<HashSet<String>, DbError> {
@@ -6742,6 +6687,57 @@ const V5_DRAWER_COLUMN_MIGRATIONS: &[DrawerColumnMigration] = &[
         name: "content_hash",
         sql: "ALTER TABLE drawers ADD COLUMN content_hash TEXT;",
     },
+];
+
+const V13_TYPED_INGEST_CHECK_REPLACEMENTS: &[(&str, &str)] = &[
+    (
+        "memory_kind TEXT NOT NULL CHECK(memory_kind IN ('evidence', 'knowledge')) DEFAULT 'evidence'",
+        "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge', 'atomic_fact', 'decision', 'case', 'skill', 'foresight', 'profile_fact', 'profile_trait'))",
+    ),
+    (
+        "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge'))",
+        "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge', 'atomic_fact', 'decision', 'case', 'skill', 'foresight', 'profile_fact', 'profile_trait'))",
+    ),
+    (
+        "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge', 'profile_fact'))",
+        "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge', 'atomic_fact', 'decision', 'case', 'skill', 'foresight', 'profile_fact', 'profile_trait'))",
+    ),
+    (
+        "domain TEXT NOT NULL CHECK(domain IN ('project', 'agent', 'skill', 'global')) DEFAULT 'project'",
+        "domain TEXT NOT NULL DEFAULT 'project' CHECK(domain IN ('user', 'agent', 'project', 'skill', 'global'))",
+    ),
+    (
+        "domain TEXT NOT NULL DEFAULT 'project' CHECK(domain IN ('project', 'agent', 'skill', 'global'))",
+        "domain TEXT NOT NULL DEFAULT 'project' CHECK(domain IN ('user', 'agent', 'project', 'skill', 'global'))",
+    ),
+    ("field TEXT NOT NULL DEFAULT 'general'", "field TEXT"),
+    (
+        "status TEXT CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+        "status TEXT CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+    ),
+    (
+        "status TEXT DEFAULT 'active' CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+        "status TEXT CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+    ),
+    (
+        "status TEXT DEFAULT 'active' CHECK(status IN ('active', 'superseded', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+        "status TEXT CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+    ),
+    (
+        "status TEXT DEFAULT 'active' CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+        "status TEXT CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+    ),
+];
+
+const V15_STATUS_CHECK_REPLACEMENTS: &[(&str, &str)] = &[
+    (
+        "status TEXT NOT NULL CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+        "status TEXT NOT NULL CHECK(status IN ('pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+    ),
+    (
+        "status TEXT NOT NULL CHECK(status IN ('candidate','promoted','canonical','demoted','retired'))",
+        "status TEXT NOT NULL CHECK(status IN ('pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+    ),
 ];
 
 const V5_DRAWER_METADATA_BACKFILL_SQL: &str = r#"

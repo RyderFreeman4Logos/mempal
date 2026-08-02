@@ -13,6 +13,98 @@ fn ensure_supported_fork_ext_version(conn: &Connection) -> Result<u32, DbError> 
     Ok(current_version)
 }
 
+const V5_REPAIR_SCHEMA_OBJECTS: &[&str] = &["idx_drawers_content_hash"];
+const V11_DRAWER_COLUMNS: &[&str] = &["source_type", "confidence"];
+const V12_DRAWER_COLUMNS: &[&str] = &["compacted_into"];
+const V12_REPAIR_SCHEMA_OBJECTS: &[&str] = &[
+    "idx_drawers_compacted_into",
+    "consolidation_log",
+    "idx_consolidation_log_created_at",
+    "idx_consolidation_log_scope",
+];
+const V13_DRAWER_COLUMNS: &[&str] = &["is_pinned", "pin_order", "supersedes"];
+const V13_REPAIR_SCHEMA_OBJECTS: &[&str] = &["idx_drawers_pinned", "idx_drawers_supersedes"];
+const V14_DRAWER_COLUMNS: &[&str] = &["consolidation_priority", "last_sleep_at"];
+const V14_REPAIR_SCHEMA_OBJECTS: &[&str] = &[
+    "idx_drawers_consolidation_priority",
+    "idx_drawers_last_sleep_at",
+    "sleep_log",
+    "idx_sleep_log_created_at",
+    "sleep_resolution_log",
+    "idx_sleep_resolution_log_created_at",
+];
+const V15_KNOWLEDGE_CARD_COLUMNS: &[&str] = &[
+    "auto_generated",
+    "crystallization_score",
+    "source_drawer_ids",
+];
+const V15_REPAIR_SCHEMA_OBJECTS: &[&str] = &["idx_knowledge_cards_auto_pending"];
+
+fn schema_repairs_required(conn: &Connection) -> Result<bool, DbError> {
+    let drawer_columns = drawers_column_names(conn)?;
+    let schema_objects = schema_object_names(conn)?;
+    let drawers_sql = table_sql(conn, "drawers")?;
+
+    if V5_DRAWER_COLUMN_MIGRATIONS
+        .iter()
+        .any(|column| !drawer_columns.contains(column.name))
+        || required_names_missing(&schema_objects, V5_REPAIR_SCHEMA_OBJECTS)
+        || required_names_missing(&drawer_columns, V11_DRAWER_COLUMNS)
+        || !drawers_source_type_check_is_current(&drawers_sql)
+        || required_names_missing(&drawer_columns, V12_DRAWER_COLUMNS)
+        || required_names_missing(&schema_objects, V12_REPAIR_SCHEMA_OBJECTS)
+        || required_names_missing(&drawer_columns, V13_DRAWER_COLUMNS)
+        || schema_sql_requires_rewrite(&drawers_sql, V13_TYPED_INGEST_CHECK_REPLACEMENTS)
+        || required_names_missing(&schema_objects, V13_REPAIR_SCHEMA_OBJECTS)
+        || required_names_missing(&drawer_columns, V14_DRAWER_COLUMNS)
+        || required_names_missing(&schema_objects, V14_REPAIR_SCHEMA_OBJECTS)
+    {
+        return Ok(true);
+    }
+
+    // V15 only repairs the V8 table when that table already exists.
+    if !schema_objects.contains("knowledge_cards") {
+        return Ok(false);
+    }
+    let knowledge_card_columns = table_column_names(conn, "knowledge_cards")?;
+    let knowledge_cards_sql = table_sql(conn, "knowledge_cards")?;
+    Ok(
+        required_names_missing(&knowledge_card_columns, V15_KNOWLEDGE_CARD_COLUMNS)
+            || required_names_missing(&schema_objects, V15_REPAIR_SCHEMA_OBJECTS)
+            || schema_sql_requires_rewrite(&knowledge_cards_sql, V15_STATUS_CHECK_REPLACEMENTS),
+    )
+}
+
+fn required_names_missing(existing: &HashSet<String>, required: &[&str]) -> bool {
+    required.iter().any(|name| !existing.contains(*name))
+}
+
+fn schema_sql_requires_rewrite(table_sql: &str, replacements: &[(&str, &str)]) -> bool {
+    replacements
+        .iter()
+        .any(|(legacy, _)| table_sql.contains(legacy))
+}
+
+pub(super) fn table_sql(conn: &Connection, table_name: &str) -> Result<String, DbError> {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table_name],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+pub(super) fn drawers_source_type_check_is_current(table_sql: &str) -> bool {
+    [
+        "user_explicit",
+        "agent_observation",
+        "agent_inference",
+        "system_generated",
+    ]
+    .iter()
+    .all(|source_type| table_sql.contains(source_type))
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         Self::open_with_mode(path, OpenMode::ReadWrite, true)
@@ -169,7 +261,7 @@ impl Database {
             ensure_wal_journal_mode(&conn)?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
             conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-            if schema_version < CURRENT_SCHEMA_VERSION {
+            if schema_version < CURRENT_SCHEMA_VERSION || schema_repairs_required(&conn)? {
                 apply_migrations(&conn)?;
             }
             if fork_ext_version < CURRENT_FORK_EXT_VERSION {
@@ -398,6 +490,58 @@ mod tests {
             .expect("release same-version writer");
 
         opened.expect("current schema open must not request a SQLite write lock");
+    }
+
+    #[test]
+    fn current_schema_db_open_repairs_all_legacy_structural_invariants() {
+        for (repair, damage_sql, invariant_sql) in [
+            (
+                "V5 drawer metadata",
+                "DROP INDEX idx_drawers_content_hash; ALTER TABLE drawers DROP COLUMN content_hash;",
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('drawers') WHERE name = 'content_hash')",
+            ),
+            (
+                "V11 source confidence",
+                "ALTER TABLE drawers DROP COLUMN confidence;",
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('drawers') WHERE name = 'confidence')",
+            ),
+            (
+                "V12 compaction",
+                "DROP TABLE consolidation_log;",
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'consolidation_log')",
+            ),
+            (
+                "V13 typed pinned",
+                "DROP INDEX idx_drawers_pinned;",
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_drawers_pinned')",
+            ),
+            (
+                "V14 sleep",
+                "DROP TABLE sleep_log;",
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sleep_log')",
+            ),
+            (
+                "V15 crystallization",
+                "ALTER TABLE knowledge_cards DROP COLUMN crystallization_score;",
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('knowledge_cards') WHERE name = 'crystallization_score')",
+            ),
+        ] {
+            let tempdir = short_tempdir();
+            let db_path = tempdir.path().join("palace.db");
+            drop(Database::open(&db_path).expect("initialize current database"));
+            let conn = Connection::open(&db_path).expect("open fixture database");
+            conn.execute_batch(damage_sql)
+                .unwrap_or_else(|error| panic!("damage {repair} fixture: {error}"));
+            drop(conn);
+
+            let repaired = Database::open(&db_path)
+                .unwrap_or_else(|error| panic!("repair {repair} fixture: {error}"));
+            let satisfied = repaired
+                .conn()
+                .query_row(invariant_sql, [], |row| row.get::<_, bool>(0))
+                .unwrap_or_else(|error| panic!("validate {repair} fixture: {error}"));
+            assert!(satisfied, "{repair} invariant was not repaired");
+        }
     }
 
     #[test]
