@@ -248,16 +248,6 @@ async fn run_llm_worker_inner(
     let worker_id = format!("llm-worker-{}-{idx}", std::process::id());
     tracing::info!("LLM worker started: {worker_id}");
 
-    if idx == 0 {
-        let reclaimed = store
-            .reclaim_stale(LLM_CLAIM_TTL_SECS)
-            .await
-            .context("LLM worker failed to reclaim stale claims")?;
-        if reclaimed > 0 {
-            tracing::info!("LLM worker reclaimed {reclaimed} stale tasks");
-        }
-    }
-
     // Restart with fresh config whenever hot-reloadable LLM settings change,
     // cancelling any in-flight task through the generation receiver.
     let mut llm_gen_rx = ConfigHandle::subscribe_llm_gen();

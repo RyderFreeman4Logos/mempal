@@ -32,6 +32,27 @@ async fn write_observer_reports_stall_when_queue_has_work_and_no_recent_writes()
 }
 
 #[tokio::test]
+async fn write_observer_does_not_restart_for_transient_sqlite_stall() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    sync_store
+        .enqueue("hook:user-prompt-submit", "{}")
+        .expect("enqueue pending message");
+    let store = AsyncPendingMessageStore::from_store(sync_store);
+
+    let observer = DaemonWriteObserver::new();
+    observer.force_last_successful_write_for_test(unix_secs().saturating_sub(DAEMON_STALL_SECONDS));
+    observer.record_error("claim_next failed: sqlite error: database is locked");
+
+    assert!(
+        !observer.maybe_log_stall(&store).await,
+        "transient SQLite pressure must keep the daemon alive so workers can recover"
+    );
+}
+
+#[tokio::test]
 async fn write_observer_ignores_empty_queue() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
@@ -67,6 +88,48 @@ async fn write_observer_stall_checks_record_queue_io_burst() {
     DaemonWriteObserver::new().maybe_log_stall(&store).await;
 
     assert!(queue_sample_count() > before);
+}
+
+#[test]
+fn daemon_storage_open_skips_queue_reclaim_while_writer_is_busy() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    drop(Database::open(&db_path).expect("initialize database"));
+
+    let holder = rusqlite::Connection::open(&db_path).expect("open SQLite lock holder");
+    holder
+        .busy_timeout(Duration::ZERO)
+        .expect("make lock holder fail fast");
+    holder
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold SQLite write lock");
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let open_path = db_path.clone();
+    let opener = std::thread::spawn(move || {
+        let outcome = open_daemon_storage_once(&open_path)
+            .map(drop)
+            .map_err(|error| format!("{error:#}"));
+        sender.send(outcome).expect("send daemon storage result");
+    });
+    let outcome = receiver.recv_timeout(Duration::from_secs(2)).ok();
+    let opened_while_busy = outcome.is_some();
+
+    holder
+        .execute_batch("ROLLBACK;")
+        .expect("release SQLite write lock");
+    let outcome = outcome.unwrap_or_else(|| {
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("daemon storage open must finish after releasing lock")
+    });
+    opener.join().expect("join daemon storage opener");
+
+    outcome.expect("open daemon storage");
+    assert!(
+        opened_while_busy,
+        "daemon restart must not perform queue reclamation while opening storage"
+    );
 }
 
 #[test]

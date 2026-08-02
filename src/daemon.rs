@@ -282,12 +282,6 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     let worker_id = writer_lease.lease().owner.clone();
     let claim_ttl_secs = context.config.hooks.daemon_claim_ttl_secs as i64;
     let poll_interval = Duration::from_millis(context.config.hooks.daemon_poll_interval_ms);
-    let reclaimed = context
-        .store
-        .reclaim_stale(claim_ttl_secs)
-        .await
-        .context("failed to reclaim stale daemon claims")?;
-    tracing::info!("daemon startup reclaim_stale reclaimed={reclaimed}");
     let ingest_drain_worker = spawn_daemon_ingest_drain_worker(context, &db_path, &writer_lease)
         .context("failed to start daemon async ingest worker")?;
     let stall_watchdog_handle = spawn_stall_watchdog(

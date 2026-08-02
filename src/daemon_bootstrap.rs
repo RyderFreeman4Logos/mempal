@@ -167,6 +167,17 @@ impl DaemonWriteObserver {
             return false;
         }
 
+        if is_sqlite_lock_message(&diagnostic.last_error) {
+            tracing::warn!(
+                queued_count = diagnostic.queued_count,
+                seconds_since_successful_write = diagnostic.seconds_since_successful_write,
+                last_error = %diagnostic.last_error,
+                uptime_secs = diagnostic.uptime_secs,
+                "daemon writes remain blocked by transient SQLite contention; keeping workers alive to retry"
+            );
+            return false;
+        }
+
         tracing::error!(
             queued_count = diagnostic.queued_count,
             seconds_since_successful_write = diagnostic.seconds_since_successful_write,
@@ -406,17 +417,20 @@ fn open_daemon_storage_once(
         crate::core::db_admission::DbHolderClass::Daemon,
     )
     .context("failed to open daemon async database")?;
-    let store = AsyncPendingMessageStore::new(db.path()).context("failed to open pending queue")?;
+    let store = AsyncPendingMessageStore::new_without_reclaim(db.path());
     Ok((db, async_db, store))
 }
 
 fn is_sqlite_lock_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        let message = cause.to_string();
-        message.contains("database is locked")
-            || message.contains("database file is locked")
-            || message.contains("database is busy")
-    })
+    error
+        .chain()
+        .any(|cause| is_sqlite_lock_message(&cause.to_string()))
+}
+
+fn is_sqlite_lock_message(message: &str) -> bool {
+    message.contains("database is locked")
+        || message.contains("database file is locked")
+        || message.contains("database is busy")
 }
 
 #[cfg(target_os = "linux")]
