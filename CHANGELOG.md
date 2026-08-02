@@ -56,7 +56,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   after a daemon generation finishes startup without post-admission faults;
   cooldown-blocked retries can no longer extend an outage indefinitely (#844).
 
-- **Daemon/MCP/CLI coexistence and ingest liveness**: isolate MCP reads and queue diagnostics in query-only SQLite paths while the daemon owns the writer lease; return ingest operation identities after durable queue admission; reject unconfirmed or self-held queue locks before any receipt; define timed-out receipts as durable admission with status unknown and pollable through `mempal_operation_status`; route `ingest --stdin --wait --json` through queue admission with structured no-write receipts; and bound daemon SIGTERM ingest-worker drain by residual `DAEMON_DRAIN_BUDGET` (#843, #849, #850).
+- **Daemon/MCP/CLI coexistence and ingest liveness**: daemons open complete current SQLite schemas beside live MCP writers without a write lock; retain future-schema rejection/incomplete-schema repairs, query-only MCP reads/diagnostics, durable receipts, and bounded SIGTERM drains (#843, #849, #850, #853).
 
 - **MCP reads**: retry transient SQLite busy/locked errors on all query-only MCP reads (read_drawer, search, timeline, context, brief) under the existing search deadline, preventing opaque -32603 under daemon contention (#840).
 - **SQLite mutation retries**: bound shared 10-second CLI/MCP retry backoff, writer admission, and SQLite busy waits; a mutation that commits reports success, while unstarted expired MCP deletes return structured retryable lock errors (#838).
