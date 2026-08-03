@@ -85,7 +85,7 @@ async fn write_observer_does_not_restart_for_typed_sqlite_protocol_stall() {
 }
 
 #[tokio::test]
-async fn write_observer_fresh_heartbeat_protocol_lock_suppresses_stall_without_claim() {
+async fn hook_heartbeat_result_observation_preserves_semantic_stall_clock() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
@@ -105,24 +105,24 @@ async fn write_observer_fresh_heartbeat_protocol_lock_suppresses_stall_without_c
     let observer = DaemonWriteObserver::new();
     observer.force_last_successful_write_for_test(unix_secs().saturating_sub(DAEMON_STALL_SECONDS));
 
-    // Production path: already-claimed work only refreshes heartbeat; no later claim error.
-    let heartbeat_error = store
-        .refresh_heartbeat(claimed.id.clone(), "hook-worker".to_string())
-        .await
-        .expect_err("injected heartbeat SQLITE_PROTOCOL lock");
-    assert!(
-        heartbeat_error.is_sqlite_lock(),
-        "heartbeat injection must remain typed as a SQLite lock"
-    );
-    observer.record_queue_error(
-        format!("failed to refresh hook message heartbeat {}", claimed.id),
-        &heartbeat_error,
-    );
-
+    crate::daemon::refresh_hook_message_heartbeat(&store, &claimed.id, "hook-worker", &observer)
+        .await;
     assert!(
         !observer.maybe_log_stall(&store).await,
         "fresh heartbeat FileLockingProtocolFailed contention must suppress false stall recovery without a subsequent claim error"
     );
+
+    crate::daemon::refresh_hook_message_heartbeat(&store, &claimed.id, "hook-worker", &observer)
+        .await;
+    let diagnostic = observer
+        .stall_diagnostic(&store, unix_secs())
+        .await
+        .expect("maintenance success must not advance the semantic stall clock");
+    assert_eq!(diagnostic.last_error, "none recorded");
+    assert!(diagnostic.seconds_since_successful_write >= DAEMON_STALL_SECONDS);
+
+    observer.record_successful_write();
+    assert_eq!(observer.stall_diagnostic(&store, unix_secs()).await, None);
 }
 
 #[tokio::test]

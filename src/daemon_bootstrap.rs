@@ -140,12 +140,44 @@ impl DaemonWriteObserver {
     }
 
     pub fn record_successful_write(&self) {
-        let last_error = self.inner.last_error.lock();
         self.inner
             .last_successful_write_secs
             .store(unix_secs(), Ordering::Relaxed);
-        if let Ok(mut last_error) = last_error {
+        self.record_queue_maintenance_success();
+    }
+
+    pub fn record_queue_maintenance_success(&self) {
+        if let Ok(mut last_error) = self.inner.last_error.lock() {
             *last_error = None;
+        }
+    }
+
+    pub fn observe_semantic_queue_result<T>(
+        &self,
+        context: impl Into<String>,
+        result: &std::result::Result<T, QueueError>,
+    ) {
+        self.observe_queue_result(context, result, true);
+    }
+
+    pub fn observe_maintenance_queue_result<T>(
+        &self,
+        context: impl Into<String>,
+        result: &std::result::Result<T, QueueError>,
+    ) {
+        self.observe_queue_result(context, result, false);
+    }
+
+    fn observe_queue_result<T>(
+        &self,
+        context: impl Into<String>,
+        result: &std::result::Result<T, QueueError>,
+        semantic_success: bool,
+    ) {
+        match result {
+            Ok(_) if semantic_success => self.record_successful_write(),
+            Ok(_) => self.record_queue_maintenance_success(),
+            Err(error) => self.record_queue_error(context, error),
         }
     }
 
@@ -282,6 +314,16 @@ impl DaemonWriteObserver {
         {
             *observed_at = timestamp_secs;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_error_for_test(&self) -> Option<(String, bool)> {
+        self.inner
+            .last_error
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|(error, is_sqlite_lock, _)| (error.clone(), *is_sqlite_lock))
     }
 }
 

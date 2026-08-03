@@ -293,53 +293,68 @@ async fn run_llm_worker_inner(
         };
         idle_count = 0;
 
-        let (router, config) =
-            match client_for_claimed_generation(&client_runtime, &mut llm_gen_rx).await {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    status.record_failure(&error);
-                    let message_id = message.id.clone();
-                    tracing::warn!(
-                        %error,
-                        message_id,
-                        "LLM client unavailable after claim; releasing task for retry"
+        let (router, config) = match client_for_claimed_generation(&client_runtime, &mut llm_gen_rx)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                status.record_failure(&error);
+                let message_id = message.id.clone();
+                tracing::warn!(
+                    %error,
+                    message_id,
+                    "LLM client unavailable after claim; releasing task for retry"
+                );
+                let release_result = store.release_claim(message).await;
+                write_observer.observe_maintenance_queue_result(
+                        format!(
+                            "failed to release claimed LLM task {message_id} after client preparation failure"
+                        ),
+                        &release_result,
                     );
-                    if let Err(release_error) = store.release_claim(message).await {
-                        tracing::warn!(
-                            ?release_error,
-                            message_id,
-                            "failed to release claimed LLM task after client preparation failure; \
+                if let Err(release_error) = release_result {
+                    tracing::warn!(
+                        ?release_error,
+                        message_id,
+                        "failed to release claimed LLM task after client preparation failure; \
                              task will be reclaimed by TTL or next startup"
-                        );
-                    }
-                    let retry_interval = ConfigHandle::current().llm.retry_interval_secs.max(1);
-                    tokio::time::sleep(Duration::from_secs(retry_interval)).await;
-                    continue;
+                    );
                 }
-            };
+                let retry_interval = ConfigHandle::current().llm.retry_interval_secs.max(1);
+                tokio::time::sleep(Duration::from_secs(retry_interval)).await;
+                continue;
+            }
+        };
 
         let message_id = message.id.clone();
         tracing::info!("LLM worker claimed task {message_id}");
         let start = Instant::now();
 
+        let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::channel(1);
         let heartbeat_store = store.clone();
         let heartbeat_message_id = message.id.clone();
         let heartbeat_worker_id = worker_id.clone();
         let heartbeat_write_observer = write_observer.clone();
-        let heartbeat: Box<HeartbeatCallback> = Box::new(move || {
-            let store = heartbeat_store.clone();
-            let message_id = heartbeat_message_id.clone();
-            let worker_id = heartbeat_worker_id.clone();
-            let write_observer = heartbeat_write_observer.clone();
-            tokio::spawn(async move {
-                if let Err(error) = store.refresh_heartbeat(message_id.clone(), worker_id).await {
-                    write_observer.record_queue_error(
-                        format!("failed to refresh LLM task heartbeat {message_id}"),
-                        &error,
+        let heartbeat_handle = tokio::spawn(async move {
+            while heartbeat_rx.recv().await.is_some() {
+                let result = heartbeat_store
+                    .refresh_heartbeat(heartbeat_message_id.clone(), heartbeat_worker_id.clone())
+                    .await;
+                heartbeat_write_observer.observe_maintenance_queue_result(
+                    format!("failed to refresh LLM task heartbeat {heartbeat_message_id}"),
+                    &result,
+                );
+                if let Err(error) = result {
+                    tracing::warn!(
+                        ?error,
+                        message_id = heartbeat_message_id,
+                        "failed to refresh LLM task heartbeat"
                     );
-                    tracing::warn!(?error, message_id, "failed to refresh LLM task heartbeat");
                 }
-            });
+            }
+        });
+        let heartbeat: Box<HeartbeatCallback> = Box::new(move || {
+            let _ = heartbeat_tx.try_send(());
             Ok(())
         });
 
@@ -360,26 +375,32 @@ async fn run_llm_worker_inner(
             ) => Some(result),
             _ = llm_gen_rx.changed() => None,
         };
+        drop(heartbeat);
+        heartbeat_handle.abort();
+        let _ = heartbeat_handle.await;
 
         let latency_ms = start.elapsed().as_millis();
         match task_result {
             Some(Ok(())) => {
                 tracing::info!("LLM task {message_id} completed in {latency_ms}ms");
-                if let Err(error) = confirm_llm_task_async(&store, message.clone()).await {
-                    if let Some(queue_error) = error
-                        .chain()
-                        .find_map(|cause| cause.downcast_ref::<crate::core::queue::QueueError>())
-                    {
-                        write_observer.record_queue_error(
-                            format!("failed to confirm LLM task {message_id}"),
-                            queue_error,
+                let confirm_result = confirm_llm_task_async(&store, message.clone()).await;
+                write_observer.observe_semantic_queue_result(
+                    format!("failed to confirm LLM task {message_id}"),
+                    &confirm_result,
+                );
+                if let Err(error) = confirm_result {
+                    if error.is_sqlite_lock() {
+                        tracing::warn!(
+                            ?error,
+                            message_id,
+                            "LLM task confirm hit SQLite contention; keeping worker capacity alive"
                         );
-                    } else {
-                        write_observer.record_error(error.to_string());
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
                     }
-                    return Err(error);
+                    return Err(error)
+                        .with_context(|| format!("failed to confirm LLM task {message_id}"));
                 }
-                write_observer.record_successful_write();
                 if let Some(observer) = completion_observer.take() {
                     let _ = observer.send(());
                 }
@@ -388,14 +409,23 @@ async fn run_llm_worker_inner(
                 tracing::error!("LLM task {message_id} failed after {latency_ms}ms: {error}");
                 write_observer.record_error(error.to_string());
                 let disposition = llm_task_failure_disposition(&error);
-                if let Err(mark_error) = store
+                let mark_result = store
                     .mark_failed_with_disposition(message.clone(), error.to_string(), disposition)
-                    .await
-                {
-                    write_observer.record_queue_error(
-                        format!("failed to mark_failed LLM task {message_id}"),
-                        &mark_error,
-                    );
+                    .await;
+                write_observer.observe_maintenance_queue_result(
+                    format!("failed to mark_failed LLM task {message_id}"),
+                    &mark_result,
+                );
+                if let Err(mark_error) = mark_result {
+                    if mark_error.is_sqlite_lock() {
+                        tracing::warn!(
+                            ?mark_error,
+                            message_id,
+                            "LLM task mark_failed hit SQLite contention; keeping worker capacity alive"
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
                     return Err(mark_error)
                         .with_context(|| format!("failed to mark_failed LLM task {message_id}"));
                 }
@@ -406,11 +436,12 @@ async fn run_llm_worker_inner(
                     message_id,
                     "LLM worker restarting due to config change; releasing task back to pending"
                 );
-                if let Err(error) = store.release_claim(message.clone()).await {
-                    write_observer.record_queue_error(
-                        format!("failed to release claimed LLM task {message_id}"),
-                        &error,
-                    );
+                let release_result = store.release_claim(message.clone()).await;
+                write_observer.observe_maintenance_queue_result(
+                    format!("failed to release claimed LLM task {message_id}"),
+                    &release_result,
+                );
+                if let Err(error) = release_result {
                     tracing::warn!(
                         ?error,
                         message_id,
@@ -439,21 +470,19 @@ fn llm_idle_poll_interval(base_interval: Duration, idle_count: u32) -> Duration 
 async fn confirm_llm_task_async(
     store: &AsyncPendingMessageStore,
     claim: ClaimedMessage,
-) -> Result<()> {
+) -> crate::core::queue::Result<()> {
     let message_id = claim.id.clone();
     match store.confirm(claim).await {
-        Ok(()) => {}
+        Ok(()) => Ok(()),
         Err(crate::core::queue::QueueError::MessageNotFound(_)) => {
             tracing::warn!(
                 message_id,
                 "LLM task already removed before confirm; continuing"
             );
+            Ok(())
         }
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to confirm LLM task {message_id}"));
-        }
+        Err(error) => Err(error),
     }
-    Ok(())
 }
 
 /// Confirm a completed LLM task for synchronous callers and legacy tests.

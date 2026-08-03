@@ -721,7 +721,7 @@ async fn process_hook_worker_message_inner(
         &state.write_observer,
     )
     .await;
-    let heartbeat_handle = spawn_hook_message_heartbeat(
+    let (heartbeat_trigger, heartbeat_handle) = spawn_hook_message_heartbeat(
         state.store.clone(),
         message_id.clone(),
         state.worker_id.clone(),
@@ -743,20 +743,24 @@ async fn process_hook_worker_message_inner(
             config: state.config.as_ref(),
             mempal_home: &state.mempal_home,
             runtime_writer_lease: state.runtime_writer_lease.as_ref(),
+            heartbeat_trigger: Some(heartbeat_trigger),
         },
     )
     .await;
+    heartbeat_handle.abort();
+    let _ = heartbeat_handle.await;
 
     match result {
         Ok(_) => {
-            if let Err(error) = state.store.confirm(message.clone()).await {
+            let confirm_result = state.store.confirm(message.clone()).await;
+            state.write_observer.observe_semantic_queue_result(
+                format!("failed to confirm {message_id}"),
+                &confirm_result,
+            );
+            if let Err(error) = confirm_result {
                 tracing::error!(?error, "failed to confirm {message_id}");
-                state
-                    .write_observer
-                    .record_queue_error(format!("failed to confirm {message_id}"), &error);
                 span.finish_error(error);
             } else {
-                state.write_observer.record_successful_write();
                 span.finish_success();
             }
         }
@@ -765,23 +769,22 @@ async fn process_hook_worker_message_inner(
             tracing::error!("daemon message {message_id} failed: {error_text}");
             state.write_observer.record_error(error_text.clone());
             let disposition = queue_failure_disposition(&error);
-            if let Err(mark_error) = state
+            let mark_result = state
                 .store
                 .mark_failed_with_disposition(message.clone(), error_text.clone(), disposition)
-                .await
-            {
+                .await;
+            state.write_observer.observe_maintenance_queue_result(
+                format!("failed to mark_failed {message_id}"),
+                &mark_result,
+            );
+            if let Err(mark_error) = mark_result {
                 tracing::error!(?mark_error, "failed to mark_failed {message_id}");
-                state
-                    .write_observer
-                    .record_queue_error(format!("failed to mark_failed {message_id}"), &mark_error);
                 span.finish_error(mark_error);
             } else {
                 span.finish_error(error_text);
             }
         }
     }
-    heartbeat_handle.abort();
-    let _ = heartbeat_handle.await;
 }
 
 fn spawn_hook_message_heartbeat(
@@ -791,13 +794,21 @@ fn spawn_hook_message_heartbeat(
     write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
     interval: Duration,
     mut observer: Option<tokio::sync::oneshot::Sender<()>>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> (tokio::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (trigger_tx, mut trigger_rx) = tokio::sync::mpsc::channel(1);
+    let heartbeat = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await;
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                trigger = trigger_rx.recv() => {
+                    if trigger.is_none() {
+                        break;
+                    }
+                }
+            }
             if shutdown_requested() {
                 break;
             }
@@ -806,23 +817,30 @@ fn spawn_hook_message_heartbeat(
                 let _ = observer.send(());
             }
         }
-    })
+    });
+    (trigger_tx, heartbeat)
 }
 
-async fn refresh_hook_message_heartbeat(
+fn trigger_hook_message_heartbeat(trigger: &Option<tokio::sync::mpsc::Sender<()>>) {
+    if let Some(trigger) = trigger {
+        let _ = trigger.try_send(());
+    }
+}
+
+pub(crate) async fn refresh_hook_message_heartbeat(
     store: &AsyncPendingMessageStore,
     message_id: &str,
     worker_id: &str,
     write_observer: &crate::daemon_bootstrap::DaemonWriteObserver,
 ) {
-    if let Err(error) = store
+    let result = store
         .refresh_heartbeat(message_id.to_string(), worker_id.to_string())
-        .await
-    {
-        write_observer.record_queue_error(
-            format!("failed to refresh hook message heartbeat {message_id}"),
-            &error,
-        );
+        .await;
+    write_observer.observe_maintenance_queue_result(
+        format!("failed to refresh hook message heartbeat {message_id}"),
+        &result,
+    );
+    if let Err(error) = result {
         tracing::warn!(
             ?error,
             message_id,
@@ -1224,13 +1242,12 @@ pub struct DaemonIngestContext<'a> {
     pub config: &'a crate::core::config::Config,
     pub mempal_home: &'a Path,
     pub runtime_writer_lease: Option<&'a RuntimeWriterLease>,
+    pub heartbeat_trigger: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
 struct DrawerIngestContext<'a, E: Embedder + ?Sized> {
     db: &'a AsyncDb,
     store: &'a AsyncPendingMessageStore,
-    worker_id: &'a str,
-    message: &'a ClaimedMessage,
     embedder: &'a E,
     daemon: &'a DaemonIngestContext<'a>,
     envelope: &'a CapturedHookEnvelope,
@@ -1282,7 +1299,7 @@ where
 pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
     db: &AsyncDb,
     store: &AsyncPendingMessageStore,
-    worker_id: &str,
+    _worker_id: &str,
     message: &ClaimedMessage,
     embedder: &E,
     context: DaemonIngestContext<'_>,
@@ -1308,8 +1325,6 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
     let drawer_context = DrawerIngestContext {
         db,
         store,
-        worker_id,
-        message,
         embedder,
         daemon: &context,
         envelope: &envelope,
@@ -1529,9 +1544,6 @@ async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
     ingest_context: &DrawerIngestContext<'_, E>,
 ) -> Result<Option<crate::xurl::ingest::IngestStats>> {
     let db = ingest_context.db;
-    let store = ingest_context.store;
-    let worker_id = ingest_context.worker_id;
-    let message = ingest_context.message;
     let embedder = ingest_context.embedder;
     let daemon = ingest_context.daemon;
     let envelope = ingest_context.envelope;
@@ -1591,40 +1603,14 @@ async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
     .with_context(|| format!("failed to parse Hermes state.db {}", hermes_db.display()))?;
     let turns_parsed = parsed_turns.len();
 
-    let heartbeat_store = store.clone();
-    let heartbeat_message_id = message.id.clone();
-    let heartbeat_worker_id = worker_id.to_string();
+    let embed_heartbeat_trigger = daemon.heartbeat_trigger.clone();
     let embed_heartbeat = move || -> crate::embed::Result<()> {
-        let store = heartbeat_store.clone();
-        let message_id = heartbeat_message_id.clone();
-        let worker_id = heartbeat_worker_id.clone();
-        tokio::spawn(async move {
-            if let Err(error) = store.refresh_heartbeat(message_id.clone(), worker_id).await {
-                tracing::warn!(
-                    ?error,
-                    message_id,
-                    "failed to refresh Hermes auto-ingest embed heartbeat"
-                );
-            }
-        });
+        trigger_hook_message_heartbeat(&embed_heartbeat_trigger);
         Ok(())
     };
-    let llm_heartbeat_store = store.clone();
-    let llm_heartbeat_message_id = message.id.clone();
-    let llm_heartbeat_worker_id = worker_id.to_string();
+    let llm_heartbeat_trigger = daemon.heartbeat_trigger.clone();
     let llm_heartbeat = move || -> std::result::Result<(), crate::llm::LlmError> {
-        let store = llm_heartbeat_store.clone();
-        let message_id = llm_heartbeat_message_id.clone();
-        let worker_id = llm_heartbeat_worker_id.clone();
-        tokio::spawn(async move {
-            if let Err(error) = store.refresh_heartbeat(message_id.clone(), worker_id).await {
-                tracing::warn!(
-                    ?error,
-                    message_id,
-                    "failed to refresh Hermes auto-ingest LLM heartbeat"
-                );
-            }
-        });
+        trigger_hook_message_heartbeat(&llm_heartbeat_trigger);
         Ok(())
     };
 
@@ -2435,40 +2421,14 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         return Ok(drawer_id);
     }
 
-    let heartbeat_store = context.store.clone();
-    let heartbeat_message_id = context.message.id.clone();
-    let heartbeat_worker_id = context.worker_id.to_string();
+    let heartbeat_trigger = context.daemon.heartbeat_trigger.clone();
     let heartbeat = move || -> crate::embed::Result<()> {
-        let store = heartbeat_store.clone();
-        let message_id = heartbeat_message_id.clone();
-        let worker_id = heartbeat_worker_id.clone();
-        tokio::spawn(async move {
-            if let Err(error) = store.refresh_heartbeat(message_id.clone(), worker_id).await {
-                tracing::warn!(
-                    ?error,
-                    message_id,
-                    "failed to refresh daemon ingest heartbeat"
-                );
-            }
-        });
+        trigger_hook_message_heartbeat(&heartbeat_trigger);
         Ok(())
     };
-    let llm_heartbeat_store = context.store.clone();
-    let llm_heartbeat_message_id = context.message.id.clone();
-    let llm_heartbeat_worker_id = context.worker_id.to_string();
+    let llm_heartbeat_trigger = context.daemon.heartbeat_trigger.clone();
     let llm_heartbeat = move || -> std::result::Result<(), crate::llm::LlmError> {
-        let store = llm_heartbeat_store.clone();
-        let message_id = llm_heartbeat_message_id.clone();
-        let worker_id = llm_heartbeat_worker_id.clone();
-        tokio::spawn(async move {
-            if let Err(error) = store.refresh_heartbeat(message_id.clone(), worker_id).await {
-                tracing::warn!(
-                    ?error,
-                    message_id,
-                    "failed to refresh daemon LLM gating heartbeat"
-                );
-            }
-        });
+        trigger_hook_message_heartbeat(&llm_heartbeat_trigger);
         Ok(())
     };
 
@@ -5662,6 +5622,7 @@ mod tests {
                 config: &config,
                 mempal_home: tmp.path(),
                 runtime_writer_lease: None,
+                heartbeat_trigger: None,
             },
         )
         .await
@@ -5735,6 +5696,7 @@ mod tests {
                 config: &config,
                 mempal_home: tmp.path(),
                 runtime_writer_lease: None,
+                heartbeat_trigger: None,
             },
         )
         .await
@@ -5848,6 +5810,7 @@ mod tests {
                 config: &config,
                 mempal_home: tmp.path(),
                 runtime_writer_lease: None,
+                heartbeat_trigger: None,
             },
         )
         .await
@@ -5984,6 +5947,7 @@ mod tests {
                 config: &config,
                 mempal_home: tmp.path(),
                 runtime_writer_lease: None,
+                heartbeat_trigger: None,
             },
         )
         .await
@@ -6212,6 +6176,7 @@ mod tests {
                 config: &config,
                 mempal_home: tmp.path(),
                 runtime_writer_lease: None,
+                heartbeat_trigger: None,
             },
         )
         .await
@@ -6445,6 +6410,7 @@ mod tests {
                 config: &config,
                 mempal_home: tmp.path(),
                 runtime_writer_lease: None,
+                heartbeat_trigger: None,
             },
         )
         .await
@@ -6556,6 +6522,7 @@ mod tests {
                 config: &config,
                 mempal_home: tmp.path(),
                 runtime_writer_lease: None,
+                heartbeat_trigger: None,
             },
         )
         .await

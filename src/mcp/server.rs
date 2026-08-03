@@ -1055,7 +1055,16 @@ impl MempalMcpServer {
                 break;
             }
 
-            match claim_next_ingest_with_io(&queue, &worker_id).await {
+            let claim_result = claim_next_ingest_with_io(&queue, &worker_id).await;
+            if let Some(observer) = &self.daemon_write_observer {
+                match &claim_result {
+                    Ok(Some(_)) => observer.record_queue_maintenance_success(),
+                    Ok(None) => {}
+                    Err(error) => observer
+                        .record_queue_error("failed to claim next MCP ingest operation", error),
+                }
+            }
+            match claim_result {
                 Ok(Some(claim)) => {
                     retry_count = 0;
                     idle_count = 0;
@@ -1076,9 +1085,6 @@ impl MempalMcpServer {
                     }
                 }
                 Err(error) if is_transient_ingest_claim_error(&error) => {
-                    if let Some(observer) = &self.daemon_write_observer {
-                        observer.record_claim_error(&error);
-                    }
                     idle_count = 0;
                     retry_count = retry_count.saturating_add(1);
                     let next_delay = ingest_worker_backoff_delay(retry_count);
@@ -1160,7 +1166,14 @@ impl MempalMcpServer {
             None => {
                 let detail = format!("failed to decode ingest operation {}", claim.id);
                 span.finish_error(&detail);
-                complete_failed_ingest_claim(queue, &claim, queue_wait_ms, detail).await?;
+                complete_failed_ingest_claim(
+                    queue,
+                    &claim,
+                    queue_wait_ms,
+                    detail,
+                    self.daemon_write_observer.as_ref(),
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -1179,9 +1192,13 @@ impl MempalMcpServer {
                 Ok(Some(lease)) => Some(lease),
                 Ok(None) => {
                     Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                    if let Err(error) = Self::release_claim_with_lock_retry(queue, claim)
-                        .await
-                        .context("failed to release ingest claim after writer lease conflict")
+                    if let Err(error) = Self::release_claim_with_lock_retry(
+                        queue,
+                        claim,
+                        self.daemon_write_observer.as_ref(),
+                    )
+                    .await
+                    .context("failed to release ingest claim after writer lease conflict")
                     {
                         span.finish_error(&error);
                         return Err(error);
@@ -1192,9 +1209,13 @@ impl MempalMcpServer {
                 }
                 Err(error) if anyhow_chain_contains_sqlite_lock(&error) => {
                     Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                    if let Err(error) = Self::release_claim_with_lock_retry(queue, claim)
-                        .await
-                        .context("failed to release ingest claim after transient writer lease lock")
+                    if let Err(error) = Self::release_claim_with_lock_retry(
+                        queue,
+                        claim,
+                        self.daemon_write_observer.as_ref(),
+                    )
+                    .await
+                    .context("failed to release ingest claim after transient writer lease lock")
                     {
                         span.finish_error(&error);
                         return Err(error);
@@ -1228,9 +1249,13 @@ impl MempalMcpServer {
                 Some(writer_lease) => writer_lease.release().await,
                 None => Ok(()),
             };
-            let claim_released = Self::release_claim_with_lock_retry(queue, claim)
-                .await
-                .context("failed to release ingest claim after writer lease was lost");
+            let claim_released = Self::release_claim_with_lock_retry(
+                queue,
+                claim,
+                self.daemon_write_observer.as_ref(),
+            )
+            .await
+            .context("failed to release ingest claim after writer lease was lost");
             let result = claim_released.and(released);
             match &result {
                 Ok(()) => span.finish_error_class("writer_lease_lost"),
@@ -1257,6 +1282,7 @@ impl MempalMcpServer {
                 &claim,
                 detail.clone(),
                 next_delay,
+                self.daemon_write_observer.as_ref(),
             )
             .await;
             let released = match writer_lease {
@@ -1272,6 +1298,7 @@ impl MempalMcpServer {
             return result;
         }
 
+        Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
         Self::refresh_ingest_claim_heartbeat_once(
             queue,
             &claim.id,
@@ -1289,7 +1316,6 @@ impl MempalMcpServer {
                 false,
             )
             .await;
-        Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
         let released = match writer_lease {
             Some(writer_lease) => writer_lease.release().await,
             None => Ok(()),
@@ -1314,7 +1340,14 @@ impl MempalMcpServer {
             Some(queued) => queued,
             None => {
                 let detail = format!("failed to decode ingest operation {}", claim.id);
-                complete_failed_ingest_claim(queue, &claim, queue_wait_ms, detail).await?;
+                complete_failed_ingest_claim(
+                    queue,
+                    &claim,
+                    queue_wait_ms,
+                    detail,
+                    self.daemon_write_observer.as_ref(),
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -1333,17 +1366,25 @@ impl MempalMcpServer {
                 Ok(Some(lease)) => Some(lease),
                 Ok(None) => {
                     Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                    Self::release_claim_with_lock_retry(queue, claim)
-                        .await
-                        .context(
-                            "failed to release scoped ingest claim after writer lease conflict",
-                        )?;
+                    Self::release_claim_with_lock_retry(
+                        queue,
+                        claim,
+                        self.daemon_write_observer.as_ref(),
+                    )
+                    .await
+                    .context("failed to release scoped ingest claim after writer lease conflict")?;
                     tokio::time::sleep(INGEST_POLL_INTERVAL).await;
                     return Ok(());
                 }
                 Err(error) if anyhow_chain_contains_sqlite_lock(&error) => {
                     Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                    Self::release_claim_with_lock_retry(queue, claim).await.context(
+                    Self::release_claim_with_lock_retry(
+                        queue,
+                        claim,
+                        self.daemon_write_observer.as_ref(),
+                    )
+                    .await
+                    .context(
                         "failed to release scoped ingest claim after transient writer lease lock",
                     )?;
                     tokio::time::sleep(INGEST_POLL_INTERVAL).await;
@@ -1376,7 +1417,7 @@ impl MempalMcpServer {
                 Some(writer_lease) => writer_lease.release().await,
                 None => Ok(()),
             };
-            Self::release_claim_with_lock_retry(queue, claim)
+            Self::release_claim_with_lock_retry(queue, claim, self.daemon_write_observer.as_ref())
                 .await
                 .context("failed to release scoped ingest claim after writer lease was lost")?;
             released?;
@@ -1401,6 +1442,7 @@ impl MempalMcpServer {
                 &claim,
                 detail.clone(),
                 next_delay,
+                self.daemon_write_observer.as_ref(),
             )
             .await?;
             let released = match writer_lease {
@@ -1412,6 +1454,7 @@ impl MempalMcpServer {
             return Ok(());
         }
 
+        Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
         Self::refresh_ingest_claim_heartbeat_once(
             queue,
             &claim.id,
@@ -1429,7 +1472,6 @@ impl MempalMcpServer {
                 false,
             )
             .await;
-        Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
         let released = match writer_lease {
             Some(writer_lease) => writer_lease.release().await,
             None => Ok(()),
@@ -1460,14 +1502,20 @@ impl MempalMcpServer {
                     detail,
                     completion_deadline.saturating_sub(MCP_SCOPED_INGEST_CLAIM_CLEANUP_MARGIN),
                     true,
+                    self.daemon_write_observer.as_ref(),
                 )
                 .await
                 {
                     if anyhow_chain_contains_sqlite_lock(&error) {
                         let release_deadline =
                             scoped_process_remaining(started, budget).unwrap_or_default();
-                        Self::release_scoped_claim_after_timeout(queue, claim, release_deadline)
-                            .await?;
+                        Self::release_scoped_claim_after_timeout(
+                            queue,
+                            claim,
+                            release_deadline,
+                            self.daemon_write_observer.as_ref(),
+                        )
+                        .await?;
                         return Ok(ScopedIngestProcessResult::TimedOut);
                     }
                     return Err(error);
@@ -1488,7 +1536,13 @@ impl MempalMcpServer {
         } else {
             let Some(remaining) = scoped_process_remaining(started, budget) else {
                 Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                Self::release_scoped_claim_after_timeout(queue, claim, Duration::ZERO).await?;
+                Self::release_scoped_claim_after_timeout(
+                    queue,
+                    claim,
+                    Duration::ZERO,
+                    self.daemon_write_observer.as_ref(),
+                )
+                .await?;
                 return Ok(ScopedIngestProcessResult::TimedOut);
             };
             match tokio::time::timeout(remaining, self.acquire_ingest_writer_lease(worker_id)).await
@@ -1500,6 +1554,7 @@ impl MempalMcpServer {
                         queue,
                         claim,
                         remaining.min(CLAIM_LOCK_RETRY_DEADLINE),
+                        self.daemon_write_observer.as_ref(),
                     )
                     .await
                     .context("failed to release scoped ingest claim after writer lease conflict")?;
@@ -1511,6 +1566,7 @@ impl MempalMcpServer {
                         queue,
                         claim,
                         remaining.min(CLAIM_LOCK_RETRY_DEADLINE),
+                        self.daemon_write_observer.as_ref(),
                     )
                     .await
                     .context(
@@ -1523,7 +1579,13 @@ impl MempalMcpServer {
                 }
                 Err(_) => {
                     Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                    Self::release_scoped_claim_after_timeout(queue, claim, Duration::ZERO).await?;
+                    Self::release_scoped_claim_after_timeout(
+                        queue,
+                        claim,
+                        Duration::ZERO,
+                        self.daemon_write_observer.as_ref(),
+                    )
+                    .await?;
                     return Ok(ScopedIngestProcessResult::TimedOut);
                 }
             }
@@ -1536,7 +1598,13 @@ impl MempalMcpServer {
                 if let Some(writer_lease) = writer_lease {
                     let _ = writer_lease.release().await;
                 }
-                Self::release_scoped_claim_after_timeout(queue, claim, Duration::ZERO).await?;
+                Self::release_scoped_claim_after_timeout(
+                    queue,
+                    claim,
+                    Duration::ZERO,
+                    self.daemon_write_observer.as_ref(),
+                )
+                .await?;
                 return Ok(ScopedIngestProcessResult::TimedOut);
             };
             if tokio::time::timeout(remaining, tokio::time::sleep(delay))
@@ -1549,7 +1617,13 @@ impl MempalMcpServer {
                 }
                 let release_deadline =
                     scoped_process_remaining(started, budget).unwrap_or_default();
-                Self::release_scoped_claim_after_timeout(queue, claim, release_deadline).await?;
+                Self::release_scoped_claim_after_timeout(
+                    queue,
+                    claim,
+                    release_deadline,
+                    self.daemon_write_observer.as_ref(),
+                )
+                .await?;
                 return Ok(ScopedIngestProcessResult::TimedOut);
             }
         }
@@ -1561,7 +1635,13 @@ impl MempalMcpServer {
             if let Some(writer_lease) = writer_lease {
                 let _ = writer_lease.release().await;
             }
-            Self::release_scoped_claim_after_timeout(queue, claim, Duration::ZERO).await?;
+            Self::release_scoped_claim_after_timeout(
+                queue,
+                claim,
+                Duration::ZERO,
+                self.daemon_write_observer.as_ref(),
+            )
+            .await?;
             return Ok(ScopedIngestProcessResult::TimedOut);
         };
         let outcome = match tokio::time::timeout(
@@ -1579,7 +1659,13 @@ impl MempalMcpServer {
                 }
                 let release_deadline =
                     scoped_process_remaining(started, budget).unwrap_or_default();
-                Self::release_scoped_claim_after_timeout(queue, claim, release_deadline).await?;
+                Self::release_scoped_claim_after_timeout(
+                    queue,
+                    claim,
+                    release_deadline,
+                    self.daemon_write_observer.as_ref(),
+                )
+                .await?;
                 return Ok(ScopedIngestProcessResult::TimedOut);
             }
         };
@@ -1595,6 +1681,7 @@ impl MempalMcpServer {
                 queue,
                 claim,
                 release_deadline.min(CLAIM_LOCK_RETRY_DEADLINE),
+                self.daemon_write_observer.as_ref(),
             )
             .await
             .context("failed to release scoped ingest claim after writer lease was lost")?;
@@ -1612,12 +1699,14 @@ impl MempalMcpServer {
                 queue,
                 claim,
                 release_deadline.min(CLAIM_LOCK_RETRY_DEADLINE),
+                self.daemon_write_observer.as_ref(),
             )
             .await
             .context("failed to release scoped ingest claim after transient write lock")?;
             return Ok(ScopedIngestProcessResult::ReleasedForRetry);
         }
 
+        Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
         Self::refresh_ingest_claim_heartbeat_once(
             queue,
             &claim.id,
@@ -1636,7 +1725,6 @@ impl MempalMcpServer {
                 true,
             )
             .await;
-        Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
         let released = match writer_lease {
             Some(writer_lease) => writer_lease.release().await,
             None => Ok(()),
@@ -1702,6 +1790,7 @@ impl MempalMcpServer {
                     },
                     result_retry_deadline,
                     bound_attempt_busy_timeout,
+                    self.daemon_write_observer.as_ref(),
                 )
                 .await
                 .map_err(|error| {
@@ -1716,6 +1805,7 @@ impl MempalMcpServer {
                     detail,
                     result_retry_deadline,
                     bound_attempt_busy_timeout,
+                    self.daemon_write_observer.as_ref(),
                 )
                 .await?;
             }
@@ -1741,24 +1831,21 @@ impl MempalMcpServer {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        match queue.refresh_heartbeat(claim_id.clone(), heartbeat_worker_id.clone()).await {
+                        let result = queue
+                            .refresh_heartbeat(claim_id.clone(), heartbeat_worker_id.clone())
+                            .await;
+                        if let Some(observer) = &write_observer {
+                            observer.observe_maintenance_queue_result(
+                                format!("failed to refresh async ingest heartbeat {claim_id}"),
+                                &result,
+                            );
+                        }
+                        match result {
                             Ok(()) => {}
                             Err(error) if should_continue_ingest_heartbeat_after_error(&error) => {
-                                if let Some(observer) = &write_observer {
-                                    observer.record_queue_error(
-                                        format!("failed to refresh async ingest heartbeat {claim_id}"),
-                                        &error,
-                                    );
-                                }
                                 tracing::warn!(error = %error, claim_id = %claim_id, "transient failure refreshing async ingest heartbeat; will retry");
                             }
                             Err(error) => {
-                                if let Some(observer) = &write_observer {
-                                    observer.record_queue_error(
-                                        format!("failed to refresh async ingest heartbeat {claim_id}"),
-                                        &error,
-                                    );
-                                }
                                 tracing::warn!(error = %error, claim_id = %claim_id, "failed to refresh async ingest heartbeat");
                                 break;
                             }
@@ -1770,43 +1857,31 @@ impl MempalMcpServer {
         });
         (stop_tx, heartbeat)
     }
-
     async fn refresh_ingest_claim_heartbeat_once(
         queue: &AsyncPendingMessageStore,
         claim_id: &str,
         worker_id: &str,
         write_observer: Option<&crate::daemon_bootstrap::DaemonWriteObserver>,
     ) {
-        match queue
+        let result = queue
             .refresh_heartbeat(claim_id.to_string(), worker_id.to_string())
-            .await
-        {
+            .await;
+        if let Some(observer) = write_observer {
+            observer.observe_maintenance_queue_result(
+                format!("failed to refresh async ingest heartbeat before completion {claim_id}"),
+                &result,
+            );
+        }
+        match result {
             Ok(()) => {}
             Err(error) if should_continue_ingest_heartbeat_after_error(&error) => {
-                if let Some(observer) = write_observer {
-                    observer.record_queue_error(
-                        format!(
-                            "failed to refresh async ingest heartbeat before completion {claim_id}"
-                        ),
-                        &error,
-                    );
-                }
                 tracing::warn!(error = %error, claim_id, "transient failure refreshing async ingest heartbeat before completion");
             }
             Err(error) => {
-                if let Some(observer) = write_observer {
-                    observer.record_queue_error(
-                        format!(
-                            "failed to refresh async ingest heartbeat before completion {claim_id}"
-                        ),
-                        &error,
-                    );
-                }
                 tracing::warn!(error = %error, claim_id, "failed to refresh async ingest heartbeat before completion");
             }
         }
     }
-
     async fn stop_ingest_claim_heartbeat(
         stop_tx: tokio::sync::oneshot::Sender<()>,
         heartbeat: tokio::task::JoinHandle<()>,
@@ -2838,7 +2913,13 @@ impl MempalMcpServer {
                 Ok(Some(claim)) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if scoped_ingest_processing_budget(remaining).is_none() {
-                        Self::release_scoped_claim_after_timeout(&queue, claim, remaining).await?;
+                        Self::release_scoped_claim_after_timeout(
+                            &queue,
+                            claim,
+                            remaining,
+                            self.daemon_write_observer.as_ref(),
+                        )
+                        .await?;
                         return Ok(None);
                     }
 
@@ -2935,8 +3016,9 @@ impl MempalMcpServer {
         queue: &AsyncPendingMessageStore,
         claim: ClaimedMessage,
         retry_deadline: Duration,
+        write_observer: Option<&crate::daemon_bootstrap::DaemonWriteObserver>,
     ) -> std::result::Result<(), ErrorData> {
-        Self::release_claim_with_lock_retry_deadline(queue, claim, retry_deadline)
+        Self::release_claim_with_lock_retry_deadline(queue, claim, retry_deadline, write_observer)
             .await
             .map_err(|error| {
                 ErrorData::internal_error(
@@ -2949,11 +3031,13 @@ impl MempalMcpServer {
     async fn release_claim_with_lock_retry(
         queue: &AsyncPendingMessageStore,
         claim: ClaimedMessage,
+        write_observer: Option<&crate::daemon_bootstrap::DaemonWriteObserver>,
     ) -> crate::core::queue::Result<()> {
         Self::release_claim_with_lock_retry_deadline(
             queue,
             claim,
             MCP_INGEST_CLAIM_RELEASE_RETRY_DEADLINE,
+            write_observer,
         )
         .await
     }
@@ -2962,17 +3046,28 @@ impl MempalMcpServer {
         queue: &AsyncPendingMessageStore,
         claim: ClaimedMessage,
         retry_deadline: Duration,
+        write_observer: Option<&crate::daemon_bootstrap::DaemonWriteObserver>,
     ) -> crate::core::queue::Result<()> {
         let started = Instant::now();
         loop {
-            match queue
+            let release_result = queue
                 .release_claim_with_busy_timeout(
                     claim.clone(),
                     MCP_INGEST_CLAIM_RELEASE_BUSY_TIMEOUT,
                 )
-                .await
-            {
-                Ok(()) | Err(QueueError::ClaimLost(_)) => return Ok(()),
+                .await;
+            let result = match release_result {
+                Ok(()) | Err(QueueError::ClaimLost(_)) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Some(observer) = write_observer {
+                observer.observe_maintenance_queue_result(
+                    format!("failed to release MCP ingest claim {}", claim.id),
+                    &result,
+                );
+            }
+            match result {
+                Ok(()) => return Ok(()),
                 Err(error) if error.is_sqlite_lock() && started.elapsed() < retry_deadline => {
                     let remaining = retry_deadline.saturating_sub(started.elapsed());
                     tracing::warn!(
@@ -12326,8 +12421,9 @@ async fn requeue_ingest_claim_after_transient_write_lock(
     claim: &ClaimedMessage,
     detail: String,
     retry_delay: Duration,
+    write_observer: Option<&crate::daemon_bootstrap::DaemonWriteObserver>,
 ) -> anyhow::Result<()> {
-    queue
+    let result = queue
         .mark_failed_with_disposition(
             claim.clone(),
             detail,
@@ -12335,13 +12431,18 @@ async fn requeue_ingest_claim_after_transient_write_lock(
                 delay_ms: i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
             },
         )
-        .await
-        .map_err(|error| {
-            anyhow::Error::new(error)
-                .context("failed to requeue async ingest after transient write lock")
-        })
+        .await;
+    if let Some(observer) = write_observer {
+        observer.observe_maintenance_queue_result(
+            format!("failed to requeue MCP ingest claim {}", claim.id),
+            &result,
+        );
+    }
+    result.map_err(|error| {
+        anyhow::Error::new(error)
+            .context("failed to requeue async ingest after transient write lock")
+    })
 }
-
 fn push_mcp_timeout_warning(
     response_warnings: &mut Vec<String>,
     system_warnings: &mut Vec<SystemWarning>,
@@ -12465,6 +12566,7 @@ async fn complete_failed_ingest_claim(
     claim: &ClaimedMessage,
     queue_wait_ms: u64,
     detail: String,
+    write_observer: Option<&crate::daemon_bootstrap::DaemonWriteObserver>,
 ) -> anyhow::Result<()> {
     complete_failed_ingest_claim_with_lock_retry_deadline(
         queue,
@@ -12473,6 +12575,7 @@ async fn complete_failed_ingest_claim(
         detail,
         MCP_INGEST_RESULT_RETRY_DEADLINE,
         false,
+        write_observer,
     )
     .await
 }
@@ -12484,6 +12587,7 @@ async fn complete_failed_ingest_claim_with_lock_retry_deadline(
     detail: String,
     result_retry_deadline: Duration,
     bound_attempt_busy_timeout: bool,
+    write_observer: Option<&crate::daemon_bootstrap::DaemonWriteObserver>,
 ) -> anyhow::Result<()> {
     let mut finalized =
         finalize_failed_ingest_response(claim.id.clone(), claim.created_at, detail.clone());
@@ -12504,6 +12608,7 @@ async fn complete_failed_ingest_claim_with_lock_retry_deadline(
         },
         result_retry_deadline,
         bound_attempt_busy_timeout,
+        write_observer,
     )
     .await
     .map_err(|error| anyhow::Error::new(error).context("failed to store async ingest failure"))?;
@@ -12516,6 +12621,7 @@ async fn complete_ingest_operation_with_lock_retry_deadline(
     completion: PendingOperationCompletion,
     retry_deadline: Duration,
     bound_attempt_busy_timeout: bool,
+    write_observer: Option<&crate::daemon_bootstrap::DaemonWriteObserver>,
 ) -> crate::core::queue::Result<()> {
     let started = Instant::now();
     loop {
@@ -12525,25 +12631,26 @@ async fn complete_ingest_operation_with_lock_retry_deadline(
         } else {
             None
         };
-        match queue
+        let result = queue
             .complete_operation_with_busy_timeout(claim.clone(), completion.clone(), busy_timeout)
-            .await
-        {
+            .await;
+        if let Some(observer) = write_observer {
+            observer.observe_semantic_queue_result(
+                format!("failed to complete MCP ingest claim {}", claim.id),
+                &result,
+            );
+        }
+        match result {
             Ok(()) => return Ok(()),
             Err(error) if error.is_sqlite_lock() && started.elapsed() < retry_deadline => {
                 let remaining = retry_deadline.saturating_sub(started.elapsed());
-                tracing::warn!(
-                    ?error,
-                    operation_id = %claim.id,
-                    "retrying async ingest result persistence after SQLite lock"
-                );
+                tracing::warn!(?error, operation_id = %claim.id, "retrying async ingest result persistence after SQLite lock");
                 tokio::time::sleep(MCP_INGEST_RESULT_RETRY_DELAY.min(remaining)).await;
             }
             Err(error) => return Err(error),
         }
     }
 }
-
 fn rfc3339_from_secs(secs: i64) -> String {
     crate::cowork::peek::format_rfc3339(UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64))
 }
@@ -16829,175 +16936,7 @@ pattern_boost = 0.2
         assert!(!completed.created_drawer_ids.is_empty());
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_async_ingest_malformed_payload_records_failed_receipt() {
-        let (_tempdir, db_path, server) = setup_server();
-        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
-        let operation_id = queue
-            .enqueue(INGEST_ASYNC_KIND, "{not json")
-            .expect("enqueue malformed async ingest");
-        let claim = queue
-            .claim_next_by_kind("worker-malformed", 60, INGEST_ASYNC_KIND)
-            .expect("claim malformed op")
-            .expect("claimed malformed op");
-        let async_queue = AsyncPendingMessageStore::from_store(queue.clone());
-
-        server
-            .process_ingest_claim(&async_queue, "worker-malformed", claim)
-            .await
-            .expect("process malformed payload");
-
-        let failed = server
-            .operation_status_json_for_test(&operation_id)
-            .await
-            .expect("failed status");
-        assert_eq!(failed.state, Some(IngestOperationState::Failed));
-        assert!(failed.drawer_id.is_empty());
-        assert!(
-            failed
-                .failure_detail
-                .as_deref()
-                .is_some_and(|detail| detail.contains("failed to decode ingest operation")),
-            "{failed:?}"
-        );
-
-        let record = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path)
-            .operation_status(&operation_id)
-            .expect("load operation record")
-            .expect("operation record exists");
-        assert_eq!(record.op_state, IngestOperationState::Failed.as_str());
-        assert!(record.completed_at.is_some());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_async_ingest_failure_receipt_retries_transient_sqlite_lock() {
-        let (_tempdir, db_path, server) = setup_server();
-        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
-        let operation_id = queue
-            .enqueue(INGEST_ASYNC_KIND, "{not json")
-            .expect("enqueue malformed async ingest");
-        let claim = queue
-            .claim_next_by_kind("worker-failure-lock", 60, INGEST_ASYNC_KIND)
-            .expect("claim malformed op")
-            .expect("claimed malformed op");
-        let async_queue = AsyncPendingMessageStore::from_store(queue.clone())
-            .with_complete_lock_failures_for_test(2);
-
-        server
-            .process_ingest_claim(&async_queue, "worker-failure-lock", claim)
-            .await
-            .expect("transient failure receipt persistence locks should be retried");
-
-        let failed = server
-            .operation_status_json_for_test(&operation_id)
-            .await
-            .expect("failed status");
-        assert_eq!(failed.state, Some(IngestOperationState::Failed));
-        assert!(failed.drawer_id.is_empty());
-        assert!(
-            failed
-                .failure_detail
-                .as_deref()
-                .is_some_and(|detail| detail.contains("failed to decode ingest operation")),
-            "{failed:?}"
-        );
-        let record = queue
-            .operation_status(&operation_id)
-            .expect("load operation record")
-            .expect("operation record exists");
-        assert_eq!(record.op_state, IngestOperationState::Failed.as_str());
-        assert!(record.completed_at.is_some());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_scoped_finite_malformed_payload_completion_lock_releases_claim() {
-        let (_tempdir, db_path, server) = setup_server();
-        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
-        let operation_id = queue
-            .enqueue(INGEST_ASYNC_KIND, "{not json")
-            .expect("enqueue malformed async ingest");
-        let claim = queue
-            .claim_next_by_kind("worker-finite-failure-lock", 60, INGEST_ASYNC_KIND)
-            .expect("claim malformed op")
-            .expect("claimed malformed op");
-        let async_queue = AsyncPendingMessageStore::from_store(queue.clone())
-            .with_complete_lock_failures_for_test(10_000);
-
-        let started = Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_secs(3),
-            server.process_ingest_claim_inline_with_budget(
-                &async_queue,
-                "worker-finite-failure-lock",
-                claim,
-                Duration::from_secs(1),
-            ),
-        )
-        .await
-        .expect("finite scoped failure receipt retry must not use the 300s background window")
-        .expect("malformed payload should release for retry when failure receipt is locked");
-
-        assert_eq!(result, ScopedIngestProcessResult::TimedOut);
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "finite scoped failure receipt retry exceeded the caller budget"
-        );
-        let record = queue
-            .operation_status(&operation_id)
-            .expect("load operation record")
-            .expect("operation record exists");
-        assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
-        assert!(
-            record.claimed_at.is_none(),
-            "malformed payload must release the claim when failure receipt persistence times out"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_scoped_finite_malformed_payload_real_sqlite_lock_respects_budget() {
-        let (_tempdir, db_path, server) = setup_server();
-        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
-        let operation_id = queue
-            .enqueue(INGEST_ASYNC_KIND, "{not json")
-            .expect("enqueue malformed async ingest");
-        let claim = queue
-            .claim_next_by_kind("worker-real-failure-lock", 60, INGEST_ASYNC_KIND)
-            .expect("claim malformed op")
-            .expect("claimed malformed op");
-        let async_queue = AsyncPendingMessageStore::from_store(queue.clone());
-        let lock = hold_sqlite_write_lock(db_path.clone(), Duration::from_secs(2));
-
-        let started = Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_secs(3),
-            server.process_ingest_claim_inline_with_budget(
-                &async_queue,
-                "worker-real-failure-lock",
-                claim,
-                Duration::from_secs(1),
-            ),
-        )
-        .await
-        .expect("finite scoped failure receipt must not wait for SQLite's default busy timeout");
-        let error = result.expect_err("real locked failure receipt should return a bounded error");
-        assert!(
-            error
-                .to_string()
-                .contains("failed to release timed-out scoped ingest claim"),
-            "{error:#}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "finite scoped malformed-payload completion waited for the default SQLite busy timeout"
-        );
-        lock.join().expect("lock thread");
-        let record = queue
-            .operation_status(&operation_id)
-            .expect("load operation record")
-            .expect("operation record exists");
-        assert_eq!(record.op_state, IngestOperationState::Running.as_str());
-        assert!(record.completed_at.is_none());
-    }
+    include!("server/tests/ingest_malformed_receipt_tests.rs");
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_async_ingest_retries_when_writer_lease_lost_before_tier2_audit() {

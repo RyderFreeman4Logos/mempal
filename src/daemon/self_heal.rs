@@ -237,22 +237,21 @@ async fn persist_hook_ipc_request(
     write_observer: &crate::daemon_bootstrap::DaemonWriteObserver,
     request: crate::hook_ipc::HookIpcEnqueueRequest,
 ) -> crate::hook_ipc::HookIpcEnqueueResponse {
-    match store
+    let result = store
         .enqueue_idempotent_with_key_fail_fast(
             request.kind.clone(),
             request.payload.clone(),
             request.idempotency_key.clone(),
         )
-        .await
-    {
+        .await;
+    write_observer.observe_semantic_queue_result("failed to persist hook IPC capture", &result);
+    match result {
         Ok(message_id) => {
             tracing::debug!(message_id, kind = %request.kind, "persisted hook IPC capture");
-            write_observer.record_successful_write();
             crate::hook_ipc::HookIpcEnqueueResponse::Accepted
         }
         Err(error) => {
             let message = format!("failed to persist hook IPC capture: {error}");
-            write_observer.record_queue_error("failed to persist hook IPC capture", &error);
             tracing::warn!(?error, kind = %request.kind, "failed to persist hook IPC capture");
             crate::hook_ipc::HookIpcEnqueueResponse::Error { message }
         }

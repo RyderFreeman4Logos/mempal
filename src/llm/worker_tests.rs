@@ -380,6 +380,132 @@ impl Drop for ConfigHarnessResetGuard {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_worker_observes_client_preparation_release_lock() {
+    let _guard = crate::core::config::global_config_test_lock()
+        .lock_owned()
+        .await;
+    let _shutdown_guard = crate::daemon::global_shutdown_test_lock()
+        .lock_owned()
+        .await;
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let _config_reset = ConfigHarnessResetGuard;
+    let config_path = tmp.path().join("config.toml");
+    let db_path = tmp.path().join("palace.db");
+    std::fs::write(
+        &config_path,
+        "[config_hot_reload]\nenabled = false\n[llm]\nenabled = true\nenabled_for = [\"gating\"]\nbase_url = \"https://example.com/v1\"\nmodel = \"test-model\"\nretry_interval_secs = 1\n[privacy.remote_calls]\nfail_closed = true\n",
+    )
+    .expect("write unavailable LLM config");
+    ConfigHandle::bootstrap_quiet(&config_path).expect("bootstrap unavailable LLM config");
+
+    let db = Database::open(&db_path).expect("open db");
+    let store = PendingMessageStore::new(db.path()).expect("open queue");
+    store
+        .enqueue(LLM_TASK_KIND, "{}")
+        .expect("enqueue LLM task");
+    let async_store = AsyncPendingMessageStore::from_store(store)
+        .with_release_lock_failures_for_test(1);
+    let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+    let client_runtime = Arc::new(Mutex::new(LlmClientRuntime::new(
+        &ConfigHandle::current().llm,
+    )));
+    let test_lease = db
+        .runtime_writer_lease_acquire("sqlite-writer", "test", "llm-worker-test", 300, None)
+        .expect("acquire test lease")
+        .expect("test lease available");
+    let observer = DaemonWriteObserver::for_test();
+    let worker = tokio::spawn(run_llm_worker(
+        Arc::new(async_store),
+        client_runtime,
+        Arc::new(LlmStatus::new(5)),
+        async_db,
+        observer.clone(),
+        test_lease,
+    ));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if observer.last_error_for_test().is_some_and(|(error, is_lock)| {
+                is_lock && error.contains("client preparation failure")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("client-preparation release lock should reach the typed observer");
+    worker.abort();
+    let _ = worker.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_worker_survives_confirm_lock_contention() {
+    let _guard = crate::core::config::global_config_test_lock()
+        .lock_owned()
+        .await;
+    let _shutdown_guard = crate::daemon::global_shutdown_test_lock()
+        .lock_owned()
+        .await;
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let _config_reset = ConfigHarnessResetGuard;
+    let config_path = tmp.path().join("config.toml");
+    let db_path = tmp.path().join("palace.db");
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_notify = Arc::new(Notify::new());
+    let (base_url, server) =
+        spawn_counting_llm_server(Arc::clone(&request_count), request_notify).await;
+    std::fs::write(&config_path, worker_test_config(&base_url)).expect("write worker config");
+    ConfigHandle::bootstrap_quiet(&config_path).expect("bootstrap worker config");
+
+    let db = Database::open(&db_path).expect("open db");
+    let store = PendingMessageStore::new(db.path()).expect("open queue");
+    for drawer_id in ["confirm-lock-first", "confirm-lock-second"] {
+        insert_drawer(&db, drawer_id);
+        record_pending_llm_audit(&db, drawer_id);
+        store
+            .enqueue(
+                LLM_TASK_KIND,
+                &serde_json::to_string(&gating_task(drawer_id)).expect("serialize task"),
+            )
+            .expect("enqueue LLM task");
+    }
+    let async_store = AsyncPendingMessageStore::from_store(store.clone())
+        .with_complete_lock_failures_for_test(1);
+    let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+    let client_runtime = Arc::new(Mutex::new(LlmClientRuntime::new(
+        &ConfigHandle::current().llm,
+    )));
+    let test_lease = db
+        .runtime_writer_lease_acquire("sqlite-writer", "test", "llm-worker-test", 300, None)
+        .expect("acquire test lease")
+        .expect("test lease available");
+    let (worker_completed, completion) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(run_llm_worker_inner(
+        Arc::new(async_store),
+        client_runtime,
+        Arc::new(LlmStatus::new(5)),
+        async_db,
+        DaemonWriteObserver::for_test(),
+        test_lease,
+        Some(worker_completed),
+    ));
+
+    tokio::time::timeout(Duration::from_secs(20), completion)
+        .await
+        .expect("worker should retain capacity after confirm lock")
+        .expect("worker completion observer should remain connected");
+    worker.abort();
+    let _ = worker.await;
+    server.abort();
+    let _ = server.await;
+
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    let stats = store.stats().expect("queue stats");
+    assert_eq!((stats.pending, stats.claimed), (0, 1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_worker_uses_reloaded_client_when_generation_changes_before_claim_returns() {
     let _guard = crate::core::config::global_config_test_lock()
         .lock_owned()
