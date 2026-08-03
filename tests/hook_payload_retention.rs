@@ -83,9 +83,9 @@ impl OwnedForegroundDaemon {
             let retention_diagnostics = output.contains("hook payload retention")
                 && output.contains("scanned_files=2")
                 && output.contains("deleted_files=1");
-            // This message is emitted only after the production signal handlers
-            // are installed, so SIGTERM below exercises the real shutdown path.
-            let signal_handler_ready = output.contains("daemon log path");
+            // Scheduler startup follows signal-handler installation and keeps this
+            // hooks-disabled fixture alive until SIGTERM.
+            let signal_handler_ready = output.contains("daemon embedded sleep scheduler started");
             if expired_removed
                 && within_budget_preserved
                 && retention_diagnostics
@@ -368,7 +368,7 @@ fn daemon_startup_runs_hook_payload_retention_with_configured_age_budget() {
     std::fs::write(
         mempal_home.join("config.toml"),
         format!(
-            "db_path = \"{}\"\n\n[hooks]\nenabled = false\npayload_retention_days = 30\n\n[daemon]\nlog_path = \"{}\"\n",
+            "db_path = \"{}\"\n\n[hooks]\nenabled = false\npayload_retention_days = 30\n\n[daemon]\nlog_path = \"{}\"\n\n[sleep]\nenabled = true\nauto_interval_secs = 3600\nphases = [\"salience\"]\n",
             db_path.display(),
             log_path.display()
         ),
