@@ -200,14 +200,14 @@ fn test_reindex_batched_does_not_block_concurrent_reads() {
         .map(|i| (format!("batch-drawer-{i:04}"), 1))
         .collect();
 
-    let db_path_writer = db_path.clone();
+    let db_r = Database::open(&db_path).expect("open reader db");
+    let db_w = Database::open(&db_path).expect("open writer db");
     let updates_for_writer = updates.clone();
     let writer_done = Arc::new(AtomicBool::new(false));
     let writer_done_clone = Arc::clone(&writer_done);
 
     // Writer: bulk_update_importance in a separate thread using its own DB connection
     let writer = thread::spawn(move || {
-        let db_w = Database::open(&db_path_writer).expect("open writer db");
         db_w.bulk_update_importance(&updates_for_writer)
             .expect("bulk update importance");
         writer_done_clone.store(true, Ordering::SeqCst);
@@ -218,7 +218,6 @@ fn test_reindex_batched_does_not_block_concurrent_reads() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut read_succeeded = false;
     while Instant::now() < deadline {
-        let db_r = Database::open(&db_path).expect("open reader db");
         let count: i64 = db_r
             .conn()
             .query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))
@@ -235,8 +234,7 @@ fn test_reindex_batched_does_not_block_concurrent_reads() {
     writer.join().expect("writer thread panicked");
 
     // After writer completes, all rows should have importance = 1
-    let db_final = Database::open(&db_path).expect("open final db");
-    let still_zero: i64 = db_final
+    let still_zero: i64 = db_r
         .conn()
         .query_row(
             "SELECT COUNT(*) FROM drawers WHERE importance = 0",
