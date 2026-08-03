@@ -18,6 +18,7 @@ use mempal::core::utils::iso_timestamp;
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory, global_embed_status};
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::time::Instant;
 use tower::ServiceExt;
 
 #[path = "search_budget/admission.rs"]
@@ -232,7 +233,7 @@ fn search_metadata(headers: &HeaderMap) -> Value {
     .expect("parse search metadata")
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn slow_embedder_uses_bm25_within_single_caller_budget() {
     let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new("");
@@ -243,7 +244,7 @@ async fn slow_embedder_uses_bm25_within_single_caller_budget() {
         4,
     );
     let state = env.state(Arc::new(SlowEmbedderFactory));
-    let started = StdInstant::now();
+    let started = Instant::now();
     let (status, headers, body) = get_json(
         state.clone(),
         "/api/search?q=alpha&scope=global&top_k=5&deadline_ms=2000&correlation_id=slow-embed-test",
@@ -272,7 +273,7 @@ async fn slow_embedder_uses_bm25_within_single_caller_budget() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn embedding_timeout_without_bm25_fallback_returns_gateway_timeout() {
     let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::with_options(false, 30, 30, "");
@@ -283,7 +284,7 @@ async fn embedding_timeout_without_bm25_fallback_returns_gateway_timeout() {
         4,
     );
     let state = env.state(Arc::new(SlowEmbedderFactory));
-    let started = StdInstant::now();
+    let started = Instant::now();
     let (status, headers, body) = get_json(
         state.clone(),
         "/api/search?q=alpha&scope=global&top_k=5&deadline_ms=2000&correlation_id=embed-no-fallback",
@@ -369,7 +370,7 @@ async fn hybrid_db_timeout_without_bm25_fallback_returns_gateway_timeout() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn slow_reranker_preserves_ranking_before_caller_budget_expires() {
     let _guard = TEST_LOCK.lock().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -398,7 +399,7 @@ top_k = 50
     insert_search_drawer(&db, "drawer_rank_a", "alpha primary memory", 4);
     insert_search_drawer(&db, "drawer_rank_b", "alpha secondary memory", 2);
     let state = env.state(Arc::new(FailingEmbedderFactory));
-    let started = StdInstant::now();
+    let started = Instant::now();
 
     let (status, headers, body) = get_json(
         state.clone(),
@@ -572,7 +573,7 @@ search_db_deadline_secs = 480
     assert_eq!(search_metadata(&headers)["deadline_ms"], 480_000);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stages_share_remaining_budget_without_serial_timeout_addition() {
     let _guard = TEST_LOCK.lock().await;
     // Total E2E budget 2s; slow embed would take 5s alone. Shared budget forces
@@ -585,7 +586,7 @@ async fn stages_share_remaining_budget_without_serial_timeout_addition() {
         4,
     );
     let state = env.state(Arc::new(SlowEmbedderFactory));
-    let started = StdInstant::now();
+    let started = Instant::now();
     let (status, headers, body) = get_json(
         state,
         "/api/search?q=alpha&scope=global&top_k=5&correlation_id=shared-budget",
