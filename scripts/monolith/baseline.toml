@@ -437,10 +437,10 @@ rationale = "xurl store drift reconciled for #783 to exact formatter/tokenizer o
 [[files]]
 path = "tests/cli_dashboard.rs"
 kind = "test"
-baseline_tokens = 10804
-baseline_lines = 1476
-issue = "838"
-rationale = "#838 hardens the load-sensitive observability readonly dashboard fixture under full-suite contention (disable hot-reload watcher + bounded bootstrap-only retries); exact no-growth ratchet."
+baseline_tokens = 10937
+baseline_lines = 1493
+issue = "859"
+rationale = "#859 replaces the blind tail-follow startup sleep with a seed-output readiness handshake; exact formatter/tokenizer no-growth ratchet."
 
 [[files]]
 path = "tests/config_hot_reload.rs"

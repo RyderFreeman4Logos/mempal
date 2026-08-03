@@ -241,11 +241,7 @@ fn spawn_mempal(home: &Path, cwd: &Path, args: &[&str]) -> Child {
         .expect("spawn mempal")
 }
 
-fn read_lines_until(
-    child: &mut Child,
-    expected_lines: usize,
-    timeout: Duration,
-) -> (Vec<String>, Option<Instant>) {
+fn child_output_lines(child: &mut Child) -> mpsc::Receiver<String> {
     let stdout = child.stdout.take().expect("stdout");
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -261,7 +257,14 @@ fn read_lines_until(
             }
         }
     });
+    rx
+}
 
+fn read_lines_until(
+    rx: &mpsc::Receiver<String>,
+    expected_lines: usize,
+    timeout: Duration,
+) -> (Vec<String>, Option<Instant>) {
     let start = Instant::now();
     let mut first_at = None;
     let mut lines = Vec::new();
@@ -767,8 +770,20 @@ async fn test_tail_follow_coalesces_event_storm() {
 #[test]
 fn test_tail_follow_sees_new_drawers() {
     let env = DashboardEnv::new();
-    let mut child = spawn_mempal(&env.home, env.cwd(), &["tail", "--follow", "--limit", "0"]);
-    std::thread::sleep(Duration::from_secs(2));
+    insert_drawer(
+        &env.db_path,
+        &drawer_seed(
+            "follow-seed",
+            "tail follow readiness seed",
+            "default",
+            Some("follow"),
+            "1713001000",
+            2,
+        ),
+    );
+    let mut child = spawn_mempal(&env.home, env.cwd(), &["tail", "--follow", "--limit", "1"]);
+    let output_lines = child_output_lines(&mut child);
+    let (seed_lines, _) = read_lines_until(&output_lines, 1, Duration::from_secs(10));
 
     insert_drawer(
         &env.db_path,
@@ -782,12 +797,14 @@ fn test_tail_follow_sees_new_drawers() {
         ),
     );
 
-    let (lines, _) = read_lines_until(&mut child, 1, Duration::from_secs(10));
+    let (new_lines, _) = read_lines_until(&output_lines, 1, Duration::from_secs(10));
     let _ = child.kill();
     let _ = child.wait();
 
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    assert!(lines[0].contains("follow-new"), "{lines:?}");
+    assert_eq!(seed_lines.len(), 1, "{seed_lines:?}");
+    assert!(seed_lines[0].contains("follow-seed"), "{seed_lines:?}");
+    assert_eq!(new_lines.len(), 1, "{new_lines:?}");
+    assert!(new_lines[0].contains("follow-new"), "{new_lines:?}");
 }
 
 #[test]
