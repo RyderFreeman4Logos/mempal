@@ -1215,6 +1215,14 @@ threshold = 0.5
         );
     }
 
+    struct ConfigHarnessResetGuard;
+
+    impl Drop for ConfigHarnessResetGuard {
+        fn drop(&mut self) {
+            ConfigHandle::harness_reset();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_worker_uses_reloaded_client_when_generation_changes_before_claim_returns() {
         let _guard = crate::core::config::global_config_test_lock()
@@ -1224,6 +1232,8 @@ threshold = 0.5
             .lock_owned()
             .await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
+        // Declared after `tmp` so Drop resets before TempDir deletion.
+        let _config_reset = ConfigHarnessResetGuard;
         let config_path = tmp.path().join("config.toml");
         let db_path = tmp.path().join("palace.db");
 
@@ -1312,6 +1322,7 @@ threshold = 0.5
             .lock_owned()
             .await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
+        let _config_reset = ConfigHarnessResetGuard;
         let config_path = tmp.path().join("config.toml");
         let db_path = tmp.path().join("palace.db");
 

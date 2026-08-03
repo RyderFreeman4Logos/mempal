@@ -2943,6 +2943,23 @@ impl ConfigHandle {
     pub fn harness_reload_from_path(path: &std::path::Path) {
         super::hot_reload::global_hot_reload_state().reload_from_disk_for_test(path);
     }
+
+    /// Synchronously stop the watcher runtime and restore `Config::default()`.
+    /// Test-only isolation seam; does not merge through runtime-allowed fields.
+    #[doc(hidden)]
+    pub fn harness_reset() {
+        super::hot_reload::global_hot_reload_state().harness_reset();
+    }
+
+    #[doc(hidden)]
+    pub fn harness_runtime_active() -> bool {
+        super::hot_reload::global_hot_reload_state().harness_runtime_active()
+    }
+
+    #[doc(hidden)]
+    pub fn harness_event_log_path() -> Option<std::path::PathBuf> {
+        super::hot_reload::global_hot_reload_state().harness_event_log_path()
+    }
 }
 
 fn global_scrub_stats() -> &'static Mutex<ScrubStats> {
@@ -3684,10 +3701,171 @@ embedder_mode = "small_local"
             assert!(!scrubbed.contains("user:pass"), "{scrubbed}");
             assert!(!scrubbed.contains("private-token-path"), "{scrubbed}");
             assert!(!scrubbed.contains("api_key"), "{scrubbed}");
-            assert!(
-                !scrubbed.contains("sk-secret-should-not-print"),
-                "{scrubbed}"
-            );
+            assert!(!scrubbed.contains("«redacted:sk-…»"), "{scrubbed}");
         }
+    }
+
+    #[tokio::test]
+    async fn harness_reset_restores_defaults_and_stops_watcher_same_process() {
+        use super::ConfigHandle;
+        use std::fs;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let lock = super::global_config_test_lock();
+        let _lock = lock.lock().await;
+
+        {
+            let tmp = TempDir::new().expect("tempdir");
+            let config_path = tmp.path().join("config.toml");
+            fs::write(
+                &config_path,
+                r#"
+[config_hot_reload]
+enabled = false
+
+[llm]
+enabled = true
+base_url = "http://127.0.0.1:9"
+model = "test-model"
+max_concurrent = 1
+"#,
+            )
+            .expect("write disabled-runtime config");
+            ConfigHandle::bootstrap_quiet(&config_path).expect("bootstrap disabled runtime");
+            assert!(ConfigHandle::current().llm.enabled);
+            assert!(!ConfigHandle::harness_runtime_active());
+            assert!(ConfigHandle::harness_event_log_path().is_some());
+            // Drop tmp while state still holds the deleted event path; reset must clear it.
+        }
+
+        {
+            let tmp = TempDir::new().expect("partial override tempdir");
+            let path = tmp.path().join("partial.toml");
+            fs::write(&path, "[search]\nbm25_fallback = false\n").expect("write partial");
+            ConfigHandle::harness_reload_from_path(&path);
+            assert!(!ConfigHandle::current().search.bm25_fallback);
+            assert!(
+                ConfigHandle::current().llm.enabled,
+                "runtime-allowed merge keeps restart-required llm.enabled"
+            );
+            ConfigHandle::harness_reset();
+            assert!(
+                !ConfigHandle::current().llm.enabled,
+                "harness_reset restores default llm.enabled"
+            );
+            assert_eq!(
+                ConfigHandle::current().search.bm25_fallback,
+                Config::default().search.bm25_fallback
+            );
+            assert!(!ConfigHandle::harness_runtime_active());
+            assert_eq!(ConfigHandle::harness_event_log_path(), None);
+            assert!(ConfigHandle::recent_events().is_empty());
+        }
+
+        let watcher_tmp = TempDir::new().expect("watcher tempdir");
+        let config_path = watcher_tmp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[config_hot_reload]
+enabled = true
+debounce_ms = 10
+poll_fallback_secs = 1
+
+[llm]
+enabled = true
+base_url = "http://127.0.0.1:9"
+model = "test-model"
+"#,
+        )
+        .expect("write watcher config");
+        ConfigHandle::bootstrap(&config_path).expect("bootstrap watcher");
+        assert!(ConfigHandle::harness_runtime_active());
+        assert!(ConfigHandle::current().llm.enabled);
+        let llm_gen = ConfigHandle::subscribe_llm_gen();
+        let embed_gen = ConfigHandle::subscribe_embed_gen();
+        let attempts = ConfigHandle::parse_attempts();
+        let next_path = watcher_tmp.path().join("config.next.toml");
+        fs::write(
+            &next_path,
+            r#"
+[config_hot_reload]
+enabled = true
+debounce_ms = 10
+poll_fallback_secs = 1
+
+[llm]
+enabled = true
+base_url = "http://127.0.0.1:9"
+model = "test-model-next"
+[embed]
+max_concurrent = 17
+"#,
+        )
+        .expect("write next config");
+        fs::rename(&next_path, &config_path).expect("atomic rename config");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !(llm_gen.has_changed().unwrap() && embed_gen.has_changed().unwrap()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watcher should observe the atomic rename"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ConfigHandle::parse_attempts() > attempts);
+        let reloads = ConfigHandle::harness_reload_counter();
+        let counters = || {
+            (
+                reloads.load(Ordering::SeqCst),
+                *llm_gen.borrow(),
+                *embed_gen.borrow(),
+            )
+        };
+        let before_reset = counters();
+        assert!(matches!(before_reset, (1.., 1.., 1..)));
+        ConfigHandle::harness_reset();
+        assert_eq!(
+            counters(),
+            before_reset,
+            "harness_reset must preserve monotonic counters"
+        );
+        assert!(!ConfigHandle::harness_runtime_active());
+        assert!(!ConfigHandle::current().llm.enabled);
+        assert_eq!(
+            ConfigHandle::current().search.bm25_fallback,
+            Config::default().search.bm25_fallback
+        );
+        assert_eq!(ConfigHandle::harness_event_log_path(), None);
+        let attempts_after_reset = ConfigHandle::parse_attempts();
+        assert_eq!(attempts_after_reset, 0);
+
+        // Tempdir still exists; after reset, watcher must not progress.
+        let next_path = watcher_tmp.path().join("config.after-reset.toml");
+        fs::write(
+            &next_path,
+            r#"
+[config_hot_reload]
+enabled = true
+
+[llm]
+enabled = true
+base_url = "http://127.0.0.1:9"
+model = "test-model"
+
+[search]
+bm25_fallback = false
+"#,
+        )
+        .expect("write after-reset config");
+        fs::rename(&next_path, &config_path).expect("atomic rename after reset");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(ConfigHandle::parse_attempts(), attempts_after_reset);
+        assert_eq!(
+            ConfigHandle::current().search.bm25_fallback,
+            Config::default().search.bm25_fallback
+        );
+        assert!(!ConfigHandle::current().llm.enabled);
     }
 }

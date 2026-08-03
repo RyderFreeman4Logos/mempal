@@ -127,6 +127,13 @@ impl TestEnv {
     }
 }
 
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        // Drop runs before TempDir field drop; stop watcher first.
+        ConfigHandle::harness_reset();
+    }
+}
+
 fn write_config_atomic(path: &Path, content: &str) {
     let tmp_path = path.with_extension("tmp");
     fs::write(&tmp_path, content).expect("write temp config");

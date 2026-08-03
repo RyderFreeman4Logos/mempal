@@ -89,12 +89,14 @@ struct RuntimeControl {
     control_tx: mpsc::Sender<WatchMessage>,
     coordinator: thread::JoinHandle<()>,
     poller: thread::JoinHandle<()>,
+    poller_thread: thread::Thread,
 }
 
 impl RuntimeControl {
     fn stop(self) {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.control_tx.send(WatchMessage::Stop);
+        self.poller_thread.unpark();
         let _ = self.coordinator.join();
         let _ = self.poller.join();
     }
@@ -309,6 +311,50 @@ impl HotReloadState {
         self.reload_from_disk(path);
     }
 
+    /// Test-only: resets the snapshot, watcher runtime, event path/log, parse
+    /// attempts, and runtime prototypes without runtime-allowed merges.
+    /// Successful-reload and generation counters intentionally remain monotonic so
+    /// existing subscribers never move backward.
+    #[doc(hidden)]
+    pub fn harness_reset(&self) {
+        if let Some(existing) = self.runtime.lock().expect("runtime mutex poisoned").take() {
+            existing.stop();
+        }
+
+        let defaults = Config::default();
+        let snapshot =
+            ConfigSnapshot::from_config(defaults.clone()).expect("default config is valid");
+        self.snapshot.store(Arc::new(snapshot));
+        *self
+            .event_log_path
+            .lock()
+            .expect("event log path mutex poisoned") = None;
+        self.event_log
+            .lock()
+            .expect("event log mutex poisoned")
+            .clear();
+        self.parse_attempts.store(0, Ordering::SeqCst);
+        self.runtime_prototypes.store(Arc::new(
+            defaults.ingest_gating.embedding_classifier.prototypes,
+        ));
+    }
+
+    #[doc(hidden)]
+    pub fn harness_runtime_active(&self) -> bool {
+        self.runtime
+            .lock()
+            .expect("runtime mutex poisoned")
+            .is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn harness_event_log_path(&self) -> Option<PathBuf> {
+        self.event_log_path
+            .lock()
+            .expect("event log path mutex poisoned")
+            .clone()
+    }
+
     fn start_runtime(
         &self,
         path: PathBuf,
@@ -411,7 +457,10 @@ impl HotReloadState {
         let poller = thread::spawn(move || {
             let mut previous = file_signature(&poll_path);
             while !stop_for_poller.load(Ordering::SeqCst) {
-                thread::sleep(poll_interval);
+                thread::park_timeout(poll_interval);
+                if stop_for_poller.load(Ordering::SeqCst) {
+                    break;
+                }
                 if !poll_toggle.load(Ordering::SeqCst) {
                     previous = file_signature(&poll_path);
                     continue;
@@ -424,6 +473,7 @@ impl HotReloadState {
                 }
             }
         });
+        let poller_thread = poller.thread().clone();
 
         let _ = ready_rx.recv_timeout(Duration::from_secs(1));
 
@@ -432,6 +482,7 @@ impl HotReloadState {
             control_tx,
             coordinator,
             poller,
+            poller_thread,
         }
     }
 
