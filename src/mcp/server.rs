@@ -15380,10 +15380,8 @@ quality_policy = "llm_required_for_keep"
 
     impl Drop for ConfigOverrideGuard {
         fn drop(&mut self) {
-            let tempdir = tempfile::tempdir().expect("config reset tempdir");
-            let path = tempdir.path().join("default.toml");
-            fs::write(&path, "").expect("write default config");
-            crate::core::config::ConfigHandle::harness_reload_from_path(&path);
+            // Drop runs before field drops, so the override tempdir is still alive.
+            crate::core::config::ConfigHandle::harness_reset();
         }
     }
 
