@@ -3709,6 +3709,7 @@ embedder_mode = "small_local"
     async fn harness_reset_restores_defaults_and_stops_watcher_same_process() {
         use super::ConfigHandle;
         use std::fs;
+        use std::sync::atomic::Ordering;
         use std::time::Duration;
         use tempfile::TempDir;
 
@@ -3798,7 +3799,7 @@ poll_fallback_secs = 1
 [llm]
 enabled = true
 base_url = "http://127.0.0.1:9"
-model = "test-model"
+model = "test-model-next"
 
 [search]
 bm25_fallback = false
@@ -3817,7 +3818,22 @@ bm25_fallback = false
         assert!(!ConfigHandle::current().search.bm25_fallback);
         assert!(ConfigHandle::parse_attempts() > previous_attempts);
 
+        let reload_counter = ConfigHandle::harness_reload_counter();
+        let counters_before_reset = (
+            reload_counter.load(Ordering::SeqCst),
+            ConfigHandle::current_llm_runtime_snapshot().generation,
+            ConfigHandle::current_embed_generation(),
+        );
         ConfigHandle::harness_reset();
+        assert_eq!(
+            (
+                reload_counter.load(Ordering::SeqCst),
+                ConfigHandle::current_llm_runtime_snapshot().generation,
+                ConfigHandle::current_embed_generation(),
+            ),
+            counters_before_reset,
+            "harness_reset must preserve monotonic counters"
+        );
         assert!(!ConfigHandle::harness_runtime_active());
         assert!(!ConfigHandle::current().llm.enabled);
         assert_eq!(

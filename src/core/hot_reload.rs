@@ -311,8 +311,10 @@ impl HotReloadState {
         self.reload_from_disk(path);
     }
 
-    /// Synchronously stop any watcher runtime and restore a pure default snapshot.
-    /// Test-only: bypasses runtime-allowed merges so restart-required fields reset.
+    /// Test-only: resets the snapshot, watcher runtime, event path/log, parse
+    /// attempts, and runtime prototypes without runtime-allowed merges.
+    /// Successful-reload and generation counters intentionally remain monotonic so
+    /// existing subscribers never move backward.
     #[doc(hidden)]
     pub fn harness_reset(&self) {
         if let Some(existing) = self.runtime.lock().expect("runtime mutex poisoned").take() {

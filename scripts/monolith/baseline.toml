@@ -173,16 +173,16 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/core/config.rs"
 kind = "source"
-baseline_tokens = 30286
-baseline_lines = 3858
+baseline_tokens = 30408
+baseline_lines = 3874
 issue = "859"
 rationale = "#859 adds test-only ConfigHandle::harness_reset same-process isolation regression; exact no-growth ratchet."
 
 [[files]]
 path = "src/core/hot_reload.rs"
 kind = "source"
-baseline_tokens = 6034
-baseline_lines = 809
+baseline_tokens = 6055
+baseline_lines = 811
 issue = "859"
 rationale = "#859 adds interruptible poller wake and test-only harness_reset isolation seam; exact no-growth ratchet."
 
