@@ -42,6 +42,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **Local-gate fixtures**: make timing and lifecycle fixtures deterministic, with
+  regression coverage for harness resets, counter advancement, and lease
+  countdown projection (#859).
+
 - **Daemon supervisor cooldowns**: return the stable temporary-refusal status
   `75` (`EX_TEMPFAIL`) only when an active restart-budget cooldown refuses
   bootstrap, and ship a canonical systemd unit that prevents this status from
