@@ -3784,9 +3784,9 @@ model = "test-model"
         ConfigHandle::bootstrap(&config_path).expect("bootstrap watcher");
         assert!(ConfigHandle::harness_runtime_active());
         assert!(ConfigHandle::current().llm.enabled);
-
-        let previous = ConfigHandle::version();
-        let previous_attempts = ConfigHandle::parse_attempts();
+        let llm_gen = ConfigHandle::subscribe_llm_gen();
+        let embed_gen = ConfigHandle::subscribe_embed_gen();
+        let attempts = ConfigHandle::parse_attempts();
         let next_path = watcher_tmp.path().join("config.next.toml");
         fs::write(
             &next_path,
@@ -3800,38 +3800,35 @@ poll_fallback_secs = 1
 enabled = true
 base_url = "http://127.0.0.1:9"
 model = "test-model-next"
-
-[search]
-bm25_fallback = false
+[embed]
+max_concurrent = 17
 "#,
         )
         .expect("write next config");
         fs::rename(&next_path, &config_path).expect("atomic rename config");
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while ConfigHandle::version() == previous {
+        while !(llm_gen.has_changed().unwrap() && embed_gen.has_changed().unwrap()) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "watcher should observe the atomic rename"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(!ConfigHandle::current().search.bm25_fallback);
-        assert!(ConfigHandle::parse_attempts() > previous_attempts);
-
-        let reload_counter = ConfigHandle::harness_reload_counter();
-        let counters_before_reset = (
-            reload_counter.load(Ordering::SeqCst),
-            ConfigHandle::current_llm_runtime_snapshot().generation,
-            ConfigHandle::current_embed_generation(),
-        );
+        assert!(ConfigHandle::parse_attempts() > attempts);
+        let reloads = ConfigHandle::harness_reload_counter();
+        let counters = || {
+            (
+                reloads.load(Ordering::SeqCst),
+                *llm_gen.borrow(),
+                *embed_gen.borrow(),
+            )
+        };
+        let before_reset = counters();
+        assert!(matches!(before_reset, (1.., 1.., 1..)));
         ConfigHandle::harness_reset();
         assert_eq!(
-            (
-                reload_counter.load(Ordering::SeqCst),
-                ConfigHandle::current_llm_runtime_snapshot().generation,
-                ConfigHandle::current_embed_generation(),
-            ),
-            counters_before_reset,
+            counters(),
+            before_reset,
             "harness_reset must preserve monotonic counters"
         );
         assert!(!ConfigHandle::harness_runtime_active());
