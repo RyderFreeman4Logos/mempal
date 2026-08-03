@@ -276,7 +276,10 @@ async fn run_llm_worker_inner(
             )
             .await
         {
-            Ok(Some(msg)) => msg,
+            Ok(Some(msg)) => {
+                write_observer.record_queue_maintenance_success();
+                msg
+            }
             Ok(None) => {
                 let effective_interval = llm_idle_poll_interval(LLM_POLL_INTERVAL, idle_count);
                 idle_count = idle_count.saturating_add(1);
@@ -376,7 +379,6 @@ async fn run_llm_worker_inner(
             _ = llm_gen_rx.changed() => None,
         };
         drop(heartbeat);
-        heartbeat_handle.abort();
         let _ = heartbeat_handle.await;
 
         let latency_ms = start.elapsed().as_millis();

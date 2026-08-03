@@ -237,8 +237,8 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/core/queue.rs"
 kind = "source"
-baseline_tokens = 24278
-baseline_lines = 3186
+baseline_tokens = 24150
+baseline_lines = 3155
 issue = "858"
 rationale = "#858 typed daemon queue-write SQLite contention observations need heartbeat lock-fault injection on AsyncPendingMessageStore; exact no-growth ratchet."
 
@@ -277,8 +277,8 @@ rationale = "Writer-lease fenced crystallization writes; #680 correctness fix"
 [[files]]
 path = "src/daemon.rs"
 kind = "source"
-baseline_tokens = 52707
-baseline_lines = 6645
+baseline_tokens = 54102
+baseline_lines = 6792
 issue = "858"
 rationale = "#858 hooks typed queue-write SQLite contention into confirm/mark_failed/heartbeat observation paths; exact no-growth ratchet."
 
@@ -333,8 +333,8 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/llm/worker.rs"
 kind = "source"
-baseline_tokens = 12457
-baseline_lines = 1511
+baseline_tokens = 7113
+baseline_lines = 897
 issue = "858"
 rationale = "#858 LLM heartbeat/confirm/mark_failed/release paths record typed queue SQLite contention; exact no-growth ratchet."
 
@@ -365,8 +365,8 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 181390
-baseline_lines = 22853
+baseline_tokens = 180458
+baseline_lines = 22792
 issue = "858"
 rationale = "#858 daemon-scoped ingest heartbeat/write paths record typed queue SQLite contention; exact no-growth ratchet."
 

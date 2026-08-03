@@ -649,7 +649,7 @@ impl AsyncPendingMessageStore {
     }
 
     pub async fn mark_failed(&self, claim: ClaimedMessage, error: String) -> Result<()> {
-        self.run(move |store| store.mark_failed(&claim, &error))
+        self.mark_failed_with_disposition(claim, error, QueueFailureDisposition::Retryable)
             .await
     }
 
@@ -659,6 +659,10 @@ impl AsyncPendingMessageStore {
         error: String,
         disposition: QueueFailureDisposition,
     ) -> Result<()> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if consume_lock_failure(&self.complete_lock_failures) {
+            return Err(sqlite_busy_queue_error());
+        }
         self.run(move |store| store.mark_failed_with_disposition(&claim, &error, disposition))
             .await
     }

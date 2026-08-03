@@ -9,6 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
+#[path = "worker_contention_tests.rs"]
+mod contention_tests;
+
 fn spawn_runtime_ticker() -> (Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
     let ticks = Arc::new(AtomicU64::new(0));
     let ticks_bg = Arc::clone(&ticks);

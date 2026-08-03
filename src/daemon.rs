@@ -743,11 +743,11 @@ async fn process_hook_worker_message_inner(
             config: state.config.as_ref(),
             mempal_home: &state.mempal_home,
             runtime_writer_lease: state.runtime_writer_lease.as_ref(),
-            heartbeat_trigger: Some(heartbeat_trigger),
+            heartbeat_trigger: Some(heartbeat_trigger.clone()),
         },
     )
     .await;
-    heartbeat_handle.abort();
+    drop(heartbeat_trigger);
     let _ = heartbeat_handle.await;
 
     match result {
@@ -1273,6 +1273,9 @@ where
     match store.claim_next(worker_id, claim_ttl_secs).await {
         Ok(Some(message)) => {
             backoff.reset();
+            if let Some(observer) = &backoff.write_observer {
+                observer.record_queue_maintenance_success();
+            }
             ClaimPollResult::Claimed(message)
         }
         Ok(None) => {
@@ -4579,16 +4582,33 @@ mod tests {
             Ok(Some(claimed_message("msg-1"))),
             Err(sqlite_busy_queue_error_for_test()),
         ]);
-        let mut backoff = ClaimBackoffState::default();
+        let write_observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+        let mut backoff = ClaimBackoffState {
+            write_observer: Some(write_observer.clone()),
+            ..Default::default()
+        };
         let observed = Arc::new(Mutex::new(Vec::new()));
 
-        for _ in 0..5 {
+        for attempt in 0..5 {
             let observed = Arc::clone(&observed);
-            let _ = poll_claim_next(&store, "worker-a", 60, &mut backoff, move |duration| {
+            let result = poll_claim_next(&store, "worker-a", 60, &mut backoff, move |duration| {
                 observed.lock().expect("observed durations").push(duration);
                 Box::pin(std::future::ready(()))
             })
             .await;
+            if attempt == 3 {
+                assert!(matches!(result, ClaimPollResult::Claimed(_)));
+                assert_eq!(
+                    write_observer.last_error_for_test(),
+                    None,
+                    "a successful claim mutation must clear observed SQLite contention"
+                );
+            } else if attempt <= 2 {
+                assert!(
+                    write_observer.last_error_for_test().is_some(),
+                    "only a successful claim may clear the preceding claim contention"
+                );
+            }
         }
 
         assert_eq!(
@@ -5397,6 +5417,13 @@ mod tests {
         release: Arc<Notify>,
     }
 
+    struct HeartbeatFinalizationOverlapEmbedder {
+        attempts: AtomicUsize,
+        first_started: Arc<Notify>,
+        first_release: Arc<Notify>,
+        second_started: Arc<Notify>,
+    }
+
     #[async_trait::async_trait]
     impl Embedder for ControlledEmbedder {
         async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
@@ -5419,6 +5446,159 @@ mod tests {
         fn name(&self) -> &str {
             "controlled-test"
         }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for HeartbeatFinalizationOverlapEmbedder {
+        async fn embed(&self, _texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_started.notify_one();
+                self.first_release.notified().await;
+                return Err(EmbedError::Runtime("retry heartbeat overlap".to_string()));
+            }
+            self.second_started.notify_one();
+            Err(EmbedError::InvalidResponse(
+                "finish while heartbeat write is blocked".to_string(),
+            ))
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        fn name(&self) -> &str {
+            "heartbeat-finalization-overlap"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hook_worker_joins_in_flight_heartbeat_before_finalization() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
+        let _shutdown_guard = ShutdownResetGuard::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let mempal_home = tmp.path().join(".mempal");
+        std::fs::create_dir_all(&mempal_home).expect("create mempal home");
+        let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(db.path()).expect("store");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+        let hook_payload = serde_json::json!({
+            "tool_name": "Bash",
+            "input": "printf overlap",
+            "output": "overlap",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let queued_id = store
+            .enqueue(
+                HookEvent::PostToolUse.queue_kind(),
+                &serde_json::to_string(&envelope).expect("serialize envelope"),
+            )
+            .expect("enqueue hook envelope");
+        let worker_id = "heartbeat-overlap-worker";
+        let message = store
+            .claim_next(worker_id, 60)
+            .expect("claim next")
+            .expect("claimed message");
+        let first_claim_token = message.claim_token.clone();
+        let first_started = Arc::new(Notify::new());
+        let first_release = Arc::new(Notify::new());
+        let second_started = Arc::new(Notify::new());
+        let (heartbeat_observer, heartbeat_observed) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(super::process_hook_worker_message_inner(
+            HookWorkerState {
+                async_db,
+                db_path: db_path.clone(),
+                store: async_store,
+                worker_id: worker_id.to_string(),
+                embedder: Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
+                    HeartbeatFinalizationOverlapEmbedder {
+                        attempts: AtomicUsize::new(0),
+                        first_started: Arc::clone(&first_started),
+                        first_release: Arc::clone(&first_release),
+                        second_started: Arc::clone(&second_started),
+                    },
+                ))),
+                prototype_classifier: Arc::new(ArcSwap::from_pointee(None)),
+                llm_gate: None,
+                config: Arc::new(Config::default()),
+                mempal_home,
+                write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+                runtime_writer_lease: None,
+                idle_observer: None,
+            },
+            message,
+            60,
+            Some(heartbeat_observer),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(30), first_started.notified())
+            .await
+            .expect("first embed attempt should start");
+        let lock = rusqlite::Connection::open(&db_path).expect("open write-lock connection");
+        lock.execute_batch("BEGIN IMMEDIATE")
+            .expect("hold heartbeat write lock");
+        first_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(30), second_started.notified())
+            .await
+            .expect("second embed attempt should reach finalization");
+        lock.execute_batch("ROLLBACK").expect("release write lock");
+
+        tokio::time::timeout(Duration::from_secs(30), worker)
+            .await
+            .expect("hook worker should finish")
+            .expect("hook worker should not panic");
+        tokio::time::timeout(Duration::from_secs(1), heartbeat_observed)
+            .await
+            .expect("heartbeat observation should complete before finalization")
+            .expect("heartbeat observer must not escape through an aborted wrapper");
+
+        rusqlite::Connection::open(&db_path)
+            .expect("open queue retry connection")
+            .execute(
+                "UPDATE pending_messages \
+                 SET status = 'pending', op_state = 'queued', next_attempt_at = 0, \
+                     claim_token = NULL, claimed_at = NULL, heartbeat_at = NULL \
+                 WHERE id = ?1",
+                [queued_id.as_str()],
+            )
+            .expect("requeue failed hook for the next generation");
+        let next_generation = store
+            .claim_next(worker_id, 60)
+            .expect("claim next generation")
+            .expect("manually requeued hook should be claimable");
+        assert_ne!(next_generation.claim_token, first_claim_token);
+        let conn = rusqlite::Connection::open(&db_path).expect("open heartbeat probe connection");
+        conn.execute(
+            "UPDATE pending_messages SET heartbeat_at = 0 WHERE id = ?1",
+            [queued_id.as_str()],
+        )
+        .expect("set next-generation heartbeat sentinel");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let heartbeat_at: i64 = conn
+            .query_row(
+                "SELECT heartbeat_at FROM pending_messages WHERE id = ?1",
+                [queued_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("read next-generation heartbeat");
+        assert_eq!(
+            heartbeat_at, 0,
+            "no previous heartbeat may reach the next claim"
+        );
     }
 
     #[tokio::test]
