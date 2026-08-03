@@ -3,7 +3,9 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant as StdInstant};
+use std::time::Duration;
+#[cfg(feature = "db-test-seam")]
+use std::time::Instant as StdInstant;
 
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
