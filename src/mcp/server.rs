@@ -15393,10 +15393,8 @@ quality_policy = "llm_required_for_keep"
 
     impl Drop for ConfigOverrideGuard {
         fn drop(&mut self) {
-            let tempdir = tempfile::tempdir().expect("config reset tempdir");
-            let path = tempdir.path().join("default.toml");
-            fs::write(&path, "").expect("write default config");
-            crate::core::config::ConfigHandle::harness_reload_from_path(&path);
+            // Drop runs before field drops, so the override tempdir is still alive.
+            crate::core::config::ConfigHandle::harness_reset();
         }
     }
 
@@ -18465,7 +18463,7 @@ prototypes = ["keep"]
         assert!(error.to_string().contains("domain"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_mcp_brief_embedding_deadline_falls_back_to_bm25() {
         let _config_guard = ConfigOverrideGuard::install(
             "[search]\nbm25_fallback = true\n\n[embed.retry]\nsearch_deadline_secs = 1\n",
@@ -18482,38 +18480,40 @@ prototypes = ["keep"]
             "tests://mcp/brief/deadline",
             4,
         );
-        let async_db = AsyncDb::open(&db_path, 4).expect("open async db fixture");
+        let query_only_async_db =
+            QueryOnlyAsyncDb::open(&db_path, 4).expect("open query-only async db fixture");
         let gate = Arc::new(Notify::new());
+        let release_gate = Arc::clone(&gate);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            release_gate.notify_one();
+        });
         let call_count = Arc::new(AtomicUsize::new(0));
         let server = MempalMcpServer::new_with_factory(
             db_path,
             Arc::new(BlockingEmbedderFactory {
                 vector: vec![0.1, 0.2, 0.3],
                 call_count: Arc::clone(&call_count),
-                gate: Arc::clone(&gate),
+                gate,
                 released: Arc::new(AtomicBool::new(false)),
             }),
         )
         .expect("create MCP server")
-        .with_async_db_for_test(async_db);
+        .with_query_only_async_db_for_test(query_only_async_db);
 
-        let response = tokio::time::timeout(
-            Duration::from_secs(4),
-            server.mempal_brief(Parameters(BriefMcpRequest {
+        let response = server
+            .mempal_brief(Parameters(BriefMcpRequest {
                 query: "MCP synthetic deadline query".to_string(),
                 field: Some(anchor::DEFAULT_FIELD.to_string()),
                 domain: Some("project".to_string()),
                 cwd: None,
                 max_items: Some(3),
                 dao_tian_limit: None,
-            })),
-        )
-        .await
-        .expect("brief should return before client timeout")
-        .expect("brief response")
-        .0;
+            }))
+            .await
+            .expect("brief response")
+            .0;
 
-        gate.notify_waiters();
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
         assert_eq!(response.search_mode, "bm25_only");
         assert!(

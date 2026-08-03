@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::{
     Database, DeleteRequest, Parameters, hold_sqlite_write_lock, insert_drawer, setup_server,
@@ -67,19 +67,22 @@ async fn test_mcp_delete_retry_deadline_rejects_queued_late_write_without_soft_d
         .await
         .expect("fixture must use the cached MCP async database pool");
 
-    // Hold a real external SQLite write lock beyond the retry deadline. A
-    // queued pooled writer keeps the delete waiting for its sole writer permit
-    // until after that deadline, which used to let a late attempt soft-delete
-    // after the caller had already timed out.
-    let lock = hold_sqlite_write_lock(db_path.clone(), Duration::from_millis(11_000));
+    // Keep both contention points locked until the delete returns its deadline
+    // error. Cleanup is deliberately completed before any result assertions.
+    let lock = rusqlite::Connection::open(&db_path).expect("open SQLite lock connection");
+    lock.execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold SQLite write lock");
     let (writer_ready_tx, writer_ready_rx) = tokio::sync::oneshot::channel();
+    let (writer_release_tx, writer_release_rx) = std::sync::mpsc::channel();
     let writer = tokio::spawn(async move {
         async_db
             .run_write(move |_| {
                 writer_ready_tx
                     .send(())
                     .expect("signal queued writer holds the pool permit");
-                std::thread::sleep(Duration::from_millis(10_250));
+                writer_release_rx
+                    .recv()
+                    .expect("release queued writer permit");
                 Ok::<(), crate::core::db::DbError>(())
             })
             .await
@@ -89,7 +92,6 @@ async fn test_mcp_delete_retry_deadline_rejects_queued_late_write_without_soft_d
         .expect("queued writer must acquire the pool permit")
         .expect("queued writer readiness sender must stay alive");
 
-    let started = Instant::now();
     let mut delete = tokio::spawn(async move {
         server
             .mempal_delete(Parameters(DeleteRequest {
@@ -97,29 +99,34 @@ async fn test_mcp_delete_retry_deadline_rejects_queued_late_write_without_soft_d
             }))
             .await
     });
-    let bounded = tokio::time::timeout(Duration::from_millis(10_750), &mut delete).await;
-    let elapsed = started.elapsed();
+    // This 20s timeout is only a deadlock guard; sqlite_retry's exact 10s budget is
+    // covered by `async_wrapper_passes_exact_shared_ten_second_deadline`.
+    let bounded = tokio::time::timeout(Duration::from_secs(20), &mut delete).await;
+    let returned_before_release = bounded.is_ok();
 
-    lock.join().expect("release SQLite write lock");
-    writer
-        .await
+    let writer_release_result = writer_release_tx.send(());
+    let writer_result = writer.await;
+    let rollback_result = lock.execute_batch("ROLLBACK;");
+    let delete_result = match bounded {
+        Ok(result) => result,
+        Err(_) => delete.await,
+    };
+
+    writer_release_result.expect("release queued writer permit");
+    writer_result
         .expect("queued writer task")
         .expect("queued writer");
-    let delete = match bounded {
-        Ok(result) => result.expect("MCP delete task must not panic"),
-        Err(_) => delete
-            .await
-            .expect("drain a formerly late MCP delete after lock release"),
-    };
+    rollback_result.expect("release SQLite write lock");
+    assert!(
+        returned_before_release,
+        "MCP delete must reject before the held writer permit and SQLite lock are released"
+    );
+    let delete = delete_result.expect("MCP delete task must not panic");
 
     let error = match delete {
         Ok(_) => panic!("MCP delete must not report success after its retry deadline"),
         Err(error) => error,
     };
-    assert!(
-        elapsed < Duration::from_millis(10_750),
-        "MCP delete exceeded its wall-clock retry budget: {elapsed:?}"
-    );
     let data = error
         .data
         .as_ref()

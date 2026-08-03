@@ -210,6 +210,44 @@ async fn send_hook_ipc_request(
     serde_json::from_str(line.trim()).expect("hook IPC response")
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_hook_ipc_readiness_does_not_persist_queue_row() {
+    let _test_guard = lock_hook_ipc_tests().await;
+    super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    let tmp = short_tempdir();
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+
+    let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+    let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+    let (mut client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
+    let handler = tokio::spawn(super::handle_hook_ipc_connection(server, store, observer));
+    tokio::io::AsyncWriteExt::write_all(&mut client, b"{\"probe\":\"readiness\"}\n")
+        .await
+        .expect("write readiness request");
+    tokio::io::AsyncWriteExt::flush(&mut client)
+        .await
+        .expect("flush readiness request");
+
+    let mut reader = tokio::io::BufReader::new(client);
+    let mut line = String::new();
+    tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+        .await
+        .expect("read readiness response");
+    handler.await.expect("handler task");
+    let response = crate::hook_ipc::HookIpcResponse::Readiness(
+        serde_json::from_str(line.trim()).expect("hook IPC readiness response"),
+    );
+    assert!(matches!(
+        response,
+        crate::hook_ipc::HookIpcResponse::Readiness(
+            crate::hook_ipc::HookIpcReadinessResponse::Ready { .. }
+        )
+    ));
+    assert_eq!(pending_message_total(&db_path), 0);
+}
+
 #[tokio::test]
 async fn test_hook_ipc_ack_requires_sqlite_persistence() {
     let _test_guard = lock_hook_ipc_tests().await;

@@ -173,10 +173,18 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/core/config.rs"
 kind = "source"
-baseline_tokens = 29018
-baseline_lines = 3693
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt recalibrated after #677 config growth; no-growth ratchet."
+baseline_tokens = 30408
+baseline_lines = 3874
+issue = "859"
+rationale = "#859 adds test-only ConfigHandle::harness_reset same-process isolation regression; exact no-growth ratchet."
+
+[[files]]
+path = "src/core/hot_reload.rs"
+kind = "source"
+baseline_tokens = 6055
+baseline_lines = 811
+issue = "859"
+rationale = "#859 adds interruptible poller wake and test-only harness_reset isolation seam; exact no-growth ratchet."
 
 [[files]]
 path = "src/core/db.rs"
@@ -325,10 +333,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/llm/worker.rs"
 kind = "source"
-baseline_tokens = 12300
-baseline_lines = 1480
-issue = "680"
-rationale = "Writer-lease generation fence threaded through run_llm_worker; #680 review F1 correctness fix"
+baseline_tokens = 12308
+baseline_lines = 1491
+issue = "859"
+rationale = "#859 routes LLM bootstrap tests through RAII ConfigHandle::harness_reset; exact no-growth ratchet."
 
 [[files]]
 path = "src/longmemeval.rs"
@@ -437,18 +445,18 @@ rationale = "xurl store drift reconciled for #783 to exact formatter/tokenizer o
 [[files]]
 path = "tests/cli_dashboard.rs"
 kind = "test"
-baseline_tokens = 10804
-baseline_lines = 1476
-issue = "838"
-rationale = "#838 hardens the load-sensitive observability readonly dashboard fixture under full-suite contention (disable hot-reload watcher + bounded bootstrap-only retries); exact no-growth ratchet."
+baseline_tokens = 10937
+baseline_lines = 1493
+issue = "859"
+rationale = "#859 replaces the blind tail-follow startup sleep with a seed-output readiness handshake; exact formatter/tokenizer no-growth ratchet."
 
 [[files]]
 path = "tests/config_hot_reload.rs"
 kind = "test"
-baseline_tokens = 8142
-baseline_lines = 967
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 8181
+baseline_lines = 974
+issue = "859"
+rationale = "#859 stops hot-reload TestEnv runtime before TempDir drop; exact no-growth ratchet."
 
 [[files]]
 path = "tests/context_assembler.rs"

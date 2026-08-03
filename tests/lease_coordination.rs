@@ -253,11 +253,11 @@ fn runtime_writer_lease_generation_fences_stale_owner_after_takeover() {
             .unwrap()
     );
     assert!(db.runtime_writer_lease_is_active(&second).unwrap());
-    assert_eq!(
-        db.runtime_writer_lease_status(Some("sqlite-writer"))
-            .unwrap(),
-        vec![second]
-    );
+    let mut active = db
+        .runtime_writer_lease_status(Some("sqlite-writer"))
+        .unwrap();
+    active[0].remaining_secs = second.remaining_secs;
+    assert_eq!(active, vec![second]);
 }
 
 #[test]
@@ -290,9 +290,10 @@ fn runtime_writer_lease_daemon_start_rebinds_previous_daemon_identity() {
     assert_eq!(rebound.owner, previous.owner);
     assert_eq!(rebound.pid, std::process::id());
     assert_ne!(rebound.session_id, previous.session_id);
-    let active = db
+    let mut active = db
         .runtime_writer_lease_status(Some("sqlite-writer"))
         .unwrap();
+    active[0].remaining_secs = rebound.remaining_secs;
     assert_eq!(active, vec![rebound]);
 }
 

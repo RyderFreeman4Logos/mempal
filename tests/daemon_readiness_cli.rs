@@ -6,7 +6,6 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use mempal::core::db::Database;
-use mempal::core::queue::PendingMessageStore;
 use tempfile::TempDir;
 
 fn mempal_bin() -> String {
@@ -216,11 +215,6 @@ fn test_daemon_wait_after_restart_requires_status_and_write_transport_readiness(
         tmp.path().join(".mempal/daemon-hook.sock").exists(),
         "readiness must include the daemon write transport"
     );
-    let queue_stats = PendingMessageStore::new_without_reclaim(&db_path)
-        .stats()
-        .expect("read queue stats after readiness probe");
-    assert_eq!(queue_stats.pending, 0, "readiness probe must not enqueue");
-    assert_eq!(queue_stats.claimed, 0, "readiness probe must not claim");
 
     let mut status_command = Command::new(mempal_bin());
     status_command
