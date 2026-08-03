@@ -1,5 +1,15 @@
 use super::*;
-use crate::core::queue::PendingMessageStore;
+use crate::core::queue::{PendingMessageStore, QueueError};
+
+fn sqlite_protocol_queue_error() -> QueueError {
+    QueueError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::FileLockingProtocolFailed,
+            extended_code: rusqlite::ffi::SQLITE_PROTOCOL,
+        },
+        Some("locking protocol conflict".to_string()),
+    ))
+}
 
 #[tokio::test]
 async fn write_observer_reports_stall_when_queue_has_work_and_no_recent_writes() {
@@ -43,7 +53,7 @@ async fn write_observer_requests_recovery_after_success_invalidates_lock_error()
     let store = AsyncPendingMessageStore::from_store(sync_store);
 
     let observer = DaemonWriteObserver::new();
-    observer.record_error("claim_next failed: sqlite error: database is locked");
+    observer.record_claim_error(&sqlite_protocol_queue_error());
     observer.record_successful_write();
     observer.force_last_successful_write_for_test(unix_secs().saturating_sub(DAEMON_STALL_SECONDS));
 
@@ -54,7 +64,7 @@ async fn write_observer_requests_recovery_after_success_invalidates_lock_error()
 }
 
 #[tokio::test]
-async fn write_observer_does_not_restart_for_transient_sqlite_stall() {
+async fn write_observer_does_not_restart_for_typed_sqlite_protocol_stall() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
@@ -66,7 +76,7 @@ async fn write_observer_does_not_restart_for_transient_sqlite_stall() {
 
     let observer = DaemonWriteObserver::new();
     observer.force_last_successful_write_for_test(unix_secs().saturating_sub(DAEMON_STALL_SECONDS));
-    observer.record_claim_error("sqlite error: database is locked");
+    observer.record_claim_error(&sqlite_protocol_queue_error());
 
     assert!(
         !observer.maybe_log_stall(&store).await,
@@ -130,7 +140,7 @@ async fn write_observer_requests_recovery_after_sqlite_contention_expires() {
     let observer = DaemonWriteObserver::new();
     let now = unix_secs();
     observer.force_last_successful_write_for_test(now.saturating_sub(DAEMON_STALL_SECONDS));
-    observer.record_claim_error("sqlite error: database is locked");
+    observer.record_claim_error(&sqlite_protocol_queue_error());
     observer.force_last_error_observed_at_for_test(
         now.saturating_sub(DAEMON_SQLITE_CONTENTION_FRESHNESS_SECONDS),
     );
