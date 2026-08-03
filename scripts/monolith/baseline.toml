@@ -237,10 +237,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/core/queue.rs"
 kind = "source"
-baseline_tokens = 23943
-baseline_lines = 3151
-issue = "843"
-rationale = "#843 exports bounded read-only queue statistics for daemon status diagnostics; exact no-growth ratchet."
+baseline_tokens = 24278
+baseline_lines = 3186
+issue = "858"
+rationale = "#858 typed daemon queue-write SQLite contention observations need heartbeat lock-fault injection on AsyncPendingMessageStore; exact no-growth ratchet."
 
 [[files]]
 path = "src/core/types.rs"
@@ -277,10 +277,10 @@ rationale = "Writer-lease fenced crystallization writes; #680 correctness fix"
 [[files]]
 path = "src/daemon.rs"
 kind = "source"
-baseline_tokens = 52651
-baseline_lines = 6634
-issue = "843"
-rationale = "Bound daemon SIGTERM ingest-worker drain by residual DAEMON_DRAIN_BUDGET so zero-budget wait tests cannot hang on mid-claim embed I/O; exact no-growth ratchet."
+baseline_tokens = 52707
+baseline_lines = 6645
+issue = "858"
+rationale = "#858 hooks typed queue-write SQLite contention into confirm/mark_failed/heartbeat observation paths; exact no-growth ratchet."
 
 [[files]]
 path = "src/daemon_bootstrap.rs"
@@ -333,10 +333,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/llm/worker.rs"
 kind = "source"
-baseline_tokens = 12308
-baseline_lines = 1491
-issue = "859"
-rationale = "#859 routes LLM bootstrap tests through RAII ConfigHandle::harness_reset; exact no-growth ratchet."
+baseline_tokens = 12457
+baseline_lines = 1511
+issue = "858"
+rationale = "#858 LLM heartbeat/confirm/mark_failed/release paths record typed queue SQLite contention; exact no-growth ratchet."
 
 [[files]]
 path = "src/longmemeval.rs"
@@ -365,10 +365,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 181227
-baseline_lines = 22824
-issue = "843"
-rationale = "#843 preserves deterministic MCP ingest receipts after uncertain daemon delivery, adds budgeted scoped ingest-worker drain so daemon SIGTERM cannot hang on in-flight claims, and retries transient admission-sidecar lock contention so an admitted drain claim is not released before the lock holder exits; exact no-growth ratchet."
+baseline_tokens = 181390
+baseline_lines = 22853
+issue = "858"
+rationale = "#858 daemon-scoped ingest heartbeat/write paths record typed queue SQLite contention; exact no-growth ratchet."
 
 [[files]]
 path = "src/mcp/tools.rs"

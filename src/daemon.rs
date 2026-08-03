@@ -714,11 +714,18 @@ async fn process_hook_worker_message_inner(
         )
         .with_retry_count(message.retry_count as u64),
     );
-    refresh_hook_message_heartbeat(&state.store, &message_id, &state.worker_id).await;
+    refresh_hook_message_heartbeat(
+        &state.store,
+        &message_id,
+        &state.worker_id,
+        &state.write_observer,
+    )
+    .await;
     let heartbeat_handle = spawn_hook_message_heartbeat(
         state.store.clone(),
         message_id.clone(),
         state.worker_id.clone(),
+        state.write_observer.clone(),
         hook_message_heartbeat_interval(claim_ttl_secs),
         heartbeat_observer,
     );
@@ -746,7 +753,7 @@ async fn process_hook_worker_message_inner(
                 tracing::error!(?error, "failed to confirm {message_id}");
                 state
                     .write_observer
-                    .record_error(format!("failed to confirm {message_id}: {error}"));
+                    .record_queue_error(format!("failed to confirm {message_id}"), &error);
                 span.finish_error(error);
             } else {
                 state.write_observer.record_successful_write();
@@ -766,7 +773,7 @@ async fn process_hook_worker_message_inner(
                 tracing::error!(?mark_error, "failed to mark_failed {message_id}");
                 state
                     .write_observer
-                    .record_error(format!("failed to mark_failed {message_id}: {mark_error}"));
+                    .record_queue_error(format!("failed to mark_failed {message_id}"), &mark_error);
                 span.finish_error(mark_error);
             } else {
                 span.finish_error(error_text);
@@ -781,6 +788,7 @@ fn spawn_hook_message_heartbeat(
     store: AsyncPendingMessageStore,
     message_id: String,
     worker_id: String,
+    write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
     interval: Duration,
     mut observer: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -793,7 +801,7 @@ fn spawn_hook_message_heartbeat(
             if shutdown_requested() {
                 break;
             }
-            refresh_hook_message_heartbeat(&store, &message_id, &worker_id).await;
+            refresh_hook_message_heartbeat(&store, &message_id, &worker_id, &write_observer).await;
             if let Some(observer) = observer.take() {
                 let _ = observer.send(());
             }
@@ -805,11 +813,16 @@ async fn refresh_hook_message_heartbeat(
     store: &AsyncPendingMessageStore,
     message_id: &str,
     worker_id: &str,
+    write_observer: &crate::daemon_bootstrap::DaemonWriteObserver,
 ) {
     if let Err(error) = store
         .refresh_heartbeat(message_id.to_string(), worker_id.to_string())
         .await
     {
+        write_observer.record_queue_error(
+            format!("failed to refresh hook message heartbeat {message_id}"),
+            &error,
+        );
         tracing::warn!(
             ?error,
             message_id,

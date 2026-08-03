@@ -84,6 +84,71 @@ async fn write_observer_does_not_restart_for_typed_sqlite_protocol_stall() {
     );
 }
 
+#[tokio::test]
+async fn write_observer_fresh_heartbeat_protocol_lock_suppresses_stall_without_claim() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    sync_store
+        .enqueue("hook:user-prompt-submit", "{}")
+        .expect("enqueue pending message");
+    let store =
+        AsyncPendingMessageStore::from_store(sync_store).with_heartbeat_lock_failures_for_test(1);
+
+    let claimed = store
+        .claim_next("hook-worker".to_string(), 30)
+        .await
+        .expect("claim")
+        .expect("claimed message");
+
+    let observer = DaemonWriteObserver::new();
+    observer.force_last_successful_write_for_test(unix_secs().saturating_sub(DAEMON_STALL_SECONDS));
+
+    // Production path: already-claimed work only refreshes heartbeat; no later claim error.
+    let heartbeat_error = store
+        .refresh_heartbeat(claimed.id.clone(), "hook-worker".to_string())
+        .await
+        .expect_err("injected heartbeat SQLITE_PROTOCOL lock");
+    assert!(
+        heartbeat_error.is_sqlite_lock(),
+        "heartbeat injection must remain typed as a SQLite lock"
+    );
+    observer.record_queue_error(
+        format!("failed to refresh hook message heartbeat {}", claimed.id),
+        &heartbeat_error,
+    );
+
+    assert!(
+        !observer.maybe_log_stall(&store).await,
+        "fresh heartbeat FileLockingProtocolFailed contention must suppress false stall recovery without a subsequent claim error"
+    );
+}
+
+#[tokio::test]
+async fn write_observer_record_queue_error_non_lock_still_allows_recovery() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    sync_store
+        .enqueue("hook:user-prompt-submit", "{}")
+        .expect("enqueue pending message");
+    let store = AsyncPendingMessageStore::from_store(sync_store);
+
+    let observer = DaemonWriteObserver::new();
+    observer.force_last_successful_write_for_test(unix_secs().saturating_sub(DAEMON_STALL_SECONDS));
+    observer.record_queue_error(
+        "failed to confirm msg-1",
+        &QueueError::MessageNotFound("msg-1".to_string()),
+    );
+
+    assert!(
+        observer.maybe_log_stall(&store).await,
+        "typed non-lock queue mutation errors must remain fail-closed for stall recovery"
+    );
+}
+
 #[tokio::test(start_paused = true, flavor = "current_thread")]
 async fn daemon_ingest_claim_contention_suppresses_stall_restart() {
     crate::observability::reset_ingest_worker_backoff_for_tests();

@@ -1165,8 +1165,12 @@ impl MempalMcpServer {
             }
         };
 
-        let (stop_tx, heartbeat) =
-            Self::spawn_ingest_claim_heartbeat(queue.clone(), claim.id.clone(), worker_id);
+        let (stop_tx, heartbeat) = Self::spawn_ingest_claim_heartbeat(
+            queue.clone(),
+            claim.id.clone(),
+            worker_id,
+            self.daemon_write_observer.clone(),
+        );
         let external_writer_lease = self.external_ingest_writer_lease.clone();
         let writer_lease = if external_writer_lease.is_some() {
             None
@@ -1268,7 +1272,13 @@ impl MempalMcpServer {
             return result;
         }
 
-        Self::refresh_ingest_claim_heartbeat_once(queue, &claim.id, worker_id).await;
+        Self::refresh_ingest_claim_heartbeat_once(
+            queue,
+            &claim.id,
+            worker_id,
+            self.daemon_write_observer.as_ref(),
+        )
+        .await;
         let completed = self
             .complete_ingest_claim_outcome(
                 queue,
@@ -1309,8 +1319,12 @@ impl MempalMcpServer {
             }
         };
 
-        let (stop_tx, heartbeat) =
-            Self::spawn_ingest_claim_heartbeat(queue.clone(), claim.id.clone(), worker_id);
+        let (stop_tx, heartbeat) = Self::spawn_ingest_claim_heartbeat(
+            queue.clone(),
+            claim.id.clone(),
+            worker_id,
+            self.daemon_write_observer.clone(),
+        );
         let external_writer_lease = self.external_ingest_writer_lease.clone();
         let writer_lease = if external_writer_lease.is_some() {
             None
@@ -1398,7 +1412,13 @@ impl MempalMcpServer {
             return Ok(());
         }
 
-        Self::refresh_ingest_claim_heartbeat_once(queue, &claim.id, worker_id).await;
+        Self::refresh_ingest_claim_heartbeat_once(
+            queue,
+            &claim.id,
+            worker_id,
+            self.daemon_write_observer.as_ref(),
+        )
+        .await;
         let completed = self
             .complete_ingest_claim_outcome(
                 queue,
@@ -1456,8 +1476,12 @@ impl MempalMcpServer {
             }
         };
 
-        let (stop_tx, heartbeat) =
-            Self::spawn_ingest_claim_heartbeat(queue.clone(), claim.id.clone(), worker_id);
+        let (stop_tx, heartbeat) = Self::spawn_ingest_claim_heartbeat(
+            queue.clone(),
+            claim.id.clone(),
+            worker_id,
+            self.daemon_write_observer.clone(),
+        );
         let external_writer_lease = self.external_ingest_writer_lease.clone();
         let writer_lease = if external_writer_lease.is_some() {
             None
@@ -1594,7 +1618,13 @@ impl MempalMcpServer {
             return Ok(ScopedIngestProcessResult::ReleasedForRetry);
         }
 
-        Self::refresh_ingest_claim_heartbeat_once(queue, &claim.id, worker_id).await;
+        Self::refresh_ingest_claim_heartbeat_once(
+            queue,
+            &claim.id,
+            worker_id,
+            self.daemon_write_observer.as_ref(),
+        )
+        .await;
         let completion_deadline = scoped_process_remaining(started, budget).unwrap_or_default();
         let completed = self
             .complete_ingest_claim_outcome(
@@ -1698,6 +1728,7 @@ impl MempalMcpServer {
         queue: AsyncPendingMessageStore,
         claim_id: String,
         worker_id: &str,
+        write_observer: Option<crate::daemon_bootstrap::DaemonWriteObserver>,
     ) -> (
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<()>,
@@ -1713,9 +1744,21 @@ impl MempalMcpServer {
                         match queue.refresh_heartbeat(claim_id.clone(), heartbeat_worker_id.clone()).await {
                             Ok(()) => {}
                             Err(error) if should_continue_ingest_heartbeat_after_error(&error) => {
+                                if let Some(observer) = &write_observer {
+                                    observer.record_queue_error(
+                                        format!("failed to refresh async ingest heartbeat {claim_id}"),
+                                        &error,
+                                    );
+                                }
                                 tracing::warn!(error = %error, claim_id = %claim_id, "transient failure refreshing async ingest heartbeat; will retry");
                             }
                             Err(error) => {
+                                if let Some(observer) = &write_observer {
+                                    observer.record_queue_error(
+                                        format!("failed to refresh async ingest heartbeat {claim_id}"),
+                                        &error,
+                                    );
+                                }
                                 tracing::warn!(error = %error, claim_id = %claim_id, "failed to refresh async ingest heartbeat");
                                 break;
                             }
@@ -1732,6 +1775,7 @@ impl MempalMcpServer {
         queue: &AsyncPendingMessageStore,
         claim_id: &str,
         worker_id: &str,
+        write_observer: Option<&crate::daemon_bootstrap::DaemonWriteObserver>,
     ) {
         match queue
             .refresh_heartbeat(claim_id.to_string(), worker_id.to_string())
@@ -1739,9 +1783,25 @@ impl MempalMcpServer {
         {
             Ok(()) => {}
             Err(error) if should_continue_ingest_heartbeat_after_error(&error) => {
+                if let Some(observer) = write_observer {
+                    observer.record_queue_error(
+                        format!(
+                            "failed to refresh async ingest heartbeat before completion {claim_id}"
+                        ),
+                        &error,
+                    );
+                }
                 tracing::warn!(error = %error, claim_id, "transient failure refreshing async ingest heartbeat before completion");
             }
             Err(error) => {
+                if let Some(observer) = write_observer {
+                    observer.record_queue_error(
+                        format!(
+                            "failed to refresh async ingest heartbeat before completion {claim_id}"
+                        ),
+                        &error,
+                    );
+                }
                 tracing::warn!(error = %error, claim_id, "failed to refresh async ingest heartbeat before completion");
             }
         }

@@ -150,8 +150,13 @@ impl DaemonWriteObserver {
     }
 
     pub fn record_claim_error(&self, error: &QueueError) {
+        self.record_queue_error("claim_next failed", error);
+    }
+
+    /// Record a daemon-owned queue write/mutation failure with typed lock class.
+    pub fn record_queue_error(&self, context: impl Into<String>, error: &QueueError) {
         self.record_error_observation(
-            format!("claim_next failed: {error}"),
+            format!("{}: {error}", context.into()),
             error.is_sqlite_lock(),
         );
     }

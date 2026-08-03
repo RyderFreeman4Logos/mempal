@@ -94,6 +94,18 @@ fn sqlite_busy_queue_error() -> QueueError {
     ))
 }
 
+#[cfg(any(test, feature = "db-test-seam"))]
+fn sqlite_protocol_queue_error() -> QueueError {
+    QueueError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::FileLockingProtocolFailed,
+            extended_code: rusqlite::ffi::SQLITE_PROTOCOL,
+        },
+        // Deliberately avoid legacy message phrases; classification is typed.
+        Some("locking protocol conflict".to_string()),
+    ))
+}
+
 pub type Result<T> = std::result::Result<T, QueueError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +345,8 @@ pub struct AsyncPendingMessageStore {
     release_lock_failures: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "db-test-seam"))]
     complete_lock_failures: Arc<AtomicUsize>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    heartbeat_lock_failures: Arc<AtomicUsize>,
 }
 
 impl AsyncPendingMessageStore {
@@ -362,6 +376,8 @@ impl AsyncPendingMessageStore {
             release_lock_failures: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "db-test-seam"))]
             complete_lock_failures: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            heartbeat_lock_failures: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -381,6 +397,8 @@ impl AsyncPendingMessageStore {
             release_lock_failures: Arc::clone(&self.release_lock_failures),
             #[cfg(any(test, feature = "db-test-seam"))]
             complete_lock_failures: Arc::clone(&self.complete_lock_failures),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            heartbeat_lock_failures: Arc::clone(&self.heartbeat_lock_failures),
         }
     }
 
@@ -417,6 +435,13 @@ impl AsyncPendingMessageStore {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_complete_lock_failures_for_test(self, failures: usize) -> Self {
         self.complete_lock_failures
+            .store(failures, Ordering::SeqCst);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_heartbeat_lock_failures_for_test(self, failures: usize) -> Self {
+        self.heartbeat_lock_failures
             .store(failures, Ordering::SeqCst);
         self
     }
@@ -705,6 +730,16 @@ impl AsyncPendingMessageStore {
     }
 
     pub async fn refresh_heartbeat(&self, id: String, worker_id: String) -> Result<()> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if self
+            .heartbeat_lock_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(sqlite_protocol_queue_error());
+        }
         self.run(move |store| store.refresh_heartbeat(&id, &worker_id))
             .await
     }

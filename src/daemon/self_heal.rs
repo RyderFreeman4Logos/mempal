@@ -252,7 +252,7 @@ async fn persist_hook_ipc_request(
         }
         Err(error) => {
             let message = format!("failed to persist hook IPC capture: {error}");
-            write_observer.record_error(message.clone());
+            write_observer.record_queue_error("failed to persist hook IPC capture", &error);
             tracing::warn!(?error, kind = %request.kind, "failed to persist hook IPC capture");
             crate::hook_ipc::HookIpcEnqueueResponse::Error { message }
         }

@@ -325,12 +325,18 @@ async fn run_llm_worker_inner(
         let heartbeat_store = store.clone();
         let heartbeat_message_id = message.id.clone();
         let heartbeat_worker_id = worker_id.clone();
+        let heartbeat_write_observer = write_observer.clone();
         let heartbeat: Box<HeartbeatCallback> = Box::new(move || {
             let store = heartbeat_store.clone();
             let message_id = heartbeat_message_id.clone();
             let worker_id = heartbeat_worker_id.clone();
+            let write_observer = heartbeat_write_observer.clone();
             tokio::spawn(async move {
                 if let Err(error) = store.refresh_heartbeat(message_id.clone(), worker_id).await {
+                    write_observer.record_queue_error(
+                        format!("failed to refresh LLM task heartbeat {message_id}"),
+                        &error,
+                    );
                     tracing::warn!(?error, message_id, "failed to refresh LLM task heartbeat");
                 }
             });
@@ -359,7 +365,20 @@ async fn run_llm_worker_inner(
         match task_result {
             Some(Ok(())) => {
                 tracing::info!("LLM task {message_id} completed in {latency_ms}ms");
-                confirm_llm_task_async(&store, message.clone()).await?;
+                if let Err(error) = confirm_llm_task_async(&store, message.clone()).await {
+                    if let Some(queue_error) = error
+                        .chain()
+                        .find_map(|cause| cause.downcast_ref::<crate::core::queue::QueueError>())
+                    {
+                        write_observer.record_queue_error(
+                            format!("failed to confirm LLM task {message_id}"),
+                            queue_error,
+                        );
+                    } else {
+                        write_observer.record_error(error.to_string());
+                    }
+                    return Err(error);
+                }
                 write_observer.record_successful_write();
                 if let Some(observer) = completion_observer.take() {
                     let _ = observer.send(());
@@ -369,10 +388,17 @@ async fn run_llm_worker_inner(
                 tracing::error!("LLM task {message_id} failed after {latency_ms}ms: {error}");
                 write_observer.record_error(error.to_string());
                 let disposition = llm_task_failure_disposition(&error);
-                store
+                if let Err(mark_error) = store
                     .mark_failed_with_disposition(message.clone(), error.to_string(), disposition)
                     .await
-                    .with_context(|| format!("failed to mark_failed LLM task {message_id}"))?;
+                {
+                    write_observer.record_queue_error(
+                        format!("failed to mark_failed LLM task {message_id}"),
+                        &mark_error,
+                    );
+                    return Err(mark_error)
+                        .with_context(|| format!("failed to mark_failed LLM task {message_id}"));
+                }
             }
             None => {
                 tracing::info!(
@@ -381,6 +407,10 @@ async fn run_llm_worker_inner(
                     "LLM worker restarting due to config change; releasing task back to pending"
                 );
                 if let Err(error) = store.release_claim(message.clone()).await {
+                    write_observer.record_queue_error(
+                        format!("failed to release claimed LLM task {message_id}"),
+                        &error,
+                    );
                     tracing::warn!(
                         ?error,
                         message_id,
@@ -395,7 +425,6 @@ async fn run_llm_worker_inner(
 
     Ok(())
 }
-
 fn llm_idle_poll_interval(base_interval: Duration, idle_count: u32) -> Duration {
     let multiplier = 1_u32
         .checked_shl(idle_count.min(u32::BITS - 1))
