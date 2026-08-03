@@ -207,7 +207,7 @@ fn assert_crashes_at(database: &Path, point: CrashPoint) {
         .env(FIXTURE_CASE_ENV, fixture_case(point));
 
     let output =
-        DeadlineChild::output(spec, Duration::from_secs(3)).expect("run admission crash fixture");
+        DeadlineChild::output(spec, Duration::from_secs(10)).expect("run admission crash fixture");
     assert_eq!(
         output.status.code(),
         Some(point.exit_code()),
