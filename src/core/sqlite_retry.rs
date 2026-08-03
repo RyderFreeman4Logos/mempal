@@ -103,7 +103,8 @@ where
     F: FnMut(Instant) -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
-    let retry_deadline = Instant::now() + CONTENT_MUTATION_SQLITE_LOCK_RETRY_DEADLINE;
+    let retry_deadline =
+        tokio::time::Instant::now().into_std() + CONTENT_MUTATION_SQLITE_LOCK_RETRY_DEADLINE;
     retry_content_mutation_sqlite_lock_async_until(retry_deadline, operation, is_transient_lock)
         .await
 }
@@ -177,6 +178,20 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn async_wrapper_passes_exact_shared_ten_second_deadline() {
+        let start = tokio::time::Instant::now().into_std();
+        retry_content_mutation_sqlite_lock_async(
+            |deadline| async move {
+                assert_eq!(deadline, start + Duration::from_secs(10));
+                Ok::<_, rusqlite::Error>(())
+            },
+            |_| false,
+        )
+        .await
+        .expect("immediate operation succeeds");
+    }
 
     #[test]
     fn sync_retry_preserves_success_returned_after_deadline() {

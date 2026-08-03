@@ -99,6 +99,8 @@ async fn test_mcp_delete_retry_deadline_rejects_queued_late_write_without_soft_d
             }))
             .await
     });
+    // This 20s timeout is only a deadlock guard; sqlite_retry's exact 10s budget is
+    // covered by `async_wrapper_passes_exact_shared_ten_second_deadline`.
     let bounded = tokio::time::timeout(Duration::from_secs(20), &mut delete).await;
     let returned_before_release = bounded.is_ok();
 
