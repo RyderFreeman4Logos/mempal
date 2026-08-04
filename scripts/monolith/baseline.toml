@@ -109,18 +109,18 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "skills/smoke-test/scripts/full_smoke.py"
 kind = "source"
-baseline_tokens = 21288
+baseline_tokens = 21294
 baseline_lines = 2231
-issue = "829"
-rationale = "#829 follows accepted MCP wait-timeout operation receipts before create/update missing-ID classification; exact no-growth ratchet."
+issue = "855"
+rationale = "#855 reserves recovery_fields reason for callers so admission-blocked note() cannot TypeError on duplicate reason; exact no-growth ratchet."
 
 [[files]]
 path = "skills/smoke-test/tests/test_full_smoke_receipts.py"
 kind = "test"
-baseline_tokens = 7012
-baseline_lines = 802
-issue = "829"
-rationale = "#829 adds timeout receipt operation-follow and no-operation fail-closed smoke regressions; exact no-growth ratchet."
+baseline_tokens = 7342
+baseline_lines = 846
+issue = "855"
+rationale = "#855 adds recovery_fields reason-exclusion and admission-blocked create/update note regressions; exact no-growth ratchet."
 
 [[files]]
 path = "specs/fork-ext/p8-embed-qwen3-backend.spec.md"

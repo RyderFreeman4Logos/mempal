@@ -1293,7 +1293,7 @@ def recover_created_ids(value: Any, wait_label: str) -> tuple[list[str], dict[st
 
 
 def recovery_fields(info: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in info.items() if value not in (None, False)}
+    return {key: value for key, value in info.items() if key != 'reason' and value not in (None, False)}
 
 
 def _rest_ingest_fallback(

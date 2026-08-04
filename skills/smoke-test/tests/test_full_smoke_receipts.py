@@ -161,6 +161,50 @@ class ReceiptExtractionTests(unittest.TestCase):
         self.assertEqual(info["operation_state"], "queued")
         self.assertFalse(info["operation_id_present"])
 
+    def test_recovery_fields_excludes_reason(self) -> None:
+        fields = self.smoke.recovery_fields(
+            {"reason": "holder_budget_exceeded", "operation_state": "blocked"}
+        )
+        self.assertEqual(fields, {"operation_state": "blocked"})
+
+    def test_admission_blocked_create_and_update_notes_own_reason(self) -> None:
+        _, info = self.smoke.recover_created_ids(
+            {
+                "error": {
+                    "outcome": "admission_blocked",
+                    "action": "write_refused",
+                    "reason": "holder_budget_exceeded",
+                    "created_drawer_ids": [],
+                    "cleanup_drawer_ids": [],
+                }
+            },
+            "unused_wait",
+        )
+
+        self.assertEqual(info["reason"], "holder_budget_exceeded")
+        setattr(self.smoke, "SUMMARY", {"groups": {}, "failures": []})
+        self.smoke.note(
+            "cli_crud",
+            False,
+            reason="create_missing_created_drawer_ids",
+            **self.smoke.recovery_fields(info),
+        )
+        self.assertEqual(
+            self.smoke.SUMMARY["groups"]["cli_crud"]["reason"],
+            "create_missing_created_drawer_ids",
+        )
+
+        self.smoke.note(
+            "cli_crud",
+            False,
+            reason="update_missing_created_drawer_ids",
+            cleanup_id_count=1,
+            **self.smoke.recovery_fields(info),
+        )
+        receipt = self.smoke.SUMMARY["groups"]["cli_crud"]
+        self.assertEqual(receipt["reason"], "update_missing_created_drawer_ids")
+        self.assertEqual(receipt["cleanup_id_count"], 1)
+
     def test_classify_stderr_reports_database_extra_holder_without_raw_text(self) -> None:
         stderr = (
             b"error: failed to open database\n"
