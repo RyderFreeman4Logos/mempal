@@ -797,13 +797,13 @@ fn push_reviewed_validates_existing_receipts_without_rerunning_expensive_gates()
     );
     for preserved_tail in [
         "git push -u origin HEAD",
-        "gh pr create --base main",
+        "gh pr create --base main --fill",
         "CREATE_RC=$?",
         "PR already exists. Continuing.",
     ] {
         assert!(
             push_workflow.contains(preserved_tail),
-            "push-reviewed lost its PR creation/reuse tail: {preserved_tail}"
+            "push-reviewed tail missing: {preserved_tail}"
         );
     }
 }

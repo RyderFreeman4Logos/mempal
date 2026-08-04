@@ -284,7 +284,7 @@ push-reviewed:
     git push -u origin HEAD
     echo "=== Creating or reusing PR targeting main... ==="
     set +e
-    CREATE_OUTPUT="$(gh pr create --base main 2>&1)"
+    CREATE_OUTPUT="$(gh pr create --base main --fill 2>&1)"
     CREATE_RC=$?
     set -e
     if [ "${CREATE_RC}" -ne 0 ]; then
