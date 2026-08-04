@@ -216,6 +216,7 @@ preview_chars = 48
                 config: &self.config,
                 mempal_home: &self.mempal_home,
                 runtime_writer_lease: None,
+                heartbeat_trigger: None,
             },
         )
         .await

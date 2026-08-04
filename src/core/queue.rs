@@ -94,6 +94,18 @@ fn sqlite_busy_queue_error() -> QueueError {
     ))
 }
 
+#[cfg(any(test, feature = "db-test-seam"))]
+fn sqlite_protocol_queue_error() -> QueueError {
+    QueueError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::FileLockingProtocolFailed,
+            extended_code: rusqlite::ffi::SQLITE_PROTOCOL,
+        },
+        // Deliberately avoid legacy message phrases; classification is typed.
+        Some("locking protocol conflict".to_string()),
+    ))
+}
+
 pub type Result<T> = std::result::Result<T, QueueError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +345,17 @@ pub struct AsyncPendingMessageStore {
     release_lock_failures: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "db-test-seam"))]
     complete_lock_failures: Arc<AtomicUsize>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    heartbeat_lock_failures: Arc<AtomicUsize>,
+}
+
+#[cfg(any(test, feature = "db-test-seam"))]
+fn consume_lock_failure(counter: &AtomicUsize) -> bool {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            count.checked_sub(1)
+        })
+        .is_ok()
 }
 
 impl AsyncPendingMessageStore {
@@ -362,6 +385,8 @@ impl AsyncPendingMessageStore {
             release_lock_failures: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "db-test-seam"))]
             complete_lock_failures: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            heartbeat_lock_failures: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -381,6 +406,8 @@ impl AsyncPendingMessageStore {
             release_lock_failures: Arc::clone(&self.release_lock_failures),
             #[cfg(any(test, feature = "db-test-seam"))]
             complete_lock_failures: Arc::clone(&self.complete_lock_failures),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            heartbeat_lock_failures: Arc::clone(&self.heartbeat_lock_failures),
         }
     }
 
@@ -417,6 +444,13 @@ impl AsyncPendingMessageStore {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_complete_lock_failures_for_test(self, failures: usize) -> Self {
         self.complete_lock_failures
+            .store(failures, Ordering::SeqCst);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_heartbeat_lock_failures_for_test(self, failures: usize) -> Self {
+        self.heartbeat_lock_failures
             .store(failures, Ordering::SeqCst);
         self
     }
@@ -478,13 +512,7 @@ impl AsyncPendingMessageStore {
         idempotency_key: String,
     ) -> Result<String> {
         #[cfg(any(test, feature = "db-test-seam"))]
-        if self
-            .enqueue_lock_failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                count.checked_sub(1)
-            })
-            .is_ok()
-        {
+        if consume_lock_failure(&self.enqueue_lock_failures) {
             return Err(sqlite_busy_queue_error());
         }
         self.run(move |store| {
@@ -499,13 +527,7 @@ impl AsyncPendingMessageStore {
         claim_ttl_secs: i64,
     ) -> Result<Option<ClaimedMessage>> {
         #[cfg(any(test, feature = "db-test-seam"))]
-        if self
-            .claim_lock_failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                count.checked_sub(1)
-            })
-            .is_ok()
-        {
+        if consume_lock_failure(&self.claim_lock_failures) {
             return Err(sqlite_busy_queue_error());
         }
         self.run(move |store| store.claim_next(&worker_id, claim_ttl_secs))
@@ -519,13 +541,7 @@ impl AsyncPendingMessageStore {
         kind_filter: String,
     ) -> Result<Option<ClaimedMessage>> {
         #[cfg(any(test, feature = "db-test-seam"))]
-        if self
-            .claim_lock_failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                count.checked_sub(1)
-            })
-            .is_ok()
-        {
+        if consume_lock_failure(&self.claim_lock_failures) {
             return Err(sqlite_busy_queue_error());
         }
         self.run(move |store| store.claim_next_by_kind(&worker_id, claim_ttl_secs, &kind_filter))
@@ -559,13 +575,7 @@ impl AsyncPendingMessageStore {
         retry_deadline: Duration,
     ) -> Result<Option<ClaimedMessage>> {
         #[cfg(any(test, feature = "db-test-seam"))]
-        if self
-            .claim_lock_failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                count.checked_sub(1)
-            })
-            .is_ok()
-        {
+        if consume_lock_failure(&self.claim_lock_failures) {
             return Err(sqlite_busy_queue_error());
         }
         #[cfg(any(test, feature = "db-test-seam"))]
@@ -588,6 +598,10 @@ impl AsyncPendingMessageStore {
     }
 
     pub async fn confirm(&self, claim: ClaimedMessage) -> Result<()> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if consume_lock_failure(&self.complete_lock_failures) {
+            return Err(sqlite_busy_queue_error());
+        }
         self.run(move |store| store.confirm(&claim)).await
     }
 
@@ -621,13 +635,7 @@ impl AsyncPendingMessageStore {
         busy_timeout: Option<Duration>,
     ) -> Result<()> {
         #[cfg(any(test, feature = "db-test-seam"))]
-        if self
-            .complete_lock_failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                count.checked_sub(1)
-            })
-            .is_ok()
-        {
+        if consume_lock_failure(&self.complete_lock_failures) {
             return Err(sqlite_busy_queue_error());
         }
         self.run(move |store| {
@@ -641,7 +649,7 @@ impl AsyncPendingMessageStore {
     }
 
     pub async fn mark_failed(&self, claim: ClaimedMessage, error: String) -> Result<()> {
-        self.run(move |store| store.mark_failed(&claim, &error))
+        self.mark_failed_with_disposition(claim, error, QueueFailureDisposition::Retryable)
             .await
     }
 
@@ -651,6 +659,10 @@ impl AsyncPendingMessageStore {
         error: String,
         disposition: QueueFailureDisposition,
     ) -> Result<()> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if consume_lock_failure(&self.complete_lock_failures) {
+            return Err(sqlite_busy_queue_error());
+        }
         self.run(move |store| store.mark_failed_with_disposition(&claim, &error, disposition))
             .await
     }
@@ -673,13 +685,7 @@ impl AsyncPendingMessageStore {
 
     pub async fn release_claim(&self, claim: ClaimedMessage) -> Result<()> {
         #[cfg(any(test, feature = "db-test-seam"))]
-        if self
-            .release_lock_failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                count.checked_sub(1)
-            })
-            .is_ok()
-        {
+        if consume_lock_failure(&self.release_lock_failures) {
             return Err(sqlite_busy_queue_error());
         }
         self.run(move |store| store.release_claim(&claim)).await
@@ -691,13 +697,7 @@ impl AsyncPendingMessageStore {
         busy_timeout: Duration,
     ) -> Result<()> {
         #[cfg(any(test, feature = "db-test-seam"))]
-        if self
-            .release_lock_failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                count.checked_sub(1)
-            })
-            .is_ok()
-        {
+        if consume_lock_failure(&self.release_lock_failures) {
             return Err(sqlite_busy_queue_error());
         }
         self.run(move |store| store.release_claim_with_busy_timeout(&claim, Some(busy_timeout)))
@@ -705,6 +705,10 @@ impl AsyncPendingMessageStore {
     }
 
     pub async fn refresh_heartbeat(&self, id: String, worker_id: String) -> Result<()> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if consume_lock_failure(&self.heartbeat_lock_failures) {
+            return Err(sqlite_protocol_queue_error());
+        }
         self.run(move |store| store.refresh_heartbeat(&id, &worker_id))
             .await
     }

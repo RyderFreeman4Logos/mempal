@@ -121,6 +121,7 @@ async fn test_daemon_heartbeat_fires_during_embed_retry() {
             config: &config,
             mempal_home: &mempal_home,
             runtime_writer_lease: None,
+            heartbeat_trigger: None,
         },
     )
     .await
@@ -232,6 +233,7 @@ enabled = true
             config: &config,
             mempal_home: &mempal_home,
             runtime_writer_lease: None,
+            heartbeat_trigger: None,
         },
     )
     .await

@@ -154,6 +154,7 @@ enabled = false
                 config: &self.config,
                 mempal_home: &self.mempal_home,
                 runtime_writer_lease: None,
+                heartbeat_trigger: None,
             },
         )
         .await
@@ -377,6 +378,7 @@ enabled = false
                 config: &self.config,
                 mempal_home: &self.mempal_home,
                 runtime_writer_lease: None,
+                heartbeat_trigger: None,
             },
         )
         .await

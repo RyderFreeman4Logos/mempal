@@ -1,5 +1,15 @@
 use super::*;
-use crate::core::queue::PendingMessageStore;
+use crate::core::queue::{PendingMessageStore, QueueError};
+
+fn sqlite_protocol_queue_error() -> QueueError {
+    QueueError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::FileLockingProtocolFailed,
+            extended_code: rusqlite::ffi::SQLITE_PROTOCOL,
+        },
+        Some("locking protocol conflict".to_string()),
+    ))
+}
 
 #[tokio::test]
 async fn write_observer_reports_stall_when_queue_has_work_and_no_recent_writes() {
@@ -28,6 +38,181 @@ async fn write_observer_reports_stall_when_queue_has_work_and_no_recent_writes()
     assert!(
         !observer.maybe_log_stall(&store).await,
         "one stalled generation must emit only one recovery signal per throttle window"
+    );
+}
+
+#[tokio::test]
+async fn write_observer_requests_recovery_after_success_invalidates_lock_error() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    sync_store
+        .enqueue("hook:user-prompt-submit", "{}")
+        .expect("enqueue pending message");
+    let store = AsyncPendingMessageStore::from_store(sync_store);
+
+    let observer = DaemonWriteObserver::new();
+    observer.record_claim_error(&sqlite_protocol_queue_error());
+    observer.record_successful_write();
+    observer.force_last_successful_write_for_test(unix_secs().saturating_sub(DAEMON_STALL_SECONDS));
+
+    assert!(
+        observer.maybe_log_stall(&store).await,
+        "a successful write must invalidate historical SQLite contention"
+    );
+}
+
+#[tokio::test]
+async fn write_observer_does_not_restart_for_typed_sqlite_protocol_stall() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    sync_store
+        .enqueue("hook:user-prompt-submit", "{}")
+        .expect("enqueue pending message");
+    let store = AsyncPendingMessageStore::from_store(sync_store);
+
+    let observer = DaemonWriteObserver::new();
+    observer.force_last_successful_write_for_test(unix_secs().saturating_sub(DAEMON_STALL_SECONDS));
+    observer.record_claim_error(&sqlite_protocol_queue_error());
+
+    assert!(
+        !observer.maybe_log_stall(&store).await,
+        "transient SQLite pressure must keep the daemon alive so workers can recover"
+    );
+}
+
+#[tokio::test]
+async fn hook_heartbeat_result_observation_preserves_semantic_stall_clock() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    sync_store
+        .enqueue("hook:user-prompt-submit", "{}")
+        .expect("enqueue pending message");
+    let store =
+        AsyncPendingMessageStore::from_store(sync_store).with_heartbeat_lock_failures_for_test(1);
+
+    let claimed = store
+        .claim_next("hook-worker".to_string(), 30)
+        .await
+        .expect("claim")
+        .expect("claimed message");
+
+    let observer = DaemonWriteObserver::new();
+    observer.force_last_successful_write_for_test(unix_secs().saturating_sub(DAEMON_STALL_SECONDS));
+
+    crate::daemon::refresh_hook_message_heartbeat(&store, &claimed.id, "hook-worker", &observer)
+        .await;
+    assert!(
+        !observer.maybe_log_stall(&store).await,
+        "fresh heartbeat FileLockingProtocolFailed contention must suppress false stall recovery without a subsequent claim error"
+    );
+
+    crate::daemon::refresh_hook_message_heartbeat(&store, &claimed.id, "hook-worker", &observer)
+        .await;
+    let diagnostic = observer
+        .stall_diagnostic(&store, unix_secs())
+        .await
+        .expect("maintenance success must not advance the semantic stall clock");
+    assert_eq!(diagnostic.last_error, "none recorded");
+    assert!(diagnostic.seconds_since_successful_write >= DAEMON_STALL_SECONDS);
+
+    observer.record_successful_write();
+    assert_eq!(observer.stall_diagnostic(&store, unix_secs()).await, None);
+}
+
+#[tokio::test]
+async fn write_observer_record_queue_error_non_lock_still_allows_recovery() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    sync_store
+        .enqueue("hook:user-prompt-submit", "{}")
+        .expect("enqueue pending message");
+    let store = AsyncPendingMessageStore::from_store(sync_store);
+
+    let observer = DaemonWriteObserver::new();
+    observer.force_last_successful_write_for_test(unix_secs().saturating_sub(DAEMON_STALL_SECONDS));
+    observer.record_queue_error(
+        "failed to confirm msg-1",
+        &QueueError::MessageNotFound("msg-1".to_string()),
+    );
+
+    assert!(
+        observer.maybe_log_stall(&store).await,
+        "typed non-lock queue mutation errors must remain fail-closed for stall recovery"
+    );
+}
+
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn daemon_ingest_claim_contention_suppresses_stall_restart() {
+    crate::observability::reset_ingest_worker_backoff_for_tests();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("initialize database");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    sync_store
+        .enqueue("ingest_async", "{}")
+        .expect("enqueue async ingest");
+    let store =
+        AsyncPendingMessageStore::from_store(sync_store).with_claim_lock_failures_for_test(1);
+    let observer = DaemonWriteObserver::new();
+    observer.force_last_successful_write_for_test(unix_secs().saturating_sub(DAEMON_STALL_SECONDS));
+    let server = crate::mcp::MempalMcpServer::new(db_path, crate::core::config::Config::default())
+        .expect("create daemon-scoped ingest server")
+        .with_async_queue_for_test(store.clone())
+        .with_daemon_write_observer(observer.clone());
+    let worker = server.spawn_scoped_ingest_drain_worker();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let snapshot = crate::observability::ingest_worker_backoff_snapshot();
+        if snapshot.retry_count == 1
+            && snapshot.last_error_class.as_deref() == Some("sqlite_locked")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for daemon ingest claim contention"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        !observer.maybe_log_stall(&store).await,
+        "current daemon ingest claim contention must keep retrying instead of restarting"
+    );
+    worker.shutdown_and_drain().await;
+}
+
+#[tokio::test]
+async fn write_observer_requests_recovery_after_sqlite_contention_expires() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    sync_store
+        .enqueue("hook:user-prompt-submit", "{}")
+        .expect("enqueue pending message");
+    let store = AsyncPendingMessageStore::from_store(sync_store);
+
+    let observer = DaemonWriteObserver::new();
+    let now = unix_secs();
+    observer.force_last_successful_write_for_test(now.saturating_sub(DAEMON_STALL_SECONDS));
+    observer.record_claim_error(&sqlite_protocol_queue_error());
+    observer.force_last_error_observed_at_for_test(
+        now.saturating_sub(DAEMON_SQLITE_CONTENTION_FRESHNESS_SECONDS),
+    );
+
+    assert!(
+        observer.maybe_log_stall(&store).await,
+        "expired SQLite contention must not suppress recovery"
     );
 }
 
@@ -67,6 +252,48 @@ async fn write_observer_stall_checks_record_queue_io_burst() {
     DaemonWriteObserver::new().maybe_log_stall(&store).await;
 
     assert!(queue_sample_count() > before);
+}
+
+#[test]
+fn daemon_storage_open_skips_queue_reclaim_while_writer_is_busy() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    drop(Database::open(&db_path).expect("initialize database"));
+
+    let holder = rusqlite::Connection::open(&db_path).expect("open SQLite lock holder");
+    holder
+        .busy_timeout(Duration::ZERO)
+        .expect("make lock holder fail fast");
+    holder
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold SQLite write lock");
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let open_path = db_path.clone();
+    let opener = std::thread::spawn(move || {
+        let outcome = open_daemon_storage_once(&open_path)
+            .map(drop)
+            .map_err(|error| format!("{error:#}"));
+        sender.send(outcome).expect("send daemon storage result");
+    });
+    let outcome = receiver.recv_timeout(Duration::from_secs(2)).ok();
+    let opened_while_busy = outcome.is_some();
+
+    holder
+        .execute_batch("ROLLBACK;")
+        .expect("release SQLite write lock");
+    let outcome = outcome.unwrap_or_else(|| {
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("daemon storage open must finish after releasing lock")
+    });
+    opener.join().expect("join daemon storage opener");
+
+    outcome.expect("open daemon storage");
+    assert!(
+        opened_while_busy,
+        "daemon restart must not perform queue reclamation while opening storage"
+    );
 }
 
 #[test]

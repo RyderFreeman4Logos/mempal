@@ -56,7 +56,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   after a daemon generation finishes startup without post-admission faults;
   cooldown-blocked retries can no longer extend an outage indefinitely (#844).
 
-- **Daemon/MCP/CLI coexistence**: daemons open complete current schemas beside live MCP writers, survive bounded writer-lease renewal locks from CRUD pressure without restart-budget churn, and retain future-schema rejection, incomplete-schema repair, query-only reads, durable receipts, and bounded drains; matching local-gate timing/lifecycle fixtures are deterministic with reset-counter and lease-countdown regression coverage (#843, #849, #850, #853, #856, #859).
+- **Daemon/MCP/CLI coexistence**: daemons open complete current schemas beside live MCP writers, skip queue reclamation during bootstrap, keep retrying transient SQLite write stalls instead of restarting, survive bounded writer-lease renewal locks from CRUD pressure without restart-budget churn, and retain future-schema rejection, incomplete-schema repair, query-only reads, durable receipts, and bounded drains; matching local-gate timing/lifecycle fixtures are deterministic with reset-counter and lease-countdown regression coverage (#843, #849, #850, #853, #856, #858, #859).
 
 - **MCP reads**: retry transient SQLite busy/locked errors on all query-only MCP reads (read_drawer, search, timeline, context, brief) under the existing search deadline, preventing opaque -32603 under daemon contention (#840).
 - **SQLite mutation retries**: bound shared 10-second CLI/MCP retry backoff, writer admission, and SQLite busy waits; a mutation that commits reports success, while unstarted expired MCP deletes return structured retryable lock errors (#838).

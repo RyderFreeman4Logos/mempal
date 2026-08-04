@@ -13,7 +13,7 @@ use crate::core::{
     async_db::RESOURCE_BOUNDED_READERS,
     config::{Config, ConfigHandle},
     db::Database,
-    queue::AsyncPendingMessageStore,
+    queue::{AsyncPendingMessageStore, QueueError},
 };
 use crate::daemon_recovery::{
     DaemonRecovery, DaemonRecoveryFaultReporter, RecoveryFault, RestartDecision,
@@ -28,6 +28,7 @@ use crate::process_diagnostics::{
 
 const DAEMON_STALL_SECONDS: u64 = 5 * 60;
 const DAEMON_STALL_LOG_THROTTLE_SECONDS: u64 = 60;
+const DAEMON_SQLITE_CONTENTION_FRESHNESS_SECONDS: u64 = 60;
 
 /// Stable process exit status for a daemon start refused by an active restart
 /// budget cooldown. This is sysexits `EX_TEMPFAIL` and is intentionally
@@ -80,16 +81,17 @@ const DB_HOLDER_TERM_POLL: Duration = Duration::from_millis(100);
 
 pub type SharedDatabase = Arc<AsyncMutex<Database>>;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct DaemonWriteObserver {
     inner: Arc<DaemonWriteObserverInner>,
 }
 
+#[derive(Debug)]
 struct DaemonWriteObserverInner {
     started_at: Instant,
     last_successful_write_secs: AtomicU64,
     last_stall_log_secs: AtomicU64,
-    last_error: Mutex<Option<String>>,
+    last_error: Mutex<Option<(String, bool, u64)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +99,8 @@ struct DaemonStallDiagnostic {
     queued_count: u64,
     seconds_since_successful_write: u64,
     last_error: String,
+    last_error_is_sqlite_lock: bool,
+    last_error_age_secs: Option<u64>,
     uptime_secs: u64,
 }
 
@@ -139,11 +143,63 @@ impl DaemonWriteObserver {
         self.inner
             .last_successful_write_secs
             .store(unix_secs(), Ordering::Relaxed);
+        self.record_queue_maintenance_success();
+    }
+
+    pub fn record_queue_maintenance_success(&self) {
+        if let Ok(mut last_error) = self.inner.last_error.lock() {
+            *last_error = None;
+        }
+    }
+
+    pub fn observe_semantic_queue_result<T>(
+        &self,
+        context: impl Into<String>,
+        result: &std::result::Result<T, QueueError>,
+    ) {
+        self.observe_queue_result(context, result, true);
+    }
+
+    pub fn observe_maintenance_queue_result<T>(
+        &self,
+        context: impl Into<String>,
+        result: &std::result::Result<T, QueueError>,
+    ) {
+        self.observe_queue_result(context, result, false);
+    }
+
+    fn observe_queue_result<T>(
+        &self,
+        context: impl Into<String>,
+        result: &std::result::Result<T, QueueError>,
+        semantic_success: bool,
+    ) {
+        match result {
+            Ok(_) if semantic_success => self.record_successful_write(),
+            Ok(_) => self.record_queue_maintenance_success(),
+            Err(error) => self.record_queue_error(context, error),
+        }
+    }
+
+    pub fn record_claim_error(&self, error: &QueueError) {
+        self.record_queue_error("claim_next failed", error);
+    }
+
+    /// Record a daemon-owned queue write/mutation failure with typed lock class.
+    pub fn record_queue_error(&self, context: impl Into<String>, error: &QueueError) {
+        self.record_error_observation(
+            format!("{}: {error}", context.into()),
+            error.is_sqlite_lock(),
+        );
     }
 
     pub fn record_error(&self, error: impl Into<String>) {
+        self.record_error_observation(error.into(), false);
+    }
+
+    fn record_error_observation(&self, error: String, is_sqlite_lock: bool) {
         if let Ok(mut last_error) = self.inner.last_error.lock() {
-            *last_error = Some(error.into());
+            *last_error = Some((error, is_sqlite_lock, unix_secs()));
         }
     }
 
@@ -164,6 +220,21 @@ impl DaemonWriteObserver {
             .compare_exchange(last_log, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
+            return false;
+        }
+
+        if diagnostic.last_error_is_sqlite_lock
+            && diagnostic
+                .last_error_age_secs
+                .is_some_and(|age| age < DAEMON_SQLITE_CONTENTION_FRESHNESS_SECONDS)
+        {
+            tracing::warn!(
+                queued_count = diagnostic.queued_count,
+                seconds_since_successful_write = diagnostic.seconds_since_successful_write,
+                last_error = %diagnostic.last_error,
+                uptime_secs = diagnostic.uptime_secs,
+                "daemon writes remain blocked by transient SQLite contention; keeping workers alive to retry"
+            );
             return false;
         }
 
@@ -194,27 +265,37 @@ impl DaemonWriteObserver {
             return None;
         }
 
-        let last_successful_write = self
-            .inner
-            .last_successful_write_secs
-            .load(Ordering::Relaxed);
+        let (last_successful_write, last_error, last_error_is_sqlite_lock, last_error_age_secs) =
+            if let Ok(last_error) = self.inner.last_error.lock() {
+                let last_successful_write = self
+                    .inner
+                    .last_successful_write_secs
+                    .load(Ordering::Relaxed);
+                let (last_error, is_sqlite_lock, age) = last_error
+                    .as_ref()
+                    .map(|(error, is_sqlite_lock, observed_at)| {
+                        (
+                            error.clone(),
+                            *is_sqlite_lock,
+                            Some(now_secs.saturating_sub(*observed_at)),
+                        )
+                    })
+                    .unwrap_or_else(|| ("none recorded".to_string(), false, None));
+                (last_successful_write, last_error, is_sqlite_lock, age)
+            } else {
+                (now_secs, "none recorded".to_string(), false, None)
+            };
         let seconds_since_successful_write = now_secs.saturating_sub(last_successful_write);
         if seconds_since_successful_write < DAEMON_STALL_SECONDS {
             return None;
         }
 
-        let last_error = self
-            .inner
-            .last_error
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .unwrap_or_else(|| "none recorded".to_string());
-
         Some(DaemonStallDiagnostic {
             queued_count,
             seconds_since_successful_write,
             last_error,
+            last_error_is_sqlite_lock,
+            last_error_age_secs,
             uptime_secs: self.inner.started_at.elapsed().as_secs(),
         })
     }
@@ -224,6 +305,25 @@ impl DaemonWriteObserver {
         self.inner
             .last_successful_write_secs
             .store(timestamp_secs, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn force_last_error_observed_at_for_test(&self, timestamp_secs: u64) {
+        if let Ok(mut last_error) = self.inner.last_error.lock()
+            && let Some((_, _, observed_at)) = last_error.as_mut()
+        {
+            *observed_at = timestamp_secs;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_error_for_test(&self) -> Option<(String, bool)> {
+        self.inner
+            .last_error
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|(error, is_sqlite_lock, _)| (error.clone(), *is_sqlite_lock))
     }
 }
 
@@ -406,17 +506,20 @@ fn open_daemon_storage_once(
         crate::core::db_admission::DbHolderClass::Daemon,
     )
     .context("failed to open daemon async database")?;
-    let store = AsyncPendingMessageStore::new(db.path()).context("failed to open pending queue")?;
+    let store = AsyncPendingMessageStore::new_without_reclaim(db.path());
     Ok((db, async_db, store))
 }
 
 fn is_sqlite_lock_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        let message = cause.to_string();
-        message.contains("database is locked")
-            || message.contains("database file is locked")
-            || message.contains("database is busy")
-    })
+    error
+        .chain()
+        .any(|cause| is_sqlite_lock_message(&cause.to_string()))
+}
+
+fn is_sqlite_lock_message(message: &str) -> bool {
+    message.contains("database is locked")
+        || message.contains("database file is locked")
+        || message.contains("database is busy")
 }
 
 #[cfg(target_os = "linux")]
