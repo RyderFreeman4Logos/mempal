@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8747
+baseline_tokens = 8739
 baseline_lines = 609
-issue = "847"
-rationale = "#847 documents the stable daemon restart-budget cooldown temporary-refusal exit status and its canonical systemd restart suppression; append-only changelog growth is unavoidable, exact no-growth ratchet."
+issue = "858"
+rationale = "#858 documents retrying transient queue-write SQLite stalls across daemon/MCP/CLI paths without restart-budget churn; exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
