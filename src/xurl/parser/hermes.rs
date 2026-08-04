@@ -88,6 +88,9 @@ pub fn parse_hermes_db_with_options(
         source_expr,
     } = SessionJoin::new(&columns, &session_columns);
     let message_id_expr = optional_text_expr(&columns, &["message_id", "messageId", "id"], "m");
+    let session_id_column = ["session_id", "sessionId"]
+        .into_iter()
+        .find(|column| columns.contains(*column));
     let session_id_expr = optional_text_expr(&columns, &["session_id", "sessionId"], "m");
     let tool_name_expr = optional_text_expr(&columns, &["tool_name", "toolName"], "m");
     let tool_call_id_expr = optional_text_expr(&columns, &["tool_call_id", "toolCallId"], "m");
@@ -116,20 +119,26 @@ pub fn parse_hermes_db_with_options(
         }
     };
 
+    let session_filter = session_id_column.zip(options.session_id_filter.as_deref());
+    let session_predicate = session_filter
+        .map(|(column, _)| format!("AND m.{column} = ?1"))
+        .unwrap_or_default();
     let sql = format!(
         "SELECT {message_id_expr}, m.role, m.content, m.timestamp, {session_id_expr}, \
          {cwd_expr}, {tool_name_expr}, {tool_call_id_expr}, {title_expr}, {source_expr} \
          FROM messages AS m {session_join} \
-         WHERE m.role IN ('user', 'assistant') {state_predicate} \
+         WHERE m.role IN ('user', 'assistant') {state_predicate} {session_predicate} \
          ORDER BY m.timestamp{id_order}"
     );
 
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| XurlError::Parse(format!("failed to prepare hermes query: {e}")))?;
-    let mut rows = stmt
-        .query([])
-        .map_err(|e| XurlError::Parse(format!("hermes query error: {e}")))?;
+    let query = match session_filter {
+        Some((_, filter)) => stmt.query([filter]),
+        None => stmt.query([]),
+    };
+    let mut rows = query.map_err(|e| XurlError::Parse(format!("hermes query error: {e}")))?;
 
     let mut turns = Vec::new();
     let mut turn_index: u32 = 0;

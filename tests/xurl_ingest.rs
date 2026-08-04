@@ -436,6 +436,41 @@ fn hermes_db_messages_join_their_own_session_metadata() {
     assert_eq!(turns[1].project_path.as_deref(), Some("/repo/b"));
 }
 
+#[test]
+fn hermes_db_session_filter_uses_message_session_index() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("state.db");
+    let conn = Connection::open(&path).expect("open Hermes fixture db");
+    conn.execute_batch(
+        "CREATE TABLE message_rows (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp REAL NOT NULL,
+            poison INTEGER NOT NULL
+        );
+        CREATE INDEX message_rows_session_id ON message_rows(session_id);
+        CREATE VIEW messages AS
+            SELECT id, session_id, role, content, timestamp
+            FROM message_rows
+            WHERE CASE WHEN poison = 1 THEN abs(-9223372036854775808) ELSE 1 END = 1;
+        INSERT INTO message_rows VALUES
+            ('target-message', 'target-session', 'user', 'target content', 1.0, 0),
+            ('other-message', 'other-session', 'assistant', 'other content', 2.0, 1);",
+    )
+    .expect("create indexed multi-session Hermes fixture");
+    drop(conn);
+
+    let mut options = HermesParseOptions::new("fallback", "default", false);
+    options.session_id_filter = Some("target-session".to_string());
+    let turns = parse_hermes_db_with_options(&path, &options).expect("parse target session");
+
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].session_id, "target-session");
+    assert_eq!(turns[0].content, "target content");
+}
+
 #[tokio::test]
 async fn ingest_hermes_jsonl_is_idempotent_by_profile_session_message() {
     let dir = TempDir::new().unwrap();
