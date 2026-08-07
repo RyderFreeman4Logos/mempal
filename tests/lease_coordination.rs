@@ -297,6 +297,71 @@ fn runtime_writer_lease_daemon_start_rebinds_previous_daemon_identity() {
     assert_eq!(active, vec![rebound]);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn runtime_writer_lease_daemon_start_reclaims_dead_maintenance_holder() {
+    let db = open_test_db();
+    let maintenance = db
+        .runtime_writer_lease_acquire(
+            "sqlite-writer",
+            "mempal-maintenance-rejudge-dead",
+            "maintenance",
+            300,
+            None,
+        )
+        .unwrap()
+        .expect("maintenance lease");
+
+    db.conn()
+        .execute(
+            "UPDATE runtime_writer_leases SET pid = ?2 WHERE name = ?1",
+            rusqlite::params![maintenance.name, i64::from(u32::MAX)],
+        )
+        .expect("simulate exited rejudge process");
+
+    let daemon = db
+        .runtime_writer_lease_acquire_for_daemon_start("sqlite-writer", 300, None)
+        .unwrap()
+        .expect("daemon start must reclaim a dead maintenance lease");
+
+    assert_eq!(daemon.mode, "daemon");
+    assert!(daemon.generation > maintenance.generation);
+    assert_eq!(
+        db.runtime_writer_lease_status(Some("sqlite-writer"))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn runtime_writer_lease_daemon_start_preserves_live_maintenance_holder() {
+    let db = open_test_db();
+    let maintenance = db
+        .runtime_writer_lease_acquire(
+            "sqlite-writer",
+            "mempal-maintenance-rejudge-live",
+            "maintenance",
+            300,
+            None,
+        )
+        .unwrap()
+        .expect("maintenance lease");
+
+    assert!(
+        db.runtime_writer_lease_acquire_for_daemon_start("sqlite-writer", 300, None)
+            .unwrap()
+            .is_none(),
+        "daemon start must not steal a live maintenance lease"
+    );
+    let active = db
+        .runtime_writer_lease_status(Some("sqlite-writer"))
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].session_id, maintenance.session_id);
+}
+
 #[test]
 fn runtime_writer_daemon_liveness_rejects_reused_pid_identity() {
     let db = open_test_db();

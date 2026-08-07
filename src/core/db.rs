@@ -5347,10 +5347,10 @@ impl Database {
         )
     }
 
-    /// Acquire the daemon writer lease after removing a dead previous daemon
-    /// identity for the same lease name.
+    /// Acquire the daemon writer lease after removing dead previous writer
+    /// identities for the same lease name.
     ///
-    /// Live daemon holders and non-daemon holders are never replaced.
+    /// Live holders are never replaced.
     pub fn runtime_writer_lease_acquire_for_daemon_start(
         &self,
         name: &str,
@@ -5390,37 +5390,39 @@ impl Database {
                 RuntimeWriterLeaseAcquirePolicy::Standard
             ))?;
             if policy == RuntimeWriterLeaseAcquirePolicy::RebindDeadDaemon {
-                let previous_daemon = self
-                    .conn
-                    .query_row(
-                        "SELECT owner, pid, boot_id, session_id, generation \
-                         FROM runtime_writer_leases \
-                         WHERE name = ?1 AND mode = 'daemon'",
-                        [name],
-                        |row| {
+                let previous_holders = {
+                    let mut statement = self.conn.prepare(
+                        "SELECT owner, pid, boot_id, session_id, generation, mode \
+                         FROM runtime_writer_leases WHERE name = ?1",
+                    )?;
+                    statement
+                        .query_map([name], |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
                                 row.get::<_, i64>(1)?,
                                 row.get::<_, Option<String>>(2)?,
                                 row.get::<_, String>(3)?,
                                 row.get::<_, i64>(4)?,
+                                row.get::<_, String>(5)?,
                             ))
-                        },
-                    )
-                    .optional()?;
-                if let Some((
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                for (
                     previous_owner,
                     previous_pid,
                     previous_boot_id,
                     previous_session_id,
                     previous_generation,
-                )) = previous_daemon
+                    previous_mode,
+                ) in previous_holders
                 {
                     let previous_is_live = u32::try_from(previous_pid).ok().is_some_and(|pid| {
-                        runtime_writer_daemon_is_live_holder(
+                        runtime_writer_lease_holder_is_live(
                             &previous_owner,
                             pid,
                             previous_boot_id.as_deref(),
+                            &previous_mode,
                         )
                     });
                     if !previous_is_live {
