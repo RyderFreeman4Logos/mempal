@@ -354,7 +354,7 @@ fn push_reviewed_has_a_fixed_main_base_without_parameters() {
         "push-reviewed accepts an arbitrary base"
     );
     assert!(
-        justfile.contains("gh pr create --base main"),
+        justfile.contains("gh pr create --base main --fill"),
         "push-reviewed must create PRs against canonical main"
     );
     assert!(
@@ -378,7 +378,7 @@ fn push_reviewed_has_a_fixed_main_base_without_parameters() {
     );
     let dry_run = [output.stdout, output.stderr].concat();
     assert!(
-        String::from_utf8_lossy(&dry_run).contains("gh pr create --base main"),
+        String::from_utf8_lossy(&dry_run).contains("gh pr create --base main --fill"),
         "push-reviewed dry run lost canonical main base"
     );
 }
