@@ -146,31 +146,7 @@ fn runtime_writer_process_is_live_holder(pid: u32, boot_id: Option<&str>) -> boo
     }
 
     let proc_dir = PathBuf::from(format!("/proc/{pid}"));
-    if !proc_dir.exists() {
-        return false;
-    }
-    if pid == std::process::id() {
-        return true;
-    }
-
-    let exe_matches = fs::read_link(proc_dir.join("exe"))
-        .ok()
-        .as_deref()
-        .is_some_and(runtime_writer_path_is_mempal_holder);
-    if exe_matches {
-        return true;
-    }
-
-    fs::read(proc_dir.join("cmdline"))
-        .ok()
-        .and_then(|cmdline| {
-            cmdline
-                .split(|byte| *byte == 0)
-                .find(|part| !part.is_empty())
-                .map(|part| PathBuf::from(String::from_utf8_lossy(part).into_owned()))
-        })
-        .as_deref()
-        .is_some_and(runtime_writer_path_is_mempal_holder)
+    proc_dir.exists()
 }
 
 #[cfg(target_os = "linux")]
@@ -203,13 +179,6 @@ fn runtime_writer_lease_holder_is_live(
 #[cfg(not(target_os = "linux"))]
 fn runtime_writer_process_is_live_holder(_pid: u32, _boot_id: Option<&str>) -> bool {
     false
-}
-
-#[cfg(target_os = "linux")]
-fn runtime_writer_path_is_mempal_holder(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "mempal")
 }
 
 fn truncate_preview(content: &str, max_chars: usize) -> String {
