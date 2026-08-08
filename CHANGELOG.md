@@ -56,7 +56,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   after a daemon generation finishes startup without post-admission faults;
   cooldown-blocked retries can no longer extend an outage indefinitely (#844).
 
-- **Daemon/MCP/CLI coexistence**: open schemas beside live MCP writers; skip bootstrap queue reclaim; retry SQLite stalls; wait/retry held writer leases; reclaim dead `sqlite-writer` holders by birth/ns liveness (fail-closed if unverifiable); keep schema reject/repair, query-only reads, receipts, drains; fixtures cover leases (#843, #849, #850, #853, #856, #858, #859, #869, #870). Hermes SessionEnd ingest uses indexed SQL session filters (#864).
+- **Daemon/MCP/CLI coexistence**: both typed temporary admission refusals—restart-budget cooldowns and still-held live `sqlite-writer` leases after bounded retry—map to exit `75` (`EX_TEMPFAIL`) to prevent systemd restart thrash (#843, #849, #850, #853, #856, #858, #859, #864, #869, #870).
 
 - **MCP reads**: retry transient SQLite busy/locked errors on all query-only MCP reads (read_drawer, search, timeline, context, brief) under the existing search deadline, preventing opaque -32603 under daemon contention (#840).
 - **SQLite mutation retries**: bound shared 10-second CLI/MCP retry backoff, writer admission, and SQLite busy waits; a mutation that commits reports success, while unstarted expired MCP deletes return structured retryable lock errors (#838).

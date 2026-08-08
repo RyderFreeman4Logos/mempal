@@ -111,12 +111,13 @@ async fn acquire_daemon_writer_lease_with_bounded_wait(
             ));
         }
 
-        let active = {
+        let holders = {
             let db = db.lock().await;
-            db.runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
-                .unwrap_or_default()
+            match db.runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME)) {
+                Ok(active) => format_runtime_writer_leases(&active),
+                Err(_) => "holder status unavailable".to_string(),
+            }
         };
-        let holders = format_runtime_writer_leases(&active);
         let now = Instant::now();
         let deadline = *deadline.get_or_insert_with(|| {
             eprintln!(
