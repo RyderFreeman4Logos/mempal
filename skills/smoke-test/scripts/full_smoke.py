@@ -1130,6 +1130,80 @@ def created_ids_from(value: Any) -> list[str]:
     return list(dict.fromkeys(ids))
 
 
+def _is_nonnegative_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def holder_budget_no_write_receipt(value: Any) -> dict[str, Any] | None:
+    """Return only a complete direct holder-budget receipt safe to bypass cleanup."""
+    if not isinstance(value, dict):
+        return None
+    for receipt in receipt_dicts_from(value):
+        capacity = receipt.get('capacity')
+        headroom = receipt.get('headroom')
+        admission = receipt.get('profile_admission')
+        if (
+            receipt.get('outcome') != 'admission_blocked'
+            or receipt.get('reason') != 'holder_budget_exceeded'
+            or receipt.get('action') != 'write_refused'
+            or receipt.get('created_drawer_ids') != []
+            or receipt.get('cleanup_drawer_ids') != []
+            or not isinstance(capacity, dict)
+            or not isinstance(headroom, dict)
+            or not isinstance(admission, dict)
+        ):
+            continue
+        fields = (
+            capacity.get('holders'), capacity.get('cache_bytes'),
+            headroom.get('holders'), headroom.get('cache_bytes'),
+            admission.get('active_holders'), admission.get('configured_holder_limit'),
+            admission.get('active_cache_bytes'), admission.get('configured_cache_bytes'),
+            admission.get('reaped_stale_holders_this_snapshot'),
+            admission.get('reserved_service_holders'), admission.get('service_holders'),
+            admission.get('requested_cache_bytes'),
+        )
+        if not all(_is_nonnegative_integer(field) for field in fields):
+            continue
+        holders, cache_bytes, holder_headroom, cache_headroom = fields[:4]
+        active_holders, configured_holders, active_cache, configured_cache = fields[4:8]
+        _reaped, reserved_holders, service_holders, requested_cache = fields[8:]
+        budget_reason = admission.get('budget_reason')
+        if (
+            holders == 0
+            or cache_bytes == 0
+            or requested_cache == 0
+            or configured_holders != holders
+            or configured_cache != cache_bytes
+            or holder_headroom != max(0, holders - active_holders)
+            or cache_headroom != max(0, cache_bytes - active_cache)
+            or service_holders > active_holders
+            or reserved_holders > holders
+            or budget_reason not in {
+                'holder_limit', 'cache_budget', 'reserved_service_slots',
+            }
+        ):
+            continue
+        if budget_reason == 'holder_limit' and active_holders < holders:
+            continue
+        if budget_reason == 'cache_budget' and (
+            active_holders >= holders or active_cache + requested_cache <= cache_bytes
+        ):
+            continue
+        if budget_reason == 'reserved_service_slots' and (
+            active_holders >= holders
+            or active_cache + requested_cache > cache_bytes
+            or reserved_holders == 0
+            or active_holders + 1 + reserved_holders <= holders
+        ):
+            continue
+        return {
+            'outcome': 'admission_blocked',
+            'reason': 'holder_budget_exceeded',
+            'cleanup_required': False,
+        }
+    return None
+
+
 def create_terminal_receipt(value: Any) -> dict[str, Any] | None:
     """Classify only the documented cleanup-safe create terminal contracts."""
     receipts = receipt_dicts_from(value)
@@ -1418,7 +1492,7 @@ def cli_crud() -> list[str]:
         timeout=130,
     )
     ids, create_recovery = recover_created_ids(parsed, 'cli_create_wait')
-    direct_receipt = create_terminal_receipt(parsed)
+    direct_receipt = holder_budget_no_write_receipt(parsed)
     _remember_created_ids(ids)
 
     # Fallback: if CLI direct-write fails due to daemon writer lease, retry via REST.
@@ -1688,7 +1762,7 @@ def mcp_crud() -> list[str]:
         _checkpoint_manifest()
         create, info = _mcp_tool_with_hard_timeout(client, 'mempal_ingest', create_args, timeout=30)
         ids = created_ids_from(create)
-        mcp_receipt = create_terminal_receipt([create, info])
+        mcp_receipt = holder_budget_no_write_receipt(info)
         _remember_created_ids(ids)
         create_receipt = [create, info]
         create_operation_id = operation_id_from(create_receipt)

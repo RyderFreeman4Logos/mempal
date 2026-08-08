@@ -109,10 +109,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "skills/smoke-test/scripts/full_smoke.py"
 kind = "source"
-baseline_tokens = 21294
-baseline_lines = 2231
-issue = "855"
-rationale = "#855 reserves recovery_fields reason for callers so admission-blocked note() cannot TypeError on duplicate reason; exact no-growth ratchet."
+baseline_tokens = 21861
+baseline_lines = 2297
+issue = "876"
+rationale = "#876 validates complete holder-budget receipts before CLI/MCP no-write bypass; exact no-growth ratchet."
 
 [[files]]
 path = "skills/smoke-test/tests/test_full_smoke_receipts.py"

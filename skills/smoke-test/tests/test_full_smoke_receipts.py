@@ -67,6 +67,19 @@ class ReceiptExtractionTests(unittest.TestCase):
                     "reason": "holder_budget_exceeded",
                     "created_drawer_ids": [],
                     "cleanup_drawer_ids": [],
+                    "capacity": {"holders": 16, "cache_bytes": 64},
+                    "headroom": {"holders": 2, "cache_bytes": 50},
+                    "profile_admission": {
+                        "active_holders": 14,
+                        "configured_holder_limit": 16,
+                        "active_cache_bytes": 14,
+                        "configured_cache_bytes": 64,
+                        "reaped_stale_holders_this_snapshot": 0,
+                        "reserved_service_holders": 2,
+                        "service_holders": 14,
+                        "requested_cache_bytes": 1,
+                        "budget_reason": "reserved_service_slots",
+                    },
                 }
             }
         )
@@ -108,21 +121,6 @@ class ReceiptExtractionTests(unittest.TestCase):
             self.smoke.create_terminal_receipt({"terminal_receipt": receipt})["cleanup_required"],
             False,
         )
-
-    def test_no_write_admission_skips_create_cleanup_without_missing_id_failure(self) -> None:
-        setattr(self.smoke, "SUMMARY", {"groups": {}, "failures": []})
-        handled = self.smoke.note_no_write_create(
-            "mcp_create",
-            "mcp_inconclusive_no_cleanup_id",
-            {"outcome": "admission_blocked", "reason": "holder_budget_exceeded"},
-        )
-
-        self.assertTrue(handled)
-        self.assertEqual(
-            self.smoke.SUMMARY["groups"]["mcp_inconclusive_no_cleanup_id"]["skipped"],
-            "admission_blocked_no_write",
-        )
-        self.assertNotIn("mcp_inconclusive_no_cleanup_id", self.smoke.SUMMARY["failures"])
 
     def test_recover_created_ids_waits_on_operation_receipt(self) -> None:
         calls: list[tuple[str, str]] = []

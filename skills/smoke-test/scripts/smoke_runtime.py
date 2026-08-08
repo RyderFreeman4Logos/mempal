@@ -77,6 +77,25 @@ def terminal_no_write_receipt(error: Any) -> dict[str, Any] | None:
             }
             if numeric:
                 receipt[key] = numeric
+    profile_admission = data.get("profile_admission")
+    if isinstance(profile_admission, dict):
+        retained = {
+            field: value
+            for field in (
+                "active_holders",
+                "configured_holder_limit",
+                "active_cache_bytes",
+                "configured_cache_bytes",
+                "reaped_stale_holders_this_snapshot",
+                "reserved_service_holders",
+                "service_holders",
+                "requested_cache_bytes",
+                "budget_reason",
+            )
+            if (value := profile_admission.get(field)) is not None
+        }
+        if retained:
+            receipt["profile_admission"] = retained
     return receipt
 
 
