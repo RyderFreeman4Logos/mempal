@@ -1,6 +1,15 @@
 use super::*;
 use crate::core::queue::{PendingMessageStore, QueueError};
 
+#[test]
+fn cooldown_refusal_keeps_the_temporary_exit_status() {
+    let error = anyhow::Error::new(DaemonCooldownRequired::new(1));
+    assert_eq!(
+        temporary_refusal_exit_status(&error),
+        Some(DAEMON_COOLDOWN_TEMPFAIL_EXIT_STATUS)
+    );
+}
+
 fn sqlite_protocol_queue_error() -> QueueError {
     QueueError::Sqlite(rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error {

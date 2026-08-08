@@ -1,4 +1,5 @@
 use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use mempal::daemon_bootstrap::{DaemonContext, temporary_refusal_exit_status};
 use mempal::daemon_recovery::{
@@ -257,7 +258,7 @@ fn one_process_generation_consumes_at_most_one_fault_slot() {
 }
 
 #[test]
-fn restart_budget_admission_precedes_storage_bootstrap() {
+fn restart_budget_admission_waits_for_cooldown_before_storage_bootstrap() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let mempal_home = tempdir.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
@@ -290,48 +291,44 @@ log_path = "{}"
     }
     assert_eq!(final_decision, RestartDecision::CooldownRequired);
     let recovery_state_path = mempal_home.join("daemon-recovery.json");
-    let frozen_recovery_state = fs::read(&recovery_state_path).expect("read frozen recovery state");
+    let mut recovery_state: serde_json::Value = serde_json::from_slice(
+        &fs::read(&recovery_state_path).expect("read exhausted recovery state"),
+    )
+    .expect("parse recovery state");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after unix epoch")
+        .as_secs();
+    recovery_state["cooldown_until_unix_secs"] = serde_json::json!(now + 1);
+    fs::write(
+        &recovery_state_path,
+        serde_json::to_vec(&recovery_state).expect("encode shortened cooldown"),
+    )
+    .expect("shorten cooldown for bootstrap test");
 
     let runtime_root = tempdir.path().join("runtime");
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-    let error = match DaemonContext::bootstrap_with_events_for_test(
-        config_path,
-        true,
-        Some(tx),
-        &runtime_root,
-    ) {
-        Ok(context) => {
-            drop(context);
-            panic!("cooldown must reject daemon bootstrap")
-        }
-        Err(error) => error,
-    };
+    let context =
+        DaemonContext::bootstrap_with_events_for_test(config_path, true, Some(tx), &runtime_root)
+            .expect("bootstrap should continue after the cooldown wait");
+    drop(context);
 
-    assert!(
-        error
-            .to_string()
-            .contains("daemon restart budget exhausted"),
-        "unexpected bootstrap error: {error:#}"
-    );
-    assert_eq!(
-        temporary_refusal_exit_status(&error),
-        Some(75),
-        "cooldown-only bootstrap refusal must use the stable EX_TEMPFAIL status"
-    );
     let generic_bootstrap_error = anyhow::anyhow!("unrelated bootstrap failure");
+    let mut stages = Vec::new();
+    while let Some(stage) = rx.blocking_recv() {
+        stages.push(stage);
+    }
+    assert_eq!(
+        stages.first(),
+        Some(&mempal::bootstrap_events::BootstrapEvent::RecoveryAdmitted)
+    );
+    assert!(
+        db_path.exists(),
+        "bootstrap should open storage after recovery"
+    );
     assert_eq!(
         temporary_refusal_exit_status(&generic_bootstrap_error),
         None,
         "only cooldown refusals may use the temporary-refusal status"
     );
-    assert_eq!(
-        fs::read(&recovery_state_path).expect("read recovery state after refusal"),
-        frozen_recovery_state,
-        "cooldown refusal must not rearm or mutate frozen recovery state"
-    );
-    assert!(
-        rx.blocking_recv().is_none(),
-        "cooldown must reject bootstrap before daemonizing or opening SQLite"
-    );
-    assert!(!db_path.exists(), "cooldown must prevent database creation");
 }

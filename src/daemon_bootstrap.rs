@@ -16,7 +16,8 @@ use crate::core::{
     queue::{AsyncPendingMessageStore, QueueError},
 };
 use crate::daemon_recovery::{
-    DaemonRecovery, DaemonRecoveryFaultReporter, RecoveryFault, RestartDecision,
+    DaemonRecovery, DaemonRecoveryFaultReporter, RESTART_COOLDOWN_SECS, RecoveryFault,
+    RestartDecision,
 };
 use anyhow::{Context, Result};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -29,6 +30,7 @@ use crate::process_diagnostics::{
 const DAEMON_STALL_SECONDS: u64 = 5 * 60;
 const DAEMON_STALL_LOG_THROTTLE_SECONDS: u64 = 60;
 const DAEMON_SQLITE_CONTENTION_FRESHNESS_SECONDS: u64 = 60;
+const DAEMON_COOLDOWN_WAIT_MAX: Duration = Duration::from_secs(RESTART_COOLDOWN_SECS);
 
 /// Stable process exit status for a daemon start refused by an active restart
 /// budget cooldown. This is sysexits `EX_TEMPFAIL` and is intentionally
@@ -405,18 +407,7 @@ fn bootstrap_inner(
     // but before daemonizing or opening SQLite. Startup remediation and the
     // worker generation must therefore share one bounded recovery budget.
     let recovery = DaemonRecovery::new(&mempal_home);
-    if recovery
-        .admit_start()
-        .context("failed to inspect daemon restart budget")?
-        == RestartDecision::CooldownRequired
-    {
-        let snapshot = recovery
-            .snapshot()
-            .context("failed to read exhausted daemon restart budget")?;
-        return Err(anyhow::Error::new(DaemonCooldownRequired::new(
-            snapshot.cooldown_remaining_secs,
-        )));
-    }
+    admit_start_with_cooldown_wait(&recovery)?;
     let recovery_faults = DaemonRecoveryFaultReporter::new(recovery.clone());
     emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::RecoveryAdmitted);
 
@@ -470,6 +461,50 @@ fn bootstrap_inner(
         _pid_guard: pid_guard,
         _lock_guard: lock_guard,
     })
+}
+
+fn admit_start_with_cooldown_wait(recovery: &DaemonRecovery) -> Result<()> {
+    if recovery
+        .admit_start()
+        .context("failed to inspect daemon restart budget")?
+        == RestartDecision::RestartAllowed
+    {
+        return Ok(());
+    }
+
+    let snapshot = recovery
+        .snapshot()
+        .context("failed to read exhausted daemon restart budget")?;
+    // Recovery timestamps are whole Unix seconds; add one second so a sleep
+    // that starts just before the next tick cannot retry one tick too early.
+    let wait_secs = snapshot
+        .cooldown_remaining_secs
+        .min(RESTART_COOLDOWN_SECS.saturating_sub(1))
+        .saturating_add(1);
+    let wait = Duration::from_secs(wait_secs).min(DAEMON_COOLDOWN_WAIT_MAX);
+    eprintln!(
+        "daemon restart budget cooldown active; {}s remaining; intentionally waiting before retrying the recovery path",
+        snapshot.cooldown_remaining_secs
+    );
+    std::thread::sleep(wait);
+    eprintln!(
+        "daemon restart budget cooldown wait ended; retrying admission to continue the recovery path"
+    );
+
+    if recovery
+        .admit_start()
+        .context("failed to retry daemon restart budget admission")?
+        == RestartDecision::CooldownRequired
+    {
+        let snapshot = recovery
+            .snapshot()
+            .context("failed to read daemon restart budget after cooldown wait")?;
+        return Err(anyhow::Error::new(DaemonCooldownRequired::new(
+            snapshot.cooldown_remaining_secs,
+        )));
+    }
+    eprintln!("daemon restart budget cooldown cleared; continuing daemon bootstrap recovery path");
+    Ok(())
 }
 
 fn open_daemon_storage_with_remediation(
