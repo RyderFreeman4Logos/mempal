@@ -32,9 +32,8 @@ const DAEMON_STALL_LOG_THROTTLE_SECONDS: u64 = 60;
 const DAEMON_SQLITE_CONTENTION_FRESHNESS_SECONDS: u64 = 60;
 const DAEMON_COOLDOWN_WAIT_MAX: Duration = Duration::from_secs(RESTART_COOLDOWN_SECS);
 
-/// Stable process exit status for a daemon start refused by an active restart
-/// budget cooldown. This is sysexits `EX_TEMPFAIL` and is intentionally
-/// reserved for the cooldown-only admission path.
+/// Stable process exit status for a temporary daemon admission refusal. This
+/// is sysexits `EX_TEMPFAIL` and prevents supervisor restart thrash.
 pub const DAEMON_COOLDOWN_TEMPFAIL_EXIT_STATUS: i32 = 75;
 
 /// A daemon start was refused solely because its restart budget is cooling down.
@@ -63,12 +62,34 @@ impl std::fmt::Display for DaemonCooldownRequired {
 
 impl std::error::Error for DaemonCooldownRequired {}
 
+/// A daemon start could not acquire the live SQLite writer lease after its bounded admission wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonWriterLeaseHeld(String);
+
+impl DaemonWriterLeaseHeld {
+    pub(crate) fn new(holders: impl Into<String>) -> Self {
+        Self(holders.into())
+    }
+}
+
+impl std::fmt::Display for DaemonWriterLeaseHeld {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "daemon SQLite writer lease remained held after bounded admission wait: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for DaemonWriterLeaseHeld {}
+
 /// Returns the stable temporary-refusal process exit status when `error` was
-/// caused by a cooldown-only daemon admission refusal.
+/// caused by a temporary daemon admission refusal.
 pub fn temporary_refusal_exit_status(error: &anyhow::Error) -> Option<i32> {
     error
         .chain()
-        .any(|cause| cause.is::<DaemonCooldownRequired>())
+        .any(|cause| cause.is::<DaemonCooldownRequired>() || cause.is::<DaemonWriterLeaseHeld>())
         .then_some(DAEMON_COOLDOWN_TEMPFAIL_EXIT_STATUS)
 }
 

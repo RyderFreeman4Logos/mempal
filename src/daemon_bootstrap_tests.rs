@@ -10,6 +10,15 @@ fn cooldown_refusal_keeps_the_temporary_exit_status() {
     );
 }
 
+#[test]
+fn writer_lease_refusal_keeps_the_temporary_exit_status() {
+    let error = anyhow::Error::new(DaemonWriterLeaseHeld::new("mode=mcp pid=42 owner=test"));
+    assert_eq!(
+        temporary_refusal_exit_status(&error),
+        Some(DAEMON_COOLDOWN_TEMPFAIL_EXIT_STATUS)
+    );
+}
+
 fn sqlite_protocol_queue_error() -> QueueError {
     QueueError::Sqlite(rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error {
