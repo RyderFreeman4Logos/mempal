@@ -365,8 +365,8 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 180458
-baseline_lines = 22792
+baseline_tokens = 181144
+baseline_lines = 22858
 issue = "858"
 rationale = "#858 daemon-scoped ingest heartbeat/write paths record typed queue SQLite contention; exact no-growth ratchet."
 

@@ -2464,10 +2464,7 @@ impl MempalMcpServer {
                 let diagnostic =
                     status_database_diagnostic(&self.db_path, "async_db", error.as_ref());
                 if diagnostic.failure_kind == "holder_budget_exceeded" {
-                    return Err(mcp_async_pool_admission_error(
-                        &self.db_path,
-                        error.as_ref(),
-                    ));
+                    return Err(mcp_async_pool_admission_error(&self.db_path, &error));
                 }
                 Ok(())
             }
@@ -12178,12 +12175,59 @@ fn profile_admission_snapshot(db_path: &Path, pool_loaded_key: &str) -> serde_js
     admission
 }
 
-fn mcp_async_pool_admission_error(
-    db_path: &Path,
-    error: &(dyn std::error::Error + 'static),
-) -> ErrorData {
-    let diagnostic = status_database_diagnostic(db_path, "async_db", error);
-    let admission = profile_admission_snapshot(db_path, "async_pool_loaded");
+fn budget_exceeded_profile_admission(error: &anyhow::Error) -> Option<serde_json::Value> {
+    let admission = match error.downcast_ref::<crate::core::db::DbError>() {
+        Some(crate::core::db::DbError::Admission(
+            admission @ crate::core::db_admission::DbAdmissionError::BudgetExceeded { .. },
+        )) => admission,
+        _ => match error.downcast_ref::<crate::core::db_admission::DbAdmissionError>() {
+            Some(
+                admission @ crate::core::db_admission::DbAdmissionError::BudgetExceeded { .. },
+            ) => admission,
+            _ => return None,
+        },
+    };
+    let crate::core::db_admission::DbAdmissionError::BudgetExceeded {
+        active_holders,
+        max_holders,
+        active_cache_bytes,
+        max_cache_bytes,
+        requested_cache_bytes,
+        reaped_stale_holders,
+        reserved_service_holders,
+        service_holders,
+        reason,
+    } = admission
+    else {
+        return None;
+    };
+    Some(serde_json::json!({
+        "active_holders": active_holders,
+        "configured_holder_limit": max_holders,
+        "active_cache_bytes": active_cache_bytes,
+        "configured_cache_bytes": max_cache_bytes,
+        "available_cache_bytes": max_cache_bytes.saturating_sub(*active_cache_bytes),
+        "reaped_stale_holders_this_snapshot": reaped_stale_holders,
+        "reserved_service_holders": reserved_service_holders,
+        "service_holders": service_holders,
+        "requested_cache_bytes": requested_cache_bytes,
+        "budget_reason": reason.to_string(),
+        "capacity": {"holders": max_holders, "cache_bytes": max_cache_bytes},
+        "headroom": {
+            "holders": max_holders.saturating_sub(*active_holders),
+            "cache_bytes": max_cache_bytes.saturating_sub(*active_cache_bytes),
+        },
+    }))
+}
+
+fn mcp_async_pool_admission_error(db_path: &Path, error: &anyhow::Error) -> ErrorData {
+    let diagnostic = status_database_diagnostic(db_path, "async_db", error.as_ref());
+    let mut admission = profile_admission_snapshot(db_path, "async_pool_loaded");
+    if let Some(fields) = budget_exceeded_profile_admission(error)
+        && let (Some(admission), Some(fields)) = (admission.as_object_mut(), fields.as_object())
+    {
+        admission.extend(fields.clone());
+    }
     let capacity = admission.get("capacity").cloned();
     let headroom = admission.get("headroom").cloned();
     let message = if diagnostic.failure_kind == "holder_budget_exceeded" {
@@ -22168,8 +22212,30 @@ prototypes = ["keep"]
         assert_eq!(data["created_drawer_ids"], serde_json::json!([]));
         assert_eq!(data["cleanup_drawer_ids"], serde_json::json!([]));
         assert_eq!(data["capacity"]["holders"], 16);
+        assert_eq!(data["capacity"]["cache_bytes"], 256 * 1024 * 1024);
+        assert_eq!(data["profile_admission"]["active_holders"], 14);
+        assert_eq!(data["profile_admission"]["configured_holder_limit"], 16);
+        assert_eq!(
+            data["profile_admission"]["active_cache_bytes"],
+            14 * 16 * 1024 * 1024
+        );
+        assert_eq!(
+            data["profile_admission"]["configured_cache_bytes"],
+            256 * 1024 * 1024
+        );
+        assert_eq!(
+            data["profile_admission"]["reaped_stale_holders_this_snapshot"],
+            0
+        );
+        assert_eq!(data["profile_admission"]["reserved_service_holders"], 2);
         assert_eq!(data["profile_admission"]["service_holders"], 14);
         assert_eq!(data["headroom"]["holders"], 2);
+        assert_eq!(data["headroom"]["cache_bytes"], 32 * 1024 * 1024);
+        assert_eq!(
+            data["profile_admission"]["requested_cache_bytes"],
+            3 * 16 * 1024 * 1024
+        );
+        assert_eq!(data["profile_admission"]["budget_reason"], "cache_budget");
     }
 
     #[tokio::test]
