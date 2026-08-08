@@ -1135,8 +1135,8 @@ def _is_nonnegative_integer(value: Any) -> bool:
 
 
 def holder_budget_no_write_receipt(value: Any) -> dict[str, Any] | None:
-    """Return only a complete direct holder-budget receipt safe to bypass cleanup."""
-    if not isinstance(value, dict):
+    """Return exact holder-budget no-write receipt."""
+    if created_ids_from(value):
         return None
     for receipt in receipt_dicts_from(value):
         capacity = receipt.get('capacity')
@@ -1206,6 +1206,13 @@ def holder_budget_no_write_receipt(value: Any) -> dict[str, Any] | None:
 
 def create_terminal_receipt(value: Any) -> dict[str, Any] | None:
     """Classify only the documented cleanup-safe create terminal contracts."""
+    created_ids = created_ids_from(value)
+    if created_ids:
+        return {
+            'outcome': 'write_accepted',
+            'created_drawer_ids': created_ids,
+            'cleanup_required': True,
+        }
     receipts = receipt_dicts_from(value)
     for receipt in receipts:
         if receipt.get('outcome') != 'admission_blocked':
@@ -1221,13 +1228,6 @@ def create_terminal_receipt(value: Any) -> dict[str, Any] | None:
             'outcome': 'admission_blocked',
             'reason': reason if isinstance(reason, str) and reason else 'unknown_admission_reason',
             'cleanup_required': False,
-        }
-    created_ids = created_ids_from(value)
-    if created_ids:
-        return {
-            'outcome': 'write_accepted',
-            'created_drawer_ids': created_ids,
-            'cleanup_required': True,
         }
     return None
 
@@ -1494,6 +1494,8 @@ def cli_crud() -> list[str]:
     ids, create_recovery = recover_created_ids(parsed, 'cli_create_wait')
     direct_receipt = holder_budget_no_write_receipt(parsed)
     _remember_created_ids(ids)
+    if not ids and direct_receipt and note_no_write_create('cli_create', 'cli_crud', direct_receipt):
+        return cleanup_ids
 
     # Fallback: if CLI direct-write fails due to daemon writer lease, retry via REST.
     # The fork's daemon holds a long-lived sqlite-writer lease; CLI ingest that
@@ -1511,8 +1513,6 @@ def cli_crud() -> list[str]:
     elif ids and create_recovery.get('recovered_via'):
         note('cli_create', True, created_id_count=len(ids), **recovery_fields(create_recovery))
     if not ids:
-        if direct_receipt and note_no_write_create('cli_create', 'cli_crud', direct_receipt):
-            return cleanup_ids
         note('cli_crud', False, reason='create_missing_created_drawer_ids', **recovery_fields(create_recovery))
         return cleanup_ids
     cleanup_ids.extend(ids)
@@ -1761,16 +1761,20 @@ def mcp_crud() -> list[str]:
         create_args = {'content': f'{MARKER} reversible MCP smoke drawer; nonce {NONCE}; lexical tokens azurequill basaltfern cobaltlyric; safe to delete', 'wing': 'smoke', 'room': 'mcp', 'source_type': 'agent_inference', 'memory_kind': 'evidence', 'domain': 'project', 'field': 'smoke', 'smoke': True, 'wait': True, 'wait_timeout_secs': 15}
         _checkpoint_manifest()
         create, info = _mcp_tool_with_hard_timeout(client, 'mempal_ingest', create_args, timeout=30)
-        ids = created_ids_from(create)
-        mcp_receipt = holder_budget_no_write_receipt(info)
-        _remember_created_ids(ids)
         create_receipt = [create, info]
+        ids = created_ids_from(create_receipt)
+        mcp_receipt = holder_budget_no_write_receipt(create_receipt)
+        _remember_created_ids(ids)
         create_operation_id = operation_id_from(create_receipt)
         create_timeout_operation_id = followable_timeout_operation_id(create_receipt)
         create_recovery: dict[str, Any] = {
             'operation_id_present': bool(create_operation_id),
             'operation_state': operation_state_from(create_receipt),
         }
+        if not ids and mcp_receipt and note_no_write_create(
+            'mcp_create', 'mcp_inconclusive_no_cleanup_id', mcp_receipt
+        ):
+            return cleanup_ids
         if create_operation_id and client is not None:
             status_structured, status_info = client.tool(
                 'mempal_operation_status',
@@ -1826,10 +1830,6 @@ def mcp_crud() -> list[str]:
 
         if ids:
             clear_probe_failures('mcp_create_rest', 'mcp_create_rest_fallback')
-        if not ids and mcp_receipt and note_no_write_create(
-            'mcp_create', 'mcp_inconclusive_no_cleanup_id', mcp_receipt
-        ):
-            return cleanup_ids
         # MCP create passes when the MCP tool returned IDs immediately or when a
         # queued operation was recovered via mempal_operation_status. REST
         # fallback keeps the suite going but does not mask MCP write failure.
@@ -1879,9 +1879,9 @@ def mcp_crud() -> list[str]:
         update_args = {'content': f'{MARKER} reversible MCP smoke drawer updated; nonce {NONCE[::-1]}; lexical tokens deltaorchid embervault frostcairn; safe to delete', 'wing': 'smoke', 'room': 'mcp', 'source_type': 'agent_inference', 'memory_kind': 'evidence', 'domain': 'project', 'field': 'smoke', 'smoke': True, 'supersedes': created_id, 'wait': True, 'wait_timeout_secs': 15}
         _checkpoint_manifest()
         update, uinfo = _mcp_tool_with_hard_timeout(client, 'mempal_ingest', update_args, timeout=30)
-        upd_ids = created_ids_from(update)
-        _remember_created_ids(upd_ids)
         update_receipt = [update, uinfo]
+        upd_ids = created_ids_from(update_receipt)
+        _remember_created_ids(upd_ids)
         update_timeout_operation_id = followable_timeout_operation_id(update_receipt)
         update_recovery: dict[str, Any] = {
             'operation_id_present': bool(operation_id_from(update_receipt)),
