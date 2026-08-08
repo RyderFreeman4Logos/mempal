@@ -136,9 +136,23 @@ fn runtime_writer_lease_acquire_renew_release() {
     assert_eq!(lease.mode, "daemon");
     assert_eq!(lease.pid, std::process::id());
     assert!(lease.remaining_secs > 0);
+    let metadata: serde_json::Value =
+        serde_json::from_str(lease.metadata_json.as_deref().unwrap()).unwrap();
     assert_eq!(
-        lease.metadata_json.as_deref(),
-        Some(r#"{"command":"daemon"}"#)
+        metadata.get("command").and_then(serde_json::Value::as_str),
+        Some("daemon")
+    );
+    assert!(
+        metadata
+            .get("process_identity")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(
+        metadata
+            .get("pid_namespace")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
     );
 
     assert!(db.runtime_writer_lease_renew(&lease, 600).unwrap());
@@ -295,6 +309,112 @@ fn runtime_writer_lease_daemon_start_rebinds_previous_daemon_identity() {
         .unwrap();
     active[0].remaining_secs = rebound.remaining_secs;
     assert_eq!(active, vec![rebound]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn runtime_writer_lease_daemon_start_reclaims_dead_maintenance_holder() {
+    let db = open_test_db();
+    let maintenance = db
+        .runtime_writer_lease_acquire(
+            "sqlite-writer",
+            "mempal-maintenance-rejudge-dead",
+            "maintenance",
+            300,
+            None,
+        )
+        .unwrap()
+        .expect("maintenance lease");
+
+    db.conn()
+        .execute(
+            "UPDATE runtime_writer_leases SET pid = ?2 WHERE name = ?1",
+            rusqlite::params![maintenance.name, i64::from(u32::MAX)],
+        )
+        .expect("simulate exited rejudge process");
+
+    let daemon = db
+        .runtime_writer_lease_acquire_for_daemon_start("sqlite-writer", 300, None)
+        .unwrap()
+        .expect("daemon start must reclaim a dead maintenance lease");
+
+    assert_eq!(daemon.mode, "daemon");
+    assert!(daemon.generation > maintenance.generation);
+    assert_eq!(
+        db.runtime_writer_lease_status(Some("sqlite-writer"))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn runtime_writer_lease_daemon_start_preserves_live_maintenance_holder() {
+    let db = open_test_db();
+    let maintenance = db
+        .runtime_writer_lease_acquire(
+            "sqlite-writer",
+            "mempal-maintenance-rejudge-live",
+            "maintenance",
+            300,
+            None,
+        )
+        .unwrap()
+        .expect("maintenance lease");
+
+    assert!(
+        db.runtime_writer_lease_acquire_for_daemon_start("sqlite-writer", 300, None)
+            .unwrap()
+            .is_none(),
+        "daemon start must not steal a live maintenance lease"
+    );
+    let active = db
+        .runtime_writer_lease_status(Some("sqlite-writer"))
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].session_id, maintenance.session_id);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn runtime_writer_lease_daemon_start_reclaims_same_pid_with_wrong_birth_identity() {
+    let db = open_test_db();
+    let maintenance = db
+        .runtime_writer_lease_acquire(
+            "sqlite-writer",
+            "mempal-maintenance-rejudge-reused-pid",
+            "maintenance",
+            300,
+            None,
+        )
+        .unwrap()
+        .expect("maintenance lease");
+    let pid_namespace = std::fs::read_link("/proc/self/ns/pid")
+        .expect("current PID namespace")
+        .into_os_string()
+        .into_string()
+        .expect("PID namespace UTF-8");
+
+    db.conn()
+        .execute(
+            "UPDATE runtime_writer_leases SET metadata_json = ?2 WHERE name = ?1",
+            rusqlite::params![
+                maintenance.name,
+                format!(
+                    r#"{{"process_identity":"previous-birth","pid_namespace":"{pid_namespace}"}}"#
+                )
+            ],
+        )
+        .expect("simulate same-boot PID reuse");
+
+    let daemon = db
+        .runtime_writer_lease_acquire_for_daemon_start("sqlite-writer", 300, None)
+        .unwrap()
+        .expect("daemon start must reclaim a mismatched process birth");
+
+    assert_eq!(daemon.mode, "daemon");
+    assert!(daemon.generation > maintenance.generation);
 }
 
 #[test]

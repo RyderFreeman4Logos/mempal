@@ -39,6 +39,12 @@ use super::{
 };
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
+#[path = "db_writer_lease_liveness.rs"]
+mod db_writer_lease_liveness;
+use db_writer_lease_liveness::{
+    runtime_boot_id, runtime_writer_daemon_is_live_holder, runtime_writer_lease_holder_is_live,
+    runtime_writer_lease_holder_should_retain, runtime_writer_metadata_with_process_identity,
+};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 20;
 pub const CURRENT_VECTOR_INDEX_VERSION: &str = "v2";
@@ -121,95 +127,6 @@ fn runtime_writer_metadata_marks_durable_mcp_ingest_worker(metadata_json: Option
         metadata.get("worker_role").and_then(Value::as_str),
         Some("background" | "scoped-drain")
     )
-}
-
-#[cfg(target_os = "linux")]
-fn runtime_boot_id() -> Option<String> {
-    crate::core::process_identity::boot_id()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn runtime_boot_id() -> Option<String> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn runtime_writer_process_is_live_holder(pid: u32, boot_id: Option<&str>) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    let Some(expected_boot_id) = boot_id else {
-        return false;
-    };
-    if runtime_boot_id().as_deref() != Some(expected_boot_id) {
-        return false;
-    }
-
-    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
-    if !proc_dir.exists() {
-        return false;
-    }
-    if pid == std::process::id() {
-        return true;
-    }
-
-    let exe_matches = fs::read_link(proc_dir.join("exe"))
-        .ok()
-        .as_deref()
-        .is_some_and(runtime_writer_path_is_mempal_holder);
-    if exe_matches {
-        return true;
-    }
-
-    fs::read(proc_dir.join("cmdline"))
-        .ok()
-        .and_then(|cmdline| {
-            cmdline
-                .split(|byte| *byte == 0)
-                .find(|part| !part.is_empty())
-                .map(|part| PathBuf::from(String::from_utf8_lossy(part).into_owned()))
-        })
-        .as_deref()
-        .is_some_and(runtime_writer_path_is_mempal_holder)
-}
-
-#[cfg(target_os = "linux")]
-fn runtime_writer_daemon_is_live_holder(owner: &str, pid: u32, boot_id: Option<&str>) -> bool {
-    let Some(expected_boot_id) = boot_id else {
-        return false;
-    };
-    runtime_boot_id().as_deref() == Some(expected_boot_id)
-        && crate::core::process_identity::daemon_owner_matches_process(owner, pid)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn runtime_writer_daemon_is_live_holder(owner: &str, pid: u32, _boot_id: Option<&str>) -> bool {
-    crate::core::process_identity::daemon_owner_matches_process(owner, pid)
-}
-
-fn runtime_writer_lease_holder_is_live(
-    owner: &str,
-    pid: u32,
-    boot_id: Option<&str>,
-    mode: &str,
-) -> bool {
-    if mode == "daemon" {
-        runtime_writer_daemon_is_live_holder(owner, pid, boot_id)
-    } else {
-        runtime_writer_process_is_live_holder(pid, boot_id)
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn runtime_writer_process_is_live_holder(_pid: u32, _boot_id: Option<&str>) -> bool {
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn runtime_writer_path_is_mempal_holder(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "mempal")
 }
 
 fn truncate_preview(content: &str, max_chars: usize) -> String {
@@ -5347,10 +5264,10 @@ impl Database {
         )
     }
 
-    /// Acquire the daemon writer lease after removing a dead previous daemon
-    /// identity for the same lease name.
+    /// Acquire the daemon writer lease after removing dead previous writer
+    /// identities for the same lease name.
     ///
-    /// Live daemon holders and non-daemon holders are never replaced.
+    /// Live holders are never replaced.
     pub fn runtime_writer_lease_acquire_for_daemon_start(
         &self,
         name: &str,
@@ -5384,46 +5301,52 @@ impl Database {
         let mut expires_at = String::new();
         let pid = std::process::id();
         let boot_id = runtime_boot_id();
+        let persisted_metadata_json = runtime_writer_metadata_with_process_identity(metadata_json);
         self.with_immediate_tx(|| {
             self.runtime_writer_lease_cleanup_expired_tx(!matches!(
                 policy,
                 RuntimeWriterLeaseAcquirePolicy::Standard
             ))?;
             if policy == RuntimeWriterLeaseAcquirePolicy::RebindDeadDaemon {
-                let previous_daemon = self
-                    .conn
-                    .query_row(
-                        "SELECT owner, pid, boot_id, session_id, generation \
-                         FROM runtime_writer_leases \
-                         WHERE name = ?1 AND mode = 'daemon'",
-                        [name],
-                        |row| {
+                let previous_holders = {
+                    let mut statement = self.conn.prepare(
+                        "SELECT owner, pid, boot_id, session_id, generation, mode, metadata_json \
+                         FROM runtime_writer_leases WHERE name = ?1",
+                    )?;
+                    statement
+                        .query_map([name], |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
                                 row.get::<_, i64>(1)?,
                                 row.get::<_, Option<String>>(2)?,
                                 row.get::<_, String>(3)?,
                                 row.get::<_, i64>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, Option<String>>(6)?,
                             ))
-                        },
-                    )
-                    .optional()?;
-                if let Some((
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                for (
                     previous_owner,
                     previous_pid,
                     previous_boot_id,
                     previous_session_id,
                     previous_generation,
-                )) = previous_daemon
+                    previous_mode,
+                    previous_metadata_json,
+                ) in previous_holders
                 {
-                    let previous_is_live = u32::try_from(previous_pid).ok().is_some_and(|pid| {
-                        runtime_writer_daemon_is_live_holder(
+                    let previous_should_retain = u32::try_from(previous_pid).ok().is_some_and(|pid| {
+                        runtime_writer_lease_holder_should_retain(
                             &previous_owner,
                             pid,
                             previous_boot_id.as_deref(),
+                            &previous_mode,
+                            previous_metadata_json.as_deref(),
                         )
                     });
-                    if !previous_is_live {
+                    if !previous_should_retain {
                         self.conn.execute(
                             "DELETE FROM runtime_writer_leases \
                              WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4",
@@ -5477,7 +5400,7 @@ impl Database {
                     &acquired_at,
                     &expires_at,
                     mode,
-                    metadata_json
+                    &persisted_metadata_json
                 ],
             )?;
             acquired = rows > 0;
@@ -5496,7 +5419,7 @@ impl Database {
                 expires_at,
                 heartbeat_at: acquired_at,
                 mode: mode.to_string(),
-                metadata_json: metadata_json.map(ToOwned::to_owned),
+                metadata_json: Some(persisted_metadata_json),
                 remaining_secs,
             }))
         } else {
@@ -5730,7 +5653,13 @@ impl Database {
                 &mode,
                 metadata_json.as_deref(),
             ) && u32::try_from(pid_i64).ok().is_some_and(|pid| {
-                runtime_writer_lease_holder_is_live(&owner, pid, boot_id.as_deref(), &mode)
+                runtime_writer_lease_holder_is_live(
+                    &owner,
+                    pid,
+                    boot_id.as_deref(),
+                    &mode,
+                    metadata_json.as_deref(),
+                )
             }) {
                 return Ok(true);
             }
@@ -5748,7 +5677,7 @@ impl Database {
     ) -> Result<usize, DbError> {
         let expired = {
             let mut stmt = self.conn.prepare(
-                "SELECT name, owner, pid, boot_id, session_id, generation, mode \
+                "SELECT name, owner, pid, boot_id, session_id, generation, mode, metadata_json \
                  FROM runtime_writer_leases \
                  WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')",
             )?;
@@ -5761,18 +5690,25 @@ impl Database {
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
         let mut removed = 0;
-        for (name, owner, pid, boot_id, session_id, generation, mode) in expired {
-            let preserve_live_holder = preserve_live_holders
+        for (name, owner, pid, boot_id, session_id, generation, mode, metadata_json) in expired {
+            let retain_holder = preserve_live_holders
                 && u32::try_from(pid).ok().is_some_and(|pid| {
-                    runtime_writer_lease_holder_is_live(&owner, pid, boot_id.as_deref(), &mode)
+                    runtime_writer_lease_holder_should_retain(
+                        &owner,
+                        pid,
+                        boot_id.as_deref(),
+                        &mode,
+                        metadata_json.as_deref(),
+                    )
                 });
-            if preserve_live_holder {
+            if retain_holder {
                 continue;
             }
             removed += self.conn.execute(

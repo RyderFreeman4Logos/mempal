@@ -18,6 +18,7 @@ impl Database {
                 lease.pid,
                 lease.boot_id.as_deref(),
                 &lease.mode,
+                lease.metadata_json.as_deref(),
             ) {
                 return Ok(());
             }
