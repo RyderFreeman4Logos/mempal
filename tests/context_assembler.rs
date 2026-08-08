@@ -539,12 +539,12 @@ async fn test_context_max_items_still_caps_raised_dao_tian_limit() {
 async fn test_context_prefers_worktree_anchor_before_repo_and_global() {
     let (tmp, db) = new_db();
     let repo_path = tmp.path().join("repo");
-    fs::create_dir_all(&repo_path).expect("create repo");
-    Command::new("git")
+    fs::create_dir_all(&repo_path).expect("repo");
+    Command::new("/usr/bin/git")
         .arg("init")
         .current_dir(&repo_path)
         .output()
-        .expect("git init");
+        .expect("init");
     let derived = anchor::derive_anchor_from_cwd(Some(&repo_path)).expect("derive anchor");
 
     let mut worktree = knowledge_drawer(
