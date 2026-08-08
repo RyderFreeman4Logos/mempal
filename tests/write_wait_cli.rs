@@ -1,7 +1,6 @@
 mod common;
 #[path = "write_wait_cli/ipc.rs"]
 mod ipc;
-
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};

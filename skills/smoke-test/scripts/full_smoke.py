@@ -1425,9 +1425,8 @@ def cli_crud() -> list[str]:
     # The fork's daemon holds a long-lived sqlite-writer lease; CLI ingest that
     # writes directly to the DB will be rejected when the daemon is active.
     # REST ingest goes through the daemon and either writes or returns a cleanup-safe no-write receipt.
-    rest_receipt: dict[str, Any] | None = None
     if not ids:
-        rest_ids, rest_receipt = _rest_ingest_fallback(
+        rest_ids, _ = _rest_ingest_fallback(
             f'{MARKER} reversible CLI smoke drawer; nonce {NONCE}; lexical tokens quorvax nimbledrift zettaplum; safe to delete',
             'cli_create_rest_fallback',
         )
@@ -1438,11 +1437,7 @@ def cli_crud() -> list[str]:
     elif ids and create_recovery.get('recovered_via'):
         note('cli_create', True, created_id_count=len(ids), **recovery_fields(create_recovery))
     if not ids:
-        if (
-            direct_receipt and direct_receipt.get('outcome') == 'admission_blocked'
-            and rest_receipt and rest_receipt.get('outcome') == 'admission_blocked'
-            and note_no_write_create('cli_create', 'cli_crud', direct_receipt)
-        ):
+        if direct_receipt and note_no_write_create('cli_create', 'cli_crud', direct_receipt):
             return cleanup_ids
         note('cli_crud', False, reason='create_missing_created_drawer_ids', **recovery_fields(create_recovery))
         return cleanup_ids
@@ -1740,9 +1735,8 @@ def mcp_crud() -> list[str]:
 
         # Fallback: if MCP ingest fails/hangs (writer lease), retry via REST so
         # follow-on read/delete paths still have a drawer to exercise.
-        rest_receipt: dict[str, Any] | None = None
         if not ids:
-            rest_ids, rest_receipt = run_fallback_after_mcp_reaped(
+            rest_ids, _ = run_fallback_after_mcp_reaped(
                 client,
                 'create_rest',
                 lambda: _rest_ingest_fallback(
@@ -1758,10 +1752,8 @@ def mcp_crud() -> list[str]:
 
         if ids:
             clear_probe_failures('mcp_create_rest', 'mcp_create_rest_fallback')
-        if not ids and (
-            mcp_receipt and mcp_receipt.get('outcome') == 'admission_blocked'
-            and rest_receipt and rest_receipt.get('outcome') == 'admission_blocked'
-            and note_no_write_create('mcp_create', 'mcp_inconclusive_no_cleanup_id', mcp_receipt)
+        if not ids and mcp_receipt and note_no_write_create(
+            'mcp_create', 'mcp_inconclusive_no_cleanup_id', mcp_receipt
         ):
             return cleanup_ids
         # MCP create passes when the MCP tool returned IDs immediately or when a

@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use serde_json::Value;
 
+#[path = "admission_receipts.rs"]
+mod admission_receipts;
+
 #[cfg(unix)]
 const MAX_READINESS_RESPONSE_BYTES: usize = 4096;
 #[cfg(unix)]
