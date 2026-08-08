@@ -42,6 +42,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **Writer-lease reclaim on daemon start**: reclaim dead non-daemon `sqlite-writer` holders without waiting full TTL, using process-birth identity + PID namespace liveness (fail-closed on unverifiable); keep live holders (including non-mempal same-namespace processes) (#869).
+
 - **Daemon supervisor cooldowns**: return the stable temporary-refusal status
   `75` (`EX_TEMPFAIL`) only when an active restart-budget cooldown refuses
   bootstrap, and ship a canonical systemd unit that prevents this status from
