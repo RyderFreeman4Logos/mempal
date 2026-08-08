@@ -352,7 +352,7 @@ kind = "source"
 baseline_tokens = 260191
 baseline_lines = 33712
 issue = "847"
-rationale = "#847 maps only typed daemon restart-budget cooldown refusals to the documented EX_TEMPFAIL process status while preserving generic failures; exact no-growth ratchet until the main CLI split lands."
+rationale = "#870 maps typed temporary daemon admission refusals, including restart-budget cooldown and a live writer lease still held after its bounded retry, to the documented EX_TEMPFAIL process status while preserving generic failures; exact no-growth ratchet until the main CLI split lands."
 
 [[files]]
 path = "src/markdown_export.rs"

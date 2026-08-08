@@ -6,7 +6,7 @@ fn cooldown_refusal_keeps_the_temporary_exit_status() {
     let error = anyhow::Error::new(DaemonCooldownRequired::new(1));
     assert_eq!(
         temporary_refusal_exit_status(&error),
-        Some(DAEMON_COOLDOWN_TEMPFAIL_EXIT_STATUS)
+        Some(DAEMON_TEMPORARY_ADMISSION_REFUSAL_EXIT_STATUS)
     );
 }
 
@@ -15,7 +15,7 @@ fn writer_lease_refusal_keeps_the_temporary_exit_status() {
     let error = anyhow::Error::new(DaemonWriterLeaseHeld::new("mode=mcp pid=42 owner=test"));
     assert_eq!(
         temporary_refusal_exit_status(&error),
-        Some(DAEMON_COOLDOWN_TEMPFAIL_EXIT_STATUS)
+        Some(DAEMON_TEMPORARY_ADMISSION_REFUSAL_EXIT_STATUS)
     );
 }
 

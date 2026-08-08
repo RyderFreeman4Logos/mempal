@@ -34,7 +34,7 @@ const DAEMON_COOLDOWN_WAIT_MAX: Duration = Duration::from_secs(RESTART_COOLDOWN_
 
 /// Stable process exit status for a temporary daemon admission refusal. This
 /// is sysexits `EX_TEMPFAIL` and prevents supervisor restart thrash.
-pub const DAEMON_COOLDOWN_TEMPFAIL_EXIT_STATUS: i32 = 75;
+pub const DAEMON_TEMPORARY_ADMISSION_REFUSAL_EXIT_STATUS: i32 = 75;
 
 /// A daemon start was refused solely because its restart budget is cooling down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +90,7 @@ pub fn temporary_refusal_exit_status(error: &anyhow::Error) -> Option<i32> {
     error
         .chain()
         .any(|cause| cause.is::<DaemonCooldownRequired>() || cause.is::<DaemonWriterLeaseHeld>())
-        .then_some(DAEMON_COOLDOWN_TEMPFAIL_EXIT_STATUS)
+        .then_some(DAEMON_TEMPORARY_ADMISSION_REFUSAL_EXIT_STATUS)
 }
 
 #[cfg(not(test))]
