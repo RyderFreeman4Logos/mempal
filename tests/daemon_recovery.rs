@@ -329,6 +329,6 @@ log_path = "{}"
     assert_eq!(
         temporary_refusal_exit_status(&generic_bootstrap_error),
         None,
-        "only cooldown refusals may use the temporary-refusal status"
+        "only typed temporary admission refusals may use the temporary-refusal status"
     );
 }

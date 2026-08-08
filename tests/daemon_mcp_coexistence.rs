@@ -18,6 +18,7 @@ use mempal::core::config::Config;
 use mempal::core::db::Database;
 use mempal::core::db_admission::{DbHolderClass, ProfileDbAdmission};
 use mempal::core::types::{Drawer, SourceType};
+use mempal::daemon_bootstrap::DAEMON_TEMPORARY_ADMISSION_REFUSAL_EXIT_STATUS;
 use mempal::daemon_recovery::{DaemonRecovery, MAX_RESTARTS_PER_WINDOW, RecoveryPhase};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -565,7 +566,11 @@ fn daemon_refuses_a_live_incompatible_writer_lease_without_takeover() -> Result<
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    assert!(!status.success(), "incompatible writer must be refused");
+    assert_eq!(
+        status.code(),
+        Some(DAEMON_TEMPORARY_ADMISSION_REFUSAL_EXIT_STATUS),
+        "a live incompatible writer lease must be a temporary refusal"
+    );
     assert!(started.elapsed() < Duration::from_secs(10));
     assert!(
         lease_db

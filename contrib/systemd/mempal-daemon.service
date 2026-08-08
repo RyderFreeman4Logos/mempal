@@ -1,7 +1,8 @@
 # Canonical systemd user unit for the Mempal daemon.
-# Exit status 75 is Mempal's documented EX_TEMPFAIL cooldown refusal. Keeping it
-# in RestartPreventExitStatus prevents Restart=always from retrying a frozen
-# application restart budget every RestartSec seconds.
+# Exit status 75 is Mempal's documented EX_TEMPFAIL for typed temporary daemon
+# admission refusals, including restart-budget cooldown and a live writer lease
+# still held after its bounded retry. Keeping it in RestartPreventExitStatus
+# prevents Restart=always from retrying a frozen application restart budget.
 
 [Unit]
 Description=Mempal background daemon
