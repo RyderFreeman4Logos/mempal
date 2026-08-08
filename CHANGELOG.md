@@ -42,10 +42,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
-- **Daemon supervisor cooldowns**: return the stable temporary-refusal status
-  `75` (`EX_TEMPFAIL`) only when an active restart-budget cooldown refuses
-  bootstrap, and ship a canonical systemd unit that prevents this status from
-  being retried by `Restart=always` (#847).
+- **Daemon supervisor cooldowns**: wait through active restart-budget
+  cooldowns and retry bootstrap in-process; true temporary refusals retain
+  `75` (`EX_TEMPFAIL`), while the canonical unit keeps
+  `RestartPreventExitStatus=75` for thrash protection (#847, #868).
 
 - **Daemon restart recovery**: keep the persisted restart cooldown anchored to
   its original deadline when a supervisor races replacement generations, freeze
