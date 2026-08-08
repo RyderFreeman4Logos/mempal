@@ -119,18 +119,11 @@ async fn acquire_daemon_writer_lease_with_bounded_wait(
         let holders = format_runtime_writer_leases(&active);
         let now = Instant::now();
         let deadline = *deadline.get_or_insert_with(|| {
-            let holder_wait = active
-                .iter()
-                .filter_map(|lease| u64::try_from(lease.remaining_secs).ok())
-                .map(Duration::from_secs)
-                .min()
-                .unwrap_or_default()
-                .min(wait_max);
             eprintln!(
                 "daemon SQLite writer lease is held by {holders}; waiting up to {}ms before temporary refusal",
-                holder_wait.as_millis()
+                wait_max.as_millis()
             );
-            now + holder_wait
+            now + wait_max
         });
         if now >= deadline {
             return Err(anyhow::Error::new(DaemonWriterLeaseHeld::new(holders)));
@@ -224,11 +217,12 @@ fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
         .iter()
         .map(|lease| {
             format!(
-                "mode={} pid={} owner={} name={} expires_at={} heartbeat_at={}",
+                "mode={} pid={} owner={} name={} remaining_secs={} expires_at={} heartbeat_at={}",
                 lease.mode,
                 lease.pid,
                 lease.owner,
                 lease.name,
+                lease.remaining_secs,
                 lease.expires_at,
                 lease.heartbeat_at
             )
@@ -281,6 +275,65 @@ mod tests {
         .expect("daemon admission continues after holder releases");
         assert_eq!(acquired.lease().mode, "daemon");
         assert!(releaser.await.expect("join lease releaser"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_writer_lease_waits_for_expired_live_holder_release_before_admission() {
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let holder_db = Database::open(&db_path).expect("open holder database");
+        let held = holder_db
+            .runtime_writer_lease_acquire_for_daemon_start(
+                SQLITE_WRITER_LEASE_NAME,
+                DAEMON_WRITER_LEASE_TTL_SECS,
+                None,
+            )
+            .expect("acquire live holder lease")
+            .expect("holder lease available");
+        holder_db
+            .conn()
+            .execute(
+                "UPDATE runtime_writer_leases \
+                 SET expires_at = '1970-01-01T00:00:00Z' \
+                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3",
+                rusqlite::params![&held.name, &held.owner, &held.session_id],
+            )
+            .expect("force live holder expiry");
+        let status = holder_db
+            .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+            .expect("load live expired holder status");
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].remaining_secs, 0);
+
+        let daemon_db = std::sync::Arc::new(tokio::sync::Mutex::new(
+            Database::open(&db_path).expect("open daemon database"),
+        ));
+        let release_path = db_path.clone();
+        let release_lease = held.clone();
+        let releaser = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            Database::open(&release_path)
+                .expect("open releaser database")
+                .runtime_writer_lease_release(&release_lease)
+                .expect("release live expired holder lease")
+        });
+
+        let acquired = acquire_daemon_writer_lease_with_bounded_wait(
+            &daemon_db,
+            &db_path,
+            crate::daemon_recovery::DaemonRecoveryFaultReporter::new(
+                crate::daemon_recovery::DaemonRecovery::new(tempdir.path()),
+            ),
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )
+        .await;
+        assert!(releaser.await.expect("join lease releaser"));
+
+        let acquired =
+            acquired.expect("daemon admission continues after live expired holder releases");
+        assert_eq!(acquired.lease().mode, "daemon");
     }
 
     struct ShutdownResetGuard;
