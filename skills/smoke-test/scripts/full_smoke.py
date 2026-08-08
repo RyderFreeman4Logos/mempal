@@ -1130,15 +1130,56 @@ def created_ids_from(value: Any) -> list[str]:
     return list(dict.fromkeys(ids))
 
 
-def _is_nonnegative_integer(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+_MAX_RUST_WIRE_INTEGER = (1 << 64) - 1
+
+
+def _is_nonnegative_rust_wire_integer(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= _MAX_RUST_WIRE_INTEGER
+    )
+
+
+def _attempt_envelope_is_coherent_no_write(receipts: list[dict[str, Any]]) -> bool:
+    """Reject no-write classification when any receipt can represent a write."""
+    if not receipts:
+        return False
+    for receipt in receipts:
+        for key in ('created_drawer_ids', 'cleanup_drawer_ids'):
+            if key in receipt and (
+                not isinstance(receipt[key], list)
+                or any(not isinstance(item, str) or not item for item in receipt[key])
+            ):
+                return False
+        if (
+            'operation_id' in receipt
+            or 'state' in receipt
+            or 'timed_out' in receipt
+            or 'status' in receipt
+            or receipt.get('outcome') not in (None, 'admission_blocked')
+            or receipt.get('ok') is True
+            or receipt.get('success') is True
+            or receipt.get('accepted') is True
+        ):
+            return False
+        if 'returncode' in receipt and (
+            not isinstance(receipt['returncode'], int)
+            or isinstance(receipt['returncode'], bool)
+            or receipt['returncode'] == 0
+        ):
+            return False
+    return True
 
 
 def holder_budget_no_write_receipt(value: Any) -> dict[str, Any] | None:
-    """Return exact holder-budget no-write receipt."""
+    """Return only a coherent full-attempt holder-budget no-write receipt."""
     if created_ids_from(value):
         return None
-    for receipt in receipt_dicts_from(value):
+    receipts = receipt_dicts_from(value)
+    if not _attempt_envelope_is_coherent_no_write(receipts):
+        return None
+    for receipt in receipts:
         capacity = receipt.get('capacity')
         headroom = receipt.get('headroom')
         admission = receipt.get('profile_admission')
@@ -1162,7 +1203,7 @@ def holder_budget_no_write_receipt(value: Any) -> dict[str, Any] | None:
             admission.get('reserved_service_holders'), admission.get('service_holders'),
             admission.get('requested_cache_bytes'),
         )
-        if not all(_is_nonnegative_integer(field) for field in fields):
+        if not all(_is_nonnegative_rust_wire_integer(field) for field in fields):
             continue
         holders, cache_bytes, holder_headroom, cache_headroom = fields[:4]
         active_holders, configured_holders, active_cache, configured_cache = fields[4:8]
@@ -1260,7 +1301,7 @@ def operation_id_from(value: Any) -> str | None:
 
 def followable_timeout_operation_id(value: Any) -> str | None:
     """Return an accepted MCP wait-timeout receipt's operation ID, if any."""
-    if create_terminal_receipt(value) is not None:
+    if holder_budget_no_write_receipt(value) is not None:
         return None
     for receipt in receipt_dicts_from(value):
         operation_id = receipt.get('operation_id')
@@ -1355,7 +1396,6 @@ def recover_created_ids(value: Any, wait_label: str) -> tuple[list[str], dict[st
     }
     if receipt and receipt.get('outcome') == 'admission_blocked':
         info.update(receipt)
-        return [], info
     if ids or operation_id is None:
         return ids, info
 
@@ -1491,8 +1531,9 @@ def cli_crud() -> list[str]:
         expect_json=True,
         timeout=130,
     )
+    create_attempt = [parsed, {'returncode': rc}]
     ids, create_recovery = recover_created_ids(parsed, 'cli_create_wait')
-    direct_receipt = holder_budget_no_write_receipt(parsed)
+    direct_receipt = holder_budget_no_write_receipt(create_attempt)
     _remember_created_ids(ids)
     if not ids and direct_receipt and note_no_write_create('cli_create', 'cli_crud', direct_receipt):
         return cleanup_ids

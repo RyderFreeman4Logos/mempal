@@ -44,6 +44,14 @@ class CliCrudReceiptTests(unittest.TestCase):
             },
         }
 
+    def holder_budget_attempt(
+        self,
+        wrapper: str,
+        transport: dict[str, Any],
+        **signals: Any,
+    ) -> list[dict[str, Any]]:
+        return [{**signals, wrapper: self.mcp_holder_budget_receipt()}, transport]
+
     def test_holder_budget_no_write_receipt_requires_exact_schema(self) -> None:
         smoke = load_full_smoke()
         expected = {
@@ -90,6 +98,55 @@ class CliCrudReceiptTests(unittest.TestCase):
                 "reason": "holder_budget_exceeded",
                 "cleanup_required": False,
             },
+        )
+
+    def test_holder_budget_no_write_receipt_rejects_attempt_contradictions(self) -> None:
+        smoke = load_full_smoke()
+        invalid_signals = {
+            "queued_operation": {"operation_id": "op-queued", "state": "queued"},
+            "timed_out": {"timed_out": True},
+            "write_accepted": {"outcome": "write_accepted"},
+            "accepted_status": {"status": "accepted"},
+            "malformed_id_array": {"created_drawer_ids": "drawer-not-an-array"},
+            "malformed_id_item": {"cleanup_drawer_ids": [123]},
+        }
+        overflowed = self.mcp_holder_budget_receipt()
+        overflowed["profile_admission"]["reaped_stale_holders_this_snapshot"] = 1 << 64
+
+        for surface, transport in (
+            ("cli", {"returncode": 1}),
+            ("mcp", {"ok": False}),
+        ):
+            for wrapper in ("error", "terminal_receipt"):
+                with self.subTest(surface=surface, wrapper=wrapper, signal="coherent"):
+                    self.assertIsNotNone(
+                        smoke.holder_budget_no_write_receipt(
+                            self.holder_budget_attempt(wrapper, transport)
+                        )
+                    )
+                for name, signals in invalid_signals.items():
+                    with self.subTest(surface=surface, wrapper=wrapper, signal=name):
+                        self.assertIsNone(
+                            smoke.holder_budget_no_write_receipt(
+                                self.holder_budget_attempt(wrapper, transport, **signals)
+                            )
+                        )
+                with self.subTest(surface=surface, wrapper=wrapper, signal="integer_over_u64"):
+                    self.assertIsNone(
+                        smoke.holder_budget_no_write_receipt(
+                            [{wrapper: overflowed}, transport]
+                        )
+                    )
+
+        self.assertIsNone(
+            smoke.holder_budget_no_write_receipt(
+                self.holder_budget_attempt("error", {"returncode": 0})
+            )
+        )
+        self.assertIsNone(
+            smoke.holder_budget_no_write_receipt(
+                self.holder_budget_attempt("terminal_receipt", {"ok": True})
+            )
         )
 
     def test_mcp_exact_no_write_receipt_skips_rest_fallback(self) -> None:
@@ -330,6 +387,144 @@ class CliCrudReceiptTests(unittest.TestCase):
         finally:
             smoke.SUMMARY = original_summary
             smoke.CLEANUP_MANIFEST = original_manifest
+
+    def test_cli_queued_envelope_waits_and_records_cleanup_ids(self) -> None:
+        smoke = load_full_smoke()
+        original_manifest = smoke.CLEANUP_MANIFEST
+        queued = {
+            "operation_id": "op-queued",
+            "state": "queued",
+            "timed_out": True,
+            "error": self.mcp_holder_budget_receipt(),
+        }
+
+        def run_cli(label: str, *_args: Any, **_kwargs: Any) -> tuple[int, bytes, bytes, dict[str, Any], dict[str, Any]]:
+            if label == "cli_create":
+                return 1, b"", b"", queued, {}
+            if label == "cli_update":
+                return 0, b"", b"", {"created_drawer_ids": ["drawer-update"]}, {}
+            return 0, b"", b"", {"results": []}, {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = smoke.CleanupManifest(Path(tmp) / "cleanup.json")
+            smoke.CLEANUP_MANIFEST = manifest
+            try:
+                with (
+                    mock.patch.object(smoke, "run_cli", side_effect=run_cli),
+                    mock.patch.object(
+                        smoke,
+                        "wait_operation",
+                        return_value={
+                            "state": "completed",
+                            "created_drawer_ids": ["drawer-recovered"],
+                            "cleanup_drawer_ids": ["drawer-recovered"],
+                        },
+                    ) as wait_operation,
+                    mock.patch.object(
+                        smoke,
+                        "delete_exact_ids_cli",
+                        return_value={"deleted_count": 2, "failed_count": 0},
+                    ),
+                    mock.patch.object(
+                        smoke,
+                        "_rest_ingest_fallback",
+                        side_effect=AssertionError("queued CLI receipt must recover before REST"),
+                    ) as rest_fallback,
+                ):
+                    self.assertEqual(smoke.cli_crud(), ["drawer-recovered", "drawer-update"])
+                wait_operation.assert_called_once_with("op-queued", "cli_create_wait")
+                rest_fallback.assert_not_called()
+                self.assertEqual(manifest.pending_count, 2)
+            finally:
+                manifest.discard()
+                smoke.CLEANUP_MANIFEST = original_manifest
+
+    def test_mcp_queued_envelope_checks_status_and_records_cleanup_ids(self) -> None:
+        smoke = load_full_smoke()
+        original_manifest = smoke.CLEANUP_MANIFEST
+        discover = mock.Mock()
+        discover.call.return_value = {
+            "result": {
+                "tools": [
+                    {"name": tool}
+                    for tool in (
+                        "mempal_ingest",
+                        "mempal_operation_status",
+                        "mempal_search",
+                        "mempal_read_drawer",
+                        "mempal_delete",
+                    )
+                ]
+            }
+        }
+        create_client = mock.Mock()
+        create_client.tool.return_value = (
+            {
+                "operation_id": "op-queued",
+                "state": "completed",
+                "created_drawer_ids": ["drawer-recovered"],
+                "cleanup_drawer_ids": ["drawer-recovered"],
+            },
+            {"ok": True},
+        )
+        update_client = mock.Mock()
+        update_client.tool.return_value = ({"results": []}, {"ok": True})
+        queued_info = {
+            "ok": False,
+            "operation_id": "op-queued",
+            "state": "queued",
+            "terminal_receipt": self.mcp_holder_budget_receipt(),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = smoke.CleanupManifest(Path(tmp) / "cleanup.json")
+            smoke.CLEANUP_MANIFEST = manifest
+            try:
+                with (
+                    mock.patch.object(
+                        smoke,
+                        "mcp_start_initialized",
+                        side_effect=[discover, create_client, update_client],
+                    ),
+                    mock.patch.object(smoke, "mcp_call_isolated"),
+                    mock.patch.object(
+                        smoke,
+                        "mcp_call_isolated_labeled",
+                        return_value=(None, {"ok": True}),
+                    ),
+                    mock.patch.object(
+                        smoke,
+                        "_mcp_tool_with_hard_timeout",
+                        side_effect=[
+                            (None, queued_info),
+                            ({"created_drawer_ids": ["drawer-update"]}, {"ok": True}),
+                        ],
+                    ),
+                    mock.patch.object(
+                        smoke,
+                        "delete_exact_ids_mcp",
+                        return_value={
+                            "deleted_count": 2,
+                            "failed_count": 0,
+                            "delete_failed_attempt_count": 0,
+                        },
+                    ),
+                    mock.patch.object(
+                        smoke,
+                        "_rest_ingest_fallback",
+                        side_effect=AssertionError("queued MCP receipt must check status before REST"),
+                    ) as rest_fallback,
+                ):
+                    self.assertEqual(smoke.mcp_crud(), ["drawer-recovered", "drawer-update"])
+                create_client.tool.assert_called_once_with(
+                    "mempal_operation_status", {"operation_id": "op-queued"}, timeout=30
+                )
+                rest_fallback.assert_not_called()
+                self.assertEqual(manifest.pending_count, 2)
+                self.assertNotIn("mcp_inconclusive_no_cleanup_id", smoke.SUMMARY["groups"])
+            finally:
+                manifest.discard()
+                smoke.CLEANUP_MANIFEST = original_manifest
 
     def test_cli_rest_timeout_without_exact_direct_proof_is_inconclusive(self) -> None:
         smoke = load_full_smoke()
