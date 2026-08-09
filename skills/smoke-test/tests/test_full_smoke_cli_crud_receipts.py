@@ -269,13 +269,23 @@ class CliCrudReceiptTests(unittest.TestCase):
         )
 
     def test_mcp_coherence_contradictions_reach_rest_fallback(self) -> None:
+        def receipt(envelope: dict[str, Any]) -> dict[str, Any]:
+            return envelope["error"]["data"]
+        max_wire = (1 << 64) - 1
         for name, mutate in (
-            ("top_level_pool_loaded", lambda receipt: receipt.__setitem__("async_pool_loaded", True)),
-            ("nested_pool_loaded", lambda receipt: receipt["profile_admission"].__setitem__("async_pool_loaded", True)),
-            ("diagnostic_source", lambda receipt: receipt["database_diagnostic"].__setitem__("source", "query_only_async_db")),
-            ("diagnostic_failure_kind", lambda receipt: receipt["database_diagnostic"].__setitem__("failure_kind", "locked_or_busy")),
-            ("available_cache_bytes", lambda receipt: receipt["profile_admission"].__setitem__("available_cache_bytes", 1)),
-            ("unknown_holders", lambda receipt: receipt["profile_admission"].__setitem__("unknown_holders", 1)),
+            ("top_level_pool_loaded", lambda envelope: receipt(envelope).__setitem__("async_pool_loaded", True)),
+            ("nested_pool_loaded", lambda envelope: receipt(envelope)["profile_admission"].__setitem__("async_pool_loaded", True)),
+            ("diagnostic_source", lambda envelope: receipt(envelope)["database_diagnostic"].__setitem__("source", "query_only_async_db")),
+            ("diagnostic_failure_kind", lambda envelope: receipt(envelope)["database_diagnostic"].__setitem__("failure_kind", "locked_or_busy")),
+            ("available_cache_bytes", lambda envelope: receipt(envelope)["profile_admission"].__setitem__("available_cache_bytes", 1)),
+            ("unknown_holders", lambda envelope: receipt(envelope)["profile_admission"].__setitem__("unknown_holders", 1)),
+            ("nested_capacity_float", lambda envelope: receipt(envelope)["profile_admission"]["capacity"].__setitem__("holders", 16.0)),
+            ("nested_headroom_bool", lambda envelope: (receipt(envelope)["headroom"].__setitem__("holders", 0), receipt(envelope)["profile_admission"].update(active_holders=16, budget_reason="holder_limit"), receipt(envelope)["profile_admission"]["headroom"].__setitem__("holders", False))),
+            ("float_error_code", lambda envelope: envelope["error"].__setitem__("code", -32603.0)),
+            ("invalid_unknown_holder_reason", lambda envelope: receipt(envelope)["profile_admission"].update(unknown_holders=1, unknown_holder_diagnostics=[{"generation": 0, "reason": "invalid_reason"}])),
+            ("mcp_reserved_service_reason", lambda envelope: receipt(envelope)["profile_admission"].update(budget_reason="reserved_service_slots", requested_cache_bytes=1)),
+            ("malformed_budget_reason", lambda envelope: receipt(envelope)["profile_admission"].__setitem__("budget_reason", ["cache_budget"])),
+            ("saturating_cache_ceiling", lambda envelope: (receipt(envelope)["capacity"].__setitem__("cache_bytes", max_wire), receipt(envelope)["headroom"].__setitem__("cache_bytes", 0), receipt(envelope)["profile_admission"].update(active_cache_bytes=max_wire, configured_cache_bytes=max_wire, available_cache_bytes=0, requested_cache_bytes=1, capacity={"holders": 16, "cache_bytes": max_wire}, headroom={"holders": 2, "cache_bytes": 0}))),
         ):
             with self.subTest(name=name):
                 smoke = load_full_smoke()
@@ -283,13 +293,15 @@ class CliCrudReceiptTests(unittest.TestCase):
                 original_manifest = smoke.CLEANUP_MANIFEST
                 smoke.SUMMARY = {"groups": {}, "failures": []}
                 smoke.CLEANUP_MANIFEST = None
-                receipt = self.mcp_holder_budget_receipt()
-                mutate(receipt)
+                envelope = self.mcp_error_envelope(self.mcp_holder_budget_receipt())
+                mutate(envelope)
                 self.assertEqual(
-                    smoke.classify_create_attempt(self.mcp_error_envelope(receipt)),
+                    smoke.classify_create_attempt(envelope),
                     {"kind": "inconclusive"},
                 )
-                structured, info = self.mcp_error_tool_result(smoke, receipt)
+                client = object.__new__(smoke.McpClient)
+                client.call = mock.Mock(return_value=envelope)
+                structured, info = client.tool("mempal_ingest", {}, timeout=1)
                 discover = mock.Mock()
                 discover.call.return_value = {
                     "result": {

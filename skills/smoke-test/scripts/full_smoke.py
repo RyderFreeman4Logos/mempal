@@ -37,6 +37,7 @@ def _load_sibling_module(name: str, filename: str) -> Any:
 _SMOKE_RUNTIME = _load_sibling_module('_mempal_smoke_runtime', 'smoke_runtime.py')
 _SMOKE_RECEIPTS = _load_sibling_module('_mempal_smoke_receipts', 'smoke_receipts.py')
 CleanupManifest = _SMOKE_RUNTIME.CleanupManifest
+strict_json_loads = _SMOKE_RUNTIME.strict_json_loads
 receipt_dicts_from = _SMOKE_RECEIPTS.receipt_dicts_from
 created_ids_from = _SMOKE_RECEIPTS.created_ids_from
 operation_id_from = _SMOKE_RECEIPTS.operation_id_from
@@ -617,17 +618,25 @@ def json_shape(value: Any) -> dict[str, Any]:
     return {'type': type(value).__name__}
 
 
-def parse_json_bytes(data: bytes) -> tuple[Any | None, dict[str, Any]]:
+def parse_json_bytes(
+    data: bytes, *, allow_ndjson: bool = True
+) -> tuple[Any | None, dict[str, Any]]:
     text = data.decode('utf-8', errors='replace')
     try:
-        value = json.loads(text or 'null')
+        value = strict_json_loads(text or 'null')
         return value, {'ok': True, **json_shape(value)}
     except Exception as exc:
         lines = [line for line in text.splitlines() if line.strip()]
+        if not allow_ndjson:
+            return None, {
+                'ok': False,
+                'error_type': type(exc).__name__,
+                'line_count': len(lines),
+            }
         parsed = []
         try:
             for line in lines:
-                parsed.append(json.loads(line))
+                parsed.append(strict_json_loads(line))
             return parsed, {'ok': True, 'type': 'ndjson', 'line_count': len(parsed)}
         except Exception:
             return None, {'ok': False, 'error_type': type(exc).__name__, 'line_count': len(lines)}
@@ -1145,14 +1154,6 @@ def terminal_state(value: Any) -> bool:
     return operation_state_from(value) in {'completed', 'rejected', 'failed'}
 
 
-def operation_id_from(value: Any) -> str | None:
-    for receipt in receipt_dicts_from(value):
-        operation_id = receipt.get('operation_id')
-        if isinstance(operation_id, str) and operation_id:
-            return operation_id
-    return None
-
-
 def followable_timeout_operation_id(value: Any) -> str | None:
     """Return an accepted MCP wait-timeout receipt's operation ID, if any."""
     if classify_create_attempt(value)['kind'] != 'queued':
@@ -1162,17 +1163,6 @@ def followable_timeout_operation_id(value: Any) -> str | None:
         if receipt.get('timed_out') is True and isinstance(operation_id, str) and operation_id:
             return operation_id
     return None
-
-
-def operation_state_from(value: Any) -> str | None:
-    last_state: str | None = None
-    for receipt in receipt_dicts_from(value):
-        state = receipt.get('state')
-        if isinstance(state, str) and state:
-            if state in {'completed', 'rejected', 'failed'}:
-                return state
-            last_state = state
-    return last_state
 
 
 def count_marker_matches(value: Any, room: str) -> int:
@@ -1250,11 +1240,15 @@ def recover_created_ids(value: Any, wait_label: str) -> tuple[list[str], dict[st
     }
     if classified['kind'] == 'proven_no_write':
         info['receipt'] = classified['receipt']
-    if ids or operation_id is None:
+    if classified['kind'] != 'queued' or operation_id is None:
         return ids, info
 
     waited = wait_operation(operation_id, wait_label)
-    ids = created_ids_from(waited)
+    waited_classification = classify_create_attempt(waited)
+    ids = list(dict.fromkeys([
+        *ids,
+        *waited_classification.get('created_drawer_ids', []),
+    ]))
     info['recovered_via'] = wait_label
     info['recovered_state'] = operation_state_from(waited)
     return ids, info
@@ -1303,26 +1297,51 @@ def _rest_ingest_fallback(
             )
             resp = urllib.request.urlopen(req, timeout=30)
             if resp.status in (200, 201):
-                body = json.loads(resp.read().decode())
-                ids = created_ids_from(body)
+                body, shape = parse_json_bytes(resp.read(), allow_ndjson=False)
+                classification = classify_create_attempt(body)
+                ids = classification.get('created_drawer_ids', [])
                 receipt = create_terminal_receipt(body)
                 if ids:
                     _remember_created_ids(ids)
-                    note(label, True, created_id_count=len(ids), json=json_shape(body))
+                    authoritative = classification['kind'] == 'created'
+                    fields = {} if authoritative else {
+                        'error_type': 'InconclusiveCreatedEvidence'
+                    }
+                    note(
+                        label,
+                        authoritative,
+                        created_id_count=len(ids),
+                        json=shape,
+                        **fields,
+                    )
                     return ids, receipt
-                if receipt and receipt.get('outcome') == 'admission_blocked':
-                    note(label, True, http_status=resp.status, json=json_shape(body), **receipt)
-                    return [], receipt
-                note(label, False, error_type='MissingTerminalReceipt', http_status=resp.status, json=json_shape(body))
+                note(label, False, error_type='MissingTerminalReceipt', http_status=resp.status, json=shape)
                 return [], None
         except HTTPError as exc:
             raw_body = exc.read(8193)
             if len(raw_body) > 8192:
                 note(label, False, error_type='HTTPErrorBodyTooLarge', http_status=exc.code)
                 return [], None
-            body, shape = parse_json_bytes(raw_body)
+            body, shape = parse_json_bytes(raw_body, allow_ndjson=False)
+            classification = classify_create_attempt(body)
+            ids = classification.get('created_drawer_ids', [])
             receipt = create_terminal_receipt(body)
-            if receipt and receipt.get('outcome') == 'admission_blocked':
+            if ids:
+                _remember_created_ids(ids)
+                note(
+                    label,
+                    False,
+                    error_type='HTTPError',
+                    http_status=exc.code,
+                    cleanup_id_count=len(ids),
+                    json=shape,
+                )
+                return ids, receipt
+            if (
+                exc.code == 503
+                and receipt
+                and receipt.get('outcome') == 'admission_blocked'
+            ):
                 note(label, True, http_status=exc.code, json=shape, **receipt)
                 return [], receipt
             note(label, False, error_type='HTTPError', http_status=exc.code, json=shape)
@@ -1442,10 +1461,11 @@ def cli_crud() -> list[str]:
     upd_ids, update_recovery = recover_created_ids(
         [upd_parsed, {'returncode': rc}], 'cli_update_wait'
     )
+    update_receipt = update_recovery.get('receipt')
     _remember_created_ids(upd_ids)
 
     # Fallback: retry update via REST if direct write failed (writer lease).
-    if not upd_ids:
+    if not upd_ids and not update_receipt:
         rest_upd_ids, _rest_update_receipt = _rest_ingest_fallback(
             f'{MARKER} reversible CLI smoke drawer updated; nonce {NONCE[::-1]}; lexical tokens ploverquartz rivetmint yondercoil; safe to delete',
             'cli_update_rest_fallback',
@@ -1686,20 +1706,24 @@ def mcp_crud() -> list[str]:
                 timeout=30,
             )
             note('mcp_operation_status', bool(status_info.get('ok')), **without_ok(status_info))
-            status_ids = created_ids_from(status_structured)
-            if not ids and status_ids:
-                ids = status_ids
-                _remember_created_ids(ids)
+            status_attempt = create_attempt_from_mcp_info(status_info) or status_structured
+            status_classification = classify_create_attempt(status_attempt)
+            status_ids = status_classification.get('created_drawer_ids', [])
+            if status_ids:
+                ids = list(dict.fromkeys([*ids, *status_ids]))
+                _remember_created_ids(status_ids)
                 create_recovery.update({
                     'recovered_via': 'mcp_operation_status',
-                    'recovered_state': operation_state_from(status_structured),
+                    'recovered_state': status_classification.get(
+                        'state', operation_state_from(status_attempt)
+                    ),
                 })
         elif 'mempal_operation_status' in tool_names:
             note('mcp_operation_status', True, skipped='no_operation_receipt')
         else:
             note('mcp_operation_status', True, skipped='tool_not_advertised')
 
-        if not ids and create_timeout_operation_id:
+        if create_timeout_operation_id:
             # A non-terminal MCP ingest receipt means the daemon may still be
             # processing the write. Close this stdio server before following the
             # operation via CLI so the smoke runner never observes a result while
@@ -1710,8 +1734,10 @@ def mcp_crud() -> list[str]:
                 lambda: wait_operation(create_timeout_operation_id, 'mcp_create_cli_wait'),
             )
             client = None
-            ids = created_ids_from(waited)
-            _remember_created_ids(ids)
+            waited_classification = classify_create_attempt(waited)
+            waited_ids = waited_classification.get('created_drawer_ids', [])
+            ids = list(dict.fromkeys([*ids, *waited_ids]))
+            _remember_created_ids(waited_ids)
             create_recovery.update({'recovered_via': 'mcp_create_cli_wait', 'recovered_state': operation_state_from(waited)})
             SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
@@ -1785,6 +1811,7 @@ def mcp_crud() -> list[str]:
         update, uinfo = _mcp_tool_with_hard_timeout(client, 'mempal_ingest', update_args, timeout=30)
         update_classification = classify_create_attempt(create_attempt_from_mcp_info(uinfo))
         upd_ids = update_classification.get('created_drawer_ids', [])
+        update_receipt = update_classification.get('receipt')
         _remember_created_ids(upd_ids)
         update_timeout_operation_id = (
             followable_timeout_operation_id(create_attempt_from_mcp_info(uinfo))
@@ -1794,21 +1821,23 @@ def mcp_crud() -> list[str]:
             'operation_id_present': update_classification['kind'] == 'queued',
             'operation_state': update_classification.get('state'),
         }
-        if not upd_ids and update_timeout_operation_id:
+        if update_timeout_operation_id:
             waited = run_fallback_after_mcp_reaped(
                 client,
                 'update_cli_wait',
                 lambda: wait_operation(update_timeout_operation_id, 'mcp_update_cli_wait'),
             )
             client = None
-            upd_ids = created_ids_from(waited)
-            _remember_created_ids(upd_ids)
+            waited_classification = classify_create_attempt(waited)
+            waited_ids = waited_classification.get('created_drawer_ids', [])
+            upd_ids = list(dict.fromkeys([*upd_ids, *waited_ids]))
+            _remember_created_ids(waited_ids)
             update_recovery.update({'recovered_via': 'mcp_update_cli_wait', 'recovered_state': operation_state_from(waited)})
             SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
         # Fallback: if MCP update fails/hangs (writer lease), retry via REST so
         # follow-on read/delete paths still have an updated drawer to exercise.
-        if not upd_ids:
+        if not upd_ids and not update_receipt:
             rest_upd_ids, _rest_update_receipt = run_fallback_after_mcp_reaped(
                 client,
                 'update_rest',

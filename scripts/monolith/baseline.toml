@@ -109,18 +109,18 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "skills/smoke-test/scripts/full_smoke.py"
 kind = "source"
-baseline_tokens = 22198
-baseline_lines = 2339
+baseline_tokens = 21344
+baseline_lines = 2233
 issue = "876"
-rationale = "#876 validates complete holder-budget receipts before CLI/MCP no-write bypass; exact no-growth ratchet."
+rationale = "#876 validates complete CLI/MCP/REST admission receipts, preserves cleanup IDs, and suppresses unsafe fallbacks; exact no-growth ratchet."
 
 [[files]]
 path = "skills/smoke-test/tests/test_full_smoke_receipts.py"
 kind = "test"
-baseline_tokens = 7342
-baseline_lines = 846
-issue = "855"
-rationale = "#855 adds recovery_fields reason-exclusion and admission-blocked create/update note regressions; exact no-growth ratchet."
+baseline_tokens = 6823
+baseline_lines = 778
+issue = "876"
+rationale = "#876 covers durable cleanup manifests and complete admission-receipt classification; exact no-growth ratchet."
 
 [[files]]
 path = "specs/fork-ext/p8-embed-qwen3-backend.spec.md"
@@ -367,8 +367,8 @@ path = "src/mcp/server.rs"
 kind = "source"
 baseline_tokens = 181144
 baseline_lines = 22858
-issue = "858"
-rationale = "#858 daemon-scoped ingest heartbeat/write paths record typed queue SQLite contention; exact no-growth ratchet."
+issue = "876"
+rationale = "#876 emits bounded pre-dispatch holder-budget evidence required for exact MCP no-write classification; exact no-growth ratchet."
 
 [[files]]
 path = "src/mcp/tools.rs"
