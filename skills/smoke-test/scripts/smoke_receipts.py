@@ -122,9 +122,12 @@ def _coherent_holder_budget_refusal(receipt: Any, *, mcp: bool) -> bool:
             or not isinstance(diagnostic, dict)
             or set(diagnostic) != _MCP_DIAGNOSTIC_FIELDS
             or not all(isinstance(value, str) for value in diagnostic.values())
+            or diagnostic["source"] != "async_db"
+            or diagnostic["failure_kind"] != "holder_budget_exceeded"
             or admission["async_pool_loaded"] is not False
             or admission["capacity"] != capacity
             or admission["headroom"] != headroom
+            or admission["available_cache_bytes"] != headroom["cache_bytes"]
             or not isinstance(admission["unknown_holder_diagnostics"], list)
             or any(
                 not isinstance(item, dict)
@@ -133,6 +136,7 @@ def _coherent_holder_budget_refusal(receipt: Any, *, mcp: bool) -> bool:
                 or not isinstance(item["reason"], str)
                 for item in admission["unknown_holder_diagnostics"]
             )
+            or admission["unknown_holders"] != len(admission["unknown_holder_diagnostics"])
         ):
             return False
     numeric_fields = (

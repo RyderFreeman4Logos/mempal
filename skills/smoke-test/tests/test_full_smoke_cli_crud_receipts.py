@@ -268,10 +268,14 @@ class CliCrudReceiptTests(unittest.TestCase):
             {"kind": "created", "created_drawer_ids": ["drawer-from-result"]},
         )
 
-    def test_mcp_pool_contradictions_reach_rest_fallback(self) -> None:
+    def test_mcp_coherence_contradictions_reach_rest_fallback(self) -> None:
         for name, mutate in (
-            ("top_level_true", lambda receipt: receipt.__setitem__("async_pool_loaded", True)),
-            ("nested_true", lambda receipt: receipt["profile_admission"].__setitem__("async_pool_loaded", True)),
+            ("top_level_pool_loaded", lambda receipt: receipt.__setitem__("async_pool_loaded", True)),
+            ("nested_pool_loaded", lambda receipt: receipt["profile_admission"].__setitem__("async_pool_loaded", True)),
+            ("diagnostic_source", lambda receipt: receipt["database_diagnostic"].__setitem__("source", "query_only_async_db")),
+            ("diagnostic_failure_kind", lambda receipt: receipt["database_diagnostic"].__setitem__("failure_kind", "locked_or_busy")),
+            ("available_cache_bytes", lambda receipt: receipt["profile_admission"].__setitem__("available_cache_bytes", 1)),
+            ("unknown_holders", lambda receipt: receipt["profile_admission"].__setitem__("unknown_holders", 1)),
         ):
             with self.subTest(name=name):
                 smoke = load_full_smoke()
@@ -281,6 +285,10 @@ class CliCrudReceiptTests(unittest.TestCase):
                 smoke.CLEANUP_MANIFEST = None
                 receipt = self.mcp_holder_budget_receipt()
                 mutate(receipt)
+                self.assertEqual(
+                    smoke.classify_create_attempt(self.mcp_error_envelope(receipt)),
+                    {"kind": "inconclusive"},
+                )
                 structured, info = self.mcp_error_tool_result(smoke, receipt)
                 discover = mock.Mock()
                 discover.call.return_value = {
