@@ -109,8 +109,8 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "skills/smoke-test/scripts/full_smoke.py"
 kind = "source"
-baseline_tokens = 22189
-baseline_lines = 2338
+baseline_tokens = 22198
+baseline_lines = 2339
 issue = "876"
 rationale = "#876 validates complete holder-budget receipts before CLI/MCP no-write bypass; exact no-growth ratchet."
 

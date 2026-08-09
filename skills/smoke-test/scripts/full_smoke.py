@@ -284,7 +284,7 @@ def clear_probe_failures(*labels: str) -> None:
 
 
 def without_ok(info: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in info.items() if key != 'ok'}
+    return {key: value for key, value in info.items() if key not in {'ok', 'terminal_receipt'}}
 
 
 def _probe_result(label: str) -> tuple[str, dict[str, Any]]:
@@ -1157,10 +1157,11 @@ def _attempt_envelope_is_coherent_no_write(receipts: list[dict[str, Any]]) -> bo
             or 'state' in receipt
             or 'timed_out' in receipt
             or 'status' in receipt
+            or 'queued' in receipt
             or receipt.get('outcome') not in (None, 'admission_blocked')
             or receipt.get('ok') is True
-            or receipt.get('success') is True
-            or receipt.get('accepted') is True
+            or 'success' in receipt
+            or 'accepted' in receipt
         ):
             return False
         if 'returncode' in receipt and (

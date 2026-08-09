@@ -41,8 +41,8 @@ __all__ = [
 def terminal_no_write_receipt(error: Any) -> dict[str, Any] | None:
     """Extract the cleanup-safe subset of a terminal MCP JSON-RPC refusal.
 
-    JSON-RPC error messages can include diagnostics. The smoke summary must only retain
-    the documented admission receipt fields it needs to decide that no cleanup is required.
+    JSON-RPC error messages can include diagnostics. Retain only documented receipt
+    control fields needed to classify no-write, recover work, or clean explicit IDs.
     """
     if not isinstance(error, dict):
         return None
@@ -53,8 +53,6 @@ def terminal_no_write_receipt(error: Any) -> dict[str, Any] | None:
         data.get("outcome") != "admission_blocked"
         or data.get("action") != "write_refused"
         or not isinstance(data.get("reason"), str)
-        or data.get("created_drawer_ids") != []
-        or data.get("cleanup_drawer_ids") != []
     ):
         return None
 
@@ -62,9 +60,20 @@ def terminal_no_write_receipt(error: Any) -> dict[str, Any] | None:
         "outcome": "admission_blocked",
         "reason": data["reason"],
         "action": "write_refused",
-        "created_drawer_ids": [],
-        "cleanup_drawer_ids": [],
     }
+    for key in (
+        "created_drawer_ids",
+        "cleanup_drawer_ids",
+        "operation_id",
+        "state",
+        "timed_out",
+        "status",
+        "queued",
+        "success",
+        "accepted",
+    ):
+        if key in data:
+            receipt[key] = data[key]
     for key in ("capacity", "headroom"):
         value = data.get(key)
         if isinstance(value, dict):

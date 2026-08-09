@@ -44,6 +44,14 @@ class CliCrudReceiptTests(unittest.TestCase):
             },
         }
 
+    @staticmethod
+    def projected_mcp_error(
+        smoke: ModuleType, data: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        client = object.__new__(smoke.McpClient)
+        client.call = mock.Mock(return_value={"error": {"code": -32603, "data": data}})
+        return client.tool("mempal_ingest", {}, timeout=1)
+
     def holder_budget_attempt(
         self,
         wrapper: str,
@@ -88,17 +96,32 @@ class CliCrudReceiptTests(unittest.TestCase):
 
     def test_mcp_terminal_receipt_keeps_holder_budget_metadata_for_the_create_guard(self) -> None:
         smoke = load_full_smoke()
-        terminal = smoke._SMOKE_RUNTIME.terminal_no_write_receipt(
-            {"data": self.mcp_holder_budget_receipt()}
-        )
+        structured, info = self.projected_mcp_error(smoke, self.mcp_holder_budget_receipt())
         self.assertEqual(
-            smoke.holder_budget_no_write_receipt({"terminal_receipt": terminal}),
+            smoke.holder_budget_no_write_receipt([structured, info]),
             {
                 "outcome": "admission_blocked",
                 "reason": "holder_budget_exceeded",
                 "cleanup_required": False,
             },
         )
+        self.assertNotIn("terminal_receipt", smoke.without_ok(info))
+
+    def test_mcp_error_projection_keeps_write_contradictions_for_the_classifier(self) -> None:
+        smoke = load_full_smoke()
+        cases = {
+            "queued": ("queued", True),
+            "success": ("success", True),
+            "malformed_created_ids": ("created_drawer_ids", "drawer-not-an-array"),
+        }
+
+        for name, (field, value) in cases.items():
+            with self.subTest(name=name):
+                structured, info = self.projected_mcp_error(
+                    smoke, {**self.mcp_holder_budget_receipt(), field: value}
+                )
+                self.assertEqual(info["terminal_receipt"][field], value)
+                self.assertIsNone(smoke.holder_budget_no_write_receipt([structured, info]))
 
     def test_holder_budget_no_write_receipt_rejects_attempt_contradictions(self) -> None:
         smoke = load_full_smoke()
@@ -171,9 +194,7 @@ class CliCrudReceiptTests(unittest.TestCase):
             }
         }
         create_client = mock.Mock()
-        terminal = smoke._SMOKE_RUNTIME.terminal_no_write_receipt(
-            {"data": self.mcp_holder_budget_receipt()}
-        )
+        structured, info = self.projected_mcp_error(smoke, self.mcp_holder_budget_receipt())
 
         try:
             with (
@@ -186,7 +207,7 @@ class CliCrudReceiptTests(unittest.TestCase):
                 mock.patch.object(
                     smoke,
                     "_mcp_tool_with_hard_timeout",
-                    return_value=(None, {"ok": False, "terminal_receipt": terminal}),
+                    return_value=(structured, info),
                 ),
                 mock.patch.object(
                     smoke,
@@ -275,81 +296,84 @@ class CliCrudReceiptTests(unittest.TestCase):
                     manifest.discard()
                     smoke.CLEANUP_MANIFEST = original_manifest
 
-    def test_mcp_outer_ids_override_nested_no_write_and_reach_manifest(self) -> None:
-        for nested_key in ("error", "terminal_receipt"):
-            with self.subTest(nested_key=nested_key), tempfile.TemporaryDirectory() as tmp:
-                smoke = load_full_smoke()
-                original_manifest = smoke.CLEANUP_MANIFEST
-                manifest = smoke.CleanupManifest(Path(tmp) / "cleanup.json")
-                smoke.CLEANUP_MANIFEST = manifest
-                discover = mock.Mock()
-                discover.call.return_value = {
-                    "result": {
-                        "tools": [
-                            {"name": tool}
-                            for tool in (
-                                "mempal_ingest",
-                                "mempal_operation_status",
-                                "mempal_search",
-                                "mempal_read_drawer",
-                                "mempal_delete",
-                            )
-                        ]
-                    }
+    def test_mcp_projected_outer_ids_override_nested_no_write_and_reach_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            smoke = load_full_smoke()
+            original_manifest = smoke.CLEANUP_MANIFEST
+            manifest = smoke.CleanupManifest(Path(tmp) / "cleanup.json")
+            smoke.CLEANUP_MANIFEST = manifest
+            discover = mock.Mock()
+            discover.call.return_value = {
+                "result": {
+                    "tools": [
+                        {"name": tool}
+                        for tool in (
+                            "mempal_ingest",
+                            "mempal_operation_status",
+                            "mempal_search",
+                            "mempal_read_drawer",
+                            "mempal_delete",
+                        )
+                    ]
                 }
-                create_client = mock.Mock()
-                update_client = mock.Mock()
-                update_client.tool.return_value = ({"results": []}, {"ok": True})
-                info = {
-                    "ok": False,
+            }
+            create_client = mock.Mock()
+            update_client = mock.Mock()
+            update_client.tool.return_value = ({"results": []}, {"ok": True})
+            structured, info = self.projected_mcp_error(
+                smoke,
+                {
+                    **self.mcp_holder_budget_receipt(),
                     "created_drawer_ids": ["drawer-direct"],
-                    nested_key: self.mcp_holder_budget_receipt(),
-                }
+                    "cleanup_drawer_ids": ["drawer-direct"],
+                },
+            )
+            info["error"] = self.mcp_holder_budget_receipt()
 
-                try:
-                    with (
-                        mock.patch.object(
-                            smoke,
-                            "mcp_start_initialized",
-                            side_effect=[discover, create_client, update_client],
-                        ),
-                        mock.patch.object(smoke, "mcp_call_isolated"),
-                        mock.patch.object(
-                            smoke,
-                            "mcp_call_isolated_labeled",
-                            return_value=(None, {"ok": True}),
-                        ),
-                        mock.patch.object(
-                            smoke,
-                            "_mcp_tool_with_hard_timeout",
-                            side_effect=[
-                                (None, info),
-                                ({"created_drawer_ids": ["drawer-update"]}, {"ok": True}),
-                            ],
-                        ),
-                        mock.patch.object(
-                            smoke,
-                            "delete_exact_ids_mcp",
-                            return_value={
-                                "deleted_count": 2,
-                                "failed_count": 0,
-                                "delete_failed_attempt_count": 0,
-                            },
-                        ),
-                        mock.patch.object(
-                            smoke,
-                            "_rest_ingest_fallback",
-                            side_effect=AssertionError("REST must not follow explicit cleanup IDs"),
-                        ) as rest_fallback,
-                    ):
-                        self.assertEqual(smoke.mcp_crud(), ["drawer-direct", "drawer-update"])
-                    rest_fallback.assert_not_called()
-                    self.assertEqual(manifest.pending_count, 2)
-                    self.assertTrue(smoke.SUMMARY["groups"]["mcp_crud"]["ok"])
-                    self.assertNotIn("mcp_inconclusive_no_cleanup_id", smoke.SUMMARY["groups"])
-                finally:
-                    manifest.discard()
-                    smoke.CLEANUP_MANIFEST = original_manifest
+            try:
+                with (
+                    mock.patch.object(
+                        smoke,
+                        "mcp_start_initialized",
+                        side_effect=[discover, create_client, update_client],
+                    ),
+                    mock.patch.object(smoke, "mcp_call_isolated"),
+                    mock.patch.object(
+                        smoke,
+                        "mcp_call_isolated_labeled",
+                        return_value=(None, {"ok": True}),
+                    ),
+                    mock.patch.object(
+                        smoke,
+                        "_mcp_tool_with_hard_timeout",
+                        side_effect=[
+                            (structured, info),
+                            ({"created_drawer_ids": ["drawer-update"]}, {"ok": True}),
+                        ],
+                    ),
+                    mock.patch.object(
+                        smoke,
+                        "delete_exact_ids_mcp",
+                        return_value={
+                            "deleted_count": 2,
+                            "failed_count": 0,
+                            "delete_failed_attempt_count": 0,
+                        },
+                    ),
+                    mock.patch.object(
+                        smoke,
+                        "_rest_ingest_fallback",
+                        side_effect=AssertionError("REST must not follow explicit cleanup IDs"),
+                    ) as rest_fallback,
+                ):
+                    self.assertEqual(smoke.mcp_crud(), ["drawer-direct", "drawer-update"])
+                rest_fallback.assert_not_called()
+                self.assertEqual(manifest.pending_count, 2)
+                self.assertTrue(smoke.SUMMARY["groups"]["mcp_crud"]["ok"])
+                self.assertNotIn("mcp_inconclusive_no_cleanup_id", smoke.SUMMARY["groups"])
+            finally:
+                manifest.discard()
+                smoke.CLEANUP_MANIFEST = original_manifest
 
     def test_cli_exact_no_write_receipt_skips_rest_fallback(self) -> None:
         smoke = load_full_smoke()
@@ -469,12 +493,15 @@ class CliCrudReceiptTests(unittest.TestCase):
         )
         update_client = mock.Mock()
         update_client.tool.return_value = ({"results": []}, {"ok": True})
-        queued_info = {
-            "ok": False,
-            "operation_id": "op-queued",
-            "state": "queued",
-            "terminal_receipt": self.mcp_holder_budget_receipt(),
-        }
+        structured, queued_info = self.projected_mcp_error(
+            smoke,
+            {
+                **self.mcp_holder_budget_receipt(),
+                "operation_id": "op-queued",
+                "state": "queued",
+                "queued": True,
+            },
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             manifest = smoke.CleanupManifest(Path(tmp) / "cleanup.json")
@@ -496,7 +523,7 @@ class CliCrudReceiptTests(unittest.TestCase):
                         smoke,
                         "_mcp_tool_with_hard_timeout",
                         side_effect=[
-                            (None, queued_info),
+                            (structured, queued_info),
                             ({"created_drawer_ids": ["drawer-update"]}, {"ok": True}),
                         ],
                     ),
