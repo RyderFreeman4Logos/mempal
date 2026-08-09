@@ -38,76 +38,6 @@ __all__ = [
 ]
 
 
-def terminal_no_write_receipt(error: Any) -> dict[str, Any] | None:
-    """Extract the cleanup-safe subset of a terminal MCP JSON-RPC refusal.
-
-    JSON-RPC error messages can include diagnostics. Retain only documented receipt
-    control fields needed to classify no-write, recover work, or clean explicit IDs.
-    """
-    if not isinstance(error, dict):
-        return None
-    data = error.get("data")
-    if not isinstance(data, dict):
-        return None
-    if (
-        data.get("outcome") != "admission_blocked"
-        or data.get("action") != "write_refused"
-        or not isinstance(data.get("reason"), str)
-    ):
-        return None
-
-    receipt: dict[str, Any] = {
-        "outcome": "admission_blocked",
-        "reason": data["reason"],
-        "action": "write_refused",
-    }
-    for key in (
-        "created_drawer_ids",
-        "cleanup_drawer_ids",
-        "operation_id",
-        "state",
-        "timed_out",
-        "status",
-        "queued",
-        "success",
-        "accepted",
-    ):
-        if key in data:
-            receipt[key] = data[key]
-    for key in ("capacity", "headroom"):
-        value = data.get(key)
-        if isinstance(value, dict):
-            numeric = {
-                field: amount
-                for field, amount in value.items()
-                if field in {"holders", "cache_bytes"}
-                and isinstance(amount, int)
-                and not isinstance(amount, bool)
-            }
-            if numeric:
-                receipt[key] = numeric
-    profile_admission = data.get("profile_admission")
-    if isinstance(profile_admission, dict):
-        retained = {
-            field: value
-            for field in (
-                "active_holders",
-                "configured_holder_limit",
-                "active_cache_bytes",
-                "configured_cache_bytes",
-                "reaped_stale_holders_this_snapshot",
-                "reserved_service_holders",
-                "service_holders",
-                "requested_cache_bytes",
-                "budget_reason",
-            )
-            if (value := profile_admission.get(field)) is not None
-        }
-        if retained:
-            receipt["profile_admission"] = retained
-    return receipt
-
-
 class CleanupManifest:
     """Persist only cleanup-authorized drawer IDs using atomic replacement."""
 
@@ -461,21 +391,21 @@ class McpClient:
             )
             elapsed_ms = int((time.monotonic() - started_at) * 1000)
             if "error" in message:
-                receipt = terminal_no_write_receipt(message["error"])
+                error = message["error"]
                 info: dict[str, Any] = {
                     "ok": False,
                     "latency_ms": elapsed_ms,
-                    "error_code": message["error"].get("code"),
-                    "error_message_bytes": len(json.dumps(message["error"]).encode()),
+                    "error_code": error.get("code") if isinstance(error, dict) else None,
+                    "error_message_bytes": len(json.dumps(error).encode()),
+                    "_raw_mcp_response": message,
                 }
-                if receipt is not None:
-                    info["terminal_receipt"] = receipt
                 return None, info
             structured = message.get("result", {}).get("structuredContent")
             return structured, {
                 "ok": isinstance(structured, dict),
                 "latency_ms": elapsed_ms,
                 "shape": self._json_shape(structured),
+                "_raw_mcp_response": message,
             }
         except Exception as error:
             return None, {"ok": False, "error_type": type(error).__name__}

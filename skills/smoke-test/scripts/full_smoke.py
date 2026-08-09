@@ -23,19 +23,26 @@ from pathlib import Path
 from typing import Any
 
 
-def _load_smoke_runtime() -> Any:
-    """Load the sibling runtime module without mutating global import paths."""
-    path = Path(__file__).with_name('smoke_runtime.py')
-    spec = importlib.util.spec_from_file_location('_mempal_smoke_runtime', path)
+def _load_sibling_module(name: str, filename: str) -> Any:
+    """Load a sibling smoke module without mutating global import paths."""
+    path = Path(__file__).with_name(filename)
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f'cannot load smoke runtime from {path}')
+        raise RuntimeError(f'cannot load smoke module from {path}')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-_SMOKE_RUNTIME = _load_smoke_runtime()
+_SMOKE_RUNTIME = _load_sibling_module('_mempal_smoke_runtime', 'smoke_runtime.py')
+_SMOKE_RECEIPTS = _load_sibling_module('_mempal_smoke_receipts', 'smoke_receipts.py')
 CleanupManifest = _SMOKE_RUNTIME.CleanupManifest
+receipt_dicts_from = _SMOKE_RECEIPTS.receipt_dicts_from
+created_ids_from = _SMOKE_RECEIPTS.created_ids_from
+operation_id_from = _SMOKE_RECEIPTS.operation_id_from
+operation_state_from = _SMOKE_RECEIPTS.operation_state_from
+holder_budget_no_write_receipt = _SMOKE_RECEIPTS.holder_budget_no_write_receipt
+classify_create_attempt = _SMOKE_RECEIPTS.classify_create_attempt
 
 try:
     import tomllib
@@ -284,7 +291,7 @@ def clear_probe_failures(*labels: str) -> None:
 
 
 def without_ok(info: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in info.items() if key not in {'ok', 'terminal_receipt'}}
+    return {key: value for key, value in info.items() if key != 'ok' and not key.startswith('_')}
 
 
 def _probe_result(label: str) -> tuple[str, dict[str, Any]]:
@@ -1100,178 +1107,24 @@ def probe_search_reranker_behavior(config_path: Path | None = None) -> None:
     note('reranker_reorders_results', bool(reorder.get('ok')), **without_ok(reorder))
 
 
-def receipt_dicts_from(value: Any) -> list[dict[str, Any]]:
-    """Return operation-style receipt dicts without parsing raw text payloads."""
-    receipts: list[dict[str, Any]] = []
-    if isinstance(value, dict):
-        receipts.append(value)
-        # MCP JSON-RPC and REST errors wrap their documented terminal receipts
-        # under ``error.data`` and ``error`` respectively. Keep traversal
-        # deliberately limited to those protocol envelopes; arbitrary JSON
-        # object shapes must not become cleanup evidence.
-        for key in ('structuredContent', 'result', 'payload', 'response', 'error', 'data', 'terminal_receipt'):
-            nested = value.get(key)
-            if isinstance(nested, (dict, list)):
-                receipts.extend(receipt_dicts_from(nested))
-        return receipts
-    if isinstance(value, list):
-        for item in value:
-            receipts.extend(receipt_dicts_from(item))
-    return receipts
-
-
-def created_ids_from(value: Any) -> list[str]:
-    ids: list[str] = []
-    for receipt in receipt_dicts_from(value):
-        for key in ('created_drawer_ids', 'cleanup_drawer_ids'):
-            values = receipt.get(key)
-            if isinstance(values, list):
-                ids.extend(x for x in values if isinstance(x, str) and x)
-    return list(dict.fromkeys(ids))
-
-
-_MAX_RUST_WIRE_INTEGER = (1 << 64) - 1
-
-
-def _is_nonnegative_rust_wire_integer(value: Any) -> bool:
-    return (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and 0 <= value <= _MAX_RUST_WIRE_INTEGER
-    )
-
-
-def _attempt_envelope_is_coherent_no_write(receipts: list[dict[str, Any]]) -> bool:
-    """Reject no-write classification when any receipt can represent a write."""
-    if not receipts:
-        return False
-    for receipt in receipts:
-        for key in ('created_drawer_ids', 'cleanup_drawer_ids'):
-            if key in receipt and (
-                not isinstance(receipt[key], list)
-                or any(not isinstance(item, str) or not item for item in receipt[key])
-            ):
-                return False
-        if (
-            'operation_id' in receipt
-            or 'state' in receipt
-            or 'timed_out' in receipt
-            or 'status' in receipt
-            or 'queued' in receipt
-            or receipt.get('outcome') not in (None, 'admission_blocked')
-            or receipt.get('ok') is True
-            or 'success' in receipt
-            or 'accepted' in receipt
-        ):
-            return False
-        if 'returncode' in receipt and (
-            not isinstance(receipt['returncode'], int)
-            or isinstance(receipt['returncode'], bool)
-            or receipt['returncode'] == 0
-        ):
-            return False
-    return True
-
-
-def holder_budget_no_write_receipt(value: Any) -> dict[str, Any] | None:
-    """Return only a coherent full-attempt holder-budget no-write receipt."""
-    if created_ids_from(value):
-        return None
-    receipts = receipt_dicts_from(value)
-    if not _attempt_envelope_is_coherent_no_write(receipts):
-        return None
-    for receipt in receipts:
-        capacity = receipt.get('capacity')
-        headroom = receipt.get('headroom')
-        admission = receipt.get('profile_admission')
-        if (
-            receipt.get('outcome') != 'admission_blocked'
-            or receipt.get('reason') != 'holder_budget_exceeded'
-            or receipt.get('action') != 'write_refused'
-            or receipt.get('created_drawer_ids') != []
-            or receipt.get('cleanup_drawer_ids') != []
-            or not isinstance(capacity, dict)
-            or not isinstance(headroom, dict)
-            or not isinstance(admission, dict)
-        ):
-            continue
-        fields = (
-            capacity.get('holders'), capacity.get('cache_bytes'),
-            headroom.get('holders'), headroom.get('cache_bytes'),
-            admission.get('active_holders'), admission.get('configured_holder_limit'),
-            admission.get('active_cache_bytes'), admission.get('configured_cache_bytes'),
-            admission.get('reaped_stale_holders_this_snapshot'),
-            admission.get('reserved_service_holders'), admission.get('service_holders'),
-            admission.get('requested_cache_bytes'),
-        )
-        if not all(_is_nonnegative_rust_wire_integer(field) for field in fields):
-            continue
-        holders, cache_bytes, holder_headroom, cache_headroom = fields[:4]
-        active_holders, configured_holders, active_cache, configured_cache = fields[4:8]
-        _reaped, reserved_holders, service_holders, requested_cache = fields[8:]
-        budget_reason = admission.get('budget_reason')
-        if (
-            holders == 0
-            or cache_bytes == 0
-            or requested_cache == 0
-            or configured_holders != holders
-            or configured_cache != cache_bytes
-            or holder_headroom != max(0, holders - active_holders)
-            or cache_headroom != max(0, cache_bytes - active_cache)
-            or service_holders > active_holders
-            or reserved_holders > holders
-            or budget_reason not in {
-                'holder_limit', 'cache_budget', 'reserved_service_slots',
-            }
-        ):
-            continue
-        if budget_reason == 'holder_limit' and active_holders < holders:
-            continue
-        if budget_reason == 'cache_budget' and (
-            active_holders >= holders or active_cache + requested_cache <= cache_bytes
-        ):
-            continue
-        if budget_reason == 'reserved_service_slots' and (
-            active_holders >= holders
-            or active_cache + requested_cache > cache_bytes
-            or reserved_holders == 0
-            or active_holders + 1 + reserved_holders <= holders
-        ):
-            continue
-        return {
-            'outcome': 'admission_blocked',
-            'reason': 'holder_budget_exceeded',
-            'cleanup_required': False,
-        }
-    return None
-
-
 def create_terminal_receipt(value: Any) -> dict[str, Any] | None:
-    """Classify only the documented cleanup-safe create terminal contracts."""
-    created_ids = created_ids_from(value)
-    if created_ids:
+    """Project the shared create classification into existing receipt consumers."""
+    classified = classify_create_attempt(value)
+    if classified['kind'] == 'created':
         return {
             'outcome': 'write_accepted',
-            'created_drawer_ids': created_ids,
+            'created_drawer_ids': classified['created_drawer_ids'],
             'cleanup_required': True,
         }
-    receipts = receipt_dicts_from(value)
-    for receipt in receipts:
-        if receipt.get('outcome') != 'admission_blocked':
-            continue
-        if receipt.get('action') != 'write_refused':
-            return None
-        created = receipt.get('created_drawer_ids')
-        cleanup = receipt.get('cleanup_drawer_ids')
-        if created != [] or cleanup != []:
-            return None
-        reason = receipt.get('reason')
-        return {
-            'outcome': 'admission_blocked',
-            'reason': reason if isinstance(reason, str) and reason else 'unknown_admission_reason',
-            'cleanup_required': False,
-        }
+    if classified['kind'] == 'proven_no_write':
+        return classified['receipt']
     return None
+
+
+def create_attempt_from_mcp_info(info: dict[str, Any]) -> dict[str, Any]:
+    """Return the unprojected MCP response retained for create classification."""
+    raw = info.get('_raw_mcp_response')
+    return raw if isinstance(raw, dict) else {}
 
 
 def note_no_write_create(create_label: str, downstream_label: str, receipt: dict[str, Any] | None) -> bool:
@@ -1302,7 +1155,7 @@ def operation_id_from(value: Any) -> str | None:
 
 def followable_timeout_operation_id(value: Any) -> str | None:
     """Return an accepted MCP wait-timeout receipt's operation ID, if any."""
-    if holder_budget_no_write_receipt(value) is not None:
+    if classify_create_attempt(value)['kind'] != 'queued':
         return None
     for receipt in receipt_dicts_from(value):
         operation_id = receipt.get('operation_id')
@@ -1386,17 +1239,17 @@ def wait_operation(operation_id: str, name: str) -> Any | None:
 
 
 def recover_created_ids(value: Any, wait_label: str) -> tuple[list[str], dict[str, Any]]:
-    ids = created_ids_from(value)
-    operation_id = operation_id_from(value)
-    receipt = create_terminal_receipt(value)
+    classified = classify_create_attempt(value)
+    ids = classified.get('created_drawer_ids', [])
+    operation_id = classified.get('operation_id')
     info: dict[str, Any] = {
         'operation_id_present': bool(operation_id),
-        'operation_state': operation_state_from(value),
+        'operation_state': classified.get('state', operation_state_from(value)),
         'recovered_via': None,
         'recovered_state': None,
     }
-    if receipt and receipt.get('outcome') == 'admission_blocked':
-        info.update(receipt)
+    if classified['kind'] == 'proven_no_write':
+        info['receipt'] = classified['receipt']
     if ids or operation_id is None:
         return ids, info
 
@@ -1408,7 +1261,11 @@ def recover_created_ids(value: Any, wait_label: str) -> tuple[list[str], dict[st
 
 
 def recovery_fields(info: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in info.items() if key != 'reason' and value not in (None, False)}
+    return {
+        key: value
+        for key, value in info.items()
+        if key not in {'reason', 'receipt'} and value not in (None, False)
+    }
 
 
 def _rest_ingest_fallback(
@@ -1533,8 +1390,8 @@ def cli_crud() -> list[str]:
         timeout=130,
     )
     create_attempt = [parsed, {'returncode': rc}]
-    ids, create_recovery = recover_created_ids(parsed, 'cli_create_wait')
-    direct_receipt = holder_budget_no_write_receipt(create_attempt)
+    ids, create_recovery = recover_created_ids(create_attempt, 'cli_create_wait')
+    direct_receipt = classify_create_attempt(create_attempt).get('receipt')
     _remember_created_ids(ids)
     if not ids and direct_receipt and note_no_write_create('cli_create', 'cli_crud', direct_receipt):
         return cleanup_ids
@@ -1582,7 +1439,9 @@ def cli_crud() -> list[str]:
         expect_json=True,
         timeout=130,
     )
-    upd_ids, update_recovery = recover_created_ids(upd_parsed, 'cli_update_wait')
+    upd_ids, update_recovery = recover_created_ids(
+        [upd_parsed, {'returncode': rc}], 'cli_update_wait'
+    )
     _remember_created_ids(upd_ids)
 
     # Fallback: retry update via REST if direct write failed (writer lease).
@@ -1803,15 +1662,18 @@ def mcp_crud() -> list[str]:
         create_args = {'content': f'{MARKER} reversible MCP smoke drawer; nonce {NONCE}; lexical tokens azurequill basaltfern cobaltlyric; safe to delete', 'wing': 'smoke', 'room': 'mcp', 'source_type': 'agent_inference', 'memory_kind': 'evidence', 'domain': 'project', 'field': 'smoke', 'smoke': True, 'wait': True, 'wait_timeout_secs': 15}
         _checkpoint_manifest()
         create, info = _mcp_tool_with_hard_timeout(client, 'mempal_ingest', create_args, timeout=30)
-        create_receipt = [create, info]
-        ids = created_ids_from(create_receipt)
-        mcp_receipt = holder_budget_no_write_receipt(create_receipt)
+        create_classification = classify_create_attempt(create_attempt_from_mcp_info(info))
+        ids = create_classification.get('created_drawer_ids', [])
+        mcp_receipt = create_classification.get('receipt')
         _remember_created_ids(ids)
-        create_operation_id = operation_id_from(create_receipt)
-        create_timeout_operation_id = followable_timeout_operation_id(create_receipt)
+        create_operation_id = create_classification.get('operation_id')
+        create_timeout_operation_id = (
+            followable_timeout_operation_id(create_attempt_from_mcp_info(info))
+            if create_classification['kind'] == 'queued' else None
+        )
         create_recovery: dict[str, Any] = {
             'operation_id_present': bool(create_operation_id),
-            'operation_state': operation_state_from(create_receipt),
+            'operation_state': create_classification.get('state'),
         }
         if not ids and mcp_receipt and note_no_write_create(
             'mcp_create', 'mcp_inconclusive_no_cleanup_id', mcp_receipt
@@ -1921,13 +1783,16 @@ def mcp_crud() -> list[str]:
         update_args = {'content': f'{MARKER} reversible MCP smoke drawer updated; nonce {NONCE[::-1]}; lexical tokens deltaorchid embervault frostcairn; safe to delete', 'wing': 'smoke', 'room': 'mcp', 'source_type': 'agent_inference', 'memory_kind': 'evidence', 'domain': 'project', 'field': 'smoke', 'smoke': True, 'supersedes': created_id, 'wait': True, 'wait_timeout_secs': 15}
         _checkpoint_manifest()
         update, uinfo = _mcp_tool_with_hard_timeout(client, 'mempal_ingest', update_args, timeout=30)
-        update_receipt = [update, uinfo]
-        upd_ids = created_ids_from(update_receipt)
+        update_classification = classify_create_attempt(create_attempt_from_mcp_info(uinfo))
+        upd_ids = update_classification.get('created_drawer_ids', [])
         _remember_created_ids(upd_ids)
-        update_timeout_operation_id = followable_timeout_operation_id(update_receipt)
+        update_timeout_operation_id = (
+            followable_timeout_operation_id(create_attempt_from_mcp_info(uinfo))
+            if update_classification['kind'] == 'queued' else None
+        )
         update_recovery: dict[str, Any] = {
-            'operation_id_present': bool(operation_id_from(update_receipt)),
-            'operation_state': operation_state_from(update_receipt),
+            'operation_id_present': update_classification['kind'] == 'queued',
+            'operation_state': update_classification.get('state'),
         }
         if not upd_ids and update_timeout_operation_id:
             waited = run_fallback_after_mcp_reaped(
