@@ -261,7 +261,13 @@ pub fn rusqlite_error_is_lock(error: &rusqlite::Error) -> bool {
 }
 
 pub fn db_error_is_sqlite_lock(error: &DbError) -> bool {
+    // Admission lock Busy is the same transient contention class as SQLITE_BUSY:
+    // callers that retry/map lock errors must not fail closed on a 250ms admission wait.
     matches!(error, DbError::Sqlite(sqlite) if rusqlite_error_is_lock(sqlite))
+        || matches!(
+            error,
+            DbError::Admission(super::db_admission::DbAdmissionError::Busy { .. })
+        )
 }
 
 #[derive(Debug, Error)]
@@ -7810,6 +7816,18 @@ mod tests {
         assert!(
             db_error_is_sqlite_lock(&DbError::from(protocol_error)),
             "DbError classification must preserve SQLITE_PROTOCOL as a transient lock"
+        );
+    }
+
+    #[test]
+    fn admission_busy_is_classified_as_transient_lock() {
+        let busy = DbError::Admission(super::super::db_admission::DbAdmissionError::Busy {
+            path: PathBuf::from("/tmp/profile.db.admission.lock"),
+            timeout_ms: 250,
+        });
+        assert!(
+            db_error_is_sqlite_lock(&busy),
+            "profile admission Busy is the same transient contention class as SQLITE_BUSY"
         );
     }
 

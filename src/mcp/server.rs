@@ -324,6 +324,8 @@ pub struct MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     query_only_read_delay: Option<Duration>,
     #[cfg(any(test, feature = "db-test-seam"))]
+    search_embed_deadline: Option<Duration>,
+    #[cfg(any(test, feature = "db-test-seam"))]
     async_db_open_error: Option<String>,
     #[cfg(any(test, feature = "db-test-seam"))]
     query_only_async_db_open_error: Option<String>,
@@ -618,6 +620,8 @@ impl MempalMcpServer {
             #[cfg(any(test, feature = "db-test-seam"))]
             query_only_read_delay: None,
             #[cfg(any(test, feature = "db-test-seam"))]
+            search_embed_deadline: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
             async_db_open_error: None,
             #[cfg(any(test, feature = "db-test-seam"))]
             query_only_async_db_open_error: None,
@@ -798,6 +802,11 @@ impl MempalMcpServer {
         self.search_stale_index_deadline = deadline;
         self.ingest_admission_deadline = deadline;
         self.operation_status_deadline = deadline;
+        // Production embed timeout is config-driven (default 240s) and is not
+        // covered by the MCP DB deadlines above. Test fixtures that shrink the
+        // outer client budget must also shrink this path or suite load can hang
+        // past the fixture timeout while waiting for a non-blocking stub embed.
+        self.search_embed_deadline = Some(deadline);
         self
     }
 
@@ -2287,6 +2296,14 @@ impl MempalMcpServer {
         None
     }
 
+    fn search_embed_deadline_for_request(&self, config: &Config) -> Duration {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if let Some(deadline) = self.search_embed_deadline {
+            return deadline;
+        }
+        Duration::from_secs(config.embed.retry.search_deadline_secs)
+    }
+
     async fn run_query_only_read_anyhow_bounded<F, R>(
         &self,
         stage: &'static str,
@@ -2464,10 +2481,7 @@ impl MempalMcpServer {
                 let diagnostic =
                     status_database_diagnostic(&self.db_path, "async_db", error.as_ref());
                 if diagnostic.failure_kind == "holder_budget_exceeded" {
-                    return Err(mcp_async_pool_admission_error(
-                        &self.db_path,
-                        error.as_ref(),
-                    ));
+                    return Err(mcp_async_pool_admission_error(&self.db_path, &error));
                 }
                 Ok(())
             }
@@ -5789,8 +5803,9 @@ impl MempalMcpServer {
                 }
             };
             if let Some(embedder) = embedder {
+                let embed_deadline = self.search_embed_deadline_for_request(config.as_ref());
                 match tokio::time::timeout(
-                    Duration::from_secs(config.embed.retry.search_deadline_secs),
+                    embed_deadline,
                     embedder.embed(&[request.query.as_str()]),
                 )
                 .await
@@ -5922,7 +5937,7 @@ impl MempalMcpServer {
                     Err(_) => {
                         search_mode = SearchMode::Bm25Only;
                         let warning =
-                            bm25_fallback_warning_timeout(config.embed.retry.search_deadline_secs);
+                            bm25_fallback_warning_timeout(embed_deadline.as_secs().max(1));
                         response_warnings.push(warning.clone());
                         extra_warnings.push(SystemWarning {
                             level: "warn".to_string(),
@@ -12178,12 +12193,59 @@ fn profile_admission_snapshot(db_path: &Path, pool_loaded_key: &str) -> serde_js
     admission
 }
 
-fn mcp_async_pool_admission_error(
-    db_path: &Path,
-    error: &(dyn std::error::Error + 'static),
-) -> ErrorData {
-    let diagnostic = status_database_diagnostic(db_path, "async_db", error);
-    let admission = profile_admission_snapshot(db_path, "async_pool_loaded");
+fn budget_exceeded_profile_admission(error: &anyhow::Error) -> Option<serde_json::Value> {
+    let admission = match error.downcast_ref::<crate::core::db::DbError>() {
+        Some(crate::core::db::DbError::Admission(
+            admission @ crate::core::db_admission::DbAdmissionError::BudgetExceeded { .. },
+        )) => admission,
+        _ => match error.downcast_ref::<crate::core::db_admission::DbAdmissionError>() {
+            Some(
+                admission @ crate::core::db_admission::DbAdmissionError::BudgetExceeded { .. },
+            ) => admission,
+            _ => return None,
+        },
+    };
+    let crate::core::db_admission::DbAdmissionError::BudgetExceeded {
+        active_holders,
+        max_holders,
+        active_cache_bytes,
+        max_cache_bytes,
+        requested_cache_bytes,
+        reaped_stale_holders,
+        reserved_service_holders,
+        service_holders,
+        reason,
+    } = admission
+    else {
+        return None;
+    };
+    Some(serde_json::json!({
+        "active_holders": active_holders,
+        "configured_holder_limit": max_holders,
+        "active_cache_bytes": active_cache_bytes,
+        "configured_cache_bytes": max_cache_bytes,
+        "available_cache_bytes": max_cache_bytes.saturating_sub(*active_cache_bytes),
+        "reaped_stale_holders_this_snapshot": reaped_stale_holders,
+        "reserved_service_holders": reserved_service_holders,
+        "service_holders": service_holders,
+        "requested_cache_bytes": requested_cache_bytes,
+        "budget_reason": reason.to_string(),
+        "capacity": {"holders": max_holders, "cache_bytes": max_cache_bytes},
+        "headroom": {
+            "holders": max_holders.saturating_sub(*active_holders),
+            "cache_bytes": max_cache_bytes.saturating_sub(*active_cache_bytes),
+        },
+    }))
+}
+
+fn mcp_async_pool_admission_error(db_path: &Path, error: &anyhow::Error) -> ErrorData {
+    let diagnostic = status_database_diagnostic(db_path, "async_db", error.as_ref());
+    let mut admission = profile_admission_snapshot(db_path, "async_pool_loaded");
+    if let Some(fields) = budget_exceeded_profile_admission(error)
+        && let (Some(admission), Some(fields)) = (admission.as_object_mut(), fields.as_object())
+    {
+        admission.extend(fields.clone());
+    }
     let capacity = admission.get("capacity").cloned();
     let headroom = admission.get("headroom").cloned();
     let message = if diagnostic.failure_kind == "holder_budget_exceeded" {
@@ -15978,6 +16040,85 @@ pattern_boost = 0.2
         );
 
         tokio::time::sleep(Duration::from_millis(180)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_search_embed_deadline_override_falls_back_without_waiting_for_gate() {
+        // Distinguishes the search_embed_deadline test seam from production's
+        // 240s embed.retry.search_deadline_secs: leave the embedder blocked and
+        // assert mempal_search still returns BM25-only within a short client budget.
+        let _config_guard = ConfigOverrideGuard::install(
+            "[search]\nbm25_fallback = true\n\n[embed.retry]\nsearch_deadline_secs = 240\n",
+        )
+        .await;
+        let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        insert_drawer(
+            &db_path,
+            "bounded-embed-search",
+            "bounded embed search marker",
+            "mcp",
+            Some("deadline"),
+            "bounded-embed-search.md",
+            3,
+        );
+        let query_only_async_db =
+            QueryOnlyAsyncDb::open(&db_path, 4).expect("open query-only async db fixture");
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(Notify::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let server = MempalMcpServer::new_with_factory(
+            db_path,
+            Arc::new(BlockingEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+                call_count: Arc::clone(&call_count),
+                started: Arc::clone(&started),
+                gate,
+                released: Arc::new(AtomicBool::new(false)),
+            }),
+        )
+        .expect("create MCP server")
+        .with_query_only_async_db_for_test(query_only_async_db)
+        .with_mcp_deadline_for_test(Duration::from_millis(20));
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(500),
+            server.mempal_search(Parameters(SearchRequest {
+                query: "bounded embed search marker".to_string(),
+                wing: Some("mcp".to_string()),
+                room: Some("deadline".to_string()),
+                top_k: Some(1),
+                disable_progressive: Some(true),
+                ..SearchRequest::default()
+            })),
+        )
+        .await
+        .expect("MCP search must not wait for the production 240s embed budget")
+        .expect("bounded embed-timeout response")
+        .0;
+
+        assert!(
+            call_count.load(Ordering::SeqCst) >= 1,
+            "blocked embedder must be entered so the timeout branch is exercised"
+        );
+        assert_eq!(response.search_mode, SearchMode::Bm25Only.as_str());
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("embedding deadline exceeded")),
+            "embed-timeout warning missing: {:?}",
+            response.warnings
+        );
+        assert!(
+            response
+                .system_warnings
+                .iter()
+                .any(|warning| warning.source == "embed"
+                    && warning.message.contains("embedding deadline exceeded")),
+            "system warning should expose embed timeout: {:?}",
+            response.system_warnings
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -22175,8 +22316,30 @@ prototypes = ["keep"]
         assert_eq!(data["created_drawer_ids"], serde_json::json!([]));
         assert_eq!(data["cleanup_drawer_ids"], serde_json::json!([]));
         assert_eq!(data["capacity"]["holders"], 16);
+        assert_eq!(data["capacity"]["cache_bytes"], 256 * 1024 * 1024);
+        assert_eq!(data["profile_admission"]["active_holders"], 14);
+        assert_eq!(data["profile_admission"]["configured_holder_limit"], 16);
+        assert_eq!(
+            data["profile_admission"]["active_cache_bytes"],
+            14 * 16 * 1024 * 1024
+        );
+        assert_eq!(
+            data["profile_admission"]["configured_cache_bytes"],
+            256 * 1024 * 1024
+        );
+        assert_eq!(
+            data["profile_admission"]["reaped_stale_holders_this_snapshot"],
+            0
+        );
+        assert_eq!(data["profile_admission"]["reserved_service_holders"], 2);
         assert_eq!(data["profile_admission"]["service_holders"], 14);
         assert_eq!(data["headroom"]["holders"], 2);
+        assert_eq!(data["headroom"]["cache_bytes"], 32 * 1024 * 1024);
+        assert_eq!(
+            data["profile_admission"]["requested_cache_bytes"],
+            3 * 16 * 1024 * 1024
+        );
+        assert_eq!(data["profile_admission"]["budget_reason"], "cache_budget");
     }
 
     #[tokio::test]

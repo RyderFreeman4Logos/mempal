@@ -26,7 +26,7 @@ class ReceiptExtractionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.smoke = load_full_smoke()
 
-    def test_created_ids_from_accepts_only_cleanup_safe_fields(self) -> None:
+    def test_cleanup_ids_from_accepts_only_cleanup_safe_fields(self) -> None:
         payload = {
             "drawer_ids": ["unsafe-affected-id"],
             "result": {
@@ -38,24 +38,28 @@ class ReceiptExtractionTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            self.smoke.created_ids_from(payload),
+            self.smoke.cleanup_ids_from(payload),
             ["created-a", "created-b"],
         )
 
-    def test_created_ids_from_handles_ndjson_style_receipt_lists(self) -> None:
+    def test_cleanup_ids_from_handles_ndjson_style_receipt_lists(self) -> None:
         receipts = [
             {"state": "queued", "operation_id": "op-1"},
-            {"state": "completed", "cleanup_drawer_ids": ["created-final"]},
+            {
+                "operation_id": "op-1",
+                "state": "completed",
+                "cleanup_drawer_ids": ["created-final"],
+            },
         ]
 
         self.assertEqual(
-            self.smoke.created_ids_from(receipts),
+            self.smoke.cleanup_ids_from(receipts),
             ["created-final"],
         )
         self.assertEqual(self.smoke.operation_id_from(receipts), "op-1")
         self.assertTrue(self.smoke.terminal_state(receipts))
 
-    def test_create_terminal_receipt_distinguishes_cleanup_from_no_write_admission(self) -> None:
+    def test_create_terminal_receipt_rejects_unproven_no_write_admission(self) -> None:
         accepted = self.smoke.create_terminal_receipt(
             {"created_drawer_ids": ["drawer-created"], "cleanup_drawer_ids": ["drawer-created"]}
         )
@@ -67,6 +71,19 @@ class ReceiptExtractionTests(unittest.TestCase):
                     "reason": "holder_budget_exceeded",
                     "created_drawer_ids": [],
                     "cleanup_drawer_ids": [],
+                    "capacity": {"holders": 16, "cache_bytes": 64},
+                    "headroom": {"holders": 2, "cache_bytes": 50},
+                    "profile_admission": {
+                        "active_holders": 14,
+                        "configured_holder_limit": 16,
+                        "active_cache_bytes": 14,
+                        "configured_cache_bytes": 64,
+                        "reaped_stale_holders_this_snapshot": 0,
+                        "reserved_service_holders": 2,
+                        "service_holders": 14,
+                        "requested_cache_bytes": 1,
+                        "budget_reason": "reserved_service_slots",
+                    },
                 }
             }
         )
@@ -79,50 +96,7 @@ class ReceiptExtractionTests(unittest.TestCase):
                 "cleanup_required": True,
             },
         )
-        self.assertEqual(
-            blocked,
-            {
-                "outcome": "admission_blocked",
-                "reason": "holder_budget_exceeded",
-                "cleanup_required": False,
-            },
-        )
-
-    def test_mcp_error_data_preserves_only_cleanup_safe_terminal_receipt(self) -> None:
-        receipt = self.smoke._SMOKE_RUNTIME.terminal_no_write_receipt({
-            "data": {
-                "outcome": "admission_blocked",
-                "reason": "holder_budget_exceeded",
-                "action": "write_refused",
-                "created_drawer_ids": [],
-                "cleanup_drawer_ids": [],
-                "capacity": {"holders": 16, "cache_bytes": 64},
-                "database_diagnostic": {"message": "must not reach smoke output"},
-            }
-        })
-
-        self.assertEqual(receipt["outcome"], "admission_blocked")
-        self.assertEqual(receipt["capacity"], {"holders": 16, "cache_bytes": 64})
-        self.assertNotIn("database_diagnostic", receipt)
-        self.assertEqual(
-            self.smoke.create_terminal_receipt({"terminal_receipt": receipt})["cleanup_required"],
-            False,
-        )
-
-    def test_no_write_admission_skips_create_cleanup_without_missing_id_failure(self) -> None:
-        setattr(self.smoke, "SUMMARY", {"groups": {}, "failures": []})
-        handled = self.smoke.note_no_write_create(
-            "mcp_create",
-            "mcp_inconclusive_no_cleanup_id",
-            {"outcome": "admission_blocked", "reason": "holder_budget_exceeded"},
-        )
-
-        self.assertTrue(handled)
-        self.assertEqual(
-            self.smoke.SUMMARY["groups"]["mcp_inconclusive_no_cleanup_id"]["skipped"],
-            "admission_blocked_no_write",
-        )
-        self.assertNotIn("mcp_inconclusive_no_cleanup_id", self.smoke.SUMMARY["failures"])
+        self.assertIsNone(blocked)
 
     def test_recover_created_ids_waits_on_operation_receipt(self) -> None:
         calls: list[tuple[str, str]] = []
@@ -158,7 +132,7 @@ class ReceiptExtractionTests(unittest.TestCase):
 
         self.assertIsNone(self.smoke.followable_timeout_operation_id(timeout_without_operation))
         self.assertEqual(ids, [])
-        self.assertEqual(info["operation_state"], "queued")
+        self.assertIsNone(info["operation_state"])
         self.assertFalse(info["operation_id_present"])
 
     def test_recovery_fields_excludes_reason(self) -> None:
@@ -166,44 +140,6 @@ class ReceiptExtractionTests(unittest.TestCase):
             {"reason": "holder_budget_exceeded", "operation_state": "blocked"}
         )
         self.assertEqual(fields, {"operation_state": "blocked"})
-
-    def test_admission_blocked_create_and_update_notes_own_reason(self) -> None:
-        _, info = self.smoke.recover_created_ids(
-            {
-                "error": {
-                    "outcome": "admission_blocked",
-                    "action": "write_refused",
-                    "reason": "holder_budget_exceeded",
-                    "created_drawer_ids": [],
-                    "cleanup_drawer_ids": [],
-                }
-            },
-            "unused_wait",
-        )
-
-        self.assertEqual(info["reason"], "holder_budget_exceeded")
-        setattr(self.smoke, "SUMMARY", {"groups": {}, "failures": []})
-        self.smoke.note(
-            "cli_crud",
-            False,
-            reason="create_missing_created_drawer_ids",
-            **self.smoke.recovery_fields(info),
-        )
-        self.assertEqual(
-            self.smoke.SUMMARY["groups"]["cli_crud"]["reason"],
-            "create_missing_created_drawer_ids",
-        )
-
-        self.smoke.note(
-            "cli_crud",
-            False,
-            reason="update_missing_created_drawer_ids",
-            cleanup_id_count=1,
-            **self.smoke.recovery_fields(info),
-        )
-        receipt = self.smoke.SUMMARY["groups"]["cli_crud"]
-        self.assertEqual(receipt["reason"], "update_missing_created_drawer_ids")
-        self.assertEqual(receipt["cleanup_id_count"], 1)
 
     def test_classify_stderr_reports_database_extra_holder_without_raw_text(self) -> None:
         stderr = (

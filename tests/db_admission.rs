@@ -173,11 +173,23 @@ fn concurrent_registration_never_oversubscribes_profile_budget() {
         let admitted_tx = admitted_tx.clone();
         workers.push(std::thread::spawn(move || {
             start.wait();
-            let admission = ProfileDbAdmission::acquire_with_config(
-                &db_path,
-                request(DbHolderClass::Cli, 16),
-                config,
-            );
+            // Under suite load the 250ms admission flock wait can expire as Busy
+            // before a budget decision is reached. Busy is lock contention, not
+            // a budget rejection; retry until Ok/BudgetExceeded within a bound.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let admission = loop {
+                match ProfileDbAdmission::acquire_with_config(
+                    &db_path,
+                    request(DbHolderClass::Cli, 16),
+                    config,
+                ) {
+                    Ok(holder) => break Ok(holder),
+                    Err(DbAdmissionError::Busy { .. }) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => break Err(error),
+                }
+            };
             admitted_tx
                 .send(admission.is_ok())
                 .expect("report admission");
@@ -197,7 +209,7 @@ fn concurrent_registration_never_oversubscribes_profile_budget() {
     let reported = (0..4)
         .map(|_| {
             admitted_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
+                .recv_timeout(std::time::Duration::from_secs(5))
                 .expect("worker admission result")
         })
         .filter(|admitted| *admitted)

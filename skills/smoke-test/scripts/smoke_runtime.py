@@ -34,50 +34,23 @@ __all__ = [
     "cleanup_exact_ids",
     "finalize_cleanup_manifest",
     "record_proc_io_delta",
+    "strict_json_loads",
     "terminate_and_reap_owned_processes",
 ]
 
 
-def terminal_no_write_receipt(error: Any) -> dict[str, Any] | None:
-    """Extract the cleanup-safe subset of a terminal MCP JSON-RPC refusal.
+def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object key")
+        value[key] = item
+    return value
 
-    JSON-RPC error messages can include diagnostics. The smoke summary must only retain
-    the documented admission receipt fields it needs to decide that no cleanup is required.
-    """
-    if not isinstance(error, dict):
-        return None
-    data = error.get("data")
-    if not isinstance(data, dict):
-        return None
-    if (
-        data.get("outcome") != "admission_blocked"
-        or data.get("action") != "write_refused"
-        or not isinstance(data.get("reason"), str)
-        or data.get("created_drawer_ids") != []
-        or data.get("cleanup_drawer_ids") != []
-    ):
-        return None
 
-    receipt: dict[str, Any] = {
-        "outcome": "admission_blocked",
-        "reason": data["reason"],
-        "action": "write_refused",
-        "created_drawer_ids": [],
-        "cleanup_drawer_ids": [],
-    }
-    for key in ("capacity", "headroom"):
-        value = data.get(key)
-        if isinstance(value, dict):
-            numeric = {
-                field: amount
-                for field, amount in value.items()
-                if field in {"holders", "cache_bytes"}
-                and isinstance(amount, int)
-                and not isinstance(amount, bool)
-            }
-            if numeric:
-                receipt[key] = numeric
-    return receipt
+def strict_json_loads(data: str | bytes | bytearray) -> Any:
+    """Decode JSON while rejecting duplicate keys at every object depth."""
+    return json.loads(data, object_pairs_hook=_reject_duplicate_object_keys)
 
 
 class CleanupManifest:
@@ -412,7 +385,7 @@ class McpClient:
             del self._response_buffer[: newline_index + 1]
             if not line:
                 continue
-            message = json.loads(line)
+            message = strict_json_loads(line)
             if not isinstance(message, dict):
                 raise ValueError("mcp response must be a JSON object")
             if message.get("id") == message_id:
@@ -425,32 +398,40 @@ class McpClient:
         timeout: float = 120,
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         started_at = time.monotonic()
+        raw_message: Any | None = None
         try:
             message = self.call(
                 "tools/call",
                 {"name": name, "arguments": arguments},
                 timeout=timeout,
             )
+            raw_message = message
             elapsed_ms = int((time.monotonic() - started_at) * 1000)
             if "error" in message:
-                receipt = terminal_no_write_receipt(message["error"])
+                error = message["error"]
                 info: dict[str, Any] = {
                     "ok": False,
                     "latency_ms": elapsed_ms,
-                    "error_code": message["error"].get("code"),
-                    "error_message_bytes": len(json.dumps(message["error"]).encode()),
+                    "error_code": error.get("code") if isinstance(error, dict) else None,
+                    "error_message_bytes": len(json.dumps(error).encode()),
+                    "_raw_mcp_response": message,
                 }
-                if receipt is not None:
-                    info["terminal_receipt"] = receipt
                 return None, info
-            structured = message.get("result", {}).get("structuredContent")
+            result = message.get("result")
+            if not isinstance(result, dict):
+                raise ValueError("mcp result must be a JSON object")
+            structured = result.get("structuredContent")
             return structured, {
                 "ok": isinstance(structured, dict),
                 "latency_ms": elapsed_ms,
                 "shape": self._json_shape(structured),
+                "_raw_mcp_response": message,
             }
         except Exception as error:
-            return None, {"ok": False, "error_type": type(error).__name__}
+            info = {"ok": False, "error_type": type(error).__name__}
+            if raw_message is not None:
+                info["_raw_mcp_response"] = raw_message
+            return None, info
 
     def close(self) -> bool:
         """Close the server with wait, terminate, and kill escalation."""

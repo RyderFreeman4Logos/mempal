@@ -207,6 +207,10 @@ fn anyhow_error_is_sqlite_lock(error: &anyhow::Error) -> bool {
             || error
                 .downcast_ref::<DbError>()
                 .is_some_and(crate::core::db::db_error_is_sqlite_lock)
+            || matches!(
+                error.downcast_ref::<crate::core::db_admission::DbAdmissionError>(),
+                Some(crate::core::db_admission::DbAdmissionError::Busy { .. })
+            )
     })
 }
 
@@ -235,6 +239,19 @@ fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writer_lease_retry_classifier_treats_admission_busy_as_lock() {
+        let busy = crate::core::db_admission::DbAdmissionError::Busy {
+            path: PathBuf::from("/tmp/profile.db.admission.lock"),
+            timeout_ms: 250,
+        };
+        let wrapped = anyhow::Error::new(busy).context("failed to open DB for writer lease renew");
+        assert!(
+            anyhow_error_is_sqlite_lock(&wrapped),
+            "admission Busy must remain retryable through the renew classifier"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn daemon_writer_lease_waits_for_holder_release_before_admission() {

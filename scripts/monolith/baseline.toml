@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8749
-baseline_lines = 613
-issue = "882"
-rationale = "#882's required Unreleased entry documents deterministic SQLite writer-busy and MCP embedder-entry readiness fixtures; exact no-growth ratchet."
+baseline_tokens = 8935
+baseline_lines = 630
+issue = "876"
+rationale = "#876 documents admission-receipt ownership, Busy retry classification, MCP embed deadline seam, and admission concurrent Busy fixture; exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -109,18 +109,26 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "skills/smoke-test/scripts/full_smoke.py"
 kind = "source"
-baseline_tokens = 21294
-baseline_lines = 2231
-issue = "855"
-rationale = "#855 reserves recovery_fields reason for callers so admission-blocked note() cannot TypeError on duplicate reason; exact no-growth ratchet."
+baseline_tokens = 22542
+baseline_lines = 2357
+issue = "876"
+rationale = "#876 separates cleanup authority from successful writes and rejects conflicting operation IDs across CLI/MCP/REST recovery; exact no-growth ratchet."
+
+[[files]]
+path = "skills/smoke-test/tests/test_full_smoke_cli_crud_receipts.py"
+kind = "test"
+baseline_tokens = 7202
+baseline_lines = 856
+issue = "876"
+rationale = "#876 sweeps CLI/MCP CRUD callers so cleanup-only, failed-process, and cross-operation evidence never authorize success; exact no-growth ratchet."
 
 [[files]]
 path = "skills/smoke-test/tests/test_full_smoke_receipts.py"
 kind = "test"
-baseline_tokens = 7342
-baseline_lines = 846
-issue = "855"
-rationale = "#855 adds recovery_fields reason-exclusion and admission-blocked create/update note regressions; exact no-growth ratchet."
+baseline_tokens = 6835
+baseline_lines = 782
+issue = "876"
+rationale = "#876 covers durable cleanup manifests and complete admission-receipt classification; exact no-growth ratchet."
 
 [[files]]
 path = "specs/fork-ext/p8-embed-qwen3-backend.spec.md"
@@ -365,10 +373,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 180504
-baseline_lines = 22799
-issue = "882"
-rationale = "#882 adds state-preserving mock-embedder entry notifications and replaces readiness polling; exact no-growth ratchet."
+baseline_tokens = 182087
+baseline_lines = 22962
+issue = "876"
+rationale = "#876 preserves holder-budget no-write evidence, bounds MCP search embed deadlines, and adds distinguishing deadline/admission regression tests; exact no-growth ratchet."
 
 [[files]]
 path = "src/mcp/tools.rs"
