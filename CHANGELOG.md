@@ -42,6 +42,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **Test fixture readiness**: use deterministic readiness synchronization for the
+  SQLite writer-busy and MCP embedder-entry fixtures so suite-load contention
+  cannot race their assertions (#882).
+
 - **Daemon supervisor cooldowns**: wait through active restart-budget
   cooldowns and retry bootstrap in-process; true temporary refusals retain
   `75` (`EX_TEMPFAIL`), while the canonical unit keeps

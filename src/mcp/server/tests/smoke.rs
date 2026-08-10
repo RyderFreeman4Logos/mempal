@@ -51,6 +51,7 @@ enabled = false
         Arc::new(BlockingEmbedderFactory {
             vector: vec![0.1, 0.2, 0.3],
             call_count: Arc::clone(&call_count),
+            started: Arc::new(Notify::new()),
             gate: Arc::clone(&gate),
             released: Arc::new(AtomicBool::new(false)),
         }),

@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8739
-baseline_lines = 609
-issue = "858"
-rationale = "#858 documents retrying transient queue-write SQLite stalls across daemon/MCP/CLI paths without restart-budget churn; exact no-growth ratchet."
+baseline_tokens = 8749
+baseline_lines = 613
+issue = "882"
+rationale = "#882's required Unreleased entry documents deterministic SQLite writer-busy and MCP embedder-entry readiness fixtures; exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -373,10 +373,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 181144
-baseline_lines = 22858
+baseline_tokens = 181190
+baseline_lines = 22865
 issue = "876"
-rationale = "#876 emits bounded pre-dispatch holder-budget evidence required for exact MCP no-write classification; exact no-growth ratchet."
+rationale = "#876 merges #882 readiness fixtures into holder-budget no-write evidence; exact no-growth ratchet."
 
 [[files]]
 path = "src/mcp/tools.rs"
@@ -413,10 +413,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/search/mod.rs"
 kind = "source"
-baseline_tokens = 27826
-baseline_lines = 3281
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 28118
+baseline_lines = 3314
+issue = "882"
+rationale = "#882 deterministically delays access writeback and waits for its busy-boundary failure while the SQLite writer remains held; exact no-growth ratchet."
 
 [[files]]
 path = "src/sleep.rs"
