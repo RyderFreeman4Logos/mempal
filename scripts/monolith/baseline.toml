@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 9006
-baseline_lines = 636
+baseline_tokens = 9035
+baseline_lines = 638
 issue = "871"
-rationale = "#871 documents typed high-severity daemon-outage queue visibility and no-manual-DB recovery; exact no-growth ratchet."
+rationale = "#871 documents typed daemon-outage queue visibility, unavailable observations, and no-manual-DB recovery; exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -309,10 +309,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/doctor.rs"
 kind = "source"
-baseline_tokens = 11140
-baseline_lines = 1465
+baseline_tokens = 12047
+baseline_lines = 1593
 issue = "871"
-rationale = "#871 adds the typed daemon-outage pending-queue availability classification and recovery guidance; exact no-growth ratchet."
+rationale = "#871 keeps config, queue, and daemon-identity observations typed through shared availability classification; exact no-growth ratchet."
 
 [[files]]
 path = "src/ingest/gating.rs"

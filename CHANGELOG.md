@@ -44,9 +44,11 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - **Daemon outage visibility**: `doctor`, `status`, and MCP doctor now expose a
   high-severity typed availability signal when the daemon is down with at least
-  100 pending embedding/hook queue items, plus recovery guidance to start the
-  daemon, confirm drain progress, and handle terminal failures without database
-  edits (#871).
+  100 pending embedding/hook queue items. Unreadable config/queue statistics and
+  unverified PID identities instead report explicit, privacy-safe `unavailable`
+  reasons, never a synthetic normal state. Recovery guidance covers daemon
+  restart, drain confirmation, and terminal failures without database edits
+  (#871).
 
 - **Admission receipt ownership**: bind MCP holder-budget no-write receipts and
   smoke cleanup authority to the owning operation identity so saturated

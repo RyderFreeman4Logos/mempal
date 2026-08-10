@@ -2820,9 +2820,10 @@ impl From<DoctorInstallReport> for DoctorInstallDto {
 pub struct DoctorAvailabilityDto {
     pub severity: String,
     pub signal: Option<String>,
-    pub daemon_running: bool,
-    pub pending_queue: u64,
+    pub daemon_running: Option<bool>,
+    pub pending_queue: Option<u64>,
     pub pending_queue_threshold: u64,
+    pub unavailable_reasons: Vec<String>,
 }
 
 impl From<DoctorAvailabilityReport> for DoctorAvailabilityDto {
@@ -2833,6 +2834,11 @@ impl From<DoctorAvailabilityReport> for DoctorAvailabilityDto {
             daemon_running: report.daemon_running,
             pending_queue: report.pending_queue,
             pending_queue_threshold: report.pending_queue_threshold,
+            unavailable_reasons: report
+                .unavailable_reasons
+                .into_iter()
+                .map(|reason| reason.as_str().to_string())
+                .collect(),
         }
     }
 }
@@ -3774,8 +3780,33 @@ mod tests {
         AnchorKind, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, RouteDecision,
         SearchResult, SourceType,
     };
+    use crate::doctor::{
+        DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD, DoctorAvailabilityObservation,
+        daemon_outage_queue_availability,
+    };
 
-    use super::SearchResultDto;
+    use super::{DoctorAvailabilityDto, SearchResultDto};
+
+    #[test]
+    fn mcp_doctor_projects_daemon_outage_threshold_signal() {
+        let report = daemon_outage_queue_availability(
+            DoctorAvailabilityObservation::Known(false),
+            DoctorAvailabilityObservation::Known(DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD),
+        );
+
+        let dto = DoctorAvailabilityDto::from(report);
+
+        assert_eq!(dto.severity, "high");
+        assert_eq!(
+            dto.signal.as_deref(),
+            Some("daemon_down_large_pending_queue")
+        );
+        assert_eq!(
+            dto.pending_queue_threshold,
+            DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD
+        );
+        assert!(dto.unavailable_reasons.is_empty());
+    }
 
     fn sample_result(content: &str) -> SearchResult {
         let source_type = SourceType::AgentInference;

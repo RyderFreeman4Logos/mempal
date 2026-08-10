@@ -205,6 +205,77 @@ fn test_cli_doctor_and_status_report_daemon_outage_queue_high_severity() {
 }
 
 #[test]
+fn test_cli_doctor_reports_unavailable_when_config_is_invalid() {
+    let home = TempDir::new().expect("home");
+    let mempal_home = home.path().join(".mempal");
+    fs::create_dir_all(&mempal_home).expect("create mempal home");
+    Database::open(&palace_db_path(&home)).expect("open db");
+    fs::write(mempal_home.join("config.toml"), "not = [valid toml").expect("write invalid config");
+
+    let doctor = run_mempal(&home, &["doctor", "--format", "json"]);
+    assert_success(&doctor);
+    let report: Value = serde_json::from_str(&stdout(&doctor)).expect("doctor json");
+
+    assert_eq!(report["availability"]["severity"], "unavailable");
+    assert_eq!(
+        report["availability"]["unavailable_reasons"],
+        serde_json::json!(["config"])
+    );
+}
+
+#[test]
+fn test_cli_doctor_reports_unavailable_when_queue_stats_fail() {
+    let home = TempDir::new().expect("home");
+    fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
+    fs::write(palace_db_path(&home), "not a sqlite database").expect("write invalid db");
+
+    let doctor = run_mempal(&home, &["doctor", "--format", "json"]);
+    assert_success(&doctor);
+    let report: Value = serde_json::from_str(&stdout(&doctor)).expect("doctor json");
+
+    assert_eq!(report["availability"]["severity"], "unavailable");
+    assert_eq!(
+        report["availability"]["unavailable_reasons"],
+        serde_json::json!(["queue_stats"])
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_cli_doctor_rejects_unrelated_live_pid_as_daemon_identity() {
+    let home = TempDir::new().expect("home");
+    fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
+    Database::open(&palace_db_path(&home)).expect("open db");
+    let mut unrelated = Command::new("sleep")
+        .arg("120")
+        .spawn()
+        .expect("spawn unrelated process");
+    fs::write(
+        home.path().join(".mempal/daemon.pid"),
+        unrelated.id().to_string(),
+    )
+    .expect("write stale pidfile");
+
+    let doctor = run_mempal(&home, &["doctor", "--format", "json"]);
+    let status = run_mempal(&home, &["status"]);
+    unrelated.kill().expect("stop unrelated process");
+    unrelated.wait().expect("reap unrelated process");
+    assert_success(&doctor);
+    assert_success(&status);
+    let report: Value = serde_json::from_str(&stdout(&doctor)).expect("doctor json");
+    let status = stdout(&status);
+
+    assert_eq!(report["daemon"]["running"], false);
+    assert_eq!(report["availability"]["severity"], "unavailable");
+    assert_eq!(
+        report["availability"]["unavailable_reasons"],
+        serde_json::json!(["daemon_identity"])
+    );
+    assert!(status.contains("running: false"), "{status}");
+    assert!(status.contains("availability is unavailable"), "{status}");
+}
+
+#[test]
 
 fn test_cli_doctor_reports_queue_failure_classes() {
     let home = TempDir::new().expect("home");

@@ -80,8 +80,9 @@ use mempal::crystallize::{
     CrystallizeOptions, CrystallizeSummary, run_crystallization_with_writer_lease,
 };
 use mempal::doctor::{
-    RestDoctorReport, build_doctor_report_with_daemon_status, build_rest_doctor_report,
-    daemon_outage_queue_availability,
+    DoctorAvailabilityObservation, DoctorAvailabilitySeverity, RestDoctorReport,
+    build_doctor_report_with_daemon_status, build_rest_doctor_report,
+    daemon_outage_queue_availability, inspect_daemon,
 };
 use mempal::embed::build_backend_from_name;
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder, global_embed_status};
@@ -13819,14 +13820,24 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
             ),
         });
     }
-    let (daemon_pid, daemon_running, daemon_pidfile_warning) = detect_daemon_status(db.path())?;
-    if let Some(warning) = daemon_pidfile_warning {
+    let daemon_pidfile = read_daemon_pid_for_status(db.path());
+    if let Some(warning) = daemon_pidfile.warning {
         runtime_warnings.push(warning);
     }
-    let availability = daemon_outage_queue_availability(daemon_running, queue_stats.pending);
+    let (daemon, daemon_observation) = inspect_daemon(db.path());
+    let daemon_pid = daemon.pid;
+    let daemon_running = daemon.running;
+    let availability = daemon_outage_queue_availability(
+        daemon_observation,
+        DoctorAvailabilityObservation::Known(queue_stats.pending),
+    );
     if let Some(message) = availability.warning_message() {
         runtime_warnings.push(mempal::core::config::RuntimeWarning {
-            level: "error",
+            level: match availability.severity {
+                DoctorAvailabilitySeverity::High => "error",
+                DoctorAvailabilitySeverity::Unavailable => "warn",
+                DoctorAvailabilitySeverity::Normal => "info",
+            },
             source: "daemon_outage_queue",
             message: format!("{message}. To recover, start the daemon, confirm queue claim/drain progress, then handle terminal failed operations; do not edit the database manually."),
         });
@@ -14615,52 +14626,6 @@ fn read_daemon_pid_for_status(db_path: &Path) -> DaemonPidfileProbe {
             )),
         },
     }
-}
-
-#[cfg(unix)]
-fn detect_daemon_status(
-    db_path: &Path,
-) -> Result<(
-    Option<i32>,
-    bool,
-    Option<mempal::core::config::RuntimeWarning>,
-)> {
-    let pidfile = read_daemon_pid_for_status(db_path);
-    let pidfile_pid = pidfile.pid;
-    if let Some(pid) = pidfile_pid
-        && process_is_live(pid).context("failed to probe daemon pid liveness")?
-    {
-        return Ok((Some(pid), true, pidfile.warning));
-    }
-
-    let (candidates, live_pidfile_pid) =
-        collect_daemon_candidates_with_pidfile(db_path, pidfile_pid)?;
-    let plan = mempal::daemon_singleton::plan_daemon_reap(&candidates, live_pidfile_pid);
-    if let Some(pid) = plan.keeper
-        && process_is_live(pid).context("failed to probe daemon singleton liveness")?
-    {
-        return Ok((Some(pid), true, pidfile.warning));
-    }
-
-    Ok((pidfile_pid, false, pidfile.warning))
-}
-
-#[cfg(not(unix))]
-fn detect_daemon_status(
-    db_path: &Path,
-) -> Result<(
-    Option<i32>,
-    bool,
-    Option<mempal::core::config::RuntimeWarning>,
-)> {
-    let pidfile = read_daemon_pid_for_status(db_path);
-    let daemon_pid = pidfile.pid;
-    let daemon_running = daemon_pid
-        .map(process_is_live)
-        .transpose()
-        .context("failed to probe daemon pid liveness")?
-        .unwrap_or(false);
-    Ok((daemon_pid, daemon_running, pidfile.warning))
 }
 
 #[cfg(unix)]
@@ -16045,18 +16010,6 @@ impl DaemonProcessOps for RealDaemonProcessOps {
 #[cfg(unix)]
 fn collect_daemon_candidates(db_path: &Path) -> Result<(Vec<i32>, Option<i32>)> {
     let pidfile_pid = read_daemon_pid(db_path)?;
-    collect_daemon_candidates_with_scan_and_pidfile(
-        db_path,
-        mempal::daemon_singleton::enumerate_daemon_pids,
-        pidfile_pid,
-    )
-}
-
-#[cfg(unix)]
-fn collect_daemon_candidates_with_pidfile(
-    db_path: &Path,
-    pidfile_pid: Option<i32>,
-) -> Result<(Vec<i32>, Option<i32>)> {
     collect_daemon_candidates_with_scan_and_pidfile(
         db_path,
         mempal::daemon_singleton::enumerate_daemon_pids,
