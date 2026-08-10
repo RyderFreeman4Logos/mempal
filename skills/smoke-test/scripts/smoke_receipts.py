@@ -13,6 +13,7 @@ __all__ = [
 ]
 
 _MAX_RUST_WIRE_INTEGER = (1 << 64) - 1
+_OPERATION_STATES = frozenset({"queued", "running", "completed", "rejected", "failed"})
 _CAPACITY_FIELDS = frozenset({"holders", "cache_bytes"})
 _UNKNOWN_HOLDER_REASONS = frozenset({
     "unknown_lease_version",
@@ -83,25 +84,53 @@ def created_ids_from(value: Any) -> list[str]:
     return _created_id_evidence(value)[0]
 
 
-def operation_id_from(value: Any) -> str | None:
-    """Return the first explicit operation ID from the complete attempt."""
+def _operation_evidence(value: Any) -> tuple[str | None, str | None, bool, bool]:
+    """Return one coherent operation ID, its state/timeout, and invalidity."""
+    operation_ids: list[str] = []
+    last_state: str | None = None
+    terminal_state: str | None = None
+    timed_out = False
+    malformed = False
     for receipt in receipt_dicts_from(value):
-        operation_id = receipt.get("operation_id")
-        if isinstance(operation_id, str) and operation_id:
-            return operation_id
-    return None
+        if "operation_id" in receipt:
+            operation_id = receipt["operation_id"]
+            if isinstance(operation_id, str) and operation_id:
+                operation_ids.append(operation_id)
+            else:
+                malformed = True
+        if "state" in receipt:
+            state = receipt["state"]
+            if not isinstance(state, str) or state not in _OPERATION_STATES:
+                malformed = True
+            elif state in {"completed", "rejected", "failed"}:
+                terminal_state = terminal_state or state
+            else:
+                last_state = state
+        if "timed_out" in receipt:
+            timeout = receipt["timed_out"]
+            if not isinstance(timeout, bool):
+                malformed = True
+            else:
+                timed_out = timed_out or timeout
+    unique_ids = list(dict.fromkeys(operation_ids))
+    if malformed or len(unique_ids) > 1:
+        return None, None, False, True
+    return (
+        unique_ids[0] if unique_ids else None,
+        terminal_state or last_state,
+        timed_out,
+        False,
+    )
+
+
+def operation_id_from(value: Any) -> str | None:
+    """Return the sole coherent operation ID from the complete attempt."""
+    return _operation_evidence(value)[0]
 
 
 def operation_state_from(value: Any) -> str | None:
-    """Return a terminal state first, otherwise the latest explicit state."""
-    last_state: str | None = None
-    for receipt in receipt_dicts_from(value):
-        state = receipt.get("state")
-        if isinstance(state, str) and state:
-            if state in {"completed", "rejected", "failed"}:
-                return state
-            last_state = state
-    return last_state
+    """Return state only when the complete attempt has coherent operation evidence."""
+    return _operation_evidence(value)[1]
 
 
 def _is_nonnegative_rust_wire_integer(value: Any) -> bool:
@@ -314,26 +343,36 @@ def classify_create_attempt(value: Any) -> dict[str, Any]:
     """Classify a complete create attempt before producing smoke-safe summaries."""
     created_ids, malformed_ids = _created_id_evidence(value)
     id_evidence = {"created_drawer_ids": created_ids} if created_ids else {}
-    operation_id = operation_id_from(value)
-    state = operation_state_from(value)
+    operation_id, state, timed_out, malformed_operation = _operation_evidence(value)
+    if malformed_operation:
+        return {"kind": "inconclusive", **id_evidence}
     if operation_id is not None and state not in {"completed", "rejected", "failed"}:
-        return {
+        queued = {
             "kind": "queued",
             "operation_id": operation_id,
             "state": state,
             **id_evidence,
         }
+        if timed_out:
+            queued["timed_out"] = True
+        return queued
     if state in {"queued", "running", "rejected", "failed"}:
         return {"kind": "inconclusive", **id_evidence}
-    mcp_ids_are_cleanup_only = (
+    direct_id_fields = {"created_drawer_ids", "cleanup_drawer_ids"}
+    cleanup_only_ids = (
         isinstance(value, dict)
-        and value.get("jsonrpc") == "2.0"
         and (
-            "error" in value
-            or ("result" in value and not isinstance(value["result"], dict))
+            (
+                value.get("jsonrpc") == "2.0"
+                and (
+                    "error" in value
+                    or ("result" in value and not isinstance(value["result"], dict))
+                )
+            )
+            or ("error" in value and direct_id_fields.isdisjoint(value))
         )
     )
-    if malformed_ids or (created_ids and mcp_ids_are_cleanup_only):
+    if malformed_ids or (created_ids and cleanup_only_ids):
         return {"kind": "inconclusive", **id_evidence}
     if created_ids:
         return {"kind": "created", "created_drawer_ids": created_ids}

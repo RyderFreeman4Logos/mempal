@@ -109,10 +109,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "skills/smoke-test/scripts/full_smoke.py"
 kind = "source"
-baseline_tokens = 21344
-baseline_lines = 2233
+baseline_tokens = 22085
+baseline_lines = 2292
 issue = "876"
-rationale = "#876 validates complete CLI/MCP/REST admission receipts, preserves cleanup IDs, and suppresses unsafe fallbacks; exact no-growth ratchet."
+rationale = "#876 separates cleanup authority from successful writes and rejects conflicting operation IDs across CLI/MCP/REST recovery; exact no-growth ratchet."
 
 [[files]]
 path = "skills/smoke-test/tests/test_full_smoke_receipts.py"

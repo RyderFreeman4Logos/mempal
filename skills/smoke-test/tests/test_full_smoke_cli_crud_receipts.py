@@ -569,7 +569,7 @@ class CliCrudReceiptTests(unittest.TestCase):
                         smoke,
                         "delete_exact_ids_mcp",
                         return_value={
-                            "deleted_count": 2,
+                            "deleted_count": 3,
                             "failed_count": 0,
                             "delete_failed_attempt_count": 0,
                         },
@@ -577,14 +577,13 @@ class CliCrudReceiptTests(unittest.TestCase):
                     mock.patch.object(
                         smoke,
                         "_rest_ingest_fallback",
-                        side_effect=AssertionError("REST must not follow explicit cleanup IDs"),
+                        return_value=(["drawer-rest"], {"kind": "created", "created_drawer_ids": ["drawer-rest"]}),
                     ) as rest_fallback,
                 ):
-                    self.assertEqual(smoke.mcp_crud(), ["drawer-direct", "drawer-update"])
-                rest_fallback.assert_not_called()
-                self.assertEqual(manifest.pending_count, 2)
-                self.assertTrue(smoke.SUMMARY["groups"]["mcp_crud"]["ok"])
-                self.assertNotIn("mcp_inconclusive_no_cleanup_id", smoke.SUMMARY["groups"])
+                    self.assertEqual(smoke.mcp_crud(), ["drawer-direct", "drawer-rest", "drawer-update"])
+                rest_fallback.assert_called_once()
+                self.assertEqual(manifest.pending_count, 3)
+                self.assertFalse(smoke.SUMMARY["groups"]["mcp_create"]["ok"])
             finally:
                 manifest.discard()
                 smoke.CLEANUP_MANIFEST = original_manifest

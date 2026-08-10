@@ -168,7 +168,7 @@ class ReviewFixTests(unittest.TestCase):
                 "content", "unit_rest_slow_drip_http_error"
             )
 
-        self.assertEqual(result, ([], None))
+        self.assertEqual(result, ([], {"kind": "inconclusive"}))
         self.assertLess(time.monotonic() - started, 1.0)
         error.close()
 
@@ -244,7 +244,7 @@ class ReviewFixTests(unittest.TestCase):
                 with mock.patch("urllib.request.urlopen", side_effect=effect if boundary == "error" else None, return_value=effect if boundary == "success" else None):
                     self.assertEqual(
                         self.smoke._rest_ingest_fallback("content", f"unit_rest_{boundary}"),
-                        ([], None),
+                        ([], {"kind": "inconclusive"}),
                     )
                 self.assertEqual(manifest.pending_count, 0)
                 public = json.dumps(self.smoke.SUMMARY)
@@ -313,16 +313,151 @@ class ReviewFixTests(unittest.TestCase):
             self.smoke.classify_create_attempt(malformed),
             {"kind": "inconclusive", "created_drawer_ids": ["drawer-known"]},
         )
+        ids, info = self.smoke.recover_created_ids(malformed, "unused_wait")
+        self.assertEqual(ids, ["drawer-known"])
+        self.assertEqual(info["kind"], "inconclusive")
         with mock.patch.object(
             self.smoke,
             "wait_operation",
             return_value={"state": "completed", "created_drawer_ids": ["drawer-final"]},
         ) as wait_operation:
-            ids, _info = self.smoke.recover_created_ids(queued, "unit_wait")
+            ids, info = self.smoke.recover_created_ids(queued, "unit_wait")
         self.assertEqual(ids, ["drawer-known", "drawer-final"])
+        self.assertEqual(info["kind"], "created")
         wait_operation.assert_called_once_with("operation-queued", "unit_wait")
 
-    def test_operation_status_raw_contradiction_ids_reach_manifest_before_rest(self) -> None:
+    def test_operation_receipts_require_one_coherent_id(self) -> None:
+        conflict = {
+            "result": {"structuredContent": {"operation_id": "op-A", "state": "queued"}},
+            "error": {"data": {
+                "operation_id": "op-B",
+                "state": "queued",
+                "timed_out": True,
+                "cleanup_drawer_ids": ["drawer-known"],
+                "private_raw_key": "private-raw-value",
+            }},
+        }
+        malformed = {
+            "operation_id": 7,
+            "state": "queued",
+            "cleanup_drawer_ids": ["drawer-known"],
+        }
+        malformed_state = {
+            "operation_id": "op-A",
+            "state": "private-raw-value",
+            "cleanup_drawer_ids": ["drawer-known"],
+        }
+        cases = (("conflict", conflict), ("malformed_id", malformed), ("malformed_state", malformed_state))
+        for name, attempt in cases:
+            with self.subTest(name=name):
+                classification = self.smoke.classify_create_attempt(attempt)
+                self.assertEqual(
+                    classification,
+                    {"kind": "inconclusive", "created_drawer_ids": ["drawer-known"]},
+                )
+                self.assertIsNone(self.smoke.operation_id_from(attempt))
+                self.assertIsNone(self.smoke.operation_state_from(attempt))
+                self.assertIsNone(self.smoke.followable_timeout_operation_id(attempt))
+                public = json.dumps(classification)
+                self.assertNotIn("private_raw_key", public)
+                self.assertNotIn("private-raw-value", public)
+
+        coherent = {"operation_id": "op-A", "state": "queued", "timed_out": True}
+        self.assertEqual(
+            self.smoke.classify_create_attempt(coherent),
+            {
+                "kind": "queued",
+                "operation_id": "op-A",
+                "state": "queued",
+                "timed_out": True,
+            },
+        )
+        self.assertEqual(self.smoke.operation_id_from(coherent), "op-A")
+        self.assertEqual(self.smoke.operation_state_from(coherent), "queued")
+        self.assertEqual(self.smoke.followable_timeout_operation_id(coherent), "op-A")
+
+    def test_cli_mixed_ids_are_cleanup_only_and_rest_stays_reachable(self) -> None:
+        def run_cli(label: str, *_args: object, **_kwargs: object) -> tuple[int, bytes, bytes, object, dict[str, object]]:
+            if label == "cli_create":
+                return 0, b"", b"", {
+                    "created_drawer_ids": ["drawer-known", 7],
+                    "private_raw_key": "private-raw-value",
+                }, {}
+            raise AssertionError("CRUD must not continue without authoritative create evidence")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / "cleanup.json")
+            setattr(self.smoke, "CLEANUP_MANIFEST", manifest)
+            cleanup = mock.Mock(return_value={"deleted_count": 1, "failed_count": 0})
+            with (
+                mock.patch.object(self.smoke, "run_cli", side_effect=run_cli),
+                mock.patch.object(
+                    self.smoke,
+                    "_rest_ingest_fallback",
+                    return_value=([], {"kind": "inconclusive"}),
+                ) as rest_fallback,
+                mock.patch.object(self.smoke, "delete_exact_ids_cli", cleanup),
+            ):
+                self.assertEqual(self.smoke.cli_crud(), ["drawer-known"])
+
+            self.assertEqual(rest_fallback.call_args.args[1], "cli_create_rest_fallback")
+            cleanup.assert_called_once_with(
+                ["drawer-known"], "cli_cleanup_after_create_failure", room="cli"
+            )
+            self.assertFalse(self.smoke.SUMMARY["groups"]["cli_create"]["ok"])
+            self.assertFalse(self.smoke.SUMMARY["groups"]["cli_crud"]["ok"])
+            saved = manifest.path.read_text(encoding="utf-8")
+            self.assertEqual(json.loads(saved), {"cleanup_drawer_ids": ["drawer-known"]})
+            public = json.dumps(self.smoke.SUMMARY)
+            self.assertNotIn("private_raw_key", public)
+            self.assertNotIn("private-raw-value", public)
+            self.assertNotIn("private_raw_key", saved)
+            self.assertNotIn("private-raw-value", saved)
+
+    def test_mcp_conflicting_operation_ids_never_follow(self) -> None:
+        conflict = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"structuredContent": {"operation_id": "op-A", "state": "queued"}},
+            "error": {"code": -32603, "message": "private-raw-value", "data": {
+                "operation_id": "op-B", "state": "queued", "timed_out": True,
+            }},
+        }
+        discover = mock.Mock()
+        discover.call.return_value = advertised_tools()
+        create_client = mock.Mock()
+        create_client.tool.return_value = (None, {"ok": False})
+        info = {"ok": False, "_raw_mcp_response": conflict}
+        with (
+            mock.patch.object(
+                self.smoke, "mcp_start_initialized", side_effect=[discover, create_client]
+            ),
+            mock.patch.object(self.smoke, "mcp_call_isolated"),
+            mock.patch.object(
+                self.smoke, "_mcp_tool_with_hard_timeout", return_value=(None, info)
+            ),
+            mock.patch.object(self.smoke, "wait_operation", return_value=None) as wait_operation,
+            mock.patch.object(
+                self.smoke,
+                "_rest_ingest_fallback",
+                return_value=([], {"kind": "inconclusive"}),
+            ) as rest_fallback,
+            mock.patch.object(
+                self.smoke, "run_exact_cli_cleanup_after_mcp"
+            ) as exact_cleanup,
+        ):
+            self.assertEqual(self.smoke.mcp_crud(), [])
+
+        create_client.tool.assert_not_called()
+        wait_operation.assert_not_called()
+        rest_fallback.assert_called_once()
+        exact_cleanup.assert_not_called()
+        public = json.dumps(self.smoke.SUMMARY)
+        self.assertNotIn("op-A", public)
+        self.assertNotIn("op-B", public)
+        self.assertNotIn("private-raw-value", public)
+
+    def test_operation_status_raw_contradiction_ids_keep_cleanup_and_reach_rest(self) -> None:
         discover = mock.Mock()
         discover.call.return_value = advertised_tools()
         create_client = mock.Mock()
@@ -372,13 +507,27 @@ class ReviewFixTests(unittest.TestCase):
                 mock.patch.object(self.smoke, "mcp_call_isolated"),
                 mock.patch.object(self.smoke, "mcp_call_isolated_labeled", return_value=(None, {"ok": True})),
                 mock.patch.object(self.smoke, "_mcp_tool_with_hard_timeout", side_effect=[(None, queued_info), ({"created_drawer_ids": ["drawer-update"]}, update_info)]),
-                mock.patch.object(self.smoke, "delete_exact_ids_mcp", return_value={"deleted_count": 2, "failed_count": 0, "delete_failed_attempt_count": 0}),
-                mock.patch.object(self.smoke, "_rest_ingest_fallback", side_effect=AssertionError("REST must not follow known cleanup IDs")) as rest_fallback,
+                mock.patch.object(self.smoke, "delete_exact_ids_mcp", return_value={"deleted_count": 3, "failed_count": 0, "delete_failed_attempt_count": 0}),
+                mock.patch.object(
+                    self.smoke,
+                    "_rest_ingest_fallback",
+                    return_value=(
+                        ["drawer-rest"],
+                        {"kind": "created", "created_drawer_ids": ["drawer-rest"]},
+                    ),
+                ) as rest_fallback,
             ):
-                self.assertEqual(self.smoke.mcp_crud(), ["drawer-status", "drawer-update"])
-            rest_fallback.assert_not_called()
+                self.assertEqual(
+                    self.smoke.mcp_crud(),
+                    ["drawer-status", "drawer-rest", "drawer-update"],
+                )
+            rest_fallback.assert_called_once()
             saved = manifest.path.read_text(encoding="utf-8")
-            self.assertEqual(json.loads(saved), {"cleanup_drawer_ids": ["drawer-status", "drawer-update"]})
+            self.assertEqual(
+                json.loads(saved),
+                {"cleanup_drawer_ids": ["drawer-status", "drawer-rest", "drawer-update"]},
+            )
+            self.assertFalse(self.smoke.SUMMARY["groups"]["mcp_create"]["ok"])
             public = json.dumps(self.smoke.SUMMARY)
             self.assertNotIn("private_raw_key", public)
             self.assertNotIn("private-raw-value", public)
@@ -417,7 +566,7 @@ class ReviewFixTests(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=refusal_error):
             self.assertEqual(
                 self.smoke._rest_ingest_fallback("content", "unit_rest_refusal"),
-                ([], expected["receipt"]),
+                ([], expected),
             )
         refusal_error.close()
 
@@ -439,11 +588,14 @@ class ReviewFixTests(unittest.TestCase):
                 io.BytesIO(json.dumps(body).encode()),
             )
             with mock.patch("urllib.request.urlopen", side_effect=created_error):
-                ids, receipt = self.smoke._rest_ingest_fallback(
+                ids, disposition = self.smoke._rest_ingest_fallback(
                     "content", "unit_rest_created_error"
                 )
             self.assertEqual(ids, ["drawer-rest-error"])
-            self.assertEqual(receipt["outcome"], "write_accepted")
+            self.assertEqual(
+                disposition,
+                {"kind": "inconclusive", "created_drawer_ids": ["drawer-rest-error"]},
+            )
             self.assertEqual(
                 json.loads(manifest.path.read_text(encoding="utf-8")),
                 {"cleanup_drawer_ids": ["drawer-rest-error"]},

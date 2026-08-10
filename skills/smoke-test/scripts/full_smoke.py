@@ -1155,13 +1155,10 @@ def terminal_state(value: Any) -> bool:
 
 
 def followable_timeout_operation_id(value: Any) -> str | None:
-    """Return an accepted MCP wait-timeout receipt's operation ID, if any."""
-    if classify_create_attempt(value)['kind'] != 'queued':
-        return None
-    for receipt in receipt_dicts_from(value):
-        operation_id = receipt.get('operation_id')
-        if receipt.get('timed_out') is True and isinstance(operation_id, str) and operation_id:
-            return operation_id
+    """Return a coherent queued timeout receipt's operation ID, if any."""
+    classification = classify_create_attempt(value)
+    if classification['kind'] == 'queued' and classification.get('timed_out') is True:
+        return classification['operation_id']
     return None
 
 
@@ -1233,6 +1230,7 @@ def recover_created_ids(value: Any, wait_label: str) -> tuple[list[str], dict[st
     ids = classified.get('created_drawer_ids', [])
     operation_id = classified.get('operation_id')
     info: dict[str, Any] = {
+        'kind': classified['kind'],
         'operation_id_present': bool(operation_id),
         'operation_state': classified.get('state', operation_state_from(value)),
         'recovered_via': None,
@@ -1249,8 +1247,13 @@ def recover_created_ids(value: Any, wait_label: str) -> tuple[list[str], dict[st
         *ids,
         *waited_classification.get('created_drawer_ids', []),
     ]))
+    info['kind'] = waited_classification['kind']
+    if waited_classification['kind'] == 'proven_no_write':
+        info['receipt'] = waited_classification['receipt']
     info['recovered_via'] = wait_label
-    info['recovered_state'] = operation_state_from(waited)
+    info['recovered_state'] = waited_classification.get(
+        'state', operation_state_from(waited)
+    )
     return ids, info
 
 
@@ -1264,7 +1267,7 @@ def recovery_fields(info: dict[str, Any]) -> dict[str, Any]:
 
 def _rest_ingest_fallback(
     content: str, label: str, supersedes: str | None = None, room: str = 'cli'
-) -> tuple[list[str], dict[str, Any] | None]:
+) -> tuple[list[str], dict[str, Any]]:
     """Retry direct writes through daemon REST with safe terminal outcomes."""
     import urllib.request
     payload: dict[str, Any] = {
@@ -1300,7 +1303,6 @@ def _rest_ingest_fallback(
                 body, shape = parse_json_bytes(resp.read(), allow_ndjson=False)
                 classification = classify_create_attempt(body)
                 ids = classification.get('created_drawer_ids', [])
-                receipt = create_terminal_receipt(body)
                 if ids:
                     _remember_created_ids(ids)
                     authoritative = classification['kind'] == 'created'
@@ -1314,18 +1316,17 @@ def _rest_ingest_fallback(
                         json=shape,
                         **fields,
                     )
-                    return ids, receipt
+                    return ids, classification
                 note(label, False, error_type='MissingTerminalReceipt', http_status=resp.status, json=shape)
-                return [], None
+                return [], classification
         except HTTPError as exc:
             raw_body = exc.read(8193)
             if len(raw_body) > 8192:
                 note(label, False, error_type='HTTPErrorBodyTooLarge', http_status=exc.code)
-                return [], None
+                return [], {'kind': 'inconclusive'}
             body, shape = parse_json_bytes(raw_body, allow_ndjson=False)
             classification = classify_create_attempt(body)
             ids = classification.get('created_drawer_ids', [])
-            receipt = create_terminal_receipt(body)
             if ids:
                 _remember_created_ids(ids)
                 note(
@@ -1336,25 +1337,22 @@ def _rest_ingest_fallback(
                     cleanup_id_count=len(ids),
                     json=shape,
                 )
-                return ids, receipt
-            if (
-                exc.code == 503
-                and receipt
-                and receipt.get('outcome') == 'admission_blocked'
-            ):
+                return ids, classification
+            if classification['kind'] == 'proven_no_write':
+                receipt = classification['receipt']
                 note(label, True, http_status=exc.code, json=shape, **receipt)
-                return [], receipt
+                return [], classification
             note(label, False, error_type='HTTPError', http_status=exc.code, json=shape)
-            return [], None
+            return [], classification
     except Exception as exc:
         note(label, False, error_type=type(exc).__name__)
-        return [], None
+        return [], {'kind': 'inconclusive'}
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, old_handler)
         signal.setitimer(signal.ITIMER_REAL, *old_timer)
     note(label, False, error_type='MissingTerminalReceipt')
-    return [], None
+    return [], {'kind': 'inconclusive'}
 
 
 def _mcp_tool_with_hard_timeout(
@@ -1409,33 +1407,46 @@ def cli_crud() -> list[str]:
         timeout=130,
     )
     create_attempt = [parsed, {'returncode': rc}]
-    ids, create_recovery = recover_created_ids(create_attempt, 'cli_create_wait')
-    direct_receipt = classify_create_attempt(create_attempt).get('receipt')
-    _remember_created_ids(ids)
-    if not ids and direct_receipt and note_no_write_create('cli_create', 'cli_crud', direct_receipt):
+    cleanup_evidence, create_recovery = recover_created_ids(create_attempt, 'cli_create_wait')
+    cleanup_ids.extend(cleanup_evidence)
+    _remember_created_ids(cleanup_evidence)
+    direct_receipt = create_recovery.get('receipt')
+    if not cleanup_ids and direct_receipt and note_no_write_create('cli_create', 'cli_crud', direct_receipt):
         return cleanup_ids
+    created_ids = cleanup_evidence if create_recovery['kind'] == 'created' else []
 
     # Fallback: if CLI direct-write fails due to daemon writer lease, retry via REST.
     # The fork's daemon holds a long-lived sqlite-writer lease; CLI ingest that
     # writes directly to the DB will be rejected when the daemon is active.
     # REST ingest goes through the daemon and either writes or returns a cleanup-safe no-write receipt.
-    if not ids:
-        rest_ids, _ = _rest_ingest_fallback(
+    if not created_ids:
+        note(
+            'cli_create', False, reason='create_not_authoritative',
+            cleanup_id_count=len(cleanup_evidence), **recovery_fields(create_recovery),
+        )
+        rest_ids, rest_disposition = _rest_ingest_fallback(
             f'{MARKER} reversible CLI smoke drawer; nonce {NONCE}; lexical tokens quorvax nimbledrift zettaplum; safe to delete',
             'cli_create_rest_fallback',
         )
-        if rest_ids:
-            ids = rest_ids
-            create_recovery = {'recovered_via': 'rest_fallback'}
-            note('cli_create', True, created_id_count=len(ids), via='rest_fallback')
-    elif ids and create_recovery.get('recovered_via'):
-        note('cli_create', True, created_id_count=len(ids), **recovery_fields(create_recovery))
-    if not ids:
-        note('cli_crud', False, reason='create_missing_created_drawer_ids', **recovery_fields(create_recovery))
+        cleanup_ids = list(dict.fromkeys([*cleanup_ids, *rest_ids]))
+        _remember_created_ids(rest_ids)
+        rest_disposition = rest_disposition or {'kind': 'inconclusive'}
+        if rest_disposition['kind'] == 'created':
+            created_ids = rest_ids
+            create_recovery = {'kind': 'created', 'recovered_via': 'rest_fallback'}
+            note('cli_create', True, created_id_count=len(created_ids), via='rest_fallback')
+    elif create_recovery.get('recovered_via'):
+        note('cli_create', True, created_id_count=len(created_ids), **recovery_fields(create_recovery))
+    if not created_ids:
+        if cleanup_ids:
+            delete_exact_ids_cli(cleanup_ids, 'cli_cleanup_after_create_failure', room='cli')
+        note(
+            'cli_crud', False, reason='create_missing_created_drawer_ids',
+            cleanup_id_count=len(cleanup_ids), **recovery_fields(create_recovery),
+        )
         return cleanup_ids
-    cleanup_ids.extend(ids)
-    created_id = ids[0]
-    SUMMARY['created_counts']['cli'] = len(cleanup_ids)
+    created_id = created_ids[0]
+    SUMMARY['created_counts']['cli'] = len(created_ids)
 
     run_cli('cli_read_view', ['mempal', 'view', created_id, '--all-projects'], timeout=60)
     _rc, _out, _err, search_parsed, _shape = run_cli('cli_search_created', ['mempal', 'search', MARKER, '--top-k', '5', '--json'], expect_json=True, timeout=180)
@@ -1458,32 +1469,43 @@ def cli_crud() -> list[str]:
         expect_json=True,
         timeout=130,
     )
-    upd_ids, update_recovery = recover_created_ids(
+    update_cleanup_ids, update_recovery = recover_created_ids(
         [upd_parsed, {'returncode': rc}], 'cli_update_wait'
     )
+    cleanup_ids = list(dict.fromkeys([*cleanup_ids, *update_cleanup_ids]))
+    _remember_created_ids(update_cleanup_ids)
     update_receipt = update_recovery.get('receipt')
-    _remember_created_ids(upd_ids)
+    authoritative_update_ids = (
+        update_cleanup_ids if update_recovery['kind'] == 'created' else []
+    )
 
     # Fallback: retry update via REST if direct write failed (writer lease).
-    if not upd_ids and not update_receipt:
-        rest_upd_ids, _rest_update_receipt = _rest_ingest_fallback(
+    if not authoritative_update_ids and not update_receipt:
+        note(
+            'cli_update', False, reason='update_not_authoritative',
+            cleanup_id_count=len(update_cleanup_ids), **recovery_fields(update_recovery),
+        )
+        rest_upd_ids, rest_update_disposition = _rest_ingest_fallback(
             f'{MARKER} reversible CLI smoke drawer updated; nonce {NONCE[::-1]}; lexical tokens ploverquartz rivetmint yondercoil; safe to delete',
             'cli_update_rest_fallback',
             supersedes=created_id,
         )
-        if rest_upd_ids:
-            upd_ids = rest_upd_ids
-            update_recovery = {'recovered_via': 'rest_fallback'}
-            note('cli_update', True, created_id_count=len(upd_ids), via='rest_fallback')
-    elif upd_ids and update_recovery.get('recovered_via'):
-        note('cli_update', True, created_id_count=len(upd_ids), **recovery_fields(update_recovery))
-    if not upd_ids:
+        cleanup_ids = list(dict.fromkeys([*cleanup_ids, *rest_upd_ids]))
+        _remember_created_ids(rest_upd_ids)
+        rest_update_disposition = rest_update_disposition or {'kind': 'inconclusive'}
+        if rest_update_disposition['kind'] == 'created':
+            authoritative_update_ids = rest_upd_ids
+            update_recovery = {'kind': 'created', 'recovered_via': 'rest_fallback'}
+            note('cli_update', True, created_id_count=len(authoritative_update_ids), via='rest_fallback')
+    elif authoritative_update_ids and update_recovery.get('recovered_via'):
+        note('cli_update', True, created_id_count=len(authoritative_update_ids), **recovery_fields(update_recovery))
+    if not authoritative_update_ids:
         delete_exact_ids_cli(cleanup_ids, 'cli_cleanup_after_update_failure', room='cli')
         note('cli_crud', False, reason='update_missing_created_drawer_ids', cleanup_id_count=len(cleanup_ids), **recovery_fields(update_recovery))
         return cleanup_ids
-    cleanup_ids.extend(upd_ids)
-    SUMMARY['created_counts']['cli'] = len(cleanup_ids)
-    run_cli('cli_read_updated', ['mempal', 'view', upd_ids[0], '--all-projects'], timeout=60)
+    created_ids.extend(authoritative_update_ids)
+    SUMMARY['created_counts']['cli'] = len(created_ids)
+    run_cli('cli_read_updated', ['mempal', 'view', authoritative_update_ids[0], '--all-projects'], timeout=60)
 
     delete_result = delete_exact_ids_cli(cleanup_ids, 'cli_delete_batch', room='cli')
     deleted = int(delete_result['deleted_count'])
@@ -1493,7 +1515,7 @@ def cli_crud() -> list[str]:
     post_matches = count_marker_matches(post_parsed, 'cli')
     if post_matches > 0:
         SUMMARY['cleanup']['failures'] += delete_failures
-    note('cli_crud', post_matches == 0 and deleted > 0, created_id_count=len(cleanup_ids), deleted_count=deleted, delete_failed_attempt_count=delete_failures, post_delete_active_matches=post_matches)
+    note('cli_crud', post_matches == 0 and deleted > 0, created_id_count=len(created_ids), cleanup_id_count=len(cleanup_ids), deleted_count=deleted, delete_failed_attempt_count=delete_failures, post_delete_active_matches=post_matches)
     return cleanup_ids
 
 
@@ -1682,24 +1704,29 @@ def mcp_crud() -> list[str]:
         create_args = {'content': f'{MARKER} reversible MCP smoke drawer; nonce {NONCE}; lexical tokens azurequill basaltfern cobaltlyric; safe to delete', 'wing': 'smoke', 'room': 'mcp', 'source_type': 'agent_inference', 'memory_kind': 'evidence', 'domain': 'project', 'field': 'smoke', 'smoke': True, 'wait': True, 'wait_timeout_secs': 15}
         _checkpoint_manifest()
         create, info = _mcp_tool_with_hard_timeout(client, 'mempal_ingest', create_args, timeout=30)
-        create_classification = classify_create_attempt(create_attempt_from_mcp_info(info))
-        ids = create_classification.get('created_drawer_ids', [])
+        create_attempt = create_attempt_from_mcp_info(info)
+        create_classification = classify_create_attempt(create_attempt)
+        cleanup_evidence = create_classification.get('created_drawer_ids', [])
+        cleanup_ids.extend(cleanup_evidence)
+        _remember_created_ids(cleanup_evidence)
+        created_ids = (
+            cleanup_evidence if create_classification['kind'] == 'created' else []
+        )
         mcp_receipt = create_classification.get('receipt')
-        _remember_created_ids(ids)
         create_operation_id = create_classification.get('operation_id')
         create_timeout_operation_id = (
-            followable_timeout_operation_id(create_attempt_from_mcp_info(info))
-            if create_classification['kind'] == 'queued' else None
+            create_operation_id if create_classification.get('timed_out') is True else None
         )
         create_recovery: dict[str, Any] = {
+            'kind': create_classification['kind'],
             'operation_id_present': bool(create_operation_id),
             'operation_state': create_classification.get('state'),
         }
-        if not ids and mcp_receipt and note_no_write_create(
+        if not cleanup_ids and mcp_receipt and note_no_write_create(
             'mcp_create', 'mcp_inconclusive_no_cleanup_id', mcp_receipt
         ):
             return cleanup_ids
-        if create_operation_id and client is not None:
+        if create_classification['kind'] == 'queued' and create_operation_id and client is not None:
             status_structured, status_info = client.tool(
                 'mempal_operation_status',
                 {'operation_id': create_operation_id},
@@ -1709,9 +1736,11 @@ def mcp_crud() -> list[str]:
             status_attempt = create_attempt_from_mcp_info(status_info) or status_structured
             status_classification = classify_create_attempt(status_attempt)
             status_ids = status_classification.get('created_drawer_ids', [])
-            if status_ids:
-                ids = list(dict.fromkeys([*ids, *status_ids]))
-                _remember_created_ids(status_ids)
+            cleanup_ids = list(dict.fromkeys([*cleanup_ids, *status_ids]))
+            _remember_created_ids(status_ids)
+            create_recovery['kind'] = status_classification['kind']
+            if status_classification['kind'] == 'created':
+                created_ids = status_ids
                 create_recovery.update({
                     'recovered_via': 'mcp_operation_status',
                     'recovered_state': status_classification.get(
@@ -1723,7 +1752,7 @@ def mcp_crud() -> list[str]:
         else:
             note('mcp_operation_status', True, skipped='tool_not_advertised')
 
-        if create_timeout_operation_id:
+        if create_timeout_operation_id and not created_ids:
             # A non-terminal MCP ingest receipt means the daemon may still be
             # processing the write. Close this stdio server before following the
             # operation via CLI so the smoke runner never observes a result while
@@ -1736,48 +1765,61 @@ def mcp_crud() -> list[str]:
             client = None
             waited_classification = classify_create_attempt(waited)
             waited_ids = waited_classification.get('created_drawer_ids', [])
-            ids = list(dict.fromkeys([*ids, *waited_ids]))
+            cleanup_ids = list(dict.fromkeys([*cleanup_ids, *waited_ids]))
             _remember_created_ids(waited_ids)
-            create_recovery.update({'recovered_via': 'mcp_create_cli_wait', 'recovered_state': operation_state_from(waited)})
+            create_recovery.update({
+                'kind': waited_classification['kind'],
+                'recovered_via': 'mcp_create_cli_wait',
+                'recovered_state': waited_classification.get(
+                    'state', operation_state_from(waited)
+                ),
+            })
+            if waited_classification['kind'] == 'created':
+                created_ids = waited_ids
             SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
         # Fallback: if MCP ingest fails/hangs (writer lease), retry via REST so
         # follow-on read/delete paths still have a drawer to exercise.
-        if not ids:
-            rest_ids, _ = run_fallback_after_mcp_reaped(
+        if not created_ids:
+            rest_ids, rest_disposition = run_fallback_after_mcp_reaped(
                 client,
                 'create_rest',
                 lambda: _rest_ingest_fallback(
                     f'{MARKER} reversible MCP smoke drawer; nonce {NONCE}; lexical tokens azurequill basaltfern cobaltlyric; safe to delete',
                     'mcp_create_rest_fallback',
                     room='mcp',
-                ), failure_result=([], None))
+                ), failure_result=([], {'kind': 'inconclusive'}))
             client = None
-            if rest_ids:
-                ids = rest_ids
-                create_recovery = {'recovered_via': 'rest_fallback'}
+            cleanup_ids = list(dict.fromkeys([*cleanup_ids, *rest_ids]))
+            _remember_created_ids(rest_ids)
+            rest_disposition = rest_disposition or {'kind': 'inconclusive'}
+            if rest_disposition['kind'] == 'created':
+                created_ids = rest_ids
+                create_recovery = {'kind': 'created', 'recovered_via': 'rest_fallback'}
                 SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
-        if ids:
+        if created_ids:
             clear_probe_failures('mcp_create_rest', 'mcp_create_rest_fallback')
         # MCP create passes when the MCP tool returned IDs immediately or when a
-        # queued operation was recovered via mempal_operation_status. REST
-        # fallback keeps the suite going but does not mask MCP write failure.
-        mcp_recovered = create_recovery.get('recovered_via') in ('mcp_create_cli_wait',)
-        mcp_create_ok = bool(ids) and (bool(info.get('ok')) or mcp_recovered) and create_recovery.get('recovered_via') != 'rest_fallback'
-        note('mcp_create', mcp_create_ok, created_id_count=len(ids), **recovery_fields(create_recovery), **without_ok(info))
-        if not ids:
+        # queued operation was authoritatively recovered. REST fallback keeps the
+        # suite going but does not mask MCP write failure.
+        mcp_recovered = create_recovery.get('recovered_via') in (
+            'mcp_operation_status', 'mcp_create_cli_wait',
+        )
+        mcp_create_ok = bool(created_ids) and (bool(info.get('ok')) or mcp_recovered) and create_recovery.get('recovered_via') != 'rest_fallback'
+        note('mcp_create', mcp_create_ok, created_id_count=len(created_ids), cleanup_id_count=len(cleanup_ids), **recovery_fields(create_recovery), **without_ok(info))
+        if not created_ids:
             note(
                 'mcp_inconclusive_no_cleanup_id',
                 False,
                 reason='create_missing_created_drawer_ids',
+                cleanup_id_count=len(cleanup_ids),
                 **recovery_fields(create_recovery),
                 product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/834',
             )
             return cleanup_ids
-        cleanup_ids.extend(ids)
-        created_id = ids[0]
-        SUMMARY['created_counts']['mcp'] = len(cleanup_ids)
+        created_id = created_ids[0]
+        SUMMARY['created_counts']['mcp'] = len(created_ids)
 
         if client is not None:
             client.close()
@@ -1809,19 +1851,25 @@ def mcp_crud() -> list[str]:
         update_args = {'content': f'{MARKER} reversible MCP smoke drawer updated; nonce {NONCE[::-1]}; lexical tokens deltaorchid embervault frostcairn; safe to delete', 'wing': 'smoke', 'room': 'mcp', 'source_type': 'agent_inference', 'memory_kind': 'evidence', 'domain': 'project', 'field': 'smoke', 'smoke': True, 'supersedes': created_id, 'wait': True, 'wait_timeout_secs': 15}
         _checkpoint_manifest()
         update, uinfo = _mcp_tool_with_hard_timeout(client, 'mempal_ingest', update_args, timeout=30)
-        update_classification = classify_create_attempt(create_attempt_from_mcp_info(uinfo))
-        upd_ids = update_classification.get('created_drawer_ids', [])
+        update_attempt = create_attempt_from_mcp_info(uinfo)
+        update_classification = classify_create_attempt(update_attempt)
+        update_cleanup_ids = update_classification.get('created_drawer_ids', [])
+        cleanup_ids = list(dict.fromkeys([*cleanup_ids, *update_cleanup_ids]))
+        _remember_created_ids(update_cleanup_ids)
+        authoritative_update_ids = (
+            update_cleanup_ids if update_classification['kind'] == 'created' else []
+        )
         update_receipt = update_classification.get('receipt')
-        _remember_created_ids(upd_ids)
+        update_operation_id = update_classification.get('operation_id')
         update_timeout_operation_id = (
-            followable_timeout_operation_id(create_attempt_from_mcp_info(uinfo))
-            if update_classification['kind'] == 'queued' else None
+            update_operation_id if update_classification.get('timed_out') is True else None
         )
         update_recovery: dict[str, Any] = {
-            'operation_id_present': update_classification['kind'] == 'queued',
+            'kind': update_classification['kind'],
+            'operation_id_present': bool(update_operation_id),
             'operation_state': update_classification.get('state'),
         }
-        if update_timeout_operation_id:
+        if update_timeout_operation_id and not authoritative_update_ids:
             waited = run_fallback_after_mcp_reaped(
                 client,
                 'update_cli_wait',
@@ -1830,15 +1878,23 @@ def mcp_crud() -> list[str]:
             client = None
             waited_classification = classify_create_attempt(waited)
             waited_ids = waited_classification.get('created_drawer_ids', [])
-            upd_ids = list(dict.fromkeys([*upd_ids, *waited_ids]))
+            cleanup_ids = list(dict.fromkeys([*cleanup_ids, *waited_ids]))
             _remember_created_ids(waited_ids)
-            update_recovery.update({'recovered_via': 'mcp_update_cli_wait', 'recovered_state': operation_state_from(waited)})
+            update_recovery.update({
+                'kind': waited_classification['kind'],
+                'recovered_via': 'mcp_update_cli_wait',
+                'recovered_state': waited_classification.get(
+                    'state', operation_state_from(waited)
+                ),
+            })
+            if waited_classification['kind'] == 'created':
+                authoritative_update_ids = waited_ids
             SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
         # Fallback: if MCP update fails/hangs (writer lease), retry via REST so
         # follow-on read/delete paths still have an updated drawer to exercise.
-        if not upd_ids and not update_receipt:
-            rest_upd_ids, _rest_update_receipt = run_fallback_after_mcp_reaped(
+        if not authoritative_update_ids and not update_receipt:
+            rest_upd_ids, rest_update_disposition = run_fallback_after_mcp_reaped(
                 client,
                 'update_rest',
                 lambda: _rest_ingest_fallback(
@@ -1846,50 +1902,53 @@ def mcp_crud() -> list[str]:
                     'mcp_update_rest_fallback',
                     supersedes=created_id,
                     room='mcp',
-                ), failure_result=([], None))
+                ), failure_result=([], {'kind': 'inconclusive'}))
             client = None
-            if rest_upd_ids:
-                upd_ids = rest_upd_ids
-                update_recovery = {'recovered_via': 'rest_fallback'}
+            cleanup_ids = list(dict.fromkeys([*cleanup_ids, *rest_upd_ids]))
+            _remember_created_ids(rest_upd_ids)
+            rest_update_disposition = rest_update_disposition or {'kind': 'inconclusive'}
+            if rest_update_disposition['kind'] == 'created':
+                authoritative_update_ids = rest_upd_ids
+                update_recovery = {'kind': 'created', 'recovered_via': 'rest_fallback'}
                 SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
-        if upd_ids:
+        if authoritative_update_ids:
             clear_probe_failures('mcp_update_rest', 'mcp_update_rest_fallback')
-        # MCP update passes when the MCP tool returned IDs immediately or when a
-        # queued operation was recovered via mempal_operation_status. REST
+        # MCP update passes only on direct or queued authoritative creation. REST
         # fallback keeps the suite going but does not mask MCP write failure.
-        mcp_upd_recovered = update_recovery.get('recovered_via') in ('mcp_update_cli_wait',)
-        mcp_update_ok = bool(upd_ids) and (bool(uinfo.get('ok')) or mcp_upd_recovered) and update_recovery.get('recovered_via') != 'rest_fallback'
-        note('mcp_update', mcp_update_ok, created_id_count=len(upd_ids), **recovery_fields(update_recovery), **without_ok(uinfo))
-        if not upd_ids:
+        mcp_upd_recovered = update_recovery.get('recovered_via') == 'mcp_update_cli_wait'
+        mcp_update_ok = bool(authoritative_update_ids) and (bool(uinfo.get('ok')) or mcp_upd_recovered) and update_recovery.get('recovered_via') != 'rest_fallback'
+        note('mcp_update', mcp_update_ok, created_id_count=len(authoritative_update_ids), cleanup_id_count=len(cleanup_ids), **recovery_fields(update_recovery), **without_ok(uinfo))
+        if not authoritative_update_ids:
             run_exact_cli_cleanup_after_mcp(cleanup_ids, 'mcp_cleanup_after_update_failure')
             note(
                 'mcp_inconclusive_no_cleanup_id',
                 False,
                 reason='update_missing_created_drawer_ids',
+                cleanup_id_count=len(cleanup_ids),
                 **recovery_fields(update_recovery),
                 product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/834',
             )
             return cleanup_ids
-        cleanup_ids.extend(upd_ids)
-        SUMMARY['created_counts']['mcp'] = len(cleanup_ids)
-        if client is None:
-            client = mcp_start_initialized()
-        structured, info = client.tool('mempal_read_drawer', {'drawer_id': upd_ids[0], 'all_projects': True}, timeout=60)
+        created_ids.extend(authoritative_update_ids)
+        SUMMARY['created_counts']['mcp'] = len(created_ids)
+        active_client = client if client is not None else mcp_start_initialized()
+        client = active_client
+        structured, info = active_client.tool('mempal_read_drawer', {'drawer_id': authoritative_update_ids[0], 'all_projects': True}, timeout=60)
         note('mcp_read_updated', bool(info.get('ok')), **without_ok(info))
 
-        cleanup_result = delete_exact_ids_mcp(client, cleanup_ids)
+        cleanup_result = delete_exact_ids_mcp(active_client, cleanup_ids)
         deleted = cleanup_result['deleted_count']
         delete_false_count = cleanup_result['delete_failed_attempt_count']
         SUMMARY['cleanup']['mcp_deleted_count'] = deleted
-        post, pinfo = client.tool('mempal_search', {'query': MARKER, 'top_k': 5, 'all_projects': True}, timeout=180)
+        post, pinfo = active_client.tool('mempal_search', {'query': MARKER, 'top_k': 5, 'all_projects': True}, timeout=180)
         post_matches = count_marker_matches(post, 'mcp')
         cleanup_verified = cleanup_result['failed_count'] == 0
         SUMMARY['cleanup']['failures'] += cleanup_result['failed_count']
         note('mcp_delete_batch', cleanup_verified, **cleanup_result)
-        note('mcp_crud', cleanup_verified and bool(pinfo.get('ok')) and post_matches == 0 and deleted > 0, created_id_count=len(cleanup_ids), deleted_count=deleted, delete_false_count=delete_false_count, post_delete_active_matches=post_matches)
+        note('mcp_crud', cleanup_verified and bool(pinfo.get('ok')) and post_matches == 0 and deleted > 0, created_id_count=len(created_ids), cleanup_id_count=len(cleanup_ids), deleted_count=deleted, delete_false_count=delete_false_count, post_delete_active_matches=post_matches)
         if 'mempal_status' in tool_names:
-            structured, sinfo = client.tool('mempal_status', {}, timeout=30)
+            structured, sinfo = active_client.tool('mempal_status', {}, timeout=30)
             note('mcp_status_last', bool(sinfo.get('ok')), **without_ok(sinfo))
         return cleanup_ids
     except Exception as exc:
