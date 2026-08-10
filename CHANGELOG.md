@@ -55,6 +55,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   embed path (not only DB/route deadlines) so deadline-diagnostic fixtures
   cannot hang on the production 240s embed timeout under suite load.
 
+- **Admission budget concurrent fixture**: retry profile admission `Busy` lock
+  contention in the oversubscribe test so suite-load flock waits are not
+  miscounted as budget rejections.
+
 - **Test fixture readiness**: use deterministic readiness synchronization for the
   SQLite writer-busy and MCP embedder-entry fixtures so suite-load contention
   cannot race their assertions (#882).
