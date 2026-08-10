@@ -207,6 +207,10 @@ fn anyhow_error_is_sqlite_lock(error: &anyhow::Error) -> bool {
             || error
                 .downcast_ref::<DbError>()
                 .is_some_and(crate::core::db::db_error_is_sqlite_lock)
+            || matches!(
+                error.downcast_ref::<crate::core::db_admission::DbAdmissionError>(),
+                Some(crate::core::db_admission::DbAdmissionError::Busy { .. })
+            )
     })
 }
 

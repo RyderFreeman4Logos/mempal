@@ -261,7 +261,13 @@ pub fn rusqlite_error_is_lock(error: &rusqlite::Error) -> bool {
 }
 
 pub fn db_error_is_sqlite_lock(error: &DbError) -> bool {
+    // Admission lock Busy is the same transient contention class as SQLITE_BUSY:
+    // callers that retry/map lock errors must not fail closed on a 250ms admission wait.
     matches!(error, DbError::Sqlite(sqlite) if rusqlite_error_is_lock(sqlite))
+        || matches!(
+            error,
+            DbError::Admission(super::db_admission::DbAdmissionError::Busy { .. })
+        )
 }
 
 #[derive(Debug, Error)]

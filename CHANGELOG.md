@@ -47,6 +47,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   admission attempts cannot emit false write receipts or cross-operation
   cleanup/delete IDs (#876).
 
+- **Daemon writer-lease renew**: treat profile admission lock `Busy` as the same
+  retryable contention class as SQLite busy/locked so lease heartbeat recovery
+  can wait through short admission waits under suite load.
+
 - **Test fixture readiness**: use deterministic readiness synchronization for the
   SQLite writer-busy and MCP embedder-entry fixtures so suite-load contention
   cannot race their assertions (#882).

@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8796
-baseline_lines = 618
+baseline_tokens = 8841
+baseline_lines = 622
 issue = "876"
-rationale = "#876 documents admission-receipt ownership under holder-budget saturation; exact no-growth ratchet after Unreleased entry."
+rationale = "#876 documents admission-receipt ownership and writer-lease admission Busy retry classification; exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
