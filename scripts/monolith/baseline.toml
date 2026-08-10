@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8739
-baseline_lines = 609
-issue = "858"
-rationale = "#858 documents retrying transient queue-write SQLite stalls across daemon/MCP/CLI paths without restart-budget churn; exact no-growth ratchet."
+baseline_tokens = 8749
+baseline_lines = 613
+issue = "882"
+rationale = "#882's required Unreleased entry documents deterministic SQLite writer-busy and MCP embedder-entry readiness fixtures; exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
