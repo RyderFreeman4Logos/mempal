@@ -15509,6 +15509,41 @@ quality_policy = "llm_required_for_keep"
     }
 
     #[tokio::test]
+    async fn test_mcp_doctor_serializes_high_queue_availability_at_threshold() {
+        let (_tempdir, db_path, server) = setup_server();
+        let queue = PendingMessageStore::new_without_reclaim(&db_path);
+        for index in 0..crate::doctor::DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD {
+            queue
+                .enqueue("hook_event", &format!(r#"{{"index":{index}}}"#))
+                .expect("enqueue pending message");
+        }
+
+        let response = server
+            .mempal_doctor(Parameters(DoctorRequest {}))
+            .await
+            .expect("doctor")
+            .0;
+        let serialized = serde_json::to_value(&response).expect("serialize doctor response");
+
+        assert_eq!(
+            serialized["availability"]["severity"],
+            serde_json::json!("high")
+        );
+        assert_eq!(
+            serialized["availability"]["signal"],
+            serde_json::json!("daemon_down_large_pending_queue")
+        );
+        assert_eq!(
+            serialized["availability"]["pending_queue"],
+            serde_json::json!(crate::doctor::DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD)
+        );
+        assert_eq!(
+            serialized["availability"]["unavailable_reasons"],
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
     async fn test_mcp_doctor_missing_db_is_read_only_after_server_construction() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_dir = tempdir.path().join("missing-home").join(".mempal");
@@ -15532,11 +15567,24 @@ quality_policy = "llm_required_for_keep"
             .await
             .expect("doctor")
             .0;
+        let serialized = serde_json::to_value(&response).expect("serialize doctor response");
 
         assert_eq!(response.db.path, db_path.display().to_string());
         assert!(!response.db.exists);
         assert_eq!(response.db.schema_version, None);
         assert!(response.db.compatible);
+        assert_eq!(
+            serialized["availability"]["severity"],
+            serde_json::json!("unavailable")
+        );
+        assert_eq!(
+            serialized["availability"]["signal"],
+            serde_json::json!("diagnostic_inputs_unavailable")
+        );
+        assert_eq!(
+            serialized["availability"]["unavailable_reasons"],
+            serde_json::json!(["queue_stats"])
+        );
         assert!(!db_path.exists(), "doctor must not create database file");
         assert!(
             !db_dir.exists(),

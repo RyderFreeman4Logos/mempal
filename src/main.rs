@@ -81,7 +81,7 @@ use mempal::crystallize::{
 };
 use mempal::doctor::{
     DoctorAvailabilityObservation, DoctorAvailabilitySeverity, RestDoctorReport,
-    build_doctor_report_with_daemon_status, build_rest_doctor_report,
+    build_doctor_report, build_doctor_report_with_daemon_status, build_rest_doctor_report,
     daemon_outage_queue_availability, inspect_daemon,
 };
 use mempal::embed::build_backend_from_name;
@@ -3805,7 +3805,12 @@ fn run() -> Result<()> {
         _ => {}
     }
 
-    ConfigHandle::bootstrap(&config_path).context("failed to bootstrap config hot reload")?;
+    if let Err(error) = ConfigHandle::bootstrap(&config_path) {
+        if matches!(&cli.command, Commands::Status { .. }) {
+            print_status_availability_failure(&mempal_home().join("palace.db"));
+        }
+        return Err(error).context("failed to bootstrap config hot reload");
+    }
     let config = ConfigHandle::current();
     if let Commands::Serve { mcp } = &cli.command {
         return block_on_result(serve_command(config.as_ref(), *mcp));
@@ -3928,10 +3933,15 @@ fn run() -> Result<()> {
         );
     }
     if let Commands::Status { full } = &cli.command {
-        return Database::with_diagnostic_read_only(&db_path, |db| {
+        return match Database::with_diagnostic_read_only(&db_path, |db| {
             status_command(db, config.as_ref(), *full)
-        })
-        .context("failed to open status database")?;
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                print_status_availability_failure(&db_path);
+                Err(error).context("failed to open status database")
+            }
+        };
     }
 
     let db = match if let Some(path) = empty_read_only_db_path.as_ref() {
@@ -13721,6 +13731,37 @@ fn config_intelligence_command(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn print_status_availability_failure(db_path: &Path) {
+    let availability = build_doctor_report(db_path).availability;
+    eprintln!("availability_severity={}", availability.severity.as_str());
+    eprintln!(
+        "availability_signal={}",
+        availability
+            .signal
+            .map(|signal| signal.as_str())
+            .unwrap_or("none")
+    );
+    if !availability.unavailable_reasons.is_empty() {
+        eprintln!(
+            "availability_unavailable_reasons={}",
+            availability
+                .unavailable_reasons
+                .iter()
+                .map(|reason| reason.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    if let Some(message) = availability.warning_message() {
+        eprintln!("availability_warning={message}");
+    }
+    if availability.severity == DoctorAvailabilitySeverity::Unavailable {
+        eprintln!(
+            "availability_recovery=Restore access to the mempal config and database, then rerun `mempal status`."
+        );
+    }
+}
+
 fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     let cfg_meta = ConfigHandle::snapshot_meta();
     let scrub_stats = ConfigHandle::scrub_stats();
@@ -13735,8 +13776,13 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     };
     let embed_status = global_embed_status().snapshot();
     let intelligence_status = mempal::intelligence::global_intelligence_status().snapshot();
-    let queue_stats = mempal::core::queue::queue_stats(db.conn())
-        .context("failed to query pending message stats")?;
+    let queue_stats = match mempal::core::queue::queue_stats(db.conn()) {
+        Ok(stats) => stats,
+        Err(error) => {
+            print_status_availability_failure(db.path());
+            return Err(error).context("failed to query pending message stats");
+        }
+    };
     let schema_version = db
         .schema_version()
         .context("failed to read schema version")?;

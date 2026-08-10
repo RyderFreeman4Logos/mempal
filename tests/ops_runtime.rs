@@ -224,6 +224,115 @@ fn test_cli_doctor_reports_unavailable_when_config_is_invalid() {
 }
 
 #[test]
+fn test_cli_status_emits_typed_availability_when_config_is_invalid() {
+    let home = TempDir::new().expect("home");
+    let mempal_home = home.path().join(".mempal");
+    fs::create_dir_all(&mempal_home).expect("create mempal home");
+    Database::open(&palace_db_path(&home)).expect("open db");
+    fs::write(mempal_home.join("config.toml"), "not = [valid toml").expect("write invalid config");
+
+    let status = run_mempal(&home, &["status"]);
+
+    assert!(
+        !status.status.success(),
+        "status must preserve the command error"
+    );
+    let stderr = stderr(&status);
+    assert!(
+        stderr.contains("availability_severity=unavailable"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("availability_signal=diagnostic_inputs_unavailable"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("availability_unavailable_reasons=config"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Restore access to the mempal config and database"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains(&mempal_home.display().to_string()),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_cli_status_emits_typed_availability_when_database_is_unavailable() {
+    let home = TempDir::new().expect("home");
+    let mempal_home = home.path().join(".mempal");
+    fs::create_dir_all(&mempal_home).expect("create mempal home");
+    fs::write(
+        mempal_home.join("config.toml"),
+        format!("db_path = \"{}\"\n", palace_db_path(&home).display()),
+    )
+    .expect("write config");
+    fs::write(palace_db_path(&home), "not a sqlite database").expect("write invalid db");
+
+    let status = run_mempal(&home, &["status"]);
+
+    assert!(
+        !status.status.success(),
+        "status must preserve the command error"
+    );
+    let stderr = stderr(&status);
+    assert!(
+        stderr.contains("availability_severity=unavailable"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("availability_signal=diagnostic_inputs_unavailable"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("availability_unavailable_reasons=queue_stats"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Restore access to the mempal config and database"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_cli_status_emits_typed_availability_when_queue_stats_are_unavailable() {
+    let home = TempDir::new().expect("home");
+    let mempal_home = home.path().join(".mempal");
+    fs::create_dir_all(&mempal_home).expect("create mempal home");
+    let db = Database::open(&palace_db_path(&home)).expect("open db");
+    db.conn()
+        .execute_batch("ALTER TABLE pending_messages RENAME TO pending_messages_unavailable;")
+        .expect("remove queue table");
+
+    let status = run_mempal(&home, &["status"]);
+
+    assert!(
+        !status.status.success(),
+        "status must preserve the command error"
+    );
+    let stderr = stderr(&status);
+    assert!(
+        stderr.contains("availability_severity=unavailable"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("availability_signal=diagnostic_inputs_unavailable"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("availability_unavailable_reasons=queue_stats"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Restore access to the mempal config and database"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn test_cli_doctor_reports_unavailable_when_queue_stats_fail() {
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
