@@ -324,6 +324,8 @@ pub struct MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     query_only_read_delay: Option<Duration>,
     #[cfg(any(test, feature = "db-test-seam"))]
+    search_embed_deadline: Option<Duration>,
+    #[cfg(any(test, feature = "db-test-seam"))]
     async_db_open_error: Option<String>,
     #[cfg(any(test, feature = "db-test-seam"))]
     query_only_async_db_open_error: Option<String>,
@@ -618,6 +620,8 @@ impl MempalMcpServer {
             #[cfg(any(test, feature = "db-test-seam"))]
             query_only_read_delay: None,
             #[cfg(any(test, feature = "db-test-seam"))]
+            search_embed_deadline: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
             async_db_open_error: None,
             #[cfg(any(test, feature = "db-test-seam"))]
             query_only_async_db_open_error: None,
@@ -798,6 +802,11 @@ impl MempalMcpServer {
         self.search_stale_index_deadline = deadline;
         self.ingest_admission_deadline = deadline;
         self.operation_status_deadline = deadline;
+        // Production embed timeout is config-driven (default 240s) and is not
+        // covered by the MCP DB deadlines above. Test fixtures that shrink the
+        // outer client budget must also shrink this path or suite load can hang
+        // past the fixture timeout while waiting for a non-blocking stub embed.
+        self.search_embed_deadline = Some(deadline);
         self
     }
 
@@ -2285,6 +2294,14 @@ impl MempalMcpServer {
     #[cfg(not(any(test, feature = "db-test-seam")))]
     fn query_only_read_delay_for_current_build(&self) -> Option<Duration> {
         None
+    }
+
+    fn search_embed_deadline_for_request(&self, config: &Config) -> Duration {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if let Some(deadline) = self.search_embed_deadline {
+            return deadline;
+        }
+        Duration::from_secs(config.embed.retry.search_deadline_secs)
     }
 
     async fn run_query_only_read_anyhow_bounded<F, R>(
@@ -5786,8 +5803,9 @@ impl MempalMcpServer {
                 }
             };
             if let Some(embedder) = embedder {
+                let embed_deadline = self.search_embed_deadline_for_request(config.as_ref());
                 match tokio::time::timeout(
-                    Duration::from_secs(config.embed.retry.search_deadline_secs),
+                    embed_deadline,
                     embedder.embed(&[request.query.as_str()]),
                 )
                 .await
@@ -5919,7 +5937,7 @@ impl MempalMcpServer {
                     Err(_) => {
                         search_mode = SearchMode::Bm25Only;
                         let warning =
-                            bm25_fallback_warning_timeout(config.embed.retry.search_deadline_secs);
+                            bm25_fallback_warning_timeout(embed_deadline.as_secs().max(1));
                         response_warnings.push(warning.clone());
                         extra_warnings.push(SystemWarning {
                             level: "warn".to_string(),

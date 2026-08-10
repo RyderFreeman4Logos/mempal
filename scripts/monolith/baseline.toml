@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8841
-baseline_lines = 622
+baseline_tokens = 8894
+baseline_lines = 626
 issue = "876"
-rationale = "#876 documents admission-receipt ownership and writer-lease admission Busy retry classification; exact no-growth ratchet."
+rationale = "#876 documents admission-receipt ownership, writer-lease Busy retry, and MCP search embed deadline seam; exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -373,10 +373,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 181190
-baseline_lines = 22865
+baseline_tokens = 181394
+baseline_lines = 22883
 issue = "876"
-rationale = "#876 merges #882 readiness fixtures into holder-budget no-write evidence; exact no-growth ratchet."
+rationale = "#876 preserves holder-budget no-write evidence and bounds MCP search embed deadlines for deadline fixtures; exact no-growth ratchet."
 
 [[files]]
 path = "src/mcp/tools.rs"

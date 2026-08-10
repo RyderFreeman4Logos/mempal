@@ -51,6 +51,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   retryable contention class as SQLite busy/locked so lease heartbeat recovery
   can wait through short admission waits under suite load.
 
+- **MCP search test deadlines**: `with_mcp_deadline_for_test` also bounds the
+  embed path (not only DB/route deadlines) so deadline-diagnostic fixtures
+  cannot hang on the production 240s embed timeout under suite load.
+
 - **Test fixture readiness**: use deterministic readiness synchronization for the
   SQLite writer-busy and MCP embedder-entry fixtures so suite-load contention
   cannot race their assertions (#882).
