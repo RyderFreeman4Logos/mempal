@@ -1230,19 +1230,18 @@ def wait_operation(operation_id: str, name: str) -> Any | None:
         or terminal_state(waited, expected_operation_id=operation_id)
     ):
         return waited
+    parsed_operation_id = operation_id_from(parsed, expected_operation_id=operation_id)
     if (
         any(
             not {'operation_id', 'state', 'timed_out'}.isdisjoint(receipt)
             for receipt in receipt_dicts_from(parsed)
         )
-        and operation_id_from(
-            parsed, expected_operation_id=operation_id
-        ) is None
+        and parsed_operation_id is None
     ):
         return waited
     status_rc, _out, _err, status, _shape = run_cli(name + '_status', ['mempal', 'operation', 'status', operation_id, '--json'], expect_json=True, timeout=30)
     return [
-        {'cleanup_drawer_ids': cleanup_ids_from(parsed)},
+        parsed,
         status,
         {'returncode': status_rc},
     ]

@@ -94,15 +94,15 @@ def _drawer_id_evidence(
                 continue
             for item in values:
                 if isinstance(item, str) and item:
+                    if expected_operation_id is not None and (
+                        not isinstance(expected_operation_id, str)
+                        or not expected_operation_id
+                        or receipt.get("operation_id") != expected_operation_id
+                    ):
+                        continue
                     cleanup_ids.append(item)
                     if key == "created_drawer_ids":
-                        if (
-                            expected_operation_id is None
-                            or receipt.get("operation_id") == expected_operation_id
-                        ):
-                            created_ids.append(item)
-                        else:
-                            conflicting_failure = True
+                        created_ids.append(item)
                 else:
                     malformed = True
     return (

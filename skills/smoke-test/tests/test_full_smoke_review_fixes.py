@@ -372,7 +372,7 @@ class ReviewFixTests(unittest.TestCase):
             ids, info = self.smoke.recover_created_ids(
                 {"operation_id": "op-A", "state": "queued"}, "unit_wait"
             )
-        self.assertEqual(ids, ["drawer-other"])
+        self.assertEqual(ids, [])
         self.assertEqual(info["kind"], "inconclusive")
 
     def test_operation_receipts_require_one_coherent_id(self) -> None:
@@ -495,7 +495,7 @@ class ReviewFixTests(unittest.TestCase):
             self.smoke.classify_create_attempt(
                 waited, expected_operation_id="op-A"
             ),
-            {"kind": "inconclusive", "cleanup_drawer_ids": ["drawer-other"]},
+            {"kind": "inconclusive"},
         )
         self.assertEqual(run_cli.call_count, 1)
 
@@ -627,7 +627,7 @@ class ReviewFixTests(unittest.TestCase):
                 mock.patch.object(self.smoke, "mcp_call_isolated"),
                 mock.patch.object(self.smoke, "mcp_call_isolated_labeled", return_value=(None, {"ok": True})),
                 mock.patch.object(self.smoke, "_mcp_tool_with_hard_timeout", side_effect=[(None, queued_info), ({"created_drawer_ids": ["drawer-update"]}, update_info)]),
-                mock.patch.object(self.smoke, "delete_exact_ids_mcp", return_value={"deleted_count": 3, "failed_count": 0, "delete_failed_attempt_count": 0}),
+                mock.patch.object(self.smoke, "delete_exact_ids_mcp", return_value={"deleted_count": 2, "failed_count": 0, "delete_failed_attempt_count": 0}) as delete_exact,
                 mock.patch.object(
                     self.smoke,
                     "_rest_ingest_fallback",
@@ -639,16 +639,17 @@ class ReviewFixTests(unittest.TestCase):
             ):
                 self.assertEqual(
                     self.smoke.mcp_crud(),
-                    ["drawer-status", "drawer-rest", "drawer-update"],
+                    ["drawer-rest", "drawer-update"],
                 )
             create_client.tool.assert_called_once_with(
                 "mempal_operation_status", {"operation_id": "op-A"}, timeout=30
             )
             rest_fallback.assert_called_once()
+            self.assertNotIn("drawer-status", delete_exact.call_args.args[1])
             saved = manifest.path.read_text(encoding="utf-8")
             self.assertEqual(
                 json.loads(saved),
-                {"cleanup_drawer_ids": ["drawer-status", "drawer-rest", "drawer-update"]},
+                {"cleanup_drawer_ids": ["drawer-rest", "drawer-update"]},
             )
             self.assertFalse(self.smoke.SUMMARY["groups"]["mcp_create"]["ok"])
             public = json.dumps(self.smoke.SUMMARY)

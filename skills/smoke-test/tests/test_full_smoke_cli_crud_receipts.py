@@ -513,7 +513,7 @@ class CliCrudReceiptTests(unittest.TestCase):
                 manifest.discard()
                 smoke.CLEANUP_MANIFEST = original_manifest
 
-    def test_mcp_cross_operation_update_stays_cleanup_only(self) -> None:
+    def test_mcp_foreign_update_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             smoke = load_full_smoke()
             original_manifest = smoke.CLEANUP_MANIFEST
@@ -598,11 +598,11 @@ class CliCrudReceiptTests(unittest.TestCase):
                         smoke,
                         "delete_exact_ids_mcp",
                         return_value={
-                            "deleted_count": 4,
+                            "deleted_count": 3,
                             "failed_count": 0,
                             "delete_failed_attempt_count": 0,
                         },
-                    ),
+                    ) as delete,
                     mock.patch.object(
                         smoke,
                         "_rest_ingest_fallback",
@@ -616,11 +616,11 @@ class CliCrudReceiptTests(unittest.TestCase):
                                 },
                             ),
                             (
-                                ["drawer-update-rest"],
+                                ["update-rest"],
                                 {
                                     "kind": "created",
-                                    "created_drawer_ids": ["drawer-update-rest"],
-                                    "cleanup_drawer_ids": ["drawer-update-rest"],
+                                    "created_drawer_ids": ["update-rest"],
+                                    "cleanup_drawer_ids": ["update-rest"],
                                 },
                             ),
                         ],
@@ -631,13 +631,12 @@ class CliCrudReceiptTests(unittest.TestCase):
                         [
                             "drawer-direct",
                             "drawer-rest",
-                            "drawer-other",
-                            "drawer-update-rest",
+                            "update-rest",
                         ],
                     )
                 self.assertEqual(rest_fallback.call_count, 2)
                 wait_operation.assert_called_once_with("op-A", "mcp_update_cli_wait")
-                self.assertEqual(manifest.pending_count, 4)
+                self.assertNotIn("drawer-other", str((delete.call_args, manifest.path.read_text())))
                 self.assertFalse(smoke.SUMMARY["groups"]["mcp_create"]["ok"])
                 self.assertFalse(smoke.SUMMARY["groups"]["mcp_update"]["ok"])
             finally:
