@@ -42,6 +42,12 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **Daemon outage visibility**: `doctor`, `status`, and MCP doctor now expose a
+  high-severity typed availability signal when the daemon is down with at least
+  100 pending embedding/hook queue items, plus recovery guidance to start the
+  daemon, confirm drain progress, and handle terminal failures without database
+  edits (#871).
+
 - **Admission receipt ownership**: bind MCP holder-budget no-write receipts and
   smoke cleanup authority to the owning operation identity so saturated
   admission attempts cannot emit false write receipts or cross-operation

@@ -163,6 +163,48 @@ fn test_cli_doctor_json_reports_schema_and_path() {
 }
 
 #[test]
+fn test_cli_doctor_and_status_report_daemon_outage_queue_high_severity() {
+    let home = TempDir::new().expect("home");
+    fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
+    let db_path = palace_db_path(&home);
+    Database::open(&db_path).expect("open db");
+    let store = PendingMessageStore::new_without_reclaim(&db_path);
+    for n in 0..100 {
+        store
+            .enqueue("hook_event", &format!(r#"{{"n":{n}}}"#))
+            .expect("enqueue pending row");
+    }
+
+    let doctor = run_mempal(&home, &["doctor", "--format", "json"]);
+    assert_success(&doctor);
+    let report: Value = serde_json::from_str(&stdout(&doctor)).expect("doctor json");
+    assert_eq!(report["availability"]["severity"], "high");
+    assert_eq!(
+        report["availability"]["signal"],
+        "daemon_down_large_pending_queue"
+    );
+    assert_eq!(report["availability"]["pending_queue_threshold"], 100);
+    assert!(
+        report["recommendations"]
+            .as_array()
+            .expect("recommendations")
+            .iter()
+            .any(|recommendation| recommendation
+                .as_str()
+                .unwrap_or_default()
+                .contains("start the daemon")),
+        "{report}"
+    );
+
+    let status = run_mempal(&home, &["status"]);
+    assert_success(&status);
+    let output = stdout(&status);
+    assert!(output.contains("[ERROR]"), "{output}");
+    assert!(output.contains("daemon_outage_queue"), "{output}");
+    assert!(output.contains("start the daemon"), "{output}");
+}
+
+#[test]
 
 fn test_cli_doctor_reports_queue_failure_classes() {
     let home = TempDir::new().expect("home");

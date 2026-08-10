@@ -90,10 +90,85 @@ pub struct DoctorReport {
     pub daemon: DoctorDaemonReport,
     pub install: DoctorInstallReport,
     pub embedding: DoctorEmbeddingReport,
+    pub availability: DoctorAvailabilityReport,
     pub design_insights: DoctorDesignInsightReport,
     pub restart_required_config_changes: Vec<String>,
     pub warnings: Vec<String>,
     pub recommendations: Vec<String>,
+}
+
+/// Pending work at or above this count is an availability outage when the daemon is down.
+pub const DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD: u64 = 100;
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorAvailabilitySeverity {
+    Normal,
+    High,
+}
+
+impl DoctorAvailabilitySeverity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::High => "high",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorAvailabilitySignal {
+    DaemonDownLargePendingQueue,
+}
+
+impl DoctorAvailabilitySignal {
+    pub const fn as_str(self) -> &'static str {
+        "daemon_down_large_pending_queue"
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorAvailabilityReport {
+    pub severity: DoctorAvailabilitySeverity,
+    pub signal: Option<DoctorAvailabilitySignal>,
+    pub daemon_running: bool,
+    pub pending_queue: u64,
+    pub pending_queue_threshold: u64,
+}
+
+impl DoctorAvailabilityReport {
+    pub fn warning_message(&self) -> Option<String> {
+        self.signal.map(|_| {
+            format!(
+                "daemon is down with {} pending embedding/hook queue item(s) (threshold {}); queued work cannot drain",
+                self.pending_queue, self.pending_queue_threshold
+            )
+        })
+    }
+}
+
+pub fn daemon_outage_queue_availability(
+    daemon_running: bool,
+    pending_queue: u64,
+) -> DoctorAvailabilityReport {
+    let signal = (!daemon_running && pending_queue >= DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD)
+        .then_some(DoctorAvailabilitySignal::DaemonDownLargePendingQueue);
+    DoctorAvailabilityReport {
+        severity: if signal.is_some() {
+            DoctorAvailabilitySeverity::High
+        } else {
+            DoctorAvailabilitySeverity::Normal
+        },
+        signal,
+        daemon_running,
+        pending_queue,
+        pending_queue_threshold: DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD,
+    }
+}
+
+fn daemon_outage_queue_recovery_guidance() -> &'static str {
+    "To recover, start the daemon, confirm queue claim/drain progress with `mempal status` or `mempal daemon status`, then handle terminal failed operations with `mempal queue failed`; do not edit the database manually."
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -226,6 +301,7 @@ pub fn build_doctor_report_with_daemon_status(
     let install = inspect_install();
     let config = Config::load().ok();
     let embedding = build_embedding_report(config.as_ref(), db_path, daemon_status);
+    let availability = daemon_outage_queue_availability(daemon.running, embedding.queue.pending);
     let design_insights = inspect_design_insights(db_path);
     let restart_required_config_changes = ConfigHandle::restart_required_pending();
     let mut warnings = Vec::new();
@@ -262,6 +338,7 @@ pub fn build_doctor_report_with_daemon_status(
     }
     push_db_holder_warnings(&mut warnings, &mut recommendations, &db_holders);
     push_daemon_warnings(&mut warnings, &mut recommendations, &daemon);
+    push_daemon_outage_queue_guidance(&mut warnings, &mut recommendations, &availability);
     if install.path_matches_current_exe == Some(false) {
         warnings
             .push("PATH resolves mempal to a different executable than this process".to_string());
@@ -280,6 +357,7 @@ pub fn build_doctor_report_with_daemon_status(
         daemon,
         install,
         embedding,
+        availability,
         design_insights,
         restart_required_config_changes,
         warnings,
@@ -637,6 +715,17 @@ fn push_db_holder_warnings(
             "{} extra process(es) hold the database open",
             db_holders.extra_holder_count
         ));
+    }
+}
+
+fn push_daemon_outage_queue_guidance(
+    warnings: &mut Vec<String>,
+    recommendations: &mut Vec<String>,
+    availability: &DoctorAvailabilityReport,
+) {
+    if let Some(message) = availability.warning_message() {
+        warnings.push(format!("HIGH availability: {message}"));
+        recommendations.push(daemon_outage_queue_recovery_guidance().to_string());
     }
 }
 
@@ -1089,6 +1178,19 @@ fn suggest_rest_install_command() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_outage_queue_availability_requires_daemon_down_and_large_queue() {
+        for (daemon_running, pending_queue) in [
+            (true, DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD),
+            (false, DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD - 1),
+        ] {
+            let availability = daemon_outage_queue_availability(daemon_running, pending_queue);
+
+            assert_eq!(availability.severity, DoctorAvailabilitySeverity::Normal);
+            assert_eq!(availability.signal, None);
+        }
+    }
 
     #[test]
     fn test_db_holder_warnings_report_extra_holders_alongside_specific_roles() {

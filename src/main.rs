@@ -81,6 +81,7 @@ use mempal::crystallize::{
 };
 use mempal::doctor::{
     RestDoctorReport, build_doctor_report_with_daemon_status, build_rest_doctor_report,
+    daemon_outage_queue_availability,
 };
 use mempal::embed::build_backend_from_name;
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder, global_embed_status};
@@ -13822,6 +13823,14 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     if let Some(warning) = daemon_pidfile_warning {
         runtime_warnings.push(warning);
     }
+    let availability = daemon_outage_queue_availability(daemon_running, queue_stats.pending);
+    if let Some(message) = availability.warning_message() {
+        runtime_warnings.push(mempal::core::config::RuntimeWarning {
+            level: "error",
+            source: "daemon_outage_queue",
+            message: format!("{message}. To recover, start the daemon, confirm queue claim/drain progress, then handle terminal failed operations; do not edit the database manually."),
+        });
+    }
     let last_heartbeat = db
         .conn()
         .query_row(
@@ -24664,6 +24673,22 @@ fn doctor_command(format: String) -> Result<()> {
                 report.install.path_matches_current_exe
             );
             println!("daemon_running={}", report.daemon.running);
+            println!(
+                "availability_severity={}",
+                report.availability.severity.as_str()
+            );
+            println!(
+                "availability_signal={}",
+                report
+                    .availability
+                    .signal
+                    .map(|signal| signal.as_str())
+                    .unwrap_or("none")
+            );
+            println!(
+                "availability_pending_queue_threshold={}",
+                report.availability.pending_queue_threshold
+            );
             println!(
                 "daemon_pid={}",
                 report

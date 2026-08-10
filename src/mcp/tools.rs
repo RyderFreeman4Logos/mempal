@@ -18,7 +18,7 @@ use crate::core::types::{
     MemoryDomain, MemoryKind, NeighborChunk, RouteDecision, RuntimeAdoptionEvent,
     RuntimeAdoptionSignal, RuntimeAdoptionTrack, SearchResult, TaxonomyEntry, TunnelEndpoint,
 };
-use crate::doctor::{DoctorDbReport, DoctorInstallReport, DoctorReport};
+use crate::doctor::{DoctorAvailabilityReport, DoctorDbReport, DoctorInstallReport, DoctorReport};
 use crate::field_taxonomy::FieldTaxonomyEntry;
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
@@ -2756,6 +2756,7 @@ pub struct DoctorResponse {
     pub db: DoctorDbDto,
     pub db_holders: DbHolderReport,
     pub install: DoctorInstallDto,
+    pub availability: DoctorAvailabilityDto,
     pub warnings: Vec<String>,
     pub recommendations: Vec<String>,
     pub mcp: DoctorMcpDto,
@@ -2769,6 +2770,7 @@ impl DoctorResponse {
             db: report.db.into(),
             db_holders: report.db_holders,
             install: report.install.into(),
+            availability: report.availability.into(),
             warnings: report.warnings,
             recommendations: report.recommendations,
             mcp,
@@ -2810,6 +2812,27 @@ impl From<DoctorInstallReport> for DoctorInstallDto {
             current_exe: report.current_exe,
             path_mempal: report.path_mempal,
             path_matches_current_exe: report.path_matches_current_exe,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DoctorAvailabilityDto {
+    pub severity: String,
+    pub signal: Option<String>,
+    pub daemon_running: bool,
+    pub pending_queue: u64,
+    pub pending_queue_threshold: u64,
+}
+
+impl From<DoctorAvailabilityReport> for DoctorAvailabilityDto {
+    fn from(report: DoctorAvailabilityReport) -> Self {
+        Self {
+            severity: report.severity.as_str().to_string(),
+            signal: report.signal.map(|signal| signal.as_str().to_string()),
+            daemon_running: report.daemon_running,
+            pending_queue: report.pending_queue,
+            pending_queue_threshold: report.pending_queue_threshold,
         }
     }
 }
