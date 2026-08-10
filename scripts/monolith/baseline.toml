@@ -493,10 +493,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/daemon_lifecycle.rs"
 kind = "test"
-baseline_tokens = 7665
-baseline_lines = 966
-issue = "843"
-rationale = "Readiness-probe hardening for SIGTERM drain under local-gates load (#843); no-growth ratchet after env isolation + diagnostics."
+baseline_tokens = 7753
+baseline_lines = 975
+issue = "871"
+rationale = "Daemon lifecycle admission-Busy retry under local-gates load (#871); no-growth ratchet."
 
 [[files]]
 path = "tests/embedder_reindex_scenarios.rs"
