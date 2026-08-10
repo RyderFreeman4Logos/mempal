@@ -39,7 +39,7 @@ _SMOKE_RECEIPTS = _load_sibling_module('_mempal_smoke_receipts', 'smoke_receipts
 CleanupManifest = _SMOKE_RUNTIME.CleanupManifest
 strict_json_loads = _SMOKE_RUNTIME.strict_json_loads
 receipt_dicts_from = _SMOKE_RECEIPTS.receipt_dicts_from
-created_ids_from = _SMOKE_RECEIPTS.created_ids_from
+cleanup_ids_from = _SMOKE_RECEIPTS.cleanup_ids_from
 operation_id_from = _SMOKE_RECEIPTS.operation_id_from
 operation_state_from = _SMOKE_RECEIPTS.operation_state_from
 holder_budget_no_write_receipt = _SMOKE_RECEIPTS.holder_budget_no_write_receipt
@@ -1150,8 +1150,12 @@ def note_no_write_create(create_label: str, downstream_label: str, receipt: dict
     return True
 
 
-def terminal_state(value: Any) -> bool:
-    return operation_state_from(value) in {'completed', 'rejected', 'failed'}
+def terminal_state(
+    value: Any, *, expected_operation_id: str | None = None
+) -> bool:
+    return operation_state_from(
+        value, expected_operation_id=expected_operation_id
+    ) in {'completed', 'rejected', 'failed'}
 
 
 def followable_timeout_operation_id(value: Any) -> str | None:
@@ -1217,20 +1221,41 @@ def delete_exact_ids_cli(drawer_ids: list[str], label: str, room: str | None = N
 
 
 def wait_operation(operation_id: str, name: str) -> Any | None:
-    rc, out, _err, parsed, _shape = run_cli(name, ['mempal', 'operation', 'wait', operation_id, '--timeout-secs', '300', '--json'], expect_json=True, timeout=330)
-    if created_ids_from(parsed):
-        return parsed
-    if rc != 0 or not terminal_state(parsed):
-        rc, out, _err, parsed, _shape = run_cli(name + '_status', ['mempal', 'operation', 'status', operation_id, '--json'], expect_json=True, timeout=30)
-    return parsed
+    rc, _out, _err, parsed, _shape = run_cli(name, ['mempal', 'operation', 'wait', operation_id, '--timeout-secs', '300', '--json'], expect_json=True, timeout=330)
+    waited = [parsed, {'returncode': rc}]
+    if rc == 0 and (
+        classify_create_attempt(
+            waited, expected_operation_id=operation_id
+        )['kind'] == 'created'
+        or terminal_state(waited, expected_operation_id=operation_id)
+    ):
+        return waited
+    if (
+        any(
+            not {'operation_id', 'state', 'timed_out'}.isdisjoint(receipt)
+            for receipt in receipt_dicts_from(parsed)
+        )
+        and operation_id_from(
+            parsed, expected_operation_id=operation_id
+        ) is None
+    ):
+        return waited
+    status_rc, _out, _err, status, _shape = run_cli(name + '_status', ['mempal', 'operation', 'status', operation_id, '--json'], expect_json=True, timeout=30)
+    return [
+        {'cleanup_drawer_ids': cleanup_ids_from(parsed)},
+        status,
+        {'returncode': status_rc},
+    ]
 
 
 def recover_created_ids(value: Any, wait_label: str) -> tuple[list[str], dict[str, Any]]:
     classified = classify_create_attempt(value)
-    ids = classified.get('created_drawer_ids', [])
+    ids = classified.get('cleanup_drawer_ids', [])
     operation_id = classified.get('operation_id')
     info: dict[str, Any] = {
         'kind': classified['kind'],
+        'created_drawer_ids': classified.get('created_drawer_ids', []),
+        'cleanup_drawer_ids': ids,
         'operation_id_present': bool(operation_id),
         'operation_state': classified.get('state', operation_state_from(value)),
         'recovered_via': None,
@@ -1242,17 +1267,23 @@ def recover_created_ids(value: Any, wait_label: str) -> tuple[list[str], dict[st
         return ids, info
 
     waited = wait_operation(operation_id, wait_label)
-    waited_classification = classify_create_attempt(waited)
+    waited_classification = classify_create_attempt(
+        waited, expected_operation_id=operation_id
+    )
     ids = list(dict.fromkeys([
         *ids,
-        *waited_classification.get('created_drawer_ids', []),
+        *waited_classification.get('cleanup_drawer_ids', []),
     ]))
     info['kind'] = waited_classification['kind']
+    info['created_drawer_ids'] = waited_classification.get(
+        'created_drawer_ids', []
+    )
+    info['cleanup_drawer_ids'] = ids
     if waited_classification['kind'] == 'proven_no_write':
         info['receipt'] = waited_classification['receipt']
     info['recovered_via'] = wait_label
-    info['recovered_state'] = waited_classification.get(
-        'state', operation_state_from(waited)
+    info['recovered_state'] = operation_state_from(
+        waited, expected_operation_id=operation_id
     )
     return ids, info
 
@@ -1261,7 +1292,9 @@ def recovery_fields(info: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in info.items()
-        if key not in {'reason', 'receipt'} and value not in (None, False)
+        if key not in {
+            'reason', 'receipt', 'created_drawer_ids', 'cleanup_drawer_ids'
+        } and value not in (None, False)
     }
 
 
@@ -1301,8 +1334,9 @@ def _rest_ingest_fallback(
             resp = urllib.request.urlopen(req, timeout=30)
             if resp.status in (200, 201):
                 body, shape = parse_json_bytes(resp.read(), allow_ndjson=False)
+                shape = {key: value for key, value in shape.items() if key != 'fields'}
                 classification = classify_create_attempt(body)
-                ids = classification.get('created_drawer_ids', [])
+                ids = classification.get('cleanup_drawer_ids', [])
                 if ids:
                     _remember_created_ids(ids)
                     authoritative = classification['kind'] == 'created'
@@ -1312,7 +1346,10 @@ def _rest_ingest_fallback(
                     note(
                         label,
                         authoritative,
-                        created_id_count=len(ids),
+                        created_id_count=len(
+                            classification.get('created_drawer_ids', [])
+                        ),
+                        cleanup_id_count=len(ids),
                         json=shape,
                         **fields,
                     )
@@ -1325,8 +1362,11 @@ def _rest_ingest_fallback(
                 note(label, False, error_type='HTTPErrorBodyTooLarge', http_status=exc.code)
                 return [], {'kind': 'inconclusive'}
             body, shape = parse_json_bytes(raw_body, allow_ndjson=False)
+            shape = {key: value for key, value in shape.items() if key != 'fields'}
             classification = classify_create_attempt(body)
-            ids = classification.get('created_drawer_ids', [])
+            if classification['kind'] != 'proven_no_write':
+                classification = classify_create_attempt([body, {'success': False}])
+            ids = classification.get('cleanup_drawer_ids', [])
             if ids:
                 _remember_created_ids(ids)
                 note(
@@ -1413,7 +1453,11 @@ def cli_crud() -> list[str]:
     direct_receipt = create_recovery.get('receipt')
     if not cleanup_ids and direct_receipt and note_no_write_create('cli_create', 'cli_crud', direct_receipt):
         return cleanup_ids
-    created_ids = cleanup_evidence if create_recovery['kind'] == 'created' else []
+    created_ids = (
+        create_recovery.get('created_drawer_ids', [])
+        if create_recovery['kind'] == 'created'
+        else []
+    )
 
     # Fallback: if CLI direct-write fails due to daemon writer lease, retry via REST.
     # The fork's daemon holds a long-lived sqlite-writer lease; CLI ingest that
@@ -1432,7 +1476,7 @@ def cli_crud() -> list[str]:
         _remember_created_ids(rest_ids)
         rest_disposition = rest_disposition or {'kind': 'inconclusive'}
         if rest_disposition['kind'] == 'created':
-            created_ids = rest_ids
+            created_ids = rest_disposition.get('created_drawer_ids', [])
             create_recovery = {'kind': 'created', 'recovered_via': 'rest_fallback'}
             note('cli_create', True, created_id_count=len(created_ids), via='rest_fallback')
     elif create_recovery.get('recovered_via'):
@@ -1476,7 +1520,9 @@ def cli_crud() -> list[str]:
     _remember_created_ids(update_cleanup_ids)
     update_receipt = update_recovery.get('receipt')
     authoritative_update_ids = (
-        update_cleanup_ids if update_recovery['kind'] == 'created' else []
+        update_recovery.get('created_drawer_ids', [])
+        if update_recovery['kind'] == 'created'
+        else []
     )
 
     # Fallback: retry update via REST if direct write failed (writer lease).
@@ -1494,7 +1540,9 @@ def cli_crud() -> list[str]:
         _remember_created_ids(rest_upd_ids)
         rest_update_disposition = rest_update_disposition or {'kind': 'inconclusive'}
         if rest_update_disposition['kind'] == 'created':
-            authoritative_update_ids = rest_upd_ids
+            authoritative_update_ids = rest_update_disposition.get(
+                'created_drawer_ids', []
+            )
             update_recovery = {'kind': 'created', 'recovered_via': 'rest_fallback'}
             note('cli_update', True, created_id_count=len(authoritative_update_ids), via='rest_fallback')
     elif authoritative_update_ids and update_recovery.get('recovered_via'):
@@ -1706,11 +1754,13 @@ def mcp_crud() -> list[str]:
         create, info = _mcp_tool_with_hard_timeout(client, 'mempal_ingest', create_args, timeout=30)
         create_attempt = create_attempt_from_mcp_info(info)
         create_classification = classify_create_attempt(create_attempt)
-        cleanup_evidence = create_classification.get('created_drawer_ids', [])
+        cleanup_evidence = create_classification.get('cleanup_drawer_ids', [])
         cleanup_ids.extend(cleanup_evidence)
         _remember_created_ids(cleanup_evidence)
         created_ids = (
-            cleanup_evidence if create_classification['kind'] == 'created' else []
+            create_classification.get('created_drawer_ids', [])
+            if create_classification['kind'] == 'created'
+            else []
         )
         mcp_receipt = create_classification.get('receipt')
         create_operation_id = create_classification.get('operation_id')
@@ -1734,17 +1784,20 @@ def mcp_crud() -> list[str]:
             )
             note('mcp_operation_status', bool(status_info.get('ok')), **without_ok(status_info))
             status_attempt = create_attempt_from_mcp_info(status_info) or status_structured
-            status_classification = classify_create_attempt(status_attempt)
-            status_ids = status_classification.get('created_drawer_ids', [])
+            status_classification = classify_create_attempt(
+                status_attempt, expected_operation_id=create_operation_id
+            )
+            status_ids = status_classification.get('cleanup_drawer_ids', [])
             cleanup_ids = list(dict.fromkeys([*cleanup_ids, *status_ids]))
             _remember_created_ids(status_ids)
             create_recovery['kind'] = status_classification['kind']
             if status_classification['kind'] == 'created':
-                created_ids = status_ids
+                created_ids = status_classification.get('created_drawer_ids', [])
                 create_recovery.update({
                     'recovered_via': 'mcp_operation_status',
-                    'recovered_state': status_classification.get(
-                        'state', operation_state_from(status_attempt)
+                    'recovered_state': operation_state_from(
+                        status_attempt,
+                        expected_operation_id=create_operation_id,
                     ),
                 })
         elif 'mempal_operation_status' in tool_names:
@@ -1763,19 +1816,22 @@ def mcp_crud() -> list[str]:
                 lambda: wait_operation(create_timeout_operation_id, 'mcp_create_cli_wait'),
             )
             client = None
-            waited_classification = classify_create_attempt(waited)
-            waited_ids = waited_classification.get('created_drawer_ids', [])
+            waited_classification = classify_create_attempt(
+                waited, expected_operation_id=create_timeout_operation_id
+            )
+            waited_ids = waited_classification.get('cleanup_drawer_ids', [])
             cleanup_ids = list(dict.fromkeys([*cleanup_ids, *waited_ids]))
             _remember_created_ids(waited_ids)
             create_recovery.update({
                 'kind': waited_classification['kind'],
                 'recovered_via': 'mcp_create_cli_wait',
-                'recovered_state': waited_classification.get(
-                    'state', operation_state_from(waited)
+                'recovered_state': operation_state_from(
+                    waited,
+                    expected_operation_id=create_timeout_operation_id,
                 ),
             })
             if waited_classification['kind'] == 'created':
-                created_ids = waited_ids
+                created_ids = waited_classification.get('created_drawer_ids', [])
             SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
         # Fallback: if MCP ingest fails/hangs (writer lease), retry via REST so
@@ -1794,7 +1850,7 @@ def mcp_crud() -> list[str]:
             _remember_created_ids(rest_ids)
             rest_disposition = rest_disposition or {'kind': 'inconclusive'}
             if rest_disposition['kind'] == 'created':
-                created_ids = rest_ids
+                created_ids = rest_disposition.get('created_drawer_ids', [])
                 create_recovery = {'kind': 'created', 'recovered_via': 'rest_fallback'}
                 SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
@@ -1853,11 +1909,13 @@ def mcp_crud() -> list[str]:
         update, uinfo = _mcp_tool_with_hard_timeout(client, 'mempal_ingest', update_args, timeout=30)
         update_attempt = create_attempt_from_mcp_info(uinfo)
         update_classification = classify_create_attempt(update_attempt)
-        update_cleanup_ids = update_classification.get('created_drawer_ids', [])
+        update_cleanup_ids = update_classification.get('cleanup_drawer_ids', [])
         cleanup_ids = list(dict.fromkeys([*cleanup_ids, *update_cleanup_ids]))
         _remember_created_ids(update_cleanup_ids)
         authoritative_update_ids = (
-            update_cleanup_ids if update_classification['kind'] == 'created' else []
+            update_classification.get('created_drawer_ids', [])
+            if update_classification['kind'] == 'created'
+            else []
         )
         update_receipt = update_classification.get('receipt')
         update_operation_id = update_classification.get('operation_id')
@@ -1876,19 +1934,24 @@ def mcp_crud() -> list[str]:
                 lambda: wait_operation(update_timeout_operation_id, 'mcp_update_cli_wait'),
             )
             client = None
-            waited_classification = classify_create_attempt(waited)
-            waited_ids = waited_classification.get('created_drawer_ids', [])
+            waited_classification = classify_create_attempt(
+                waited, expected_operation_id=update_timeout_operation_id
+            )
+            waited_ids = waited_classification.get('cleanup_drawer_ids', [])
             cleanup_ids = list(dict.fromkeys([*cleanup_ids, *waited_ids]))
             _remember_created_ids(waited_ids)
             update_recovery.update({
                 'kind': waited_classification['kind'],
                 'recovered_via': 'mcp_update_cli_wait',
-                'recovered_state': waited_classification.get(
-                    'state', operation_state_from(waited)
+                'recovered_state': operation_state_from(
+                    waited,
+                    expected_operation_id=update_timeout_operation_id,
                 ),
             })
             if waited_classification['kind'] == 'created':
-                authoritative_update_ids = waited_ids
+                authoritative_update_ids = waited_classification.get(
+                    'created_drawer_ids', []
+                )
             SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
         # Fallback: if MCP update fails/hangs (writer lease), retry via REST so
@@ -1908,7 +1971,9 @@ def mcp_crud() -> list[str]:
             _remember_created_ids(rest_upd_ids)
             rest_update_disposition = rest_update_disposition or {'kind': 'inconclusive'}
             if rest_update_disposition['kind'] == 'created':
-                authoritative_update_ids = rest_upd_ids
+                authoritative_update_ids = rest_update_disposition.get(
+                    'created_drawer_ids', []
+                )
                 update_recovery = {'kind': 'created', 'recovered_via': 'rest_fallback'}
                 SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 

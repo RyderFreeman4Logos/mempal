@@ -26,7 +26,7 @@ class ReceiptExtractionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.smoke = load_full_smoke()
 
-    def test_created_ids_from_accepts_only_cleanup_safe_fields(self) -> None:
+    def test_cleanup_ids_from_accepts_only_cleanup_safe_fields(self) -> None:
         payload = {
             "drawer_ids": ["unsafe-affected-id"],
             "result": {
@@ -38,18 +38,22 @@ class ReceiptExtractionTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            self.smoke.created_ids_from(payload),
+            self.smoke.cleanup_ids_from(payload),
             ["created-a", "created-b"],
         )
 
-    def test_created_ids_from_handles_ndjson_style_receipt_lists(self) -> None:
+    def test_cleanup_ids_from_handles_ndjson_style_receipt_lists(self) -> None:
         receipts = [
             {"state": "queued", "operation_id": "op-1"},
-            {"state": "completed", "cleanup_drawer_ids": ["created-final"]},
+            {
+                "operation_id": "op-1",
+                "state": "completed",
+                "cleanup_drawer_ids": ["created-final"],
+            },
         ]
 
         self.assertEqual(
-            self.smoke.created_ids_from(receipts),
+            self.smoke.cleanup_ids_from(receipts),
             ["created-final"],
         )
         self.assertEqual(self.smoke.operation_id_from(receipts), "op-1")
@@ -128,7 +132,7 @@ class ReceiptExtractionTests(unittest.TestCase):
 
         self.assertIsNone(self.smoke.followable_timeout_operation_id(timeout_without_operation))
         self.assertEqual(ids, [])
-        self.assertEqual(info["operation_state"], "queued")
+        self.assertIsNone(info["operation_state"])
         self.assertFalse(info["operation_id_present"])
 
     def test_recovery_fields_excludes_reason(self) -> None:

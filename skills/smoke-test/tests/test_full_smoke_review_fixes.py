@@ -281,37 +281,70 @@ class ReviewFixTests(unittest.TestCase):
         )
         self.assertEqual(
             classification,
-            {"kind": "inconclusive", "created_drawer_ids": ["drawer-safe"]},
+            {"kind": "inconclusive", "cleanup_drawer_ids": ["drawer-safe"]},
         )
         self.assertNotIn("private_raw_key", json.dumps(self.smoke.without_ok(info)))
         with tempfile.TemporaryDirectory() as tmp:
             manifest = self.smoke.CleanupManifest(Path(tmp) / "cleanup.json")
-            manifest.add_created_ids(classification["created_drawer_ids"])
+            manifest.add_created_ids(classification["cleanup_drawer_ids"])
             saved = manifest.path.read_text(encoding="utf-8")
             self.assertEqual(json.loads(saved), {"cleanup_drawer_ids": ["drawer-safe"]})
             self.assertNotIn("private_raw_key", saved)
             self.assertNotIn("private-raw-value", saved)
 
+    def test_cleanup_ids_never_authorize_creation(self) -> None:
+        cases = {
+            "direct_cleanup": {"cleanup_drawer_ids": ["drawer-cleanup"]},
+            "nested_cleanup": {
+                "result": {
+                    "structuredContent": {
+                        "cleanup_drawer_ids": ["drawer-cleanup"]
+                    }
+                }
+            },
+            "failed_cli": [
+                {"created_drawer_ids": ["drawer-cleanup"]},
+                {"returncode": 1},
+            ],
+        }
+        for name, attempt in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self.smoke.classify_create_attempt(attempt),
+                    {
+                        "kind": "inconclusive",
+                        "cleanup_drawer_ids": ["drawer-cleanup"],
+                    },
+                )
+        self.assertEqual(
+            self.smoke.classify_create_attempt(
+                {"created_drawer_ids": ["drawer-created"]}
+            ),
+            {
+                "kind": "created",
+                "created_drawer_ids": ["drawer-created"],
+                "cleanup_drawer_ids": ["drawer-created"],
+            },
+        )
+
     def test_mixed_malformed_ids_preserve_known_ids_without_overriding_state(self) -> None:
-        queued = {
+        malformed_queued = {
             "operation_id": "operation-queued",
             "state": "queued",
             "created_drawer_ids": ["drawer-known", 7],
             "cleanup_drawer_ids": "not-an-array",
         }
         self.assertEqual(
-            self.smoke.classify_create_attempt(queued),
+            self.smoke.classify_create_attempt(malformed_queued),
             {
-                "kind": "queued",
-                "operation_id": "operation-queued",
-                "state": "queued",
-                "created_drawer_ids": ["drawer-known"],
+                "kind": "inconclusive",
+                "cleanup_drawer_ids": ["drawer-known"],
             },
         )
         malformed = {"created_drawer_ids": ["drawer-known", 7]}
         self.assertEqual(
             self.smoke.classify_create_attempt(malformed),
-            {"kind": "inconclusive", "created_drawer_ids": ["drawer-known"]},
+            {"kind": "inconclusive", "cleanup_drawer_ids": ["drawer-known"]},
         )
         ids, info = self.smoke.recover_created_ids(malformed, "unused_wait")
         self.assertEqual(ids, ["drawer-known"])
@@ -319,12 +352,28 @@ class ReviewFixTests(unittest.TestCase):
         with mock.patch.object(
             self.smoke,
             "wait_operation",
-            return_value={"state": "completed", "created_drawer_ids": ["drawer-final"]},
         ) as wait_operation:
-            ids, info = self.smoke.recover_created_ids(queued, "unit_wait")
-        self.assertEqual(ids, ["drawer-known", "drawer-final"])
-        self.assertEqual(info["kind"], "created")
-        wait_operation.assert_called_once_with("operation-queued", "unit_wait")
+            ids, info = self.smoke.recover_created_ids(
+                malformed_queued, "unit_wait"
+            )
+        self.assertEqual(ids, ["drawer-known"])
+        self.assertEqual(info["kind"], "inconclusive")
+        wait_operation.assert_not_called()
+
+        with mock.patch.object(
+            self.smoke,
+            "wait_operation",
+            return_value={
+                "operation_id": "op-B",
+                "state": "completed",
+                "created_drawer_ids": ["drawer-other"],
+            },
+        ):
+            ids, info = self.smoke.recover_created_ids(
+                {"operation_id": "op-A", "state": "queued"}, "unit_wait"
+            )
+        self.assertEqual(ids, ["drawer-other"])
+        self.assertEqual(info["kind"], "inconclusive")
 
     def test_operation_receipts_require_one_coherent_id(self) -> None:
         conflict = {
@@ -347,13 +396,35 @@ class ReviewFixTests(unittest.TestCase):
             "state": "private-raw-value",
             "cleanup_drawer_ids": ["drawer-known"],
         }
-        cases = (("conflict", conflict), ("malformed_id", malformed), ("malformed_state", malformed_state))
+        split = {
+            "result": {"operation_id": "op-A"},
+            "error": {"data": {
+                "state": "completed",
+                "timed_out": True,
+                "cleanup_drawer_ids": ["drawer-known"],
+            }},
+        }
+        terminal_conflict = [
+            {
+                "operation_id": "op-A",
+                "state": "completed",
+                "cleanup_drawer_ids": ["drawer-known"],
+            },
+            {"operation_id": "op-A", "state": "failed"},
+        ]
+        cases = (
+            ("conflict", conflict),
+            ("malformed_id", malformed),
+            ("malformed_state", malformed_state),
+            ("split", split),
+            ("terminal_conflict", terminal_conflict),
+        )
         for name, attempt in cases:
             with self.subTest(name=name):
                 classification = self.smoke.classify_create_attempt(attempt)
                 self.assertEqual(
                     classification,
-                    {"kind": "inconclusive", "created_drawer_ids": ["drawer-known"]},
+                    {"kind": "inconclusive", "cleanup_drawer_ids": ["drawer-known"]},
                 )
                 self.assertIsNone(self.smoke.operation_id_from(attempt))
                 self.assertIsNone(self.smoke.operation_state_from(attempt))
@@ -375,6 +446,58 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(self.smoke.operation_id_from(coherent), "op-A")
         self.assertEqual(self.smoke.operation_state_from(coherent), "queued")
         self.assertEqual(self.smoke.followable_timeout_operation_id(coherent), "op-A")
+
+    def test_wait_operation_never_promotes_failed_cli_process(self) -> None:
+        terminal = {
+            "operation_id": "op-A",
+            "state": "completed",
+            "created_drawer_ids": ["drawer-cleanup"],
+        }
+        with mock.patch.object(
+            self.smoke,
+            "run_cli",
+            side_effect=[
+                (1, b"", b"", terminal, {}),
+                (1, b"", b"", None, {}),
+            ],
+        ) as run_cli:
+            waited = self.smoke.wait_operation("op-A", "unit_wait")
+
+        self.assertEqual(
+            self.smoke.classify_create_attempt(
+                waited, expected_operation_id="op-A"
+            ),
+            {"kind": "inconclusive", "cleanup_drawer_ids": ["drawer-cleanup"]},
+        )
+        self.assertEqual(run_cli.call_count, 2)
+
+        other_operation = {
+            "operation_id": "op-B",
+            "state": "completed",
+            "created_drawer_ids": ["drawer-other"],
+        }
+        expected_operation = {
+            "operation_id": "op-A",
+            "state": "completed",
+            "created_drawer_ids": ["drawer-expected"],
+        }
+        with mock.patch.object(
+            self.smoke,
+            "run_cli",
+            side_effect=[
+                (0, b"", b"", other_operation, {}),
+                (0, b"", b"", expected_operation, {}),
+            ],
+        ) as run_cli:
+            waited = self.smoke.wait_operation("op-A", "unit_wait")
+
+        self.assertEqual(
+            self.smoke.classify_create_attempt(
+                waited, expected_operation_id="op-A"
+            ),
+            {"kind": "inconclusive", "cleanup_drawer_ids": ["drawer-other"]},
+        )
+        self.assertEqual(run_cli.call_count, 1)
 
     def test_cli_mixed_ids_are_cleanup_only_and_rest_stays_reachable(self) -> None:
         def run_cli(label: str, *_args: object, **_kwargs: object) -> tuple[int, bytes, bytes, object, dict[str, object]]:
@@ -457,23 +580,20 @@ class ReviewFixTests(unittest.TestCase):
         self.assertNotIn("op-B", public)
         self.assertNotIn("private-raw-value", public)
 
-    def test_operation_status_raw_contradiction_ids_keep_cleanup_and_reach_rest(self) -> None:
+    def test_mcp_create_status_rejects_other_operation_completion(self) -> None:
         discover = mock.Mock()
         discover.call.return_value = advertised_tools()
         create_client = mock.Mock()
         create_client.tool.return_value = (
-            None,
             {
-                "ok": False,
-                "_raw_mcp_response": {
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "error": {"code": -32603, "message": "private status failure"},
-                    "result": {"structuredContent": {
-                        "cleanup_drawer_ids": ["drawer-status"],
-                        "private_raw_key": "private-raw-value",
-                    }},
-                },
+                "operation_id": "op-B",
+                "state": "completed",
+                "created_drawer_ids": ["drawer-status"],
+                "cleanup_drawer_ids": ["drawer-status"],
+                "private_raw_key": "private-raw-value",
+            },
+            {
+                "ok": True,
             },
         )
         update_client = mock.Mock()
@@ -486,7 +606,7 @@ class ReviewFixTests(unittest.TestCase):
                 "error": {
                     "code": -32603,
                     "message": "queued",
-                    "data": {"operation_id": "operation-queued", "state": "queued"},
+                    "data": {"operation_id": "op-A", "state": "queued"},
                 },
             },
         }
@@ -521,6 +641,9 @@ class ReviewFixTests(unittest.TestCase):
                     self.smoke.mcp_crud(),
                     ["drawer-status", "drawer-rest", "drawer-update"],
                 )
+            create_client.tool.assert_called_once_with(
+                "mempal_operation_status", {"operation_id": "op-A"}, timeout=30
+            )
             rest_fallback.assert_called_once()
             saved = manifest.path.read_text(encoding="utf-8")
             self.assertEqual(
@@ -574,11 +697,9 @@ class ReviewFixTests(unittest.TestCase):
             manifest = self.smoke.CleanupManifest(Path(tmp) / "cleanup.json")
             setattr(self.smoke, "CLEANUP_MANIFEST", manifest)
             body = {
-                "error": {
-                    "created_drawer_ids": ["drawer-rest-error"],
-                    "cleanup_drawer_ids": ["drawer-rest-error"],
-                    "private_raw_key": "private-raw-value",
-                }
+                "created_drawer_ids": ["drawer-rest-error"],
+                "cleanup_drawer_ids": ["drawer-rest-error"],
+                "private_raw_key": "private-raw-value",
             }
             created_error = HTTPError(
                 "http://127.0.0.1:3080/api/ingest",
@@ -594,7 +715,7 @@ class ReviewFixTests(unittest.TestCase):
             self.assertEqual(ids, ["drawer-rest-error"])
             self.assertEqual(
                 disposition,
-                {"kind": "inconclusive", "created_drawer_ids": ["drawer-rest-error"]},
+                {"kind": "inconclusive", "cleanup_drawer_ids": ["drawer-rest-error"]},
             )
             self.assertEqual(
                 json.loads(manifest.path.read_text(encoding="utf-8")),

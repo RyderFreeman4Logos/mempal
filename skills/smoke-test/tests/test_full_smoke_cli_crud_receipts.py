@@ -253,7 +253,7 @@ class CliCrudReceiptTests(unittest.TestCase):
         attempt = smoke.create_attempt_from_mcp_info(info)
 
         self.assertIsNone(structured)
-        self.assertEqual(smoke.created_ids_from(attempt), ["drawer-from-result"])
+        self.assertEqual(smoke.cleanup_ids_from(attempt), ["drawer-from-result"])
         self.assertIsNone(smoke.holder_budget_no_write_receipt(attempt))
 
     def test_mcp_result_ids_are_a_created_attempt(self) -> None:
@@ -265,7 +265,11 @@ class CliCrudReceiptTests(unittest.TestCase):
         self.assertEqual(structured, {"created_drawer_ids": ["drawer-from-result"]})
         self.assertEqual(
             smoke.classify_create_attempt(smoke.create_attempt_from_mcp_info(info)),
-            {"kind": "created", "created_drawer_ids": ["drawer-from-result"]},
+            {
+                "kind": "created",
+                "created_drawer_ids": ["drawer-from-result"],
+                "cleanup_drawer_ids": ["drawer-from-result"],
+            },
         )
 
     def test_mcp_coherence_contradictions_reach_rest_fallback(self) -> None:
@@ -444,7 +448,7 @@ class CliCrudReceiptTests(unittest.TestCase):
             smoke.SUMMARY = original_summary
             smoke.CLEANUP_MANIFEST = original_manifest
 
-    def test_outer_ids_override_nested_no_write_receipts(self) -> None:
+    def test_nested_failure_cancels_outer_created_authority(self) -> None:
         smoke = load_full_smoke()
         envelope = {
             "created_drawer_ids": ["drawer-direct"],
@@ -454,60 +458,62 @@ class CliCrudReceiptTests(unittest.TestCase):
         ids, info = smoke.recover_created_ids(envelope, "unused_wait")
 
         self.assertEqual(ids, ["drawer-direct"])
+        self.assertEqual(info["kind"], "inconclusive")
         self.assertNotIn("outcome", info)
         self.assertIsNone(smoke.holder_budget_no_write_receipt(envelope))
-        self.assertEqual(
-            smoke.create_terminal_receipt(envelope),
-            {
-                "outcome": "write_accepted",
+        self.assertIsNone(smoke.create_terminal_receipt(envelope))
+
+    def test_cli_nested_failure_reaches_fallback_and_keeps_cleanup_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            smoke = load_full_smoke()
+            original_manifest = smoke.CLEANUP_MANIFEST
+            manifest = smoke.CleanupManifest(Path(tmp) / "cleanup.json")
+            smoke.CLEANUP_MANIFEST = manifest
+            direct = {
                 "created_drawer_ids": ["drawer-direct"],
-                "cleanup_required": True,
-            },
-        )
+                "error": self.mcp_holder_budget_receipt(),
+            }
 
-    def test_cli_outer_ids_override_nested_no_write_and_reach_manifest(self) -> None:
-        for nested_key in ("error", "terminal_receipt"):
-            with self.subTest(nested_key=nested_key), tempfile.TemporaryDirectory() as tmp:
-                smoke = load_full_smoke()
-                original_manifest = smoke.CLEANUP_MANIFEST
-                manifest = smoke.CleanupManifest(Path(tmp) / "cleanup.json")
-                smoke.CLEANUP_MANIFEST = manifest
-                direct = {
-                    "created_drawer_ids": ["drawer-direct"],
-                    nested_key: self.mcp_holder_budget_receipt(),
-                }
+            def run_cli(label: str, *_args: Any, **_kwargs: Any) -> tuple[int, bytes, bytes, dict[str, Any], dict[str, Any]]:
+                if label == "cli_create":
+                    return 0, b"", b"", direct, {}
+                if label == "cli_update":
+                    return 0, b"", b"", {"created_drawer_ids": ["drawer-update"]}, {}
+                return 0, b"", b"", {"results": []}, {}
 
-                def run_cli(label: str, *_args: Any, **_kwargs: Any) -> tuple[int, bytes, bytes, dict[str, Any], dict[str, Any]]:
-                    if label == "cli_create":
-                        return 0, b"", b"", direct, {}
-                    if label == "cli_update":
-                        return 0, b"", b"", {"created_drawer_ids": ["drawer-update"]}, {}
-                    return 0, b"", b"", {"results": []}, {}
-
-                try:
-                    with (
-                        mock.patch.object(smoke, "run_cli", side_effect=run_cli),
-                        mock.patch.object(
-                            smoke,
-                            "delete_exact_ids_cli",
-                            return_value={"deleted_count": 2, "failed_count": 0},
+            try:
+                with (
+                    mock.patch.object(smoke, "run_cli", side_effect=run_cli),
+                    mock.patch.object(
+                        smoke,
+                        "delete_exact_ids_cli",
+                        return_value={"deleted_count": 3, "failed_count": 0},
+                    ),
+                    mock.patch.object(
+                        smoke,
+                        "_rest_ingest_fallback",
+                        return_value=(
+                            ["drawer-rest"],
+                            {
+                                "kind": "created",
+                                "created_drawer_ids": ["drawer-rest"],
+                                "cleanup_drawer_ids": ["drawer-rest"],
+                            },
                         ),
-                        mock.patch.object(
-                            smoke,
-                            "_rest_ingest_fallback",
-                            side_effect=AssertionError("REST must not follow explicit cleanup IDs"),
-                        ) as rest_fallback,
-                    ):
-                        self.assertEqual(smoke.cli_crud(), ["drawer-direct", "drawer-update"])
-                    rest_fallback.assert_not_called()
-                    self.assertEqual(manifest.pending_count, 2)
-                    self.assertTrue(smoke.SUMMARY["groups"]["cli_crud"]["ok"])
-                    self.assertNotIn("admission_blocked_no_write", smoke.SUMMARY["groups"]["cli_crud"].values())
-                finally:
-                    manifest.discard()
-                    smoke.CLEANUP_MANIFEST = original_manifest
+                    ) as rest_fallback,
+                ):
+                    self.assertEqual(
+                        smoke.cli_crud(),
+                        ["drawer-direct", "drawer-rest", "drawer-update"],
+                    )
+                rest_fallback.assert_called_once()
+                self.assertEqual(manifest.pending_count, 3)
+                self.assertTrue(smoke.SUMMARY["groups"]["cli_crud"]["ok"])
+            finally:
+                manifest.discard()
+                smoke.CLEANUP_MANIFEST = original_manifest
 
-    def test_mcp_raw_error_and_result_ids_reach_manifest(self) -> None:
+    def test_mcp_cross_operation_update_stays_cleanup_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             smoke = load_full_smoke()
             original_manifest = smoke.CLEANUP_MANIFEST
@@ -531,6 +537,8 @@ class CliCrudReceiptTests(unittest.TestCase):
             create_client = mock.Mock()
             update_client = mock.Mock()
             update_client.tool.return_value = ({"results": []}, {"ok": True})
+            final_client = mock.Mock()
+            final_client.tool.return_value = ({"results": []}, {"ok": True})
             structured, info = self.mcp_error_tool_result(
                 smoke,
                 self.mcp_holder_budget_receipt(),
@@ -541,13 +549,29 @@ class CliCrudReceiptTests(unittest.TestCase):
                     }
                 },
             )
+            update_info = {
+                "ok": False,
+                "_raw_mcp_response": {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "error": {
+                        "code": -32603,
+                        "message": "queued",
+                        "data": {
+                            "operation_id": "op-A",
+                            "state": "queued",
+                            "timed_out": True,
+                        },
+                    },
+                },
+            }
 
             try:
                 with (
                     mock.patch.object(
                         smoke,
                         "mcp_start_initialized",
-                        side_effect=[discover, create_client, update_client],
+                        side_effect=[discover, create_client, update_client, final_client],
                     ),
                     mock.patch.object(smoke, "mcp_call_isolated"),
                     mock.patch.object(
@@ -558,18 +582,23 @@ class CliCrudReceiptTests(unittest.TestCase):
                     mock.patch.object(
                         smoke,
                         "_mcp_tool_with_hard_timeout",
-                        side_effect=[
-                            (structured, info),
-                            self.mcp_success_tool_result(
-                                {"created_drawer_ids": ["drawer-update"]}
-                            ),
-                        ],
+                        side_effect=[(structured, info), (None, update_info)],
                     ),
+                    mock.patch.object(
+                        smoke,
+                        "wait_operation",
+                        return_value={
+                            "operation_id": "op-B",
+                            "state": "completed",
+                            "created_drawer_ids": ["drawer-other"],
+                            "cleanup_drawer_ids": ["drawer-other"],
+                        },
+                    ) as wait_operation,
                     mock.patch.object(
                         smoke,
                         "delete_exact_ids_mcp",
                         return_value={
-                            "deleted_count": 3,
+                            "deleted_count": 4,
                             "failed_count": 0,
                             "delete_failed_attempt_count": 0,
                         },
@@ -577,13 +606,40 @@ class CliCrudReceiptTests(unittest.TestCase):
                     mock.patch.object(
                         smoke,
                         "_rest_ingest_fallback",
-                        return_value=(["drawer-rest"], {"kind": "created", "created_drawer_ids": ["drawer-rest"]}),
+                        side_effect=[
+                            (
+                                ["drawer-rest"],
+                                {
+                                    "kind": "created",
+                                    "created_drawer_ids": ["drawer-rest"],
+                                    "cleanup_drawer_ids": ["drawer-rest"],
+                                },
+                            ),
+                            (
+                                ["drawer-update-rest"],
+                                {
+                                    "kind": "created",
+                                    "created_drawer_ids": ["drawer-update-rest"],
+                                    "cleanup_drawer_ids": ["drawer-update-rest"],
+                                },
+                            ),
+                        ],
                     ) as rest_fallback,
                 ):
-                    self.assertEqual(smoke.mcp_crud(), ["drawer-direct", "drawer-rest", "drawer-update"])
-                rest_fallback.assert_called_once()
-                self.assertEqual(manifest.pending_count, 3)
+                    self.assertEqual(
+                        smoke.mcp_crud(),
+                        [
+                            "drawer-direct",
+                            "drawer-rest",
+                            "drawer-other",
+                            "drawer-update-rest",
+                        ],
+                    )
+                self.assertEqual(rest_fallback.call_count, 2)
+                wait_operation.assert_called_once_with("op-A", "mcp_update_cli_wait")
+                self.assertEqual(manifest.pending_count, 4)
                 self.assertFalse(smoke.SUMMARY["groups"]["mcp_create"]["ok"])
+                self.assertFalse(smoke.SUMMARY["groups"]["mcp_update"]["ok"])
             finally:
                 manifest.discard()
                 smoke.CLEANUP_MANIFEST = original_manifest
@@ -652,6 +708,7 @@ class CliCrudReceiptTests(unittest.TestCase):
                         smoke,
                         "wait_operation",
                         return_value={
+                            "operation_id": "op-queued",
                             "state": "completed",
                             "created_drawer_ids": ["drawer-recovered"],
                             "cleanup_drawer_ids": ["drawer-recovered"],

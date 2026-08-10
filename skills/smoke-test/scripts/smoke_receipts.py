@@ -5,7 +5,7 @@ from typing import Any
 
 __all__ = [
     "classify_create_attempt",
-    "created_ids_from",
+    "cleanup_ids_from",
     "holder_budget_no_write_receipt",
     "operation_id_from",
     "operation_state_from",
@@ -60,10 +60,31 @@ def receipt_dicts_from(value: Any) -> list[dict[str, Any]]:
     return receipts
 
 
-def _created_id_evidence(value: Any) -> tuple[list[str], bool]:
-    ids: list[str] = []
+def _drawer_id_evidence(
+    value: Any, *, expected_operation_id: str | None = None
+) -> tuple[list[str], list[str], bool, bool]:
+    created_ids: list[str] = []
+    cleanup_ids: list[str] = []
     malformed = False
+    conflicting_failure = False
     for receipt in receipt_dicts_from(value):
+        if "returncode" in receipt:
+            returncode = receipt["returncode"]
+            if (
+                not isinstance(returncode, int)
+                or isinstance(returncode, bool)
+                or returncode != 0
+            ):
+                conflicting_failure = True
+        if (
+            "error" in receipt
+            or receipt.get("state") in {"rejected", "failed"}
+            or receipt.get("outcome") == "admission_blocked"
+            or receipt.get("action") == "write_refused"
+            or receipt.get("ok") is False
+            or receipt.get("success") is False
+        ):
+            conflicting_failure = True
         for key in ("created_drawer_ids", "cleanup_drawer_ids"):
             if key not in receipt:
                 continue
@@ -73,64 +94,102 @@ def _created_id_evidence(value: Any) -> tuple[list[str], bool]:
                 continue
             for item in values:
                 if isinstance(item, str) and item:
-                    ids.append(item)
+                    cleanup_ids.append(item)
+                    if key == "created_drawer_ids":
+                        if (
+                            expected_operation_id is None
+                            or receipt.get("operation_id") == expected_operation_id
+                        ):
+                            created_ids.append(item)
+                        else:
+                            conflicting_failure = True
                 else:
                     malformed = True
-    return list(dict.fromkeys(ids)), malformed
+    return (
+        list(dict.fromkeys(created_ids)),
+        list(dict.fromkeys(cleanup_ids)),
+        malformed,
+        conflicting_failure,
+    )
 
 
-def created_ids_from(value: Any) -> list[str]:
+def cleanup_ids_from(value: Any) -> list[str]:
     """Return validated explicit create/cleanup IDs from protocol receipt fields."""
-    return _created_id_evidence(value)[0]
+    return _drawer_id_evidence(value)[1]
 
 
-def _operation_evidence(value: Any) -> tuple[str | None, str | None, bool, bool]:
+def _operation_evidence(
+    value: Any, *, expected_operation_id: str | None = None
+) -> tuple[str | None, str | None, bool, bool]:
     """Return one coherent operation ID, its state/timeout, and invalidity."""
-    operation_ids: list[str] = []
-    last_state: str | None = None
-    terminal_state: str | None = None
-    timed_out = False
+    records: list[tuple[str, str | None, bool]] = []
     malformed = False
     for receipt in receipt_dicts_from(value):
-        if "operation_id" in receipt:
-            operation_id = receipt["operation_id"]
-            if isinstance(operation_id, str) and operation_id:
-                operation_ids.append(operation_id)
-            else:
-                malformed = True
+        if {"operation_id", "state", "timed_out"}.isdisjoint(receipt):
+            continue
+        operation_id = receipt.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            malformed = True
+            continue
+        state: str | None = None
         if "state" in receipt:
             state = receipt["state"]
             if not isinstance(state, str) or state not in _OPERATION_STATES:
                 malformed = True
-            elif state in {"completed", "rejected", "failed"}:
-                terminal_state = terminal_state or state
-            else:
-                last_state = state
+                state = None
+        timed_out = False
         if "timed_out" in receipt:
             timeout = receipt["timed_out"]
             if not isinstance(timeout, bool):
                 malformed = True
             else:
-                timed_out = timed_out or timeout
-    unique_ids = list(dict.fromkeys(operation_ids))
-    if malformed or len(unique_ids) > 1:
+                timed_out = timeout
+        records.append((operation_id, state, timed_out))
+    unique_ids = list(dict.fromkeys(record[0] for record in records))
+    terminal_states = {
+        state
+        for _operation_id, state, _timed_out in records
+        if state in {"completed", "rejected", "failed"}
+    }
+    if (
+        malformed
+        or len(unique_ids) > 1
+        or len(terminal_states) > 1
+        or (
+            expected_operation_id is not None
+            and (
+                not isinstance(expected_operation_id, str)
+                or not expected_operation_id
+                or unique_ids != [expected_operation_id]
+            )
+        )
+    ):
         return None, None, False, True
+    states = [state for _operation_id, state, _timed_out in records if state is not None]
     return (
         unique_ids[0] if unique_ids else None,
-        terminal_state or last_state,
-        timed_out,
+        next(iter(terminal_states)) if terminal_states else (states[-1] if states else None),
+        any(record[2] for record in records),
         False,
     )
 
 
-def operation_id_from(value: Any) -> str | None:
+def operation_id_from(
+    value: Any, *, expected_operation_id: str | None = None
+) -> str | None:
     """Return the sole coherent operation ID from the complete attempt."""
-    return _operation_evidence(value)[0]
+    return _operation_evidence(
+        value, expected_operation_id=expected_operation_id
+    )[0]
 
 
-def operation_state_from(value: Any) -> str | None:
+def operation_state_from(
+    value: Any, *, expected_operation_id: str | None = None
+) -> str | None:
     """Return state only when the complete attempt has coherent operation evidence."""
-    return _operation_evidence(value)[1]
+    return _operation_evidence(
+        value, expected_operation_id=expected_operation_id
+    )[1]
 
 
 def _is_nonnegative_rust_wire_integer(value: Any) -> bool:
@@ -329,8 +388,10 @@ def _cli_holder_budget_no_write_receipt(value: Any) -> dict[str, Any] | None:
 
 def holder_budget_no_write_receipt(value: Any) -> dict[str, Any] | None:
     """Return a strict no-write receipt only after whole-attempt classification."""
-    created_ids, malformed_ids = _created_id_evidence(value)
-    if created_ids or malformed_ids:
+    _created_ids, cleanup_ids, malformed_ids, _conflicting_failure = (
+        _drawer_id_evidence(value)
+    )
+    if cleanup_ids or malformed_ids:
         return None
     return (
         _mcp_holder_budget_no_write_receipt(value)
@@ -339,46 +400,44 @@ def holder_budget_no_write_receipt(value: Any) -> dict[str, Any] | None:
     )
 
 
-def classify_create_attempt(value: Any) -> dict[str, Any]:
+def classify_create_attempt(
+    value: Any, *, expected_operation_id: str | None = None
+) -> dict[str, Any]:
     """Classify a complete create attempt before producing smoke-safe summaries."""
-    created_ids, malformed_ids = _created_id_evidence(value)
-    id_evidence = {"created_drawer_ids": created_ids} if created_ids else {}
-    operation_id, state, timed_out, malformed_operation = _operation_evidence(value)
-    if malformed_operation:
-        return {"kind": "inconclusive", **id_evidence}
+    created_ids, cleanup_ids, malformed_ids, conflicting_failure = (
+        _drawer_id_evidence(value, expected_operation_id=expected_operation_id)
+    )
+    cleanup_evidence = {"cleanup_drawer_ids": cleanup_ids} if cleanup_ids else {}
+    operation_id, state, timed_out, malformed_operation = _operation_evidence(
+        value, expected_operation_id=expected_operation_id
+    )
+    if malformed_operation or malformed_ids:
+        return {"kind": "inconclusive", **cleanup_evidence}
     if operation_id is not None and state not in {"completed", "rejected", "failed"}:
         queued = {
             "kind": "queued",
             "operation_id": operation_id,
             "state": state,
-            **id_evidence,
+            **cleanup_evidence,
         }
         if timed_out:
             queued["timed_out"] = True
         return queued
     if state in {"queued", "running", "rejected", "failed"}:
-        return {"kind": "inconclusive", **id_evidence}
-    direct_id_fields = {"created_drawer_ids", "cleanup_drawer_ids"}
-    cleanup_only_ids = (
-        isinstance(value, dict)
-        and (
-            (
-                value.get("jsonrpc") == "2.0"
-                and (
-                    "error" in value
-                    or ("result" in value and not isinstance(value["result"], dict))
-                )
-            )
-            or ("error" in value and direct_id_fields.isdisjoint(value))
-        )
+        return {"kind": "inconclusive", **cleanup_evidence}
+    receipt = (
+        holder_budget_no_write_receipt(value)
+        if expected_operation_id is None
+        else None
     )
-    if malformed_ids or (created_ids and cleanup_only_ids):
-        return {"kind": "inconclusive", **id_evidence}
-    if created_ids:
-        return {"kind": "created", "created_drawer_ids": created_ids}
-    if operation_id is not None:
-        return {"kind": "queued", "operation_id": operation_id, "state": state}
-    receipt = holder_budget_no_write_receipt(value)
     if receipt is not None:
         return {"kind": "proven_no_write", "receipt": receipt}
-    return {"kind": "inconclusive"}
+    if conflicting_failure:
+        return {"kind": "inconclusive", **cleanup_evidence}
+    if created_ids:
+        return {
+            "kind": "created",
+            "created_drawer_ids": created_ids,
+            **cleanup_evidence,
+        }
+    return {"kind": "inconclusive", **cleanup_evidence}
