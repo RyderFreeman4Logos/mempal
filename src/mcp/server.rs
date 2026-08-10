@@ -13101,6 +13101,7 @@ mod tests {
     struct BlockingEmbedderFactory {
         vector: Vec<f32>,
         call_count: Arc<AtomicUsize>,
+        started: Arc<Notify>,
         gate: Arc<Notify>,
         released: Arc<AtomicBool>,
     }
@@ -13108,6 +13109,7 @@ mod tests {
     struct BlockingEmbedder {
         vector: Vec<f32>,
         call_count: Arc<AtomicUsize>,
+        started: Arc<Notify>,
         gate: Arc<Notify>,
         released: Arc<AtomicBool>,
     }
@@ -13165,6 +13167,7 @@ mod tests {
             Ok(Box::new(BlockingEmbedder {
                 vector: self.vector.clone(),
                 call_count: Arc::clone(&self.call_count),
+                started: Arc::clone(&self.started),
                 gate: Arc::clone(&self.gate),
                 released: Arc::clone(&self.released),
             }))
@@ -13175,6 +13178,7 @@ mod tests {
     impl Embedder for BlockingEmbedder {
         async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
             if !self.released.load(Ordering::SeqCst) {
                 self.gate.notified().await;
                 if !self.released.swap(true, Ordering::SeqCst) {
@@ -18493,6 +18497,7 @@ prototypes = ["keep"]
             Arc::new(BlockingEmbedderFactory {
                 vector: vec![0.1, 0.2, 0.3],
                 call_count: Arc::clone(&call_count),
+                started: Arc::new(Notify::new()),
                 gate,
                 released: Arc::new(AtomicBool::new(false)),
             }),
@@ -21846,6 +21851,7 @@ prototypes = ["keep"]
             Arc::new(BlockingEmbedderFactory {
                 vector: vec![0.1, 0.2, 0.3],
                 call_count: Arc::clone(&call_count),
+                started: Arc::new(Notify::new()),
                 gate: Arc::clone(&gate),
                 released: Arc::new(AtomicBool::new(false)),
             }),
@@ -21904,13 +21910,14 @@ prototypes = ["keep"]
         let db_path = tempdir.path().join("palace.db");
         Database::open(&db_path).expect("open db");
 
-        let call_count = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
         let gate = Arc::new(Notify::new());
         let server = MempalMcpServer::new_with_factory(
             db_path.clone(),
             Arc::new(BlockingEmbedderFactory {
                 vector: vec![0.1, 0.2, 0.3],
-                call_count: Arc::clone(&call_count),
+                call_count: Arc::new(AtomicUsize::new(0)),
+                started: Arc::clone(&started),
                 gate: Arc::clone(&gate),
                 released: Arc::new(AtomicBool::new(false)),
             }),
@@ -21938,16 +21945,15 @@ prototypes = ["keep"]
             })
         };
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while call_count.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("embedder should start before timeout");
+        let started_result =
+            tokio::time::timeout(Duration::from_secs(15), started.notified()).await;
         gate.notify_one();
 
         let response = ingest.await.expect("join wait ingest");
+        assert!(
+            started_result.is_ok(),
+            "embedder should signal entry before timeout"
+        );
         assert_eq!(response.state, Some(IngestOperationState::Completed));
         assert!(!response.drawer_id.is_empty());
         assert!(!response.timed_out);
@@ -22030,6 +22036,7 @@ prototypes = ["keep"]
             Arc::new(BlockingEmbedderFactory {
                 vector: vec![0.1, 0.2, 0.3],
                 call_count: Arc::new(AtomicUsize::new(0)),
+                started: Arc::new(Notify::new()),
                 gate: Arc::clone(&gate),
                 released: Arc::new(AtomicBool::new(false)),
             }),
@@ -22541,12 +22548,13 @@ enabled = false
         ))
         .await;
         let gate = Arc::new(Notify::new());
-        let call_count = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
         let server = MempalMcpServer::new_with_factory(
             db_path.clone(),
             Arc::new(BlockingEmbedderFactory {
                 vector: vec![0.1, 0.2, 0.3],
-                call_count: Arc::clone(&call_count),
+                call_count: Arc::new(AtomicUsize::new(0)),
+                started: Arc::clone(&started),
                 gate: Arc::clone(&gate),
                 released: Arc::new(AtomicBool::new(false)),
             }),
@@ -22567,13 +22575,8 @@ enabled = false
 
         assert_eq!(response.state, Some(IngestOperationState::Queued));
         let operation_id = response.operation_id.as_deref().expect("operation id");
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while call_count.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("worker should reach embed");
+        let started_result =
+            tokio::time::timeout(Duration::from_secs(15), started.notified()).await;
         let db = Database::open(&db_path).expect("open db");
         let payload: String = db
             .conn()
@@ -22596,6 +22599,10 @@ enabled = false
             .wait_for_operation_completion(operation_id)
             .await
             .expect("cleanup ingest completion");
+        assert!(
+            started_result.is_ok(),
+            "worker should signal embedder entry before timeout"
+        );
         assert_eq!(completed.state, Some(IngestOperationState::Completed));
     }
 

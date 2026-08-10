@@ -613,7 +613,13 @@ impl DeadlineChild {
                 SetupOutcome::Pending if Instant::now() >= deadline => {
                     return Ok(SetupWait::TimedOut);
                 }
-                SetupOutcome::Pending => self.wait_for_event(deadline)?,
+                SetupOutcome::Pending => match self.wait_for_event(deadline) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                        return Ok(SetupWait::TimedOut);
+                    }
+                    Err(error) => return Err(error),
+                },
             }
         }
     }
@@ -627,7 +633,11 @@ impl DeadlineChild {
             if Instant::now() >= deadline {
                 return Ok(false);
             }
-            self.wait_for_event(deadline)?;
+            match self.wait_for_event(deadline) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => return Ok(false),
+                Err(error) => return Err(error),
+            }
         }
     }
 
