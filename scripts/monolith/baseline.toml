@@ -373,10 +373,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 181394
-baseline_lines = 22883
+baseline_tokens = 182087
+baseline_lines = 22962
 issue = "876"
-rationale = "#876 preserves holder-budget no-write evidence and bounds MCP search embed deadlines for deadline fixtures; exact no-growth ratchet."
+rationale = "#876 preserves holder-budget no-write evidence, bounds MCP search embed deadlines, and adds distinguishing deadline/admission regression tests; exact no-growth ratchet."
 
 [[files]]
 path = "src/mcp/tools.rs"

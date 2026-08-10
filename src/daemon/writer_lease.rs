@@ -240,6 +240,19 @@ fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn writer_lease_retry_classifier_treats_admission_busy_as_lock() {
+        let busy = crate::core::db_admission::DbAdmissionError::Busy {
+            path: PathBuf::from("/tmp/profile.db.admission.lock"),
+            timeout_ms: 250,
+        };
+        let wrapped = anyhow::Error::new(busy).context("failed to open DB for writer lease renew");
+        assert!(
+            anyhow_error_is_sqlite_lock(&wrapped),
+            "admission Busy must remain retryable through the renew classifier"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn daemon_writer_lease_waits_for_holder_release_before_admission() {
         let tempdir = tempfile::tempdir().expect("create tempdir");

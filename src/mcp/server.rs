@@ -16043,6 +16043,85 @@ pattern_boost = 0.2
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_search_embed_deadline_override_falls_back_without_waiting_for_gate() {
+        // Distinguishes the search_embed_deadline test seam from production's
+        // 240s embed.retry.search_deadline_secs: leave the embedder blocked and
+        // assert mempal_search still returns BM25-only within a short client budget.
+        let _config_guard = ConfigOverrideGuard::install(
+            "[search]\nbm25_fallback = true\n\n[embed.retry]\nsearch_deadline_secs = 240\n",
+        )
+        .await;
+        let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        insert_drawer(
+            &db_path,
+            "bounded-embed-search",
+            "bounded embed search marker",
+            "mcp",
+            Some("deadline"),
+            "bounded-embed-search.md",
+            3,
+        );
+        let query_only_async_db =
+            QueryOnlyAsyncDb::open(&db_path, 4).expect("open query-only async db fixture");
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(Notify::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let server = MempalMcpServer::new_with_factory(
+            db_path,
+            Arc::new(BlockingEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+                call_count: Arc::clone(&call_count),
+                started: Arc::clone(&started),
+                gate,
+                released: Arc::new(AtomicBool::new(false)),
+            }),
+        )
+        .expect("create MCP server")
+        .with_query_only_async_db_for_test(query_only_async_db)
+        .with_mcp_deadline_for_test(Duration::from_millis(20));
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(500),
+            server.mempal_search(Parameters(SearchRequest {
+                query: "bounded embed search marker".to_string(),
+                wing: Some("mcp".to_string()),
+                room: Some("deadline".to_string()),
+                top_k: Some(1),
+                disable_progressive: Some(true),
+                ..SearchRequest::default()
+            })),
+        )
+        .await
+        .expect("MCP search must not wait for the production 240s embed budget")
+        .expect("bounded embed-timeout response")
+        .0;
+
+        assert!(
+            call_count.load(Ordering::SeqCst) >= 1,
+            "blocked embedder must be entered so the timeout branch is exercised"
+        );
+        assert_eq!(response.search_mode, SearchMode::Bm25Only.as_str());
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("embedding deadline exceeded")),
+            "embed-timeout warning missing: {:?}",
+            response.warnings
+        );
+        assert!(
+            response
+                .system_warnings
+                .iter()
+                .any(|warning| warning.source == "embed"
+                    && warning.message.contains("embedding deadline exceeded")),
+            "system warning should expose embed timeout: {:?}",
+            response.system_warnings
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_ingest_admission_db_work_runs_off_runtime() {
         let (_tempdir, _db_path, server) = setup_server();
         let server = server.with_ingest_warning_snapshot_delay_for_test(Duration::from_millis(300));

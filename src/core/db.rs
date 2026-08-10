@@ -7819,6 +7819,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn admission_busy_is_classified_as_transient_lock() {
+        let busy = DbError::Admission(super::super::db_admission::DbAdmissionError::Busy {
+            path: PathBuf::from("/tmp/profile.db.admission.lock"),
+            timeout_ms: 250,
+        });
+        assert!(
+            db_error_is_sqlite_lock(&busy),
+            "profile admission Busy is the same transient contention class as SQLITE_BUSY"
+        );
+    }
+
     fn test_drawer(id: &str, content: &str) -> Drawer {
         Drawer::new_bootstrap_evidence(super::super::types::BootstrapEvidenceArgs {
             id: id.to_string(),
