@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8749
-baseline_lines = 613
-issue = "882"
-rationale = "#882's required Unreleased entry documents deterministic SQLite writer-busy and MCP embedder-entry readiness fixtures; exact no-growth ratchet."
+baseline_tokens = 8796
+baseline_lines = 618
+issue = "876"
+rationale = "#876 documents admission-receipt ownership under holder-budget saturation; exact no-growth ratchet after Unreleased entry."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"

@@ -42,6 +42,11 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **Admission receipt ownership**: bind MCP holder-budget no-write receipts and
+  smoke cleanup authority to the owning operation identity so saturated
+  admission attempts cannot emit false write receipts or cross-operation
+  cleanup/delete IDs (#876).
+
 - **Test fixture readiness**: use deterministic readiness synchronization for the
   SQLite writer-busy and MCP embedder-entry fixtures so suite-load contention
   cannot race their assertions (#882).
