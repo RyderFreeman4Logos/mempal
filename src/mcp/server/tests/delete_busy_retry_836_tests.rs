@@ -1,8 +1,6 @@
 use std::time::Duration;
 
-use super::{
-    Database, DeleteRequest, Parameters, hold_sqlite_write_lock, insert_drawer, setup_server,
-};
+use super::{AsyncDb, Database, DeleteRequest, Parameters, insert_drawer, setup_server};
 
 #[tokio::test]
 async fn test_mcp_delete_retries_cached_async_pool_write_after_transient_sqlite_lock() {
@@ -17,27 +15,41 @@ async fn test_mcp_delete_retries_cached_async_pool_write_after_transient_sqlite_
         "/tmp/mcp-delete-busy-retry.md",
         2,
     );
-    server
-        .async_db()
-        .await
-        .expect("fixture must use the cached MCP async database pool");
+    let (busy_event_tx, mut busy_event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let async_db = AsyncDb::open(&db_path, 4)
+        .expect("open deterministic async database fixture")
+        .with_write_busy_timeout_for_test(Duration::from_millis(25), busy_event_tx);
+    let server = server.with_async_db_for_test(async_db);
+    let (release_lock, lock) = hold_sqlite_write_lock_until_released(db_path.clone());
+    let delete = tokio::spawn(async move {
+        server
+            .mempal_delete(Parameters(DeleteRequest {
+                drawer_id: drawer_id.to_string(),
+            }))
+            .await
+    });
 
-    // The cached pool writer has SQLite's five-second busy timeout. Hold the
-    // lock longer so this exercises the retry after run_write returns busy.
-    let lock = hold_sqlite_write_lock(db_path.clone(), Duration::from_millis(5_500));
-    let result = tokio::time::timeout(
-        Duration::from_secs(9),
-        server.mempal_delete(Parameters(DeleteRequest {
-            drawer_id: drawer_id.to_string(),
-        })),
-    )
-    .await;
-    lock.join().expect("release SQLite write lock");
+    // The first event is emitted only after SQLite returns from the locked
+    // write; release happens only after that real Busy result.
+    let first_busy = tokio::time::timeout(Duration::from_secs(1), busy_event_rx.recv()).await;
+    let release_result = release_lock.send(());
+    let lock_result = lock.join();
+    let result = tokio::time::timeout(Duration::from_secs(1), delete).await;
+
+    release_result.expect("release SQLite write lock");
+    lock_result.expect("SQLite lock thread must complete");
+    assert!(
+        first_busy
+            .expect("first SQLite write attempt must return")
+            .is_some(),
+        "the held lock must produce a real SQLite busy result before retrying"
+    );
 
     let delete = match result {
-        Ok(Ok(response)) => response.0,
-        Ok(Err(_)) => panic!("MCP delete should retry the transient SQLite lock"),
-        Err(_) => panic!("MCP delete retry should stay within its bounded lock budget"),
+        Ok(Ok(Ok(response))) => response.0,
+        Ok(Ok(Err(_))) => panic!("MCP delete should retry the transient SQLite lock"),
+        Ok(Err(_)) => panic!("MCP delete task should not panic"),
+        Err(_) => panic!("MCP delete retry should finish after the synchronized release"),
     };
     assert!(delete.deleted);
     assert!(
@@ -47,6 +59,26 @@ async fn test_mcp_delete_retries_cached_async_pool_write_after_transient_sqlite_
             .expect("check drawer after delete"),
         "successful MCP delete must persist the soft deletion"
     );
+}
+
+fn hold_sqlite_write_lock_until_released(
+    db_path: std::path::PathBuf,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let lock = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(db_path).expect("open SQLite lock connection");
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold SQLite write lock");
+        ready_tx.send(()).expect("signal SQLite lock ready");
+        release_rx.recv().expect("receive SQLite lock release");
+        conn.execute_batch("ROLLBACK;")
+            .expect("release SQLite write lock");
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("SQLite write lock must be ready");
+    (release_tx, lock)
 }
 
 #[tokio::test]

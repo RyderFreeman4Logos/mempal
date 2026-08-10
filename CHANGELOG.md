@@ -71,6 +71,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   SQLite writer-busy and MCP embedder-entry fixtures so suite-load contention
   cannot race their assertions (#882).
 
+- **MCP delete retry fixture**: force an observed SQLite Busy result before
+  synchronized lock release, eliminating the 5.5s/9s wall-clock race (#886).
+
 - **Daemon supervisor cooldowns**: wait through active restart-budget
   cooldowns and retry bootstrap in-process; true temporary refusals retain
   `75` (`EX_TEMPFAIL`), while the canonical unit keeps

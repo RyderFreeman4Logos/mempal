@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 9035
-baseline_lines = 638
-issue = "871"
-rationale = "#871 documents typed daemon-outage queue visibility, unavailable observations, and no-manual-DB recovery; exact no-growth ratchet."
+baseline_tokens = 9072
+baseline_lines = 641
+issue = "886"
+rationale = "#886 documents deterministic MCP delete Busy-retry fixture coverage; exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
