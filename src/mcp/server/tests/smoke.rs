@@ -150,7 +150,7 @@ async fn test_mcp_smoke_zero_wait_starts_background_worker() {
 }
 
 #[tokio::test]
-async fn test_mcp_positive_smoke_timeout_starts_background_worker() {
+async fn test_mcp_positive_smoke_timeout_retains_completion_owner() {
     let (_tempdir, _db_path, server) = setup_server();
     let server = server.with_ingest_processing_delay_for_test(Duration::from_secs(1));
 
@@ -168,7 +168,10 @@ async fn test_mcp_positive_smoke_timeout_starts_background_worker() {
         .expect("short smoke wait should return a durable receipt")
         .0;
 
-    assert_eq!(response.state, Some(IngestOperationState::Queued));
+    assert!(matches!(
+        response.state,
+        Some(IngestOperationState::Queued | IngestOperationState::Running)
+    ));
     assert!(response.timed_out);
     let operation_id = response.operation_id.as_deref().expect("operation id");
     let completed = tokio::time::timeout(
@@ -181,6 +184,74 @@ async fn test_mcp_positive_smoke_timeout_starts_background_worker() {
 
     assert_eq!(completed.state, Some(IngestOperationState::Completed));
     assert!(!completed.created_drawer_ids.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_mcp_smoke_wait_real_source_lock_times_out_without_blocking_runtime() {
+    let (_tempdir, db_path, server) = setup_server();
+    let request = IngestRequest {
+        content: "real source lock must not block bounded smoke wait".to_string(),
+        wing: "smoke".to_string(),
+        room: Some("mcp".to_string()),
+        smoke: Some(true),
+        wait: Some(true),
+        wait_timeout_secs: Some(1),
+        ..IngestRequest::default()
+    };
+
+    let preview = server
+        .mempal_ingest(Parameters(IngestRequest {
+            dry_run: Some(true),
+            ..request.clone()
+        }))
+        .await
+        .expect("smoke preview")
+        .0;
+    let mempal_home = db_path.parent().expect("database parent");
+    let source_lock = crate::ingest::lock::acquire_source_lock(
+        mempal_home,
+        &preview.drawer_id,
+        Duration::from_secs(1),
+    )
+    .expect("hold source lock");
+
+    let (ticks, ticker) = spawn_runtime_ticker();
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_millis(1500),
+        server.mempal_ingest(Parameters(request)),
+    )
+    .await;
+    ticker.abort();
+    let response = result
+        .expect("one-second smoke wait must return before sync source-lock timeout")
+        .expect("source-lock contention returns a durable receipt")
+        .0;
+
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "source-lock contention exceeded the bounded smoke wait"
+    );
+    assert!(
+        response.timed_out
+            || response
+                .state
+                .map(IngestOperationState::is_terminal)
+                .unwrap_or(false),
+        "bounded smoke wait must return a timeout or terminal receipt"
+    );
+    assert_runtime_ticked(&ticks, "bounded smoke ingest with a real source lock");
+
+    let operation_id = response.operation_id.as_deref().expect("operation id");
+    drop(source_lock);
+    let completed = tokio::time::timeout(
+        Duration::from_secs(4),
+        server.wait_for_operation_completion(operation_id),
+    )
+    .await
+    .expect("claimed work must retain an owner after the request deadline")
+    .expect("source-lock-contended smoke operation should complete");
+    assert_eq!(completed.state, Some(IngestOperationState::Completed));
 }
 
 #[tokio::test]

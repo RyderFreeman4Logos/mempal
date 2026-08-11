@@ -260,11 +260,6 @@ fn scoped_ingest_processing_budget(
         .filter(|budget| *budget >= minimum)
 }
 
-fn scoped_process_remaining(started: Instant, budget: Duration) -> Option<Duration> {
-    let remaining = budget.saturating_sub(started.elapsed());
-    (!remaining.is_zero()).then_some(remaining)
-}
-
 fn ingest_request_deadline(started: Instant, wait: bool, wait_timeout_secs: u64) -> Instant {
     let budget = if wait {
         clamp_wait_timeout(Duration::from_secs(wait_timeout_secs))
@@ -1432,10 +1427,6 @@ impl MempalMcpServer {
                 }
             }
         };
-        #[cfg(any(test, feature = "db-test-seam"))]
-        if let Some(delay) = self.ingest_processing_delay {
-            tokio::time::sleep(delay).await;
-        }
         let runtime_writer_lease = external_writer_lease
             .or_else(|| writer_lease.as_ref().map(|lease| lease.lease().clone()));
         let outcome = match self
@@ -1524,261 +1515,25 @@ impl MempalMcpServer {
         claim: ClaimedMessage,
         budget: Duration,
     ) -> anyhow::Result<ScopedIngestProcessResult> {
-        let started = Instant::now();
-        let queue_wait_ms = queue_wait_ms(claim.created_at, claim.claimed_at);
-        let queued = match decode_queued_ingest_operation(&claim.payload) {
-            Some(queued) => queued,
-            None => {
-                let detail = format!("failed to decode ingest operation {}", claim.id);
-                let completion_deadline =
-                    scoped_process_remaining(started, budget).unwrap_or_default();
-                if let Err(error) = complete_failed_ingest_claim_with_lock_retry_deadline(
-                    queue,
-                    &claim,
-                    queue_wait_ms,
-                    detail,
-                    completion_deadline.saturating_sub(MCP_SCOPED_INGEST_CLAIM_CLEANUP_MARGIN),
-                    true,
-                    self.daemon_write_observer.as_ref(),
-                )
+        let scoped_worker = self.clone();
+        let scoped_queue = queue.clone();
+        let scoped_worker_id = worker_id.to_string();
+        let processing = tokio::spawn(async move {
+            scoped_worker
+                .process_ingest_claim_inline(&scoped_queue, &scoped_worker_id, claim)
                 .await
-                {
-                    if anyhow_chain_contains_sqlite_lock(&error) {
-                        let release_deadline =
-                            scoped_process_remaining(started, budget).unwrap_or_default();
-                        Self::release_scoped_claim_after_timeout(
-                            queue,
-                            claim,
-                            release_deadline,
-                            self.daemon_write_observer.as_ref(),
-                        )
-                        .await?;
-                        return Ok(ScopedIngestProcessResult::TimedOut);
-                    }
-                    return Err(error);
-                }
-                return Ok(ScopedIngestProcessResult::Processed);
-            }
-        };
+        });
 
-        let (stop_tx, heartbeat) = Self::spawn_ingest_claim_heartbeat(
-            queue.clone(),
-            claim.id.clone(),
-            worker_id,
-            self.daemon_write_observer.clone(),
-        );
-        let external_writer_lease = self.external_ingest_writer_lease.clone();
-        let writer_lease = if external_writer_lease.is_some() {
-            None
-        } else {
-            let Some(remaining) = scoped_process_remaining(started, budget) else {
-                Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                Self::release_scoped_claim_after_timeout(
-                    queue,
-                    claim,
-                    Duration::ZERO,
-                    self.daemon_write_observer.as_ref(),
-                )
-                .await?;
-                return Ok(ScopedIngestProcessResult::TimedOut);
-            };
-            match tokio::time::timeout(remaining, self.acquire_ingest_writer_lease(worker_id)).await
-            {
-                Ok(Ok(Some(lease))) => Some(lease),
-                Ok(Ok(None)) => {
-                    Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                    Self::release_claim_with_lock_retry_deadline(
-                        queue,
-                        claim,
-                        remaining.min(CLAIM_LOCK_RETRY_DEADLINE),
-                        self.daemon_write_observer.as_ref(),
-                    )
-                    .await
-                    .context("failed to release scoped ingest claim after writer lease conflict")?;
-                    return Ok(ScopedIngestProcessResult::ReleasedForRetry);
-                }
-                Ok(Err(error)) if anyhow_chain_contains_sqlite_lock(&error) => {
-                    Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                    Self::release_claim_with_lock_retry_deadline(
-                        queue,
-                        claim,
-                        remaining.min(CLAIM_LOCK_RETRY_DEADLINE),
-                        self.daemon_write_observer.as_ref(),
-                    )
-                    .await
-                    .context(
-                        "failed to release scoped ingest claim after transient writer lease lock",
-                    )?;
-                    return Ok(ScopedIngestProcessResult::ReleasedForRetry);
-                }
-                Ok(Err(error)) => {
-                    Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                    let release_deadline =
-                        scoped_process_remaining(started, budget).unwrap_or_default();
-                    Self::release_scoped_claim_after_timeout(
-                        queue,
-                        claim,
-                        release_deadline,
-                        self.daemon_write_observer.as_ref(),
-                    )
-                    .await?;
-                    return Err(error).context("failed to acquire scoped MCP ingest writer lease");
-                }
-                Err(_) => {
-                    Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                    Self::release_scoped_claim_after_timeout(
-                        queue,
-                        claim,
-                        Duration::ZERO,
-                        self.daemon_write_observer.as_ref(),
-                    )
-                    .await?;
-                    return Ok(ScopedIngestProcessResult::TimedOut);
-                }
+        match tokio::time::timeout(budget, processing).await {
+            Ok(Ok(Ok(()))) => Ok(ScopedIngestProcessResult::Processed),
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Err(error)) => {
+                Err(anyhow::Error::new(error).context("scoped ingest claim task failed"))
             }
-        };
-
-        #[cfg(any(test, feature = "db-test-seam"))]
-        if let Some(delay) = self.ingest_processing_delay {
-            let Some(remaining) = scoped_process_remaining(started, budget) else {
-                Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                if let Some(writer_lease) = writer_lease {
-                    let _ = writer_lease.release().await;
-                }
-                Self::release_scoped_claim_after_timeout(
-                    queue,
-                    claim,
-                    Duration::ZERO,
-                    self.daemon_write_observer.as_ref(),
-                )
-                .await?;
-                return Ok(ScopedIngestProcessResult::TimedOut);
-            };
-            if tokio::time::timeout(remaining, tokio::time::sleep(delay))
-                .await
-                .is_err()
-            {
-                Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                if let Some(writer_lease) = writer_lease {
-                    let _ = writer_lease.release().await;
-                }
-                let release_deadline =
-                    scoped_process_remaining(started, budget).unwrap_or_default();
-                Self::release_scoped_claim_after_timeout(
-                    queue,
-                    claim,
-                    release_deadline,
-                    self.daemon_write_observer.as_ref(),
-                )
-                .await?;
-                return Ok(ScopedIngestProcessResult::TimedOut);
-            }
+            // Dropping a JoinHandle detaches the task. That task owns the claim,
+            // heartbeat, and writer lease until it records the terminal receipt.
+            Err(_) => Ok(ScopedIngestProcessResult::TimedOut),
         }
-
-        let runtime_writer_lease = external_writer_lease
-            .or_else(|| writer_lease.as_ref().map(|lease| lease.lease().clone()));
-        let Some(remaining) = scoped_process_remaining(started, budget) else {
-            Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-            if let Some(writer_lease) = writer_lease {
-                let _ = writer_lease.release().await;
-            }
-            Self::release_scoped_claim_after_timeout(
-                queue,
-                claim,
-                Duration::ZERO,
-                self.daemon_write_observer.as_ref(),
-            )
-            .await?;
-            return Ok(ScopedIngestProcessResult::TimedOut);
-        };
-        let outcome = match tokio::time::timeout(
-            remaining,
-            self.run_queued_write_inline(queued, runtime_writer_lease.as_ref()),
-        )
-        .await
-        {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(error)) => Err(error.to_string()),
-            Err(_) => {
-                Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                if let Some(writer_lease) = writer_lease {
-                    let _ = writer_lease.release().await;
-                }
-                let release_deadline =
-                    scoped_process_remaining(started, budget).unwrap_or_default();
-                Self::release_scoped_claim_after_timeout(
-                    queue,
-                    claim,
-                    release_deadline,
-                    self.daemon_write_observer.as_ref(),
-                )
-                .await?;
-                return Ok(ScopedIngestProcessResult::TimedOut);
-            }
-        };
-        if let Err(detail) = &outcome
-            && mcp_ingest_failure_is_retryable_writer_lease_lost(detail)
-        {
-            Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-            if let Some(writer_lease) = writer_lease {
-                let _ = writer_lease.release().await;
-            }
-            let release_deadline = scoped_process_remaining(started, budget).unwrap_or_default();
-            Self::release_claim_with_lock_retry_deadline(
-                queue,
-                claim,
-                release_deadline.min(CLAIM_LOCK_RETRY_DEADLINE),
-                self.daemon_write_observer.as_ref(),
-            )
-            .await
-            .context("failed to release scoped ingest claim after writer lease was lost")?;
-            return Ok(ScopedIngestProcessResult::ReleasedForRetry);
-        }
-        if let Err(detail) = &outcome
-            && mcp_ingest_failure_is_retryable_transient_write_lock(detail)
-        {
-            Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-            if let Some(writer_lease) = writer_lease {
-                let _ = writer_lease.release().await;
-            }
-            let release_deadline = scoped_process_remaining(started, budget).unwrap_or_default();
-            Self::release_claim_with_lock_retry_deadline(
-                queue,
-                claim,
-                release_deadline.min(CLAIM_LOCK_RETRY_DEADLINE),
-                self.daemon_write_observer.as_ref(),
-            )
-            .await
-            .context("failed to release scoped ingest claim after transient write lock")?;
-            return Ok(ScopedIngestProcessResult::ReleasedForRetry);
-        }
-
-        Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-        Self::refresh_ingest_claim_heartbeat_once(
-            queue,
-            &claim.id,
-            worker_id,
-            self.daemon_write_observer.as_ref(),
-        )
-        .await;
-        let completion_deadline = scoped_process_remaining(started, budget).unwrap_or_default();
-        let completed = self
-            .complete_ingest_claim_outcome(
-                queue,
-                &claim,
-                queue_wait_ms,
-                outcome,
-                completion_deadline,
-                true,
-            )
-            .await;
-        let released = match writer_lease {
-            Some(writer_lease) => writer_lease.release().await,
-            None => Ok(()),
-        };
-        completed?;
-        released?;
-        Ok(ScopedIngestProcessResult::Processed)
     }
 
     async fn complete_ingest_claim_outcome(
@@ -2153,27 +1908,6 @@ impl MempalMcpServer {
         })
         .await
         .context("blocking ingest worker task failed")?
-    }
-
-    async fn run_queued_write_inline(
-        &self,
-        operation: QueuedWriteOperation,
-        runtime_writer_lease: Option<&RuntimeWriterLease>,
-    ) -> std::result::Result<IngestResponse, ErrorData> {
-        match operation {
-            QueuedWriteOperation::Ingest(queued) => self
-                .mempal_ingest_sync_with_superseded_override(
-                    queued.request,
-                    queued.controls,
-                    runtime_writer_lease,
-                    queued.superseded_drawer_id,
-                )
-                .await
-                .map(|response| response.0),
-            QueuedWriteOperation::Delete { drawer_id } => {
-                run_durable_delete(self.db_path.clone(), drawer_id).await
-            }
-        }
     }
 
     async fn soft_delete_drawer_for_mcp(
@@ -4035,7 +3769,6 @@ fn scoped_ingest_claim_policy(wait_timeout_secs: u64, smoke: bool) -> ScopedInge
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScopedIngestProcessResult {
     Processed,
-    ReleasedForRetry,
     TimedOut,
 }
 
@@ -15323,7 +15056,7 @@ quality_policy = "llm_required_for_keep"
     }
 
     #[tokio::test]
-    async fn test_mcp_scoped_wait_over_processing_threshold_returns_timeout_receipt() {
+    async fn test_mcp_scoped_wait_timeout_retains_claim_owner() {
         let (_tempdir, db_path, server) = setup_server();
         let server = server.with_ingest_processing_delay_for_test(Duration::from_secs(7));
 
@@ -15332,7 +15065,7 @@ quality_policy = "llm_required_for_keep"
             Duration::from_millis(6_800),
             server.mempal_ingest_with_controls_scoped_worker(
                 IngestRequest {
-                    content: "scoped wait timeout must not start slow inline processing"
+                    content: "scoped wait timeout must retain slow processing ownership"
                         .to_string(),
                     wing: "mcp".to_string(),
                     room: Some("scoped-timeout".to_string()),
@@ -15349,7 +15082,10 @@ quality_policy = "llm_required_for_keep"
         .0;
 
         let operation_id = response.operation_id.as_deref().expect("operation id");
-        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(matches!(
+            response.state,
+            Some(IngestOperationState::Queued | IngestOperationState::Running)
+        ));
         assert!(response.timed_out);
         assert!(
             started.elapsed() < Duration::from_millis(6_800),
@@ -15360,15 +15096,24 @@ quality_policy = "llm_required_for_keep"
             .operation_status(operation_id)
             .expect("query operation")
             .expect("operation should still exist");
-        assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
+        assert!(matches!(record.op_state.as_str(), "claimed" | "running"));
         assert!(
-            record.claimed_at.is_none(),
-            "caller-bounded scoped wait must not leave a claim it cannot finish safely"
+            record.claimed_at.is_some(),
+            "background write must retain its claim after the caller times out"
         );
+
+        let completed = tokio::time::timeout(
+            Duration::from_secs(4),
+            server.wait_for_operation_completion(operation_id),
+        )
+        .await
+        .expect("claim owner must finish after the caller deadline")
+        .expect("claimed operation should complete");
+        assert_eq!(completed.state, Some(IngestOperationState::Completed));
     }
 
     #[tokio::test]
-    async fn test_mcp_scoped_wait_rejects_timeout_receipt_when_claim_release_is_locked() {
+    async fn test_mcp_scoped_wait_timeout_keeps_claim_when_release_is_unavailable() {
         let (_tempdir, db_path, server) = setup_server();
         let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
             .with_release_lock_failures_for_test(100);
@@ -15376,12 +15121,11 @@ quality_policy = "llm_required_for_keep"
             .with_async_queue_for_test(async_queue)
             .with_ingest_processing_delay_for_test(Duration::from_secs(7));
 
-        let result = tokio::time::timeout(
+        let response = tokio::time::timeout(
             Duration::from_millis(6_800),
             server.mempal_ingest_with_controls_scoped_worker(
                 IngestRequest {
-                    content: "scoped wait must not return receipt when release is locked"
-                        .to_string(),
+                    content: "scoped wait must not release an owned claim on timeout".to_string(),
                     wing: "mcp".to_string(),
                     room: Some("scoped-timeout".to_string()),
                     wait: Some(true),
@@ -15392,19 +15136,23 @@ quality_policy = "llm_required_for_keep"
             ),
         )
         .await
-        .expect("scoped wait must stay within the caller timeout budget");
-        let error = match result {
-            Ok(_) => panic!("release lock failure must not return a timeout receipt"),
-            Err(error) => error,
-        };
+        .expect("scoped wait must stay within the caller timeout budget")
+        .expect("claim ownership makes release lock failures irrelevant")
+        .0;
 
         assert!(
-            error
-                .message
-                .contains("failed to release timed-out scoped ingest claim"),
-            "{}",
-            error.message
+            response.timed_out,
+            "the caller must receive a timeout receipt"
         );
+        let operation_id = response.operation_id.as_deref().expect("operation id");
+        let completed = tokio::time::timeout(
+            Duration::from_secs(4),
+            server.wait_for_operation_completion(operation_id),
+        )
+        .await
+        .expect("claim owner must finish after the caller deadline")
+        .expect("claimed operation should complete");
+        assert_eq!(completed.state, Some(IngestOperationState::Completed));
     }
 
     #[tokio::test]
