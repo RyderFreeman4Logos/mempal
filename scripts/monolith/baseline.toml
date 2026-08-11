@@ -373,10 +373,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 183681
-baseline_lines = 23160
-issue = "888"
-rationale = "#888 makes bounded smoke waits locally claimable, keeps a timed-out receipt consumable, and caps lease checks to the remaining request budget; exact no-growth ratchet."
+baseline_tokens = 183949
+baseline_lines = 23194
+issue = "871"
+rationale = "#871 limits retained claims to smoke-owned off-runtime writes; finite scoped waits release or report within budget; exact no-growth ratchet."
 
 [[files]]
 path = "src/mcp/tools.rs"
