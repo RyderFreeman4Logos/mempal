@@ -373,10 +373,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 182443
-baseline_lines = 23010
+baseline_tokens = 182832
+baseline_lines = 23055
 issue = "871"
-rationale = "#871 verifies serialized mempal_doctor availability at the outage threshold and when queue diagnostics are unavailable; exact no-growth ratchet."
+rationale = "#871 verifies serialized availability and durable operation-status responses at the outage threshold; exact no-growth ratchet."
 
 [[files]]
 path = "src/mcp/tools.rs"

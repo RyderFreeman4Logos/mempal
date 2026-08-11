@@ -8782,9 +8782,7 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<OperationStatusRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
-        let system_warnings = self
-            .system_warnings_with_stale_index_bounded(self.operation_status_deadline)
-            .await?;
+        let started_at = Instant::now();
         let record = match tokio::time::timeout(
             self.operation_status_deadline,
             self.async_queue
@@ -8808,14 +8806,31 @@ impl MempalMcpServer {
             }
         };
 
-        record
-            .map(|record| Json(operation_record_to_response(record, system_warnings)))
-            .ok_or_else(|| {
-                ErrorData::invalid_params(
-                    format!("operation not found: {}", request.operation_id),
-                    None,
-                )
-            })
+        let record = record.ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!("operation not found: {}", request.operation_id),
+                None,
+            )
+        })?;
+        let warning_budget = self
+            .operation_status_deadline
+            .checked_sub(started_at.elapsed())
+            .unwrap_or_default();
+        let system_warnings = if warning_budget.is_zero() {
+            current_system_warnings()
+        } else {
+            match tokio::time::timeout(
+                warning_budget,
+                self.system_warnings_with_stale_index_bounded(warning_budget),
+            )
+            .await
+            {
+                Ok(warnings) => warnings?,
+                Err(_) => current_system_warnings(),
+            }
+        };
+
+        Ok(Json(operation_record_to_response(record, system_warnings)))
     }
 
     #[tool(
@@ -22617,6 +22632,36 @@ enabled = true
             final_status.created_drawer_ids,
             completed.created_drawer_ids
         );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_operation_status_returns_queue_result_with_slow_warning_snapshot() {
+        let (_tempdir, db_path, server) = setup_server();
+        let operation_id = PendingMessageStore::new_without_reclaim(&db_path)
+            .enqueue(INGEST_ASYNC_KIND, "{}")
+            .expect("enqueue operation");
+        let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+            .with_blocking_delay(Duration::from_millis(200));
+        let query_only_async_db = QueryOnlyAsyncDb::open(&db_path, 4)
+            .expect("open query-only async db")
+            .with_read_delay(Duration::from_millis(200));
+        let server = server
+            .with_async_queue_for_test(async_queue)
+            .with_query_only_async_db_for_test(query_only_async_db)
+            .with_mcp_deadline_for_test(Duration::from_millis(300));
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(350),
+            server.mempal_operation_status(Parameters(OperationStatusRequest { operation_id })),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let response = response
+            .expect("operation status must share its deadline with warning collection")
+            .expect("queued status should succeed")
+            .0;
+
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
     }
 
     #[tokio::test]
