@@ -42,6 +42,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **MCP smoke waits**: finite `wait=true` smoke ingests process their scoped
+  queue item inline within the remaining request deadline, while timed-out
+  receipts retain a local completion consumer (#888).
+
 - **Daemon outage visibility**: `doctor`, `status`, and MCP doctor now expose a
   high-severity typed availability signal when the daemon is down with at least
   100 pending embedding/hook queue items. Unreadable config/queue statistics and

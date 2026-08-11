@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 9072
-baseline_lines = 641
-issue = "886"
-rationale = "#886 documents deterministic MCP delete Busy-retry fixture coverage; exact no-growth ratchet."
+baseline_tokens = 9115
+baseline_lines = 645
+issue = "888"
+rationale = "#888 documents bounded inline MCP smoke waits and durable timeout completion; exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -373,10 +373,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 182832
-baseline_lines = 23055
-issue = "871"
-rationale = "#871 verifies serialized availability and durable operation-status responses at the outage threshold; exact no-growth ratchet."
+baseline_tokens = 183681
+baseline_lines = 23160
+issue = "888"
+rationale = "#888 makes bounded smoke waits locally claimable, keeps a timed-out receipt consumable, and caps lease checks to the remaining request budget; exact no-growth ratchet."
 
 [[files]]
 path = "src/mcp/tools.rs"
