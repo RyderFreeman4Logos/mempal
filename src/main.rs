@@ -6454,7 +6454,7 @@ async fn run_stdin_wait_ingest_queue(
     };
     let server = MempalMcpServer::new(db_path.to_path_buf(), config.clone())?;
     let response = match server
-        .mempal_ingest_with_controls_scoped_worker(wait_request, controls)
+        .mempal_ingest_with_controls_scoped_worker_releasing(wait_request, controls)
         .await
     {
         Ok(response) => response.0,

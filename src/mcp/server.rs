@@ -250,7 +250,10 @@ fn scoped_ingest_processing_budget(
     claim_policy: ScopedIngestClaimPolicy,
 ) -> Option<Duration> {
     let minimum = match claim_policy {
-        ScopedIngestClaimPolicy::InlineWithinDeadline => MCP_SCOPED_INGEST_MIN_PROCESSING_BUDGET,
+        ScopedIngestClaimPolicy::InlineWithinDeadline
+        | ScopedIngestClaimPolicy::InlineOwnedWithinDeadline => {
+            MCP_SCOPED_INGEST_MIN_PROCESSING_BUDGET
+        }
         ScopedIngestClaimPolicy::InlineSmokeWithinDeadline
         | ScopedIngestClaimPolicy::InlineUntilTerminal => Duration::ZERO,
         ScopedIngestClaimPolicy::PollOnly => return None,
@@ -3079,9 +3082,7 @@ impl MempalMcpServer {
                             .process_ingest_claim_inline(&scoped_queue, &scoped_worker_id, claim)
                             .await
                             .map(|()| ScopedIngestProcessResult::Processed),
-                        ScopedIngestClaimPolicy::InlineWithinDeadline
-                            if decode_queued_ingest_operation(&claim.payload).is_none() =>
-                        {
+                        ScopedIngestClaimPolicy::InlineWithinDeadline => {
                             scoped_worker
                                 .process_ingest_claim_inline_with_budget(
                                     &scoped_queue,
@@ -3092,7 +3093,7 @@ impl MempalMcpServer {
                                 )
                                 .await
                         }
-                        ScopedIngestClaimPolicy::InlineWithinDeadline
+                        ScopedIngestClaimPolicy::InlineOwnedWithinDeadline
                         | ScopedIngestClaimPolicy::InlineSmokeWithinDeadline => {
                             scoped_worker
                                 .process_ingest_claim_with_owned_task_budget(
@@ -4097,25 +4098,33 @@ const INGEST_DRAIN_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
 enum IngestWaitWorkerMode {
     Background,
     Scoped,
+    ScopedReleasing,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScopedIngestClaimPolicy {
     PollOnly,
     InlineWithinDeadline,
+    InlineOwnedWithinDeadline,
     InlineSmokeWithinDeadline,
     InlineUntilTerminal,
 }
 
-fn scoped_ingest_claim_policy(wait_timeout_secs: u64, smoke: bool) -> ScopedIngestClaimPolicy {
+fn scoped_ingest_claim_policy(
+    wait_timeout_secs: u64,
+    smoke: bool,
+    worker_mode: IngestWaitWorkerMode,
+) -> ScopedIngestClaimPolicy {
     if wait_timeout_secs == u64::MAX {
         ScopedIngestClaimPolicy::InlineUntilTerminal
     } else if wait_timeout_secs == 0 {
         ScopedIngestClaimPolicy::PollOnly
     } else if smoke {
         ScopedIngestClaimPolicy::InlineSmokeWithinDeadline
-    } else {
+    } else if matches!(worker_mode, IngestWaitWorkerMode::ScopedReleasing) {
         ScopedIngestClaimPolicy::InlineWithinDeadline
+    } else {
+        ScopedIngestClaimPolicy::InlineOwnedWithinDeadline
     }
 }
 
@@ -4163,7 +4172,7 @@ fn should_use_scoped_ingest_wait_worker(
     claim_policy != ScopedIngestClaimPolicy::PollOnly
         && matches!(processor, IngestQueueProcessor::Local)
         && use_local_ingest_worker
-        && matches!(worker_mode, IngestWaitWorkerMode::Scoped)
+        && worker_mode != IngestWaitWorkerMode::Background
 }
 
 fn ingest_worker_backoff_delay(retry_count: u64) -> Duration {
@@ -7027,6 +7036,20 @@ impl MempalMcpServer {
             .await
     }
 
+    #[doc(hidden)]
+    pub async fn mempal_ingest_with_controls_scoped_worker_releasing(
+        &self,
+        request: IngestRequest,
+        controls: IngestControls,
+    ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
+        self.mempal_ingest_with_controls_and_worker(
+            request,
+            controls,
+            IngestWaitWorkerMode::ScopedReleasing,
+        )
+        .await
+    }
+
     async fn mempal_ingest_with_controls_and_worker(
         &self,
         request: IngestRequest,
@@ -7070,7 +7093,7 @@ impl MempalMcpServer {
         // consistent set from a single `sqlite_master` read. A mid-request embed transition
         // to degraded is not lost: the degraded-write guards above reject before any
         // success response that would carry this snapshot is built.
-        let request_system_warnings = if matches!(worker_mode, IngestWaitWorkerMode::Scoped) {
+        let request_system_warnings = if worker_mode != IngestWaitWorkerMode::Background {
             current_system_warnings()
         } else {
             self.ingest_system_warnings_with_stale_index_bounded(
@@ -7207,7 +7230,7 @@ impl MempalMcpServer {
         };
         let daemon_writer_lease_visible =
             if matches!(queue_admission.processor, IngestQueueProcessor::Local) {
-                let lease_check_budget = if matches!(worker_mode, IngestWaitWorkerMode::Scoped) {
+                let lease_check_budget = if worker_mode != IngestWaitWorkerMode::Background {
                     request_deadline.saturating_duration_since(Instant::now())
                 } else {
                     self.operation_status_deadline
@@ -7264,8 +7287,11 @@ impl MempalMcpServer {
             let wait_remaining = wait_timeout
                 .checked_sub(request_started_at.elapsed())
                 .unwrap_or_default();
-            let claim_policy =
-                scoped_ingest_claim_policy(wait_timeout_secs, request.smoke.unwrap_or(false));
+            let claim_policy = scoped_ingest_claim_policy(
+                wait_timeout_secs,
+                request.smoke.unwrap_or(false),
+                worker_mode,
+            );
             let wait_result = if wait_timeout_secs == 0 {
                 self.wait_for_operation_status_with_lookup_policy(
                     operation_id,
@@ -7325,7 +7351,7 @@ impl MempalMcpServer {
                 self.spawn_ingest_drain_worker();
             }
 
-            let mut timed_out_response = if matches!(worker_mode, IngestWaitWorkerMode::Scoped) {
+            let mut timed_out_response = if worker_mode != IngestWaitWorkerMode::Background {
                 let refresh_remaining = wait_timeout
                     .checked_sub(request_started_at.elapsed())
                     .unwrap_or_default();
