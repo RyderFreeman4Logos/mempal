@@ -254,6 +254,161 @@ async fn test_mcp_smoke_wait_real_source_lock_times_out_without_blocking_runtime
     assert_eq!(completed.state, Some(IngestOperationState::Completed));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn test_mcp_scoped_finite_wait_real_source_lock_runs_off_runtime_and_retains_claim_owner() {
+    let (_tempdir, db_path, server) = setup_server();
+    let request = IngestRequest {
+        content: "ordinary finite wait source-lock contention ".repeat(1_000),
+        wing: "mcp".to_string(),
+        room: Some("runtime".to_string()),
+        wait: Some(true),
+        wait_timeout_secs: Some(6),
+        ..IngestRequest::default()
+    };
+    let controls = IngestControls {
+        no_gate: true,
+        bypass_novelty: true,
+    };
+
+    let preview = server
+        .mempal_ingest_with_controls_scoped_worker(
+            IngestRequest {
+                dry_run: Some(true),
+                ..request.clone()
+            },
+            controls,
+        )
+        .await
+        .expect("ordinary scoped preview")
+        .0;
+    assert!(
+        preview.chunk_count > 1,
+        "fixture must exercise multi-chunk ingest"
+    );
+    let server = server.with_ingest_processing_delay_for_test(Duration::from_secs(1));
+    let mempal_home = db_path.parent().expect("database parent");
+    let source_lock = crate::ingest::lock::acquire_source_lock(
+        mempal_home,
+        preview.drawer_ids.get(1).expect("second chunk drawer id"),
+        Duration::from_secs(1),
+    )
+    .expect("hold source lock");
+
+    let (ticks, ticker) = spawn_runtime_ticker();
+    let started = Instant::now();
+    let response = tokio::time::timeout(
+        Duration::from_secs(7),
+        server.mempal_ingest_with_controls_scoped_worker(request, controls),
+    )
+    .await
+    .expect("ordinary finite scoped wait must respect its request budget")
+    .expect("source-lock contention returns a durable receipt")
+    .0;
+    ticker.abort();
+
+    assert!(
+        response.timed_out,
+        "ordinary finite wait must time out under held lock"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(7),
+        "ordinary finite wait exceeded its request budget"
+    );
+    assert_runtime_ticked(&ticks, "ordinary finite ingest with a real source lock");
+
+    let operation_id = response.operation_id.as_deref().expect("operation id");
+    let record = PendingMessageStore::new_without_reclaim(&db_path)
+        .operation_status(operation_id)
+        .expect("load claimed operation")
+        .expect("operation remains queryable");
+    assert_eq!(record.op_state, IngestOperationState::Running.as_str());
+    assert!(
+        record.claimed_at.is_some(),
+        "timed-out work must retain its owner"
+    );
+
+    drop(source_lock);
+    let completed = tokio::time::timeout(
+        Duration::from_secs(4),
+        server.wait_for_operation_completion(operation_id),
+    )
+    .await
+    .expect("timed-out ordinary operation must retain its completion owner")
+    .expect("source-lock-contended ordinary operation should complete");
+    assert_eq!(completed.state, Some(IngestOperationState::Completed));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_mcp_scoped_finite_lease_timeout_releases_late_acquisition() {
+    let (_tempdir, db_path, server) = setup_server();
+    let (acquired_tx, acquired_rx) = mpsc::sync_channel(1);
+    let server = server.with_ingest_writer_lease_acquired_hook_for_test(Arc::new(move |_lease| {
+        acquired_tx.send(()).expect("report acquired writer lease");
+        std::thread::sleep(Duration::from_millis(200));
+    }));
+    let operation_id = enqueue_prepared_test_ingest_operation(
+        &server,
+        &db_path,
+        "late writer lease acquisition must not outlive its cancelled waiter",
+        "lease-timeout",
+    )
+    .await;
+    let queue = PendingMessageStore::new_without_reclaim(&db_path);
+    let claim = queue
+        .claim_next_by_kind("worker-late-lease", 60, INGEST_ASYNC_KIND)
+        .expect("claim queued operation")
+        .expect("claimed queued operation");
+    let async_queue = AsyncPendingMessageStore::from_store(queue);
+    let processing_server = server.clone();
+    let processing = tokio::spawn(async move {
+        processing_server
+            .process_ingest_claim_inline_with_budget(
+                &async_queue,
+                "worker-late-lease",
+                claim,
+                Duration::from_millis(25),
+            )
+            .await
+    });
+    tokio::task::spawn_blocking(move || {
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer lease must be acquired before the waiter times out");
+    })
+    .await
+    .expect("acquisition observer must not panic");
+    let result = processing
+        .await
+        .expect("bounded processing task must not panic")
+        .expect("lease acquisition timeout must return a bounded result");
+    assert_eq!(result, ScopedIngestProcessResult::TimedOut);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let leases = Database::open(&db_path)
+                .expect("open database after SQLite unlock")
+                .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+                .expect("read writer lease status");
+            if leases.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a lease acquired after timeout must be released, not orphaned");
+
+    let record = PendingMessageStore::new_without_reclaim(&db_path)
+        .operation_status(&operation_id)
+        .expect("load operation record")
+        .expect("operation remains queryable");
+    assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
+    assert!(
+        record.claimed_at.is_none(),
+        "timed-out claim must be released"
+    );
+}
+
 #[tokio::test]
 async fn test_mcp_scoped_smoke_wait_bounds_lease_check_to_remaining_budget() {
     let (_tempdir, db_path, server) = setup_server();

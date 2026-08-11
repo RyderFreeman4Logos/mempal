@@ -359,6 +359,8 @@ pub struct MempalMcpServer {
     #[cfg(test)]
     content_writer_lease_acquired_hook: Option<ContentWriterLeaseAcquiredHook>,
     #[cfg(test)]
+    ingest_writer_lease_acquired_hook: Option<IngestWriterLeaseAcquiredHook>,
+    #[cfg(test)]
     operation_status_json_within_probe_attempts: Arc<AtomicUsize>,
 }
 
@@ -373,6 +375,35 @@ pub(crate) enum McpIngestSideEffectStage {
 
 #[cfg(test)]
 type ContentWriterLeaseAcquiredHook = Arc<dyn Fn(&RuntimeWriterLease) + Send + Sync>;
+
+#[cfg(test)]
+type IngestWriterLeaseAcquiredHook = Arc<dyn Fn(&RuntimeWriterLease) + Send + Sync>;
+
+/// Holds a lease while its blocking acquisition crosses an async cancellation boundary.
+struct AcquiredMcpIngestWriterLease {
+    db_path: PathBuf,
+    lease: Option<RuntimeWriterLease>,
+}
+
+impl AcquiredMcpIngestWriterLease {
+    fn into_guard(mut self) -> McpIngestWriterLeaseGuard {
+        let lease = self
+            .lease
+            .take()
+            .expect("acquired ingest writer lease must be present");
+        McpIngestWriterLeaseGuard::new(std::mem::take(&mut self.db_path), lease)
+    }
+}
+
+impl Drop for AcquiredMcpIngestWriterLease {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take()
+            && let Ok(db) = Database::open_lease_control(&self.db_path)
+        {
+            let _ = db.runtime_writer_lease_release(&lease);
+        }
+    }
+}
 
 struct McpIngestWriterLeaseGuard {
     db_path: PathBuf,
@@ -657,6 +688,8 @@ impl MempalMcpServer {
             #[cfg(test)]
             content_writer_lease_acquired_hook: None,
             #[cfg(test)]
+            ingest_writer_lease_acquired_hook: None,
+            #[cfg(test)]
             operation_status_json_within_probe_attempts: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -812,6 +845,15 @@ impl MempalMcpServer {
         hook: ContentWriterLeaseAcquiredHook,
     ) -> Self {
         self.content_writer_lease_acquired_hook = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_ingest_writer_lease_acquired_hook_for_test(
+        mut self,
+        hook: IngestWriterLeaseAcquiredHook,
+    ) -> Self {
+        self.ingest_writer_lease_acquired_hook = Some(hook);
         self
     }
 
@@ -1989,6 +2031,8 @@ impl MempalMcpServer {
         }
         let db_path = self.db_path.clone();
         let owner = worker_id.to_string();
+        #[cfg(test)]
+        let acquired_hook = self.ingest_writer_lease_acquired_hook.clone();
         let metadata_json = serde_json::json!({
             "component": "mcp-ingest-worker",
             "worker_role": Self::ingest_worker_role(worker_id),
@@ -2014,12 +2058,18 @@ impl MempalMcpServer {
                     Some(&metadata_json),
                 )
                 .context("failed to acquire MCP ingest writer lease")?;
-            Ok::<_, anyhow::Error>((admitted_path, lease))
+            #[cfg(test)]
+            if let (Some(hook), Some(lease)) = (acquired_hook.as_ref(), lease.as_ref()) {
+                hook(lease);
+            }
+            Ok::<_, anyhow::Error>(lease.map(|lease| AcquiredMcpIngestWriterLease {
+                db_path: admitted_path,
+                lease: Some(lease),
+            }))
         })
         .await
         .context("MCP ingest writer lease task failed")??;
-        let (admitted_path, lease) = lease;
-        Ok(lease.map(|lease| McpIngestWriterLeaseGuard::new(admitted_path, lease)))
+        Ok(lease.map(AcquiredMcpIngestWriterLease::into_guard))
     }
 
     fn acquire_content_writer_lease(
@@ -3029,7 +3079,9 @@ impl MempalMcpServer {
                             .process_ingest_claim_inline(&scoped_queue, &scoped_worker_id, claim)
                             .await
                             .map(|()| ScopedIngestProcessResult::Processed),
-                        ScopedIngestClaimPolicy::InlineWithinDeadline => {
+                        ScopedIngestClaimPolicy::InlineWithinDeadline
+                            if decode_queued_ingest_operation(&claim.payload).is_none() =>
+                        {
                             scoped_worker
                                 .process_ingest_claim_inline_with_budget(
                                     &scoped_queue,
@@ -3040,7 +3092,8 @@ impl MempalMcpServer {
                                 )
                                 .await
                         }
-                        ScopedIngestClaimPolicy::InlineSmokeWithinDeadline => {
+                        ScopedIngestClaimPolicy::InlineWithinDeadline
+                        | ScopedIngestClaimPolicy::InlineSmokeWithinDeadline => {
                             scoped_worker
                                 .process_ingest_claim_with_owned_task_budget(
                                     &scoped_queue,
@@ -15354,91 +15407,6 @@ quality_policy = "llm_required_for_keep"
             .expect("query completed operation")
             .expect("completed operation");
         assert_eq!(record.op_state, IngestOperationState::Completed.as_str());
-    }
-
-    #[tokio::test]
-    async fn test_mcp_scoped_wait_over_processing_threshold_returns_timeout_receipt() {
-        let (_tempdir, db_path, server) = setup_server();
-        let server = server.with_ingest_processing_delay_for_test(Duration::from_secs(7));
-
-        let started = Instant::now();
-        let response = tokio::time::timeout(
-            Duration::from_millis(6_800),
-            server.mempal_ingest_with_controls_scoped_worker(
-                IngestRequest {
-                    content: "scoped wait timeout must not start slow inline processing"
-                        .to_string(),
-                    wing: "mcp".to_string(),
-                    room: Some("scoped-timeout".to_string()),
-                    wait: Some(true),
-                    wait_timeout_secs: Some(6),
-                    ..IngestRequest::default()
-                },
-                IngestControls::default(),
-            ),
-        )
-        .await
-        .expect("scoped wait must return within the caller timeout budget")
-        .expect("scoped wait should return a timeout receipt")
-        .0;
-
-        let operation_id = response.operation_id.as_deref().expect("operation id");
-        assert_eq!(response.state, Some(IngestOperationState::Queued));
-        assert!(response.timed_out);
-        assert!(
-            started.elapsed() < Duration::from_millis(6_800),
-            "scoped wait blocked until slow processing completed"
-        );
-
-        let record = PendingMessageStore::new_without_reclaim(&db_path)
-            .operation_status(operation_id)
-            .expect("query operation")
-            .expect("operation should still exist");
-        assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
-        assert!(
-            record.claimed_at.is_none(),
-            "caller-bounded scoped wait must not leave a claim it cannot finish safely"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_mcp_scoped_wait_rejects_timeout_receipt_when_claim_release_is_locked() {
-        let (_tempdir, db_path, server) = setup_server();
-        let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
-            .with_release_lock_failures_for_test(100);
-        let server = server
-            .with_async_queue_for_test(async_queue)
-            .with_ingest_processing_delay_for_test(Duration::from_secs(7));
-
-        let result = tokio::time::timeout(
-            Duration::from_millis(6_800),
-            server.mempal_ingest_with_controls_scoped_worker(
-                IngestRequest {
-                    content: "scoped wait must not return receipt when release is locked"
-                        .to_string(),
-                    wing: "mcp".to_string(),
-                    room: Some("scoped-timeout".to_string()),
-                    wait: Some(true),
-                    wait_timeout_secs: Some(6),
-                    ..IngestRequest::default()
-                },
-                IngestControls::default(),
-            ),
-        )
-        .await
-        .expect("scoped wait must stay within the caller timeout budget");
-        let error = match result {
-            Ok(_) => panic!("release lock failure must not return a timeout receipt"),
-            Err(error) => error,
-        };
-
-        assert!(
-            error
-                .message
-                .contains("failed to release timed-out scoped ingest claim"),
-            "{}",
-            error.message
-        );
     }
 
     #[tokio::test]
