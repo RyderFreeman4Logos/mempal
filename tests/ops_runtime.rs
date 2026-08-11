@@ -16,6 +16,21 @@ fn mempal_bin() -> String {
 static LOAD_DOTENV: OnceLock<()> = OnceLock::new();
 const CLI_TIMEOUT: Duration = Duration::from_secs(10);
 
+struct OwnedTestChild(Child);
+
+impl OwnedTestChild {
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for OwnedTestChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Inject hermetic embed environment into a child Command.
 fn inject_embed_env(cmd: &mut Command) {
     LOAD_DOTENV.get_or_init(|| {
@@ -298,6 +313,39 @@ fn test_cli_status_emits_typed_availability_when_database_is_unavailable() {
 }
 
 #[test]
+fn test_cli_status_emits_typed_availability_when_database_schema_is_newer() {
+    let home = TempDir::new().expect("home");
+    let mempal_home = home.path().join(".mempal");
+    fs::create_dir_all(&mempal_home).expect("create mempal home");
+    let db_path = palace_db_path(&home);
+    Database::open(&db_path).expect("open db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open raw sqlite");
+    conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+        .expect("set future schema version");
+
+    let status = run_mempal(&home, &["status"]);
+
+    assert!(
+        !status.status.success(),
+        "status must preserve the command error"
+    );
+    let stderr = stderr(&status);
+    assert!(
+        stderr.contains("availability_severity=unavailable"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("availability_signal=diagnostic_inputs_unavailable"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("availability_unavailable_reasons=queue_stats"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("availability_severity=normal"), "{stderr}");
+}
+
+#[test]
 fn test_cli_status_emits_typed_availability_when_queue_stats_are_unavailable() {
     let home = TempDir::new().expect("home");
     let mempal_home = home.path().join(".mempal");
@@ -326,6 +374,7 @@ fn test_cli_status_emits_typed_availability_when_queue_stats_are_unavailable() {
         stderr.contains("availability_unavailable_reasons=queue_stats"),
         "{stderr}"
     );
+    assert!(!stderr.contains("availability_severity=normal"), "{stderr}");
     assert!(
         stderr.contains("Restore access to the mempal config and database"),
         "{stderr}"
@@ -355,10 +404,12 @@ fn test_cli_doctor_rejects_unrelated_live_pid_as_daemon_identity() {
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
     Database::open(&palace_db_path(&home)).expect("open db");
-    let mut unrelated = Command::new("sleep")
-        .arg("120")
-        .spawn()
-        .expect("spawn unrelated process");
+    let unrelated = OwnedTestChild(
+        Command::new("sleep")
+            .arg("120")
+            .spawn()
+            .expect("spawn unrelated process"),
+    );
     fs::write(
         home.path().join(".mempal/daemon.pid"),
         unrelated.id().to_string(),
@@ -367,8 +418,6 @@ fn test_cli_doctor_rejects_unrelated_live_pid_as_daemon_identity() {
 
     let doctor = run_mempal(&home, &["doctor", "--format", "json"]);
     let status = run_mempal(&home, &["status"]);
-    unrelated.kill().expect("stop unrelated process");
-    unrelated.wait().expect("reap unrelated process");
     assert_success(&doctor);
     assert_success(&status);
     let report: Value = serde_json::from_str(&stdout(&doctor)).expect("doctor json");
