@@ -18,6 +18,9 @@ use super::queue_connection_admission as queue_admission;
 #[path = "queue_writer_lease_fence.rs"]
 mod queue_writer_lease_fence;
 
+#[path = "queue_store_construction.rs"]
+mod queue_store_construction;
+
 pub use super::queue_connection_admission::{
     queue_stats, queue_stats_readonly, queue_stats_readonly_with_busy_timeout,
     queue_write_admission_preflight,
@@ -771,14 +774,6 @@ impl AsyncPendingMessageStore {
 impl PendingMessageStore {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         Self::with_config(path, QueueConfig::default())
-    }
-
-    pub fn new_without_reclaim(path: impl AsRef<Path>) -> Self {
-        Self {
-            db_path: path.as_ref().to_path_buf(),
-            config: QueueConfig::default(),
-            connection_cache: ConnectionCache::new(),
-        }
     }
 
     pub fn with_config(path: impl AsRef<Path>, config: QueueConfig) -> Result<Self> {
