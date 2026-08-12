@@ -15954,9 +15954,15 @@ fn daemon_pid_path(db_path: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn write_daemon_pid_file(db_path: &Path, pid: i32) -> Result<()> {
-    if !process_is_live(pid)? {
-        bail!("cannot repair daemon pid file: pid {pid} is not running");
+fn write_daemon_pid_file(
+    db_path: &Path,
+    process: mempal::daemon_singleton::DaemonProcess,
+) -> Result<()> {
+    if !process.is_current() {
+        bail!(
+            "cannot repair daemon pid file: daemon pid {} changed process birth",
+            process.pid
+        );
     }
     let mempal_home = daemon_home_from_db_path(db_path);
     fs::create_dir_all(&mempal_home)
@@ -15970,7 +15976,7 @@ fn write_daemon_pid_file(db_path: &Path, pid: i32) -> Result<()> {
             .write(true)
             .open(&tmp_path)
             .with_context(|| format!("failed to open {}", tmp_path.display()))?;
-        writeln!(file, "{pid}")
+        writeln!(file, "{}", process.pid)
             .with_context(|| format!("failed to write {}", tmp_path.display()))?;
         file.sync_all()
             .with_context(|| format!("failed to sync {}", tmp_path.display()))?;
@@ -16004,6 +16010,7 @@ struct DaemonTerminateOutcome {
 trait DaemonProcessOps {
     fn signal(&mut self, pid: i32, signal: i32) -> Result<()>;
     fn is_running(&mut self, pid: i32) -> Result<bool>;
+    fn is_current(&mut self, process: &mempal::daemon_singleton::DaemonProcess) -> bool;
     fn sleep(&mut self, duration: std::time::Duration);
 }
 
@@ -16030,17 +16037,23 @@ impl DaemonProcessOps for RealDaemonProcessOps {
         process_is_live(pid)
     }
 
+    fn is_current(&mut self, process: &mempal::daemon_singleton::DaemonProcess) -> bool {
+        process.is_current()
+    }
+
     fn sleep(&mut self, duration: std::time::Duration) {
         std::thread::sleep(duration);
     }
 }
 
 #[cfg(unix)]
-fn collect_daemon_candidates(db_path: &Path) -> Result<(Vec<i32>, Option<i32>)> {
+fn collect_daemon_candidates(
+    db_path: &Path,
+) -> Result<(Vec<mempal::daemon_singleton::DaemonProcess>, Option<i32>)> {
     let pidfile_pid = read_daemon_pid(db_path)?;
     collect_daemon_candidates_with_scan_and_pidfile(
         db_path,
-        mempal::daemon_singleton::enumerate_daemon_pids,
+        mempal::daemon_singleton::enumerate_daemon_processes,
         pidfile_pid,
     )
 }
@@ -16048,41 +16061,36 @@ fn collect_daemon_candidates(db_path: &Path) -> Result<(Vec<i32>, Option<i32>)> 
 #[cfg(all(unix, test))]
 fn collect_daemon_candidates_with_scan(
     db_path: &Path,
-    enumerate_daemon_pids: impl Fn(&str, &Path) -> Vec<i32>,
-) -> Result<(Vec<i32>, Option<i32>)> {
+    enumerate_daemon_processes: impl Fn(&str, &Path) -> Vec<mempal::daemon_singleton::DaemonProcess>,
+) -> Result<(Vec<mempal::daemon_singleton::DaemonProcess>, Option<i32>)> {
     let pidfile_pid = read_daemon_pid(db_path)?;
-    collect_daemon_candidates_with_scan_and_pidfile(db_path, enumerate_daemon_pids, pidfile_pid)
+    collect_daemon_candidates_with_scan_and_pidfile(
+        db_path,
+        enumerate_daemon_processes,
+        pidfile_pid,
+    )
 }
 
 #[cfg(unix)]
 fn collect_daemon_candidates_with_scan_and_pidfile(
     db_path: &Path,
-    enumerate_daemon_pids: impl Fn(&str, &Path) -> Vec<i32>,
+    enumerate_daemon_processes: impl Fn(&str, &Path) -> Vec<mempal::daemon_singleton::DaemonProcess>,
     pidfile_pid: Option<i32>,
-) -> Result<(Vec<i32>, Option<i32>)> {
+) -> Result<(Vec<mempal::daemon_singleton::DaemonProcess>, Option<i32>)> {
     let binary =
         mempal::daemon_singleton::current_binary_name().unwrap_or_else(|| "mempal".to_string());
-    let mut candidates = enumerate_daemon_pids(&binary, db_path);
+    let mut candidates = enumerate_daemon_processes(&binary, db_path);
+    candidates.sort_unstable_by_key(|process| process.pid);
+    candidates.dedup_by_key(|process| process.pid);
+    let pidfile_pid =
+        pidfile_pid.filter(|pid| candidates.iter().any(|process| process.pid == *pid));
 
-    let live_pidfile_pid = match pidfile_pid {
-        Some(pid) if process_is_live(pid)? => {
-            if !candidates.contains(&pid) {
-                candidates.push(pid);
-            }
-            Some(pid)
-        }
-        _ => None,
-    };
-
-    candidates.sort_unstable();
-    candidates.dedup();
-
-    Ok((candidates, live_pidfile_pid))
+    Ok((candidates, pidfile_pid))
 }
 
 #[cfg(unix)]
 fn terminate_daemon_targets_with_ops(
-    targets: &[i32],
+    targets: &[mempal::daemon_singleton::DaemonProcess],
     ops: &mut impl DaemonProcessOps,
     grace: std::time::Duration,
     poll: std::time::Duration,
@@ -16091,24 +16099,31 @@ fn terminate_daemon_targets_with_ops(
     let mut remaining = Vec::new();
     let mut errors = Vec::new();
 
-    for pid in targets {
-        if let Err(error) = ops.signal(*pid, libc::SIGTERM) {
+    for process in targets {
+        let pid = process.pid;
+        if !ops.is_current(process) {
+            continue;
+        }
+        if let Err(error) = ops.signal(pid, libc::SIGTERM) {
             errors.push(format!("SIGTERM pid {pid} failed: {error}"));
         } else {
-            outcome.signaled.push(*pid);
+            outcome.signaled.push(pid);
         }
-        remaining.push(*pid);
+        remaining.push(*process);
     }
 
     let deadline = std::time::Instant::now() + grace;
     while std::time::Instant::now() < deadline {
         let mut live = Vec::new();
-        for pid in remaining {
-            match ops.is_running(pid) {
-                Ok(true) => live.push(pid),
+        for process in remaining {
+            match ops.is_running(process.pid) {
+                Ok(true) => live.push(process),
                 Ok(false) => {}
                 Err(error) => {
-                    errors.push(format!("SIGTERM status pid {pid} failed: {error}"));
+                    errors.push(format!(
+                        "SIGTERM status pid {} failed: {error}",
+                        process.pid
+                    ));
                 }
             }
         }
@@ -16125,9 +16140,13 @@ fn terminate_daemon_targets_with_ops(
         ops.sleep(poll);
     }
 
-    for pid in remaining {
+    for process in remaining {
+        let pid = process.pid;
         match ops.is_running(pid) {
             Ok(true) => {
+                if !ops.is_current(&process) {
+                    continue;
+                }
                 if let Err(error) = ops.signal(pid, libc::SIGKILL) {
                     errors.push(format!("SIGKILL pid {pid} failed: {error}"));
                 } else {
@@ -16152,7 +16171,9 @@ fn terminate_daemon_targets_with_ops(
 }
 
 #[cfg(unix)]
-fn terminate_daemon_targets(targets: &[i32]) -> Result<DaemonTerminateOutcome> {
+fn terminate_daemon_targets(
+    targets: &[mempal::daemon_singleton::DaemonProcess],
+) -> Result<DaemonTerminateOutcome> {
     let mut ops = RealDaemonProcessOps;
     terminate_daemon_targets_with_ops(targets, &mut ops, DAEMON_TERM_GRACE, DAEMON_TERM_POLL)
 }
@@ -16163,13 +16184,20 @@ fn reap_daemon_orphans(
     verbose: bool,
 ) -> Result<mempal::daemon_singleton::DaemonReapPlan> {
     let (candidates, pidfile_pid) = collect_daemon_candidates(db_path)?;
-    let plan = mempal::daemon_singleton::plan_daemon_reap(&candidates, pidfile_pid);
+    let candidate_pids = candidates
+        .iter()
+        .map(|process| process.pid)
+        .collect::<Vec<_>>();
+    let plan = mempal::daemon_singleton::plan_daemon_reap(&candidate_pids, pidfile_pid);
 
     if plan.targets.is_empty() {
-        if let Some(pid) = plan.keeper
-            && pidfile_pid != Some(pid)
+        if let Some(process) = candidates
+            .iter()
+            .copied()
+            .find(|process| Some(process.pid) == plan.keeper)
+            && pidfile_pid != Some(process.pid)
         {
-            write_daemon_pid_file(db_path, pid)?;
+            write_daemon_pid_file(db_path, process)?;
         }
         if verbose {
             match plan.keeper {
@@ -16180,11 +16208,19 @@ fn reap_daemon_orphans(
         return Ok(plan);
     }
 
-    let outcome = terminate_daemon_targets(&plan.targets)?;
-    if let Some(pid) = plan.keeper
-        && pidfile_pid != Some(pid)
+    let targets = candidates
+        .iter()
+        .filter(|process| plan.targets.contains(&process.pid))
+        .copied()
+        .collect::<Vec<_>>();
+    let outcome = terminate_daemon_targets(&targets)?;
+    if let Some(process) = candidates
+        .iter()
+        .copied()
+        .find(|process| Some(process.pid) == plan.keeper)
+        && pidfile_pid != Some(process.pid)
     {
-        write_daemon_pid_file(db_path, pid)?;
+        write_daemon_pid_file(db_path, process)?;
     }
     if verbose {
         match plan.keeper {
@@ -16223,10 +16259,7 @@ fn run_daemon_start(config_path: PathBuf, foreground: bool) -> Result<()> {
             bail!("daemon already running (pid {pid}); stop with `mempal daemon stop`");
         }
     }
-    if let Some(pid) = read_daemon_pid(&db_path)? {
-        if process_is_live(pid)? {
-            bail!("daemon already running (pid {pid}); stop with `mempal daemon stop`");
-        }
+    if read_daemon_pid(&db_path)?.is_some() {
         // Stale pidfile: remove so bootstrap can write a fresh one.
         if let Some(mempal_home) = db_path.parent() {
             let _ = std::fs::remove_file(mempal_home.join("daemon.pid"));
@@ -16313,6 +16346,8 @@ mod daemon_reap_tests {
         signals: Vec<(i32, i32)>,
         failed_signals: BTreeSet<(i32, i32)>,
         term_ignored: BTreeSet<i32>,
+        stale: BTreeSet<i32>,
+        stale_after_sigterm: BTreeSet<i32>,
     }
 
     impl DaemonProcessOps for FakeProcessOps {
@@ -16326,6 +16361,9 @@ mod daemon_reap_tests {
             {
                 self.running.insert(pid, false);
             }
+            if signal == libc::SIGTERM && self.stale_after_sigterm.contains(&pid) {
+                self.stale.insert(pid);
+            }
             Ok(())
         }
 
@@ -16333,7 +16371,18 @@ mod daemon_reap_tests {
             Ok(self.running.get(&pid).copied().unwrap_or(false))
         }
 
+        fn is_current(&mut self, process: &mempal::daemon_singleton::DaemonProcess) -> bool {
+            !self.stale.contains(&process.pid)
+        }
+
         fn sleep(&mut self, _duration: std::time::Duration) {}
+    }
+
+    fn daemon(pid: i32) -> mempal::daemon_singleton::DaemonProcess {
+        mempal::daemon_singleton::DaemonProcess {
+            pid,
+            start_time_ticks: 1,
+        }
     }
 
     #[cfg(test)]
@@ -16348,7 +16397,7 @@ mod daemon_reap_tests {
     }
 
     #[test]
-    fn test_collect_daemon_candidates_includes_running_pidfile_when_scan_is_empty() -> Result<()> {
+    fn test_collect_daemon_candidates_rejects_running_pidfile_when_scan_is_empty() -> Result<()> {
         let tmp = tempfile::tempdir().context("tempdir")?;
         let db_path = tmp.path().join("palace.db");
         let pid_path = tmp.path().join("daemon.pid");
@@ -16358,8 +16407,8 @@ mod daemon_reap_tests {
         let (candidates, pidfile_pid) =
             collect_daemon_candidates_with_scan(&db_path, |_binary, _db_path| Vec::new())?;
 
-        assert_eq!(candidates, vec![child.id() as i32]);
-        assert_eq!(pidfile_pid, Some(child.id() as i32));
+        assert!(candidates.is_empty());
+        assert_eq!(pidfile_pid, None);
 
         child.kill()?;
         child.wait()?;
@@ -16376,7 +16425,7 @@ mod daemon_reap_tests {
         ops.failed_signals.insert((22, libc::SIGKILL));
 
         let error = terminate_daemon_targets_with_ops(
-            &[11, 22],
+            &[daemon(11), daemon(22)],
             &mut ops,
             std::time::Duration::ZERO,
             std::time::Duration::from_millis(1),
@@ -16405,7 +16454,7 @@ mod daemon_reap_tests {
         ops.term_ignored.insert(42);
 
         let outcome = terminate_daemon_targets_with_ops(
-            &[42],
+            &[daemon(42)],
             &mut ops,
             std::time::Duration::ZERO,
             std::time::Duration::from_millis(1),
@@ -16424,7 +16473,7 @@ mod daemon_reap_tests {
         ops.running.insert(7, true);
 
         let outcome = terminate_daemon_targets_with_ops(
-            &[7],
+            &[daemon(7)],
             &mut ops,
             std::time::Duration::from_millis(1),
             std::time::Duration::from_millis(1),
@@ -16435,6 +16484,44 @@ mod daemon_reap_tests {
         assert!(outcome.killed.is_empty());
         assert_eq!(ops.signals, vec![(7, libc::SIGTERM)]);
     }
+
+    #[test]
+    fn test_terminate_daemon_targets_skips_reused_pid_before_sigterm() {
+        let mut ops = FakeProcessOps::default();
+        ops.running.insert(42, true);
+        ops.stale.insert(42);
+
+        let outcome = terminate_daemon_targets_with_ops(
+            &[daemon(42)],
+            &mut ops,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(1),
+        )
+        .expect("stale process should be skipped");
+
+        assert_eq!(outcome, DaemonTerminateOutcome::default());
+        assert!(ops.signals.is_empty());
+    }
+
+    #[test]
+    fn test_terminate_daemon_targets_skips_reused_pid_before_sigkill() {
+        let mut ops = FakeProcessOps::default();
+        ops.running.insert(42, true);
+        ops.term_ignored.insert(42);
+        ops.stale_after_sigterm.insert(42);
+
+        let outcome = terminate_daemon_targets_with_ops(
+            &[daemon(42)],
+            &mut ops,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(1),
+        )
+        .expect("reused process should be skipped before SIGKILL");
+
+        assert_eq!(outcome.signaled, vec![42]);
+        assert!(outcome.killed.is_empty());
+        assert_eq!(ops.signals, vec![(42, libc::SIGTERM)]);
+    }
 }
 
 const DAEMON_STATUS_QUEUE_STATS_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
@@ -16444,7 +16531,10 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
     let binary =
         mempal::daemon_singleton::current_binary_name().unwrap_or_else(|| "mempal".to_string());
     let mempal_home = daemon_home_from_db_path(db_path);
-    let siblings = mempal::daemon_singleton::enumerate_daemon_pids(&binary, db_path);
+    let siblings = mempal::daemon_singleton::enumerate_daemon_processes(&binary, db_path)
+        .into_iter()
+        .filter(mempal::daemon_singleton::DaemonProcess::is_current)
+        .collect::<Vec<_>>();
     let pidfile = read_daemon_pid_for_status(db_path);
     if let Some(warning) = pidfile.warning.as_ref() {
         println!("warning: {}", warning.message);
@@ -16459,7 +16549,7 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
             }
         }
         Some(pid) => {
-            if process_is_live(pid)? {
+            if siblings.iter().any(|process| process.pid == pid) {
                 println!("status: running");
                 println!("pid: {pid}");
                 print_daemon_process_report(pid, "");
@@ -16501,7 +16591,7 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
     if !siblings.is_empty() {
         let pids = siblings
             .iter()
-            .map(i32::to_string)
+            .map(|process| process.pid.to_string())
             .collect::<Vec<_>>()
             .join(", ");
         println!("live_daemons: {}", siblings.len());

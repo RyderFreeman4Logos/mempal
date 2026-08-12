@@ -542,7 +542,7 @@ fn test_daemon_start_repairs_orphan_pidfile_before_reporting_running() {
 
 #[cfg(unix)]
 #[test]
-fn test_daemon_stop_terminates_pidfile_only_process() {
+fn test_daemon_stop_does_not_terminate_pidfile_only_process() {
     let (tmp, db_path, _config_path) = setup_daemon_home();
     let _cleanup = DaemonHomeCleanup {
         db_path: db_path.clone(),
@@ -560,23 +560,50 @@ fn test_daemon_stop_terminates_pidfile_only_process() {
         .output()
         .expect("run daemon stop");
     assert!(
-        output.status.success(),
-        "daemon stop failed: status={:?}, stdout={}, stderr={}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        !output.status.success(),
+        "pidfile-only process is not a daemon"
     );
 
     assert!(
-        wait_for_child_exit(&mut child, Duration::from_secs(5)),
-        "pidfile-only placeholder was not terminated\n{}",
+        process_is_running_for_test(child.id() as i32),
+        "pidfile-only placeholder was terminated\n{}",
         child.diagnostics()
     );
+    child.kill().expect("kill placeholder");
+    child.wait().expect("wait placeholder");
 }
 
 #[cfg(unix)]
 #[test]
-fn test_daemon_restart_terminates_pidfile_only_process_and_restarts() {
+fn test_daemon_status_does_not_report_pidfile_only_process_as_running() {
+    let (tmp, db_path, _config_path) = setup_daemon_home();
+    let _cleanup = DaemonHomeCleanup {
+        db_path: db_path.clone(),
+    };
+    let pid_path = tmp.path().join(".mempal/daemon.pid");
+
+    let mut child = spawn_placeholder_daemon(tmp.path(), "pidfile-only-status-placeholder")
+        .expect("spawn placeholder");
+    fs::write(&pid_path, child.id().to_string()).expect("write pidfile");
+
+    let output = Command::new(mempal_bin())
+        .args(["daemon", "status"])
+        .daemon_home(tmp.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run daemon status");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("status: stopped"), "{stdout}");
+    assert!(process_is_running_for_test(child.id() as i32));
+
+    child.kill().expect("kill placeholder");
+    child.wait().expect("wait placeholder");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_daemon_restart_does_not_terminate_pidfile_only_process_and_restarts() {
     let (tmp, db_path, _config_path) = setup_daemon_home();
     let _cleanup = DaemonHomeCleanup {
         db_path: db_path.clone(),
@@ -609,10 +636,9 @@ fn test_daemon_restart_terminates_pidfile_only_process_and_restarts() {
         process_is_running_for_test(restarted_pid),
         "restarted daemon pid {restarted_pid} should be running"
     );
-    assert!(
-        wait_for_child_exit(&mut child, Duration::from_secs(5)),
-        "old daemon placeholder pid {old_pid} should be terminated by restart"
-    );
+    assert!(process_is_running_for_test(old_pid));
+    child.kill().expect("kill placeholder");
+    child.wait().expect("wait placeholder");
 }
 
 #[cfg(unix)]
@@ -689,7 +715,7 @@ fn test_status_full_treats_single_orphan_as_running() {
 
 #[cfg(unix)]
 #[test]
-fn test_daemon_reap_keeps_single_pidfile_process() {
+fn test_daemon_reap_does_not_keep_pidfile_only_process() {
     let (tmp, db_path, _config_path) = setup_daemon_home();
     let _cleanup = DaemonHomeCleanup {
         db_path: db_path.clone(),
@@ -716,8 +742,12 @@ fn test_daemon_reap_keeps_single_pidfile_process() {
 
     assert!(
         process_is_running_for_test(child.id() as i32),
-        "daemon reap should keep the pidfile-only placeholder alive\n{}",
+        "daemon reap should not signal the pidfile-only placeholder\n{}",
         child.diagnostics()
+    );
+    assert!(
+        !pid_path.exists(),
+        "pidfile-only process is not a reap keeper"
     );
     child.kill().expect("kill placeholder");
     child.wait().expect("wait placeholder");

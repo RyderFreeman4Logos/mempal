@@ -18,7 +18,7 @@ use crate::db_path_identity::DbPathIdentity;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DaemonProcess {
     pub pid: i32,
-    pub(crate) start_time_ticks: u64,
+    pub start_time_ticks: u64,
 }
 
 impl DaemonProcess {
