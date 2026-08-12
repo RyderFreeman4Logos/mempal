@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 9178
-baseline_lines = 650
-issue = "892"
-rationale = "#871/#886/#888/#889/#890 document outage visibility, deterministic Busy fixtures, and bounded MCP/daemon waits; exact no-growth ratchet."
+baseline_tokens = 9218
+baseline_lines = 654
+issue = "893"
+rationale = "#893 documents transient queue profile-admission lock retry while preserving byte-budget rejection semantics; exact no-growth ratchet."
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
 kind = "source"
@@ -244,10 +244,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/core/queue.rs"
 kind = "source"
-baseline_tokens = 24150
-baseline_lines = 3155
-issue = "858"
-rationale = "#858 typed daemon queue-write SQLite contention observations need heartbeat lock-fault injection on AsyncPendingMessageStore; exact no-growth ratchet."
+baseline_tokens = 24242
+baseline_lines = 3165
+issue = "893"
+rationale = "#893 retries transient profile-admission lock contention while opening normal queue writers; exact no-growth ratchet."
 
 [[files]]
 path = "src/core/types.rs"

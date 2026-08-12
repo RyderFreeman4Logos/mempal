@@ -42,6 +42,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **Queue byte admission**: retry transient profile-admission lock contention when
+  opening a normal queue writer, so concurrent ingest requests retain the
+  byte-budget rejection contract under suite load (#893).
+
 - **Daemon readiness CLI tests**: use the shared Linux subprocess supervisor,
   so CLI spawn, output drain, process-group cleanup, and reaping share one
   deadline and timeout reports remain redacted (#892).
