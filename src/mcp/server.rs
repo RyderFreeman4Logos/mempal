@@ -1617,7 +1617,7 @@ impl MempalMcpServer {
                 Self::release_scoped_claim_after_timeout(
                     queue,
                     claim,
-                    Duration::ZERO,
+                    CLAIM_LOCK_RETRY_DEADLINE,
                     self.daemon_write_observer.as_ref(),
                 )
                 .await?;
@@ -1670,7 +1670,7 @@ impl MempalMcpServer {
                     Self::release_scoped_claim_after_timeout(
                         queue,
                         claim,
-                        Duration::ZERO,
+                        CLAIM_LOCK_RETRY_DEADLINE,
                         self.daemon_write_observer.as_ref(),
                     )
                     .await?;
@@ -1689,7 +1689,7 @@ impl MempalMcpServer {
                 Self::release_scoped_claim_after_timeout(
                     queue,
                     claim,
-                    Duration::ZERO,
+                    CLAIM_LOCK_RETRY_DEADLINE,
                     self.daemon_write_observer.as_ref(),
                 )
                 .await?;
@@ -1726,7 +1726,7 @@ impl MempalMcpServer {
             Self::release_scoped_claim_after_timeout(
                 queue,
                 claim,
-                Duration::ZERO,
+                CLAIM_LOCK_RETRY_DEADLINE,
                 self.daemon_write_observer.as_ref(),
             )
             .await?;
