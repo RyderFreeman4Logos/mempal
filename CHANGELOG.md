@@ -59,9 +59,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   contention in the oversubscribe test so suite-load flock waits are not
   miscounted as budget rejections.
 
-- **Test fixture readiness**: use deterministic readiness synchronization for the
-  SQLite writer-busy and MCP embedder-entry fixtures so suite-load contention
-  cannot race their assertions (#882).
+- **Fixture readiness**: synchronize SQLite, MCP, and queue byte-admission
+  fixtures at their boundary so suite load cannot race or deadlock assertions;
+  the daemon lifecycle completion poll likewise retries temporary admission
+  `Busy` through its existing deadline (#882, #889, #890).
 
 - **Daemon supervisor cooldowns**: wait through active restart-budget
   cooldowns and retry bootstrap in-process; true temporary refusals retain
