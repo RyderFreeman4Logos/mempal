@@ -60,8 +60,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   miscounted as budget rejections.
 
 - **Fixture readiness**: synchronize SQLite, MCP, and queue byte-admission
-  fixtures at their boundary so suite load cannot race or deadlock assertions
-  (#882, #889).
+  fixtures at their boundary so suite load cannot race or deadlock assertions;
+  the daemon lifecycle completion poll likewise retries temporary admission
+  `Busy` through its existing deadline (#882, #889, #890).
 
 - **Daemon supervisor cooldowns**: wait through active restart-budget
   cooldowns and retry bootstrap in-process; true temporary refusals retain

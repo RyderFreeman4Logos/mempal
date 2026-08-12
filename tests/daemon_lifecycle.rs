@@ -743,10 +743,19 @@ fn test_daemon_processes_ingest_async_queue_rows() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut completed = false;
     while Instant::now() < deadline {
-        let record = PendingMessageStore::new_without_reclaim(&db_path)
+        let record = match PendingMessageStore::new_without_reclaim(&db_path)
             .operation_status(&operation_id)
-            .expect("load operation status")
-            .expect("operation record exists");
+        {
+            Ok(Some(record)) => record,
+            Err(mempal::core::queue::QueueError::Admission(
+                mempal::core::db_admission::DbAdmissionError::Busy { .. },
+            )) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Ok(None) => panic!("operation record exists"),
+            Err(error) => panic!("load operation status: {error}"),
+        };
         if record.op_state == "completed" {
             completed = true;
             break;

@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8935
-baseline_lines = 630
-issue = "876"
-rationale = "#876 documents admission-receipt ownership, Busy retry classification, MCP embed deadline seam, and admission concurrent Busy fixture; exact no-growth ratchet."
+baseline_tokens = 8955
+baseline_lines = 631
+issue = "890"
+rationale = "#876 documents admission fixes; #890 records bounded daemon lifecycle Busy polling; exact no-growth ratchet."
 
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
@@ -493,10 +493,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/daemon_lifecycle.rs"
 kind = "test"
-baseline_tokens = 7665
-baseline_lines = 966
-issue = "843"
-rationale = "Readiness-probe hardening for SIGTERM drain under local-gates load (#843); no-growth ratchet after env isolation + diagnostics."
+baseline_tokens = 7753
+baseline_lines = 975
+issue = "890"
+rationale = "Daemon lifecycle retries classified admission Busy only within its existing deadline (#890); no-growth ratchet."
 
 [[files]]
 path = "tests/embedder_reindex_scenarios.rs"
