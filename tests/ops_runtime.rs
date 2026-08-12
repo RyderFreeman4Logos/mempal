@@ -521,7 +521,10 @@ fn test_cli_doctor_reports_queue_failure_classes() {
 #[test]
 fn test_cli_daemon_status_reports_queue_failure_classes() {
     let home = TempDir::new().expect("home");
-    fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
+    let mempal_home = home.path().join(".mempal");
+    fs::create_dir_all(&mempal_home).expect("create mempal home");
+    fs::write(mempal_home.join("config.toml"), "[api]\nenabled = false\n")
+        .expect("write isolated daemon config");
     let db_path = palace_db_path(&home);
     Database::open(&db_path).expect("open db");
     let store = PendingMessageStore::new_without_reclaim(&db_path);
@@ -547,6 +550,8 @@ fn test_cli_daemon_status_reports_queue_failure_classes() {
             QueueFailureDisposition::Terminal,
         )
         .expect("mark terminal failed");
+    drop(store);
+
     let mut command = Command::new(mempal_bin());
     command
         .args(["daemon", "--foreground"])
