@@ -9,6 +9,7 @@ fn lock_admission_state(db_path: &std::path::Path) -> std::fs::File {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(lock_path)
         .expect("open admission lock");
     // SAFETY: `file` remains open for the duration of the lock in this fixture.
