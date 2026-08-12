@@ -1,6 +1,8 @@
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
+use std::time::Duration;
 
 use mempal::core::db::Database;
+use mempal::core::db_admission::{DbAdmissionRequest, DbHolderClass, ProfileDbAdmission};
 use mempal::core::queue::{PendingMessageStore, QueueConfig, QueueError};
 
 #[test]
@@ -12,24 +14,55 @@ fn concurrent_ingest_requests_cannot_exceed_active_byte_budget() {
         max_ingest_active_bytes: 1_000,
         ..QueueConfig::default()
     };
-    let barrier = Arc::new(Barrier::new(3));
+    let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("empty admission snapshot");
+    let usable_holders = if DbHolderClass::current_process().is_service_holder() {
+        snapshot.configured_holder_limit
+    } else {
+        snapshot
+            .configured_holder_limit
+            .saturating_sub(snapshot.reserved_service_holders)
+    };
+    assert!(
+        usable_holders >= 2,
+        "fixture needs two usable queue-holder slots, got {usable_holders}"
+    );
+    let saturated_holders = (0..usable_holders - 1)
+        .map(|_| {
+            ProfileDbAdmission::acquire(
+                &db_path,
+                DbAdmissionRequest::new(DbHolderClass::current_process(), 1, 1),
+            )
+            .expect("reserve all but one usable queue-holder slot")
+        })
+        .collect::<Vec<_>>();
+
+    let enqueue_barrier = Arc::new(Barrier::new(3));
+    let (ready_tx, ready_rx) = mpsc::channel();
     let payload = "m".repeat(600);
 
     let workers = (0..2)
         .map(|_| {
             let db_path = db_path.clone();
-            let barrier = Arc::clone(&barrier);
+            let enqueue_barrier = Arc::clone(&enqueue_barrier);
+            let ready_tx = ready_tx.clone();
             let payload = payload.clone();
             std::thread::spawn(move || {
-                let store =
-                    PendingMessageStore::with_config(db_path, config).expect("open queue store");
-                barrier.wait();
+                let store = PendingMessageStore::new_without_reclaim_with_config(db_path, config);
+                ready_tx.send(()).expect("report enqueue readiness");
+                enqueue_barrier.wait();
                 store.enqueue("ingest_async", &payload)
             })
         })
         .collect::<Vec<_>>();
 
-    barrier.wait();
+    drop(ready_tx);
+    for _ in 0..2 {
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queue setup must reach the enqueue boundary under constrained admission");
+    }
+    drop(saturated_holders);
+    enqueue_barrier.wait();
     let results = workers
         .into_iter()
         .map(|worker| worker.join().expect("join enqueue worker"))
