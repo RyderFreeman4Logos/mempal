@@ -91,6 +91,428 @@ enabled = false
 }
 
 #[tokio::test]
+async fn test_mcp_smoke_wait_processes_without_background_worker() {
+    let (_tempdir, _db_path, server) = setup_server();
+    server.ingest_worker_started.store(true, Ordering::SeqCst);
+
+    let response = server
+        .mempal_ingest(Parameters(IngestRequest {
+            content: "smoke wait must not depend on background worker scheduling".to_string(),
+            wing: "smoke".to_string(),
+            room: Some("mcp".to_string()),
+            smoke: Some(true),
+            wait: Some(true),
+            wait_timeout_secs: Some(5),
+            ..IngestRequest::default()
+        }))
+        .await
+        .expect("smoke ingest should complete without a background worker")
+        .0;
+
+    assert_eq!(response.state, Some(IngestOperationState::Completed));
+    assert!(!response.timed_out);
+    assert!(
+        !response.created_drawer_ids.is_empty(),
+        "smoke wait must return cleanup-safe created ids"
+    );
+}
+
+#[tokio::test]
+async fn test_mcp_smoke_zero_wait_starts_background_worker() {
+    let (_tempdir, _db_path, server) = setup_server();
+
+    let response = server
+        .mempal_ingest(Parameters(IngestRequest {
+            content: "zero-budget smoke wait must retain asynchronous delivery".to_string(),
+            wing: "smoke".to_string(),
+            room: Some("mcp".to_string()),
+            smoke: Some(true),
+            wait: Some(true),
+            wait_timeout_secs: Some(0),
+            ..IngestRequest::default()
+        }))
+        .await
+        .expect("zero-budget smoke wait should admit the operation")
+        .0;
+
+    assert_eq!(response.state, Some(IngestOperationState::Queued));
+    let operation_id = response.operation_id.as_deref().expect("operation id");
+    let completed = tokio::time::timeout(
+        Duration::from_secs(2),
+        server.wait_for_operation_completion(operation_id),
+    )
+    .await
+    .expect("zero-budget smoke wait should retain background delivery")
+    .expect("background smoke operation should complete");
+
+    assert_eq!(completed.state, Some(IngestOperationState::Completed));
+    assert!(!completed.created_drawer_ids.is_empty());
+}
+
+#[tokio::test]
+async fn test_mcp_positive_smoke_timeout_retains_completion_owner() {
+    let (_tempdir, _db_path, server) = setup_server();
+    let server = server.with_ingest_processing_delay_for_test(Duration::from_secs(1));
+
+    let response = server
+        .mempal_ingest(Parameters(IngestRequest {
+            content: "timed-out smoke wait must retain a local completion consumer".to_string(),
+            wing: "smoke".to_string(),
+            room: Some("mcp".to_string()),
+            smoke: Some(true),
+            wait: Some(true),
+            wait_timeout_secs: Some(1),
+            ..IngestRequest::default()
+        }))
+        .await
+        .expect("short smoke wait should return a durable receipt")
+        .0;
+
+    assert!(matches!(
+        response.state,
+        Some(IngestOperationState::Queued | IngestOperationState::Running)
+    ));
+    assert!(response.timed_out);
+    let operation_id = response.operation_id.as_deref().expect("operation id");
+    let completed = tokio::time::timeout(
+        Duration::from_secs(4),
+        server.wait_for_operation_completion(operation_id),
+    )
+    .await
+    .expect("timed-out smoke receipt must retain a local completion consumer")
+    .expect("background smoke operation should complete");
+
+    assert_eq!(completed.state, Some(IngestOperationState::Completed));
+    assert!(!completed.created_drawer_ids.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_mcp_smoke_wait_real_source_lock_times_out_without_blocking_runtime() {
+    let (_tempdir, db_path, server) = setup_server();
+    let request = IngestRequest {
+        content: "real source lock must not block bounded smoke wait".to_string(),
+        wing: "smoke".to_string(),
+        room: Some("mcp".to_string()),
+        smoke: Some(true),
+        wait: Some(true),
+        wait_timeout_secs: Some(1),
+        ..IngestRequest::default()
+    };
+
+    let preview = server
+        .mempal_ingest(Parameters(IngestRequest {
+            dry_run: Some(true),
+            ..request.clone()
+        }))
+        .await
+        .expect("smoke preview")
+        .0;
+    let mempal_home = db_path.parent().expect("database parent");
+    let source_lock = crate::ingest::lock::acquire_source_lock(
+        mempal_home,
+        &preview.drawer_id,
+        Duration::from_secs(1),
+    )
+    .expect("hold source lock");
+
+    let (ticks, ticker) = spawn_runtime_ticker();
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_millis(1500),
+        server.mempal_ingest(Parameters(request)),
+    )
+    .await;
+    ticker.abort();
+    let response = result
+        .expect("one-second smoke wait must return before sync source-lock timeout")
+        .expect("source-lock contention returns a durable receipt")
+        .0;
+
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "source-lock contention exceeded the bounded smoke wait"
+    );
+    assert!(
+        response.timed_out
+            || response
+                .state
+                .map(IngestOperationState::is_terminal)
+                .unwrap_or(false),
+        "bounded smoke wait must return a timeout or terminal receipt"
+    );
+    assert_runtime_ticked(&ticks, "bounded smoke ingest with a real source lock");
+
+    let operation_id = response.operation_id.as_deref().expect("operation id");
+    drop(source_lock);
+    let completed = tokio::time::timeout(
+        Duration::from_secs(4),
+        server.wait_for_operation_completion(operation_id),
+    )
+    .await
+    .expect("claimed work must retain an owner after the request deadline")
+    .expect("source-lock-contended smoke operation should complete");
+    assert_eq!(completed.state, Some(IngestOperationState::Completed));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_mcp_scoped_finite_wait_real_source_lock_runs_off_runtime_and_retains_claim_owner() {
+    let (_tempdir, db_path, server) = setup_server();
+    let request = IngestRequest {
+        content: "ordinary finite wait source-lock contention ".repeat(1_000),
+        wing: "mcp".to_string(),
+        room: Some("runtime".to_string()),
+        wait: Some(true),
+        wait_timeout_secs: Some(6),
+        ..IngestRequest::default()
+    };
+    let controls = IngestControls {
+        no_gate: true,
+        bypass_novelty: true,
+    };
+
+    let preview = server
+        .mempal_ingest_with_controls_scoped_worker(
+            IngestRequest {
+                dry_run: Some(true),
+                ..request.clone()
+            },
+            controls,
+        )
+        .await
+        .expect("ordinary scoped preview")
+        .0;
+    assert!(
+        preview.chunk_count > 1,
+        "fixture must exercise multi-chunk ingest"
+    );
+    let server = server.with_ingest_processing_delay_for_test(Duration::from_secs(1));
+    let mempal_home = db_path.parent().expect("database parent");
+    let source_lock = crate::ingest::lock::acquire_source_lock(
+        mempal_home,
+        preview.drawer_ids.get(1).expect("second chunk drawer id"),
+        Duration::from_secs(1),
+    )
+    .expect("hold source lock");
+
+    let (ticks, ticker) = spawn_runtime_ticker();
+    let started = Instant::now();
+    let response = tokio::time::timeout(
+        Duration::from_secs(7),
+        server.mempal_ingest_with_controls_scoped_worker(request, controls),
+    )
+    .await
+    .expect("ordinary finite scoped wait must respect its request budget")
+    .expect("source-lock contention returns a durable receipt")
+    .0;
+    ticker.abort();
+
+    assert!(
+        response.timed_out,
+        "ordinary finite wait must time out under held lock"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(7),
+        "ordinary finite wait exceeded its request budget"
+    );
+    assert_runtime_ticked(&ticks, "ordinary finite ingest with a real source lock");
+
+    let operation_id = response.operation_id.as_deref().expect("operation id");
+    let record = PendingMessageStore::new_without_reclaim(&db_path)
+        .operation_status(operation_id)
+        .expect("load claimed operation")
+        .expect("operation remains queryable");
+    assert_eq!(record.op_state, IngestOperationState::Running.as_str());
+    assert!(
+        record.claimed_at.is_some(),
+        "timed-out work must retain its owner"
+    );
+
+    drop(source_lock);
+    let completed = tokio::time::timeout(
+        Duration::from_secs(4),
+        server.wait_for_operation_completion(operation_id),
+    )
+    .await
+    .expect("timed-out ordinary operation must retain its completion owner")
+    .expect("source-lock-contended ordinary operation should complete");
+    assert_eq!(completed.state, Some(IngestOperationState::Completed));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_mcp_scoped_finite_lease_timeout_releases_late_acquisition() {
+    let (_tempdir, db_path, server) = setup_server();
+    let (acquired_tx, acquired_rx) = mpsc::sync_channel(1);
+    let server = server.with_ingest_writer_lease_acquired_hook_for_test(Arc::new(move |_lease| {
+        acquired_tx.send(()).expect("report acquired writer lease");
+        std::thread::sleep(Duration::from_millis(200));
+    }));
+    let operation_id = enqueue_prepared_test_ingest_operation(
+        &server,
+        &db_path,
+        "late writer lease acquisition must not outlive its cancelled waiter",
+        "lease-timeout",
+    )
+    .await;
+    let queue = PendingMessageStore::new_without_reclaim(&db_path);
+    let claim = queue
+        .claim_next_by_kind("worker-late-lease", 60, INGEST_ASYNC_KIND)
+        .expect("claim queued operation")
+        .expect("claimed queued operation");
+    let async_queue = AsyncPendingMessageStore::from_store(queue);
+    let processing_server = server.clone();
+    let processing = tokio::spawn(async move {
+        processing_server
+            .process_ingest_claim_inline_with_budget(
+                &async_queue,
+                "worker-late-lease",
+                claim,
+                Duration::from_millis(25),
+            )
+            .await
+    });
+    tokio::task::spawn_blocking(move || {
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer lease must be acquired before the waiter times out");
+    })
+    .await
+    .expect("acquisition observer must not panic");
+    let result = processing
+        .await
+        .expect("bounded processing task must not panic")
+        .expect("lease acquisition timeout must return a bounded result");
+    assert_eq!(result, ScopedIngestProcessResult::TimedOut);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let leases = Database::open(&db_path)
+                .expect("open database after SQLite unlock")
+                .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+                .expect("read writer lease status");
+            if leases.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a lease acquired after timeout must be released, not orphaned");
+
+    let record = PendingMessageStore::new_without_reclaim(&db_path)
+        .operation_status(&operation_id)
+        .expect("load operation record")
+        .expect("operation remains queryable");
+    assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
+    assert!(
+        record.claimed_at.is_none(),
+        "timed-out claim must be released"
+    );
+}
+
+#[tokio::test]
+async fn test_mcp_scoped_smoke_wait_bounds_lease_check_to_remaining_budget() {
+    let (_tempdir, db_path, server) = setup_server();
+    let async_db = QueryOnlyAsyncDb::open(&db_path, 4)
+        .expect("open query-only async db")
+        .with_read_delay(Duration::from_millis(500));
+    let server = server.with_query_only_async_db_for_test(async_db);
+
+    let started = Instant::now();
+    let visible = tokio::time::timeout(
+        Duration::from_millis(200),
+        server.daemon_writer_lease_visible_for_ingest_wait(Duration::from_millis(25)),
+    )
+    .await
+    .expect("scoped smoke wait lease check must use the residual wait budget");
+
+    assert!(!visible);
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "lease check exceeded the scoped smoke wait's remaining budget"
+    );
+}
+
+#[tokio::test]
+async fn test_mcp_scoped_smoke_preflight_uses_remaining_request_budget() {
+    let (_tempdir, db_path, server) = setup_server();
+    let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+        .with_blocking_delay(Duration::from_millis(700));
+    let server = server
+        .with_async_queue_for_test(async_queue)
+        .with_query_only_read_delay_for_test(Duration::from_millis(500));
+
+    let response = tokio::time::timeout(
+        Duration::from_millis(1100),
+        server.mempal_ingest(Parameters(IngestRequest {
+            content: "smoke preflight lease checks must honor the request budget".to_string(),
+            wing: "smoke".to_string(),
+            room: Some("mcp".to_string()),
+            smoke: Some(true),
+            wait: Some(true),
+            wait_timeout_secs: Some(1),
+            ..IngestRequest::default()
+        })),
+    )
+    .await
+    .expect("scoped smoke preflight must not outlive the request budget")
+    .expect("scoped smoke preflight should return a durable receipt")
+    .0;
+
+    assert_eq!(response.state, Some(IngestOperationState::Queued));
+    assert!(response.timed_out);
+}
+
+#[tokio::test]
+async fn test_mcp_smoke_wait_writer_lease_error_releases_and_starts_drain() {
+    let (_tempdir, db_path, server) = setup_server();
+    let server = server
+        .with_ingest_writer_lease_failures_for_test(1)
+        .with_ingest_processing_delay_for_test(Duration::from_millis(500));
+
+    let error = match server
+        .mempal_ingest(Parameters(IngestRequest {
+            content: "writer lease failures must not strand admitted smoke work".to_string(),
+            wing: "smoke".to_string(),
+            room: Some("mcp".to_string()),
+            smoke: Some(true),
+            wait: Some(true),
+            wait_timeout_secs: Some(5),
+            ..IngestRequest::default()
+        }))
+        .await
+    {
+        Ok(_) => panic!("the injected scoped writer lease failure must reach the caller"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to acquire scoped MCP ingest writer lease"),
+        "error={error}"
+    );
+    let db = Database::open(&db_path).expect("open queue database");
+    let operation_id = db
+        .conn()
+        .query_row(
+            "SELECT id FROM pending_messages WHERE kind = ?1 ORDER BY rowid DESC LIMIT 1",
+            [INGEST_ASYNC_KIND],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("writer lease error must retain an admitted operation");
+    let completed = tokio::time::timeout(
+        Duration::from_secs(4),
+        server.wait_for_operation_completion(&operation_id),
+    )
+    .await
+    .expect("writer lease failure must start a drain worker")
+    .expect("drain worker should complete the released smoke operation");
+
+    assert_eq!(completed.state, Some(IngestOperationState::Completed));
+    assert!(!completed.created_drawer_ids.is_empty());
+}
+
+#[tokio::test]
 async fn test_mcp_smoke_ingest_wait_update_and_status_return_created_ids() {
     let (_tempdir, db_path, server) = setup_server();
 

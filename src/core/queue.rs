@@ -1786,8 +1786,26 @@ impl PendingMessageStore {
         })
     }
 
-    fn open_connection(&self) -> Result<Connection> {
-        self.open_connection_with_busy_timeout(None)
+    fn open_connection_with_admission_retry(
+        &self,
+        busy_timeout: Option<Duration>,
+    ) -> Result<Connection> {
+        if let Some(timeout) = busy_timeout {
+            return self.open_connection_with_busy_timeout(Some(timeout));
+        }
+        let started = Instant::now();
+        loop {
+            match self.open_connection_with_busy_timeout(busy_timeout) {
+                Ok(connection) => return Ok(connection),
+                Err(QueueError::Admission(super::db_admission::DbAdmissionError::Busy {
+                    ..
+                })) if started.elapsed() < CLAIM_LOCK_RETRY_DEADLINE => {
+                    let remaining = CLAIM_LOCK_RETRY_DEADLINE.saturating_sub(started.elapsed());
+                    std::thread::sleep(CLAIM_LOCK_RETRY_DELAY.min(remaining));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn with_connection<T>(&self, op: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
@@ -1805,10 +1823,7 @@ impl PendingMessageStore {
             .lock()
             .map_err(|_| QueueError::ClaimConnectionMutexPoisoned)?;
         if guard.is_none() {
-            let conn = match busy_timeout {
-                Some(timeout) => self.open_connection_with_busy_timeout(Some(timeout))?,
-                None => self.open_connection()?,
-            };
+            let conn = self.open_connection_with_admission_retry(busy_timeout)?;
             #[cfg(any(test, feature = "db-test-seam"))]
             self.connection_cache
                 .writer_open_count

@@ -1,5 +1,48 @@
+use std::fs::OpenOptions;
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Barrier, mpsc};
 use std::time::Duration;
+
+fn lock_admission_state(db_path: &std::path::Path) -> std::fs::File {
+    let lock_path = db_path.with_file_name(".palace.db.admission.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .expect("open admission lock");
+    // SAFETY: `file` remains open for the duration of the lock in this fixture.
+    assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+    file
+}
+
+#[test]
+fn enqueue_retries_transient_profile_admission_lock() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let lock = lock_admission_state(&db_path);
+    let start = Arc::new(Barrier::new(2));
+    let release_start = Arc::clone(&start);
+    let releaser = std::thread::spawn(move || {
+        release_start.wait();
+        std::thread::sleep(Duration::from_millis(350));
+        drop(lock);
+    });
+    let worker_start = Arc::clone(&start);
+    let worker_path = db_path.clone();
+    let worker = std::thread::spawn(move || {
+        worker_start.wait();
+        PendingMessageStore::new_without_reclaim(worker_path).enqueue("ingest_async", "m")
+    });
+
+    worker
+        .join()
+        .expect("join enqueue worker")
+        .expect("normal queue enqueue retries a transient profile admission lock");
+    releaser.join().expect("join admission lock releaser");
+}
 
 use mempal::core::db::Database;
 use mempal::core::db_admission::{DbAdmissionRequest, DbHolderClass, ProfileDbAdmission};

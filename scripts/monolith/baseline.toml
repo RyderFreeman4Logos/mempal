@@ -5,11 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 8955
-baseline_lines = 631
-issue = "890"
-rationale = "#876 documents admission fixes; #890 records bounded daemon lifecycle Busy polling; exact no-growth ratchet."
-
+baseline_tokens = 9218
+baseline_lines = 654
+issue = "893"
+rationale = "#893 documents transient queue profile-admission lock retry while preserving byte-budget rejection semantics; exact no-growth ratchet."
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
 kind = "source"
@@ -245,10 +244,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/core/queue.rs"
 kind = "source"
-baseline_tokens = 24150
-baseline_lines = 3155
-issue = "858"
-rationale = "#858 typed daemon queue-write SQLite contention observations need heartbeat lock-fault injection on AsyncPendingMessageStore; exact no-growth ratchet."
+baseline_tokens = 24242
+baseline_lines = 3165
+issue = "893"
+rationale = "#893 retries transient profile-admission lock contention while opening normal queue writers; exact no-growth ratchet."
 
 [[files]]
 path = "src/core/types.rs"
@@ -309,10 +308,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/doctor.rs"
 kind = "source"
-baseline_tokens = 10414
-baseline_lines = 1363
-issue = "695"
-rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
+baseline_tokens = 12047
+baseline_lines = 1593
+issue = "871"
+rationale = "#871 keeps config, queue, and daemon-identity observations typed through shared availability classification; exact no-growth ratchet."
 
 [[files]]
 path = "src/ingest/gating.rs"
@@ -357,10 +356,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/main.rs"
 kind = "source"
-baseline_tokens = 260191
-baseline_lines = 33712
-issue = "847"
-rationale = "#870 maps typed temporary daemon admission refusals, including restart-budget cooldown and a live writer lease still held after its bounded retry, to the documented EX_TEMPFAIL process status while preserving generic failures; exact no-growth ratchet until the main CLI split lands."
+baseline_tokens = 260328
+baseline_lines = 33734
+issue = "871"
+rationale = "#871 emits bounded typed availability on CLI status config, database, and queue observation failures; exact no-growth ratchet until the main CLI split lands."
 
 [[files]]
 path = "src/markdown_export.rs"
@@ -373,10 +372,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/mcp/server.rs"
 kind = "source"
-baseline_tokens = 182087
-baseline_lines = 22962
-issue = "876"
-rationale = "#876 preserves holder-budget no-write evidence, bounds MCP search embed deadlines, and adds distinguishing deadline/admission regression tests; exact no-growth ratchet."
+baseline_tokens = 183949
+baseline_lines = 23194
+issue = "871"
+rationale = "#871 limits retained claims to smoke-owned off-runtime writes; finite scoped waits release or report within budget; exact no-growth ratchet."
 
 [[files]]
 path = "src/mcp/tools.rs"
@@ -496,8 +495,7 @@ kind = "test"
 baseline_tokens = 7753
 baseline_lines = 975
 issue = "890"
-rationale = "Daemon lifecycle retries classified admission Busy only within its existing deadline (#890); no-growth ratchet."
-
+rationale = "#890 retries classified admission Busy only within the daemon lifecycle fixture's existing deadline; exact no-growth ratchet."
 [[files]]
 path = "tests/embedder_reindex_scenarios.rs"
 kind = "test"

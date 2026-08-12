@@ -245,10 +245,22 @@ fn scoped_ingest_claim_retry_deadline(remaining: Duration) -> Option<Duration> {
         .filter(|deadline| !deadline.is_zero())
 }
 
-fn scoped_ingest_processing_budget(remaining: Duration) -> Option<Duration> {
+fn scoped_ingest_processing_budget(
+    remaining: Duration,
+    claim_policy: ScopedIngestClaimPolicy,
+) -> Option<Duration> {
+    let minimum = match claim_policy {
+        ScopedIngestClaimPolicy::InlineWithinDeadline
+        | ScopedIngestClaimPolicy::InlineOwnedWithinDeadline => {
+            MCP_SCOPED_INGEST_MIN_PROCESSING_BUDGET
+        }
+        ScopedIngestClaimPolicy::InlineSmokeWithinDeadline
+        | ScopedIngestClaimPolicy::InlineUntilTerminal => Duration::ZERO,
+        ScopedIngestClaimPolicy::PollOnly => return None,
+    };
     remaining
         .checked_sub(MCP_SCOPED_INGEST_CLAIM_CLEANUP_MARGIN)
-        .filter(|budget| *budget >= MCP_SCOPED_INGEST_MIN_PROCESSING_BUDGET)
+        .filter(|budget| *budget >= minimum)
 }
 
 fn scoped_process_remaining(started: Instant, budget: Duration) -> Option<Duration> {
@@ -332,6 +344,8 @@ pub struct MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     daemon_writer_lease_check_error: Option<String>,
     #[cfg(any(test, feature = "db-test-seam"))]
+    ingest_writer_lease_failures: Arc<AtomicUsize>,
+    #[cfg(any(test, feature = "db-test-seam"))]
     ingest_admission_current_mcp_holder_for_test: bool,
     #[cfg(any(test, feature = "db-test-seam"))]
     async_db_open_lock_failures: Arc<AtomicUsize>,
@@ -348,6 +362,8 @@ pub struct MempalMcpServer {
     #[cfg(test)]
     content_writer_lease_acquired_hook: Option<ContentWriterLeaseAcquiredHook>,
     #[cfg(test)]
+    ingest_writer_lease_acquired_hook: Option<IngestWriterLeaseAcquiredHook>,
+    #[cfg(test)]
     operation_status_json_within_probe_attempts: Arc<AtomicUsize>,
 }
 
@@ -362,6 +378,35 @@ pub(crate) enum McpIngestSideEffectStage {
 
 #[cfg(test)]
 type ContentWriterLeaseAcquiredHook = Arc<dyn Fn(&RuntimeWriterLease) + Send + Sync>;
+
+#[cfg(test)]
+type IngestWriterLeaseAcquiredHook = Arc<dyn Fn(&RuntimeWriterLease) + Send + Sync>;
+
+/// Holds a lease while its blocking acquisition crosses an async cancellation boundary.
+struct AcquiredMcpIngestWriterLease {
+    db_path: PathBuf,
+    lease: Option<RuntimeWriterLease>,
+}
+
+impl AcquiredMcpIngestWriterLease {
+    fn into_guard(mut self) -> McpIngestWriterLeaseGuard {
+        let lease = self
+            .lease
+            .take()
+            .expect("acquired ingest writer lease must be present");
+        McpIngestWriterLeaseGuard::new(std::mem::take(&mut self.db_path), lease)
+    }
+}
+
+impl Drop for AcquiredMcpIngestWriterLease {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take()
+            && let Ok(db) = Database::open_lease_control(&self.db_path)
+        {
+            let _ = db.runtime_writer_lease_release(&lease);
+        }
+    }
+}
 
 struct McpIngestWriterLeaseGuard {
     db_path: PathBuf,
@@ -628,6 +673,8 @@ impl MempalMcpServer {
             #[cfg(any(test, feature = "db-test-seam"))]
             daemon_writer_lease_check_error: None,
             #[cfg(any(test, feature = "db-test-seam"))]
+            ingest_writer_lease_failures: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "db-test-seam"))]
             ingest_admission_current_mcp_holder_for_test: false,
             #[cfg(any(test, feature = "db-test-seam"))]
             async_db_open_lock_failures: Arc::new(AtomicUsize::new(0)),
@@ -643,6 +690,8 @@ impl MempalMcpServer {
             mcp_ingest_side_effect_hook: None,
             #[cfg(test)]
             content_writer_lease_acquired_hook: None,
+            #[cfg(test)]
+            ingest_writer_lease_acquired_hook: None,
             #[cfg(test)]
             operation_status_json_within_probe_attempts: Arc::new(AtomicUsize::new(0)),
         })
@@ -741,6 +790,13 @@ impl MempalMcpServer {
     }
 
     #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_ingest_writer_lease_failures_for_test(self, failures: usize) -> Self {
+        self.ingest_writer_lease_failures
+            .store(failures, Ordering::SeqCst);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_ingest_admission_current_mcp_holder_for_test(mut self) -> Self {
         self.ingest_admission_current_mcp_holder_for_test = true;
         self
@@ -792,6 +848,15 @@ impl MempalMcpServer {
         hook: ContentWriterLeaseAcquiredHook,
     ) -> Self {
         self.content_writer_lease_acquired_hook = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_ingest_writer_lease_acquired_hook_for_test(
+        mut self,
+        hook: IngestWriterLeaseAcquiredHook,
+    ) -> Self {
+        self.ingest_writer_lease_acquired_hook = Some(hook);
         self
     }
 
@@ -1400,14 +1465,18 @@ impl MempalMcpServer {
                     return Ok(());
                 }
                 Err(error) => {
+                    Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
+                    Self::release_claim_with_lock_retry(
+                        queue,
+                        claim,
+                        self.daemon_write_observer.as_ref(),
+                    )
+                    .await
+                    .context("failed to release scoped ingest claim after writer lease error")?;
                     return Err(error).context("failed to acquire scoped MCP ingest writer lease");
                 }
             }
         };
-        #[cfg(any(test, feature = "db-test-seam"))]
-        if let Some(delay) = self.ingest_processing_delay {
-            tokio::time::sleep(delay).await;
-        }
         let runtime_writer_lease = external_writer_lease
             .or_else(|| writer_lease.as_ref().map(|lease| lease.lease().clone()));
         let outcome = match self
@@ -1584,6 +1653,16 @@ impl MempalMcpServer {
                     return Ok(ScopedIngestProcessResult::ReleasedForRetry);
                 }
                 Ok(Err(error)) => {
+                    Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
+                    let release_deadline =
+                        scoped_process_remaining(started, budget).unwrap_or_default();
+                    Self::release_scoped_claim_after_timeout(
+                        queue,
+                        claim,
+                        release_deadline,
+                        self.daemon_write_observer.as_ref(),
+                    )
+                    .await?;
                     return Err(error).context("failed to acquire scoped MCP ingest writer lease");
                 }
                 Err(_) => {
@@ -1741,6 +1820,34 @@ impl MempalMcpServer {
         completed?;
         released?;
         Ok(ScopedIngestProcessResult::Processed)
+    }
+
+    async fn process_ingest_claim_with_owned_task_budget(
+        &self,
+        queue: &AsyncPendingMessageStore,
+        worker_id: &str,
+        claim: ClaimedMessage,
+        budget: Duration,
+    ) -> anyhow::Result<ScopedIngestProcessResult> {
+        let scoped_worker = self.clone();
+        let scoped_queue = queue.clone();
+        let scoped_worker_id = worker_id.to_string();
+        let processing = tokio::spawn(async move {
+            scoped_worker
+                .process_ingest_claim_inline(&scoped_queue, &scoped_worker_id, claim)
+                .await
+        });
+
+        match tokio::time::timeout(budget, processing).await {
+            Ok(Ok(Ok(()))) => Ok(ScopedIngestProcessResult::Processed),
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Err(error)) => {
+                Err(anyhow::Error::new(error).context("scoped ingest claim task failed"))
+            }
+            // Dropping a JoinHandle detaches the task. That task owns the claim,
+            // heartbeat, and writer lease until it records the terminal receipt.
+            Err(_) => Ok(ScopedIngestProcessResult::TimedOut),
+        }
     }
 
     async fn complete_ingest_claim_outcome(
@@ -1915,8 +2022,20 @@ impl MempalMcpServer {
         &self,
         worker_id: &str,
     ) -> anyhow::Result<Option<McpIngestWriterLeaseGuard>> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if self
+            .ingest_writer_lease_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            anyhow::bail!("forced MCP ingest writer lease failure");
+        }
         let db_path = self.db_path.clone();
         let owner = worker_id.to_string();
+        #[cfg(test)]
+        let acquired_hook = self.ingest_writer_lease_acquired_hook.clone();
         let metadata_json = serde_json::json!({
             "component": "mcp-ingest-worker",
             "worker_role": Self::ingest_worker_role(worker_id),
@@ -1942,12 +2061,18 @@ impl MempalMcpServer {
                     Some(&metadata_json),
                 )
                 .context("failed to acquire MCP ingest writer lease")?;
-            Ok::<_, anyhow::Error>((admitted_path, lease))
+            #[cfg(test)]
+            if let (Some(hook), Some(lease)) = (acquired_hook.as_ref(), lease.as_ref()) {
+                hook(lease);
+            }
+            Ok::<_, anyhow::Error>(lease.map(|lease| AcquiredMcpIngestWriterLease {
+                db_path: admitted_path,
+                lease: Some(lease),
+            }))
         })
         .await
         .context("MCP ingest writer lease task failed")??;
-        let (admitted_path, lease) = lease;
-        Ok(lease.map(|lease| McpIngestWriterLeaseGuard::new(admitted_path, lease)))
+        Ok(lease.map(AcquiredMcpIngestWriterLease::into_guard))
     }
 
     fn acquire_content_writer_lease(
@@ -2365,7 +2490,7 @@ impl MempalMcpServer {
         }
     }
 
-    async fn daemon_writer_lease_visible_for_ingest_wait(&self) -> bool {
+    async fn daemon_writer_lease_visible_for_ingest_wait(&self, remaining: Duration) -> bool {
         #[cfg(any(test, feature = "db-test-seam"))]
         if let Some(error) = self.daemon_writer_lease_check_error.as_deref() {
             tracing::warn!(
@@ -2375,26 +2500,27 @@ impl MempalMcpServer {
             return false;
         }
 
-        match self
-            .run_query_only_read_bounded(
-                "daemon writer lease check",
-                self.operation_status_deadline
-                    .min(Duration::from_millis(500)),
-                |db| {
-                    db.runtime_writer_lease_has_live_durable_ingest_worker(SQLITE_WRITER_LEASE_NAME)
-                        .map_err(db_error)
-                },
-            )
-            .await
+        let deadline = remaining
+            .min(self.operation_status_deadline)
+            .min(Duration::from_millis(500));
+        match tokio::time::timeout(
+            deadline,
+            self.run_query_only_read_bounded("daemon writer lease check", deadline, |db| {
+                db.runtime_writer_lease_has_live_durable_ingest_worker(SQLITE_WRITER_LEASE_NAME)
+                    .map_err(db_error)
+            }),
+        )
+        .await
         {
-            Ok(visible) => visible,
-            Err(error) => {
+            Ok(Ok(visible)) => visible,
+            Ok(Err(error)) => {
                 tracing::warn!(
                     error = %error,
                     "failed to check daemon writer lease before MCP ingest wait; daemon ownership is not proven"
                 );
                 false
             }
+            Err(_) => false,
         }
     }
 
@@ -2903,13 +3029,24 @@ impl MempalMcpServer {
             if remaining.is_zero() {
                 return Ok(None);
             }
-            if scoped_ingest_processing_budget(remaining).is_none() {
+            if scoped_ingest_processing_budget(remaining, claim_policy).is_none() {
                 tokio::time::sleep(poll_interval.min(remaining)).await;
                 continue;
             }
-            if self.daemon_writer_lease_visible_for_ingest_wait().await {
+            if self
+                .daemon_writer_lease_visible_for_ingest_wait(remaining)
+                .await
+            {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(None);
+                }
                 tokio::time::sleep(poll_interval.min(remaining)).await;
                 continue;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
             }
             let Some(claim_retry_deadline) = scoped_ingest_claim_retry_deadline(remaining) else {
                 return Ok(None);
@@ -2926,7 +3063,7 @@ impl MempalMcpServer {
             {
                 Ok(Some(claim)) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    if scoped_ingest_processing_budget(remaining).is_none() {
+                    if scoped_ingest_processing_budget(remaining, claim_policy).is_none() {
                         Self::release_scoped_claim_after_timeout(
                             &queue,
                             claim,
@@ -2951,7 +3088,19 @@ impl MempalMcpServer {
                                     &scoped_queue,
                                     &scoped_worker_id,
                                     claim,
-                                    scoped_ingest_processing_budget(remaining)
+                                    scoped_ingest_processing_budget(remaining, claim_policy)
+                                        .expect("processing budget was checked before claiming"),
+                                )
+                                .await
+                        }
+                        ScopedIngestClaimPolicy::InlineOwnedWithinDeadline
+                        | ScopedIngestClaimPolicy::InlineSmokeWithinDeadline => {
+                            scoped_worker
+                                .process_ingest_claim_with_owned_task_budget(
+                                    &scoped_queue,
+                                    &scoped_worker_id,
+                                    claim,
+                                    scoped_ingest_processing_budget(remaining, claim_policy)
                                         .expect("processing budget was checked before claiming"),
                                 )
                                 .await
@@ -2976,8 +3125,12 @@ impl MempalMcpServer {
                     if process_result == ScopedIngestProcessResult::TimedOut {
                         return Ok(None);
                     }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(None);
+                    }
                     match self
-                        .operation_status_json_within(operation_id, self.operation_status_deadline)
+                        .operation_status_json_within(operation_id, remaining)
                         .await?
                     {
                         Some(response)
@@ -3945,22 +4098,33 @@ const INGEST_DRAIN_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
 enum IngestWaitWorkerMode {
     Background,
     Scoped,
+    ScopedReleasing,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScopedIngestClaimPolicy {
     PollOnly,
     InlineWithinDeadline,
+    InlineOwnedWithinDeadline,
+    InlineSmokeWithinDeadline,
     InlineUntilTerminal,
 }
 
-fn scoped_ingest_claim_policy(wait_timeout_secs: u64) -> ScopedIngestClaimPolicy {
+fn scoped_ingest_claim_policy(
+    wait_timeout_secs: u64,
+    smoke: bool,
+    worker_mode: IngestWaitWorkerMode,
+) -> ScopedIngestClaimPolicy {
     if wait_timeout_secs == u64::MAX {
         ScopedIngestClaimPolicy::InlineUntilTerminal
     } else if wait_timeout_secs == 0 {
         ScopedIngestClaimPolicy::PollOnly
-    } else {
+    } else if smoke {
+        ScopedIngestClaimPolicy::InlineSmokeWithinDeadline
+    } else if matches!(worker_mode, IngestWaitWorkerMode::ScopedReleasing) {
         ScopedIngestClaimPolicy::InlineWithinDeadline
+    } else {
+        ScopedIngestClaimPolicy::InlineOwnedWithinDeadline
     }
 }
 
@@ -4008,7 +4172,7 @@ fn should_use_scoped_ingest_wait_worker(
     claim_policy != ScopedIngestClaimPolicy::PollOnly
         && matches!(processor, IngestQueueProcessor::Local)
         && use_local_ingest_worker
-        && matches!(worker_mode, IngestWaitWorkerMode::Scoped)
+        && worker_mode != IngestWaitWorkerMode::Background
 }
 
 fn ingest_worker_backoff_delay(retry_count: u64) -> Duration {
@@ -6836,7 +7000,15 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<IngestRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
-        self.mempal_ingest_with_controls(request, IngestControls::default())
+        let worker_mode = if request.smoke.unwrap_or(false)
+            && request.wait.unwrap_or(false)
+            && request.wait_timeout_secs.unwrap_or(30) != 0
+        {
+            IngestWaitWorkerMode::Scoped
+        } else {
+            IngestWaitWorkerMode::Background
+        };
+        self.mempal_ingest_with_controls_and_worker(request, IngestControls::default(), worker_mode)
             .await
     }
 
@@ -6862,6 +7034,20 @@ impl MempalMcpServer {
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         self.mempal_ingest_with_controls_and_worker(request, controls, IngestWaitWorkerMode::Scoped)
             .await
+    }
+
+    #[doc(hidden)]
+    pub async fn mempal_ingest_with_controls_scoped_worker_releasing(
+        &self,
+        request: IngestRequest,
+        controls: IngestControls,
+    ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
+        self.mempal_ingest_with_controls_and_worker(
+            request,
+            controls,
+            IngestWaitWorkerMode::ScopedReleasing,
+        )
+        .await
     }
 
     async fn mempal_ingest_with_controls_and_worker(
@@ -6907,7 +7093,7 @@ impl MempalMcpServer {
         // consistent set from a single `sqlite_master` read. A mid-request embed transition
         // to degraded is not lost: the degraded-write guards above reject before any
         // success response that would carry this snapshot is built.
-        let request_system_warnings = if matches!(worker_mode, IngestWaitWorkerMode::Scoped) {
+        let request_system_warnings = if worker_mode != IngestWaitWorkerMode::Background {
             current_system_warnings()
         } else {
             self.ingest_system_warnings_with_stale_index_bounded(
@@ -7044,7 +7230,13 @@ impl MempalMcpServer {
         };
         let daemon_writer_lease_visible =
             if matches!(queue_admission.processor, IngestQueueProcessor::Local) {
-                self.daemon_writer_lease_visible_for_ingest_wait().await
+                let lease_check_budget = if worker_mode != IngestWaitWorkerMode::Background {
+                    request_deadline.saturating_duration_since(Instant::now())
+                } else {
+                    self.operation_status_deadline
+                };
+                self.daemon_writer_lease_visible_for_ingest_wait(lease_check_budget)
+                    .await
             } else {
                 false
             };
@@ -7095,7 +7287,11 @@ impl MempalMcpServer {
             let wait_remaining = wait_timeout
                 .checked_sub(request_started_at.elapsed())
                 .unwrap_or_default();
-            let claim_policy = scoped_ingest_claim_policy(wait_timeout_secs);
+            let claim_policy = scoped_ingest_claim_policy(
+                wait_timeout_secs,
+                request.smoke.unwrap_or(false),
+                worker_mode,
+            );
             let wait_result = if wait_timeout_secs == 0 {
                 self.wait_for_operation_status_with_lookup_policy(
                     operation_id,
@@ -7135,11 +7331,27 @@ impl MempalMcpServer {
                 )
                 .await
             };
-            if let Some(final_response) = wait_result? {
-                return Ok(Json(final_response));
+            match wait_result {
+                Ok(Some(final_response)) => return Ok(Json(final_response)),
+                Ok(None) => {}
+                Err(error) => {
+                    if request.smoke.unwrap_or(false)
+                        && matches!(worker_mode, IngestWaitWorkerMode::Scoped)
+                        && use_local_ingest_worker
+                    {
+                        self.spawn_ingest_drain_worker();
+                    }
+                    return Err(error);
+                }
+            }
+            if request.smoke.unwrap_or(false)
+                && matches!(worker_mode, IngestWaitWorkerMode::Scoped)
+                && use_local_ingest_worker
+            {
+                self.spawn_ingest_drain_worker();
             }
 
-            let mut timed_out_response = if matches!(worker_mode, IngestWaitWorkerMode::Scoped) {
+            let mut timed_out_response = if worker_mode != IngestWaitWorkerMode::Background {
                 let refresh_remaining = wait_timeout
                     .checked_sub(request_started_at.elapsed())
                     .unwrap_or_default();
@@ -7299,7 +7511,11 @@ impl MempalMcpServer {
         // REST is safe only after hook IPC proves the request was not delivered.
         // The uncertain-delivery branch above must keep using its idempotent queue
         // reconciliation path or a REST retry could create a duplicate drawer.
-        if allow_daemon_rest_fallback && self.daemon_writer_lease_visible_for_ingest_wait().await {
+        if allow_daemon_rest_fallback
+            && self
+                .daemon_writer_lease_visible_for_ingest_wait(self.operation_status_deadline)
+                .await
+        {
             let config = self.status_config_snapshot();
             let mut response = super::daemon_rest::ingest(
                 &config.api.addr,
@@ -8782,9 +8998,7 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<OperationStatusRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
-        let system_warnings = self
-            .system_warnings_with_stale_index_bounded(self.operation_status_deadline)
-            .await?;
+        let started_at = Instant::now();
         let record = match tokio::time::timeout(
             self.operation_status_deadline,
             self.async_queue
@@ -8808,14 +9022,31 @@ impl MempalMcpServer {
             }
         };
 
-        record
-            .map(|record| Json(operation_record_to_response(record, system_warnings)))
-            .ok_or_else(|| {
-                ErrorData::invalid_params(
-                    format!("operation not found: {}", request.operation_id),
-                    None,
-                )
-            })
+        let record = record.ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!("operation not found: {}", request.operation_id),
+                None,
+            )
+        })?;
+        let warning_budget = self
+            .operation_status_deadline
+            .checked_sub(started_at.elapsed())
+            .unwrap_or_default();
+        let system_warnings = if warning_budget.is_zero() {
+            current_system_warnings()
+        } else {
+            match tokio::time::timeout(
+                warning_budget,
+                self.system_warnings_with_stale_index_bounded(warning_budget),
+            )
+            .await
+            {
+                Ok(warnings) => warnings?,
+                Err(_) => current_system_warnings(),
+            }
+        };
+
+        Ok(Json(operation_record_to_response(record, system_warnings)))
     }
 
     #[tool(
@@ -13636,7 +13867,9 @@ mod tests {
         .expect("create MCP server with missing db path");
 
         assert!(
-            !server.daemon_writer_lease_visible_for_ingest_wait().await,
+            !server
+                .daemon_writer_lease_visible_for_ingest_wait(server.operation_status_deadline)
+                .await,
             "lease visibility check failures must not silently prove daemon ownership"
         );
     }
@@ -15203,91 +15436,6 @@ quality_policy = "llm_required_for_keep"
     }
 
     #[tokio::test]
-    async fn test_mcp_scoped_wait_over_processing_threshold_returns_timeout_receipt() {
-        let (_tempdir, db_path, server) = setup_server();
-        let server = server.with_ingest_processing_delay_for_test(Duration::from_secs(7));
-
-        let started = Instant::now();
-        let response = tokio::time::timeout(
-            Duration::from_millis(6_800),
-            server.mempal_ingest_with_controls_scoped_worker(
-                IngestRequest {
-                    content: "scoped wait timeout must not start slow inline processing"
-                        .to_string(),
-                    wing: "mcp".to_string(),
-                    room: Some("scoped-timeout".to_string()),
-                    wait: Some(true),
-                    wait_timeout_secs: Some(6),
-                    ..IngestRequest::default()
-                },
-                IngestControls::default(),
-            ),
-        )
-        .await
-        .expect("scoped wait must return within the caller timeout budget")
-        .expect("scoped wait should return a timeout receipt")
-        .0;
-
-        let operation_id = response.operation_id.as_deref().expect("operation id");
-        assert_eq!(response.state, Some(IngestOperationState::Queued));
-        assert!(response.timed_out);
-        assert!(
-            started.elapsed() < Duration::from_millis(6_800),
-            "scoped wait blocked until slow processing completed"
-        );
-
-        let record = PendingMessageStore::new_without_reclaim(&db_path)
-            .operation_status(operation_id)
-            .expect("query operation")
-            .expect("operation should still exist");
-        assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
-        assert!(
-            record.claimed_at.is_none(),
-            "caller-bounded scoped wait must not leave a claim it cannot finish safely"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_mcp_scoped_wait_rejects_timeout_receipt_when_claim_release_is_locked() {
-        let (_tempdir, db_path, server) = setup_server();
-        let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
-            .with_release_lock_failures_for_test(100);
-        let server = server
-            .with_async_queue_for_test(async_queue)
-            .with_ingest_processing_delay_for_test(Duration::from_secs(7));
-
-        let result = tokio::time::timeout(
-            Duration::from_millis(6_800),
-            server.mempal_ingest_with_controls_scoped_worker(
-                IngestRequest {
-                    content: "scoped wait must not return receipt when release is locked"
-                        .to_string(),
-                    wing: "mcp".to_string(),
-                    room: Some("scoped-timeout".to_string()),
-                    wait: Some(true),
-                    wait_timeout_secs: Some(6),
-                    ..IngestRequest::default()
-                },
-                IngestControls::default(),
-            ),
-        )
-        .await
-        .expect("scoped wait must stay within the caller timeout budget");
-        let error = match result {
-            Ok(_) => panic!("release lock failure must not return a timeout receipt"),
-            Err(error) => error,
-        };
-
-        assert!(
-            error
-                .message
-                .contains("failed to release timed-out scoped ingest claim"),
-            "{}",
-            error.message
-        );
-    }
-
-    #[tokio::test]
     async fn test_mcp_ingest_enqueue_waits_for_transient_sqlite_lock() {
         let (_tempdir, db_path, server) = setup_server();
         assert!(
@@ -15509,6 +15657,41 @@ quality_policy = "llm_required_for_keep"
     }
 
     #[tokio::test]
+    async fn test_mcp_doctor_serializes_high_queue_availability_at_threshold() {
+        let (_tempdir, db_path, server) = setup_server();
+        let queue = PendingMessageStore::new_without_reclaim(&db_path);
+        for index in 0..crate::doctor::DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD {
+            queue
+                .enqueue("hook_event", &format!(r#"{{"index":{index}}}"#))
+                .expect("enqueue pending message");
+        }
+
+        let response = server
+            .mempal_doctor(Parameters(DoctorRequest {}))
+            .await
+            .expect("doctor")
+            .0;
+        let serialized = serde_json::to_value(&response).expect("serialize doctor response");
+
+        assert_eq!(
+            serialized["availability"]["severity"],
+            serde_json::json!("high")
+        );
+        assert_eq!(
+            serialized["availability"]["signal"],
+            serde_json::json!("daemon_down_large_pending_queue")
+        );
+        assert_eq!(
+            serialized["availability"]["pending_queue"],
+            serde_json::json!(crate::doctor::DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD)
+        );
+        assert_eq!(
+            serialized["availability"]["unavailable_reasons"],
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
     async fn test_mcp_doctor_missing_db_is_read_only_after_server_construction() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_dir = tempdir.path().join("missing-home").join(".mempal");
@@ -15532,11 +15715,24 @@ quality_policy = "llm_required_for_keep"
             .await
             .expect("doctor")
             .0;
+        let serialized = serde_json::to_value(&response).expect("serialize doctor response");
 
         assert_eq!(response.db.path, db_path.display().to_string());
         assert!(!response.db.exists);
         assert_eq!(response.db.schema_version, None);
         assert!(response.db.compatible);
+        assert_eq!(
+            serialized["availability"]["severity"],
+            serde_json::json!("unavailable")
+        );
+        assert_eq!(
+            serialized["availability"]["signal"],
+            serde_json::json!("diagnostic_inputs_unavailable")
+        );
+        assert_eq!(
+            serialized["availability"]["unavailable_reasons"],
+            serde_json::json!(["queue_stats"])
+        );
         assert!(!db_path.exists(), "doctor must not create database file");
         assert!(
             !db_dir.exists(),
@@ -22569,6 +22765,36 @@ enabled = true
             final_status.created_drawer_ids,
             completed.created_drawer_ids
         );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_operation_status_returns_queue_result_with_slow_warning_snapshot() {
+        let (_tempdir, db_path, server) = setup_server();
+        let operation_id = PendingMessageStore::new_without_reclaim(&db_path)
+            .enqueue(INGEST_ASYNC_KIND, "{}")
+            .expect("enqueue operation");
+        let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+            .with_blocking_delay(Duration::from_millis(200));
+        let query_only_async_db = QueryOnlyAsyncDb::open(&db_path, 4)
+            .expect("open query-only async db")
+            .with_read_delay(Duration::from_millis(200));
+        let server = server
+            .with_async_queue_for_test(async_queue)
+            .with_query_only_async_db_for_test(query_only_async_db)
+            .with_mcp_deadline_for_test(Duration::from_millis(300));
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(350),
+            server.mempal_operation_status(Parameters(OperationStatusRequest { operation_id })),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let response = response
+            .expect("operation status must share its deadline with warning collection")
+            .expect("queued status should succeed")
+            .0;
+
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
     }
 
     #[tokio::test]

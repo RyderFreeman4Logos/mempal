@@ -96,6 +96,10 @@ struct ConnPool {
     count: usize,
     #[cfg(any(test, feature = "db-test-seam"))]
     reopen_delay: Mutex<Option<Duration>>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    write_busy_timeout: Mutex<Option<Duration>>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    write_busy_events: Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
 }
 
 /// Off-runtime async facade over the sync [`Database`]. Cheap to clone (the
@@ -214,6 +218,18 @@ impl AsyncDb {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_writer_reopen_delay(self, delay: Duration) -> Self {
         self.writer.set_reopen_delay(delay);
+        self
+    }
+
+    /// Override the deadline-bound writer busy timeout and report a real Busy.
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_write_busy_timeout_for_test(
+        self,
+        busy_timeout: Duration,
+        busy_events: tokio::sync::mpsc::UnboundedSender<()>,
+    ) -> Self {
+        self.writer
+            .set_write_busy_timeout_and_events(busy_timeout, busy_events);
         self
     }
 
@@ -615,7 +631,7 @@ where
                 return Err(write_deadline_exceeded_error());
             }
 
-            let out = execute_write_until(&conn, delay, deadline, f);
+            let out = execute_write_until(checkin_pool.as_ref(), &conn, delay, deadline, f);
             checkin_pool.checkin(conn);
             out
         })
@@ -636,6 +652,8 @@ where
 }
 
 fn execute_write_until<F, R>(
+    #[cfg(any(test, feature = "db-test-seam"))] pool: &ConnPool,
+    #[cfg(not(any(test, feature = "db-test-seam")))] _pool: &ConnPool,
     conn: &Database,
     delay: Option<Duration>,
     deadline: Instant,
@@ -660,7 +678,14 @@ where
     // Pooled writer connections normally use Database::open's five-second busy
     // timeout. Narrow it to this attempt's remaining shared retry budget, then
     // restore that pool default before the connection is checked back in.
-    conn.conn().busy_timeout(remaining)?;
+    #[cfg(any(test, feature = "db-test-seam"))]
+    let busy_timeout = pool
+        .write_busy_timeout()
+        .unwrap_or(remaining)
+        .min(remaining);
+    #[cfg(not(any(test, feature = "db-test-seam")))]
+    let busy_timeout = remaining;
+    conn.conn().busy_timeout(busy_timeout)?;
     conn.conn().progress_handler(
         SQLITE_PROGRESS_HANDLER_OPS,
         Some(move || Instant::now() >= deadline),
@@ -671,6 +696,8 @@ where
         return Err(write_deadline_exceeded_error());
     }
     let out = f(conn);
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pool.report_busy_write_attempt(&out);
     conn.conn().progress_handler(0, None::<fn() -> bool>);
     conn.conn().busy_timeout(Duration::from_secs(5))?;
 

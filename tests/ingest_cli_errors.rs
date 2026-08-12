@@ -5,6 +5,9 @@
 // the shared supervisor exactly like admission_supervisor does for db_admission.
 #[path = "common/harness/cli_deadline.rs"]
 mod cli_deadline;
+
+const _: fn() = cli_deadline::reference_shared_cli_deadline_api;
+
 mod common;
 #[path = "ingest_cli_errors/deadline.rs"]
 mod deadline;

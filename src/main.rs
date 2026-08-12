@@ -80,7 +80,9 @@ use mempal::crystallize::{
     CrystallizeOptions, CrystallizeSummary, run_crystallization_with_writer_lease,
 };
 use mempal::doctor::{
+    DoctorAvailabilityObservation, DoctorAvailabilitySeverity, DoctorAvailabilityUnavailableReason,
     RestDoctorReport, build_doctor_report_with_daemon_status, build_rest_doctor_report,
+    daemon_outage_queue_availability, inspect_daemon,
 };
 use mempal::embed::build_backend_from_name;
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder, global_embed_status};
@@ -3803,7 +3805,12 @@ fn run() -> Result<()> {
         _ => {}
     }
 
-    ConfigHandle::bootstrap(&config_path).context("failed to bootstrap config hot reload")?;
+    if let Err(error) = ConfigHandle::bootstrap(&config_path) {
+        if matches!(&cli.command, Commands::Status { .. }) {
+            print_status_availability_failure(DoctorAvailabilityUnavailableReason::Config);
+        }
+        return Err(error).context("failed to bootstrap config hot reload");
+    }
     let config = ConfigHandle::current();
     if let Commands::Serve { mcp } = &cli.command {
         return block_on_result(serve_command(config.as_ref(), *mcp));
@@ -3926,10 +3933,15 @@ fn run() -> Result<()> {
         );
     }
     if let Commands::Status { full } = &cli.command {
-        return Database::with_diagnostic_read_only(&db_path, |db| {
+        return match Database::with_diagnostic_read_only(&db_path, |db| {
             status_command(db, config.as_ref(), *full)
-        })
-        .context("failed to open status database")?;
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                print_status_availability_failure(DoctorAvailabilityUnavailableReason::QueueStats);
+                Err(error).context("failed to open status database")
+            }
+        };
     }
 
     let db = match if let Some(path) = empty_read_only_db_path.as_ref() {
@@ -6442,7 +6454,7 @@ async fn run_stdin_wait_ingest_queue(
     };
     let server = MempalMcpServer::new(db_path.to_path_buf(), config.clone())?;
     let response = match server
-        .mempal_ingest_with_controls_scoped_worker(wait_request, controls)
+        .mempal_ingest_with_controls_scoped_worker_releasing(wait_request, controls)
         .await
     {
         Ok(response) => response.0,
@@ -13719,6 +13731,19 @@ fn config_intelligence_command(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn print_status_availability_failure(reason: DoctorAvailabilityUnavailableReason) {
+    eprintln!("availability_severity=unavailable");
+    eprintln!("availability_signal=diagnostic_inputs_unavailable");
+    eprintln!("availability_unavailable_reasons={}", reason.as_str());
+    eprintln!(
+        "availability_warning=availability is unavailable because diagnostic input(s) could not be observed: {}",
+        reason.as_str()
+    );
+    eprintln!(
+        "availability_recovery=Restore access to the mempal config and database, then rerun `mempal status`."
+    );
+}
+
 fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     let cfg_meta = ConfigHandle::snapshot_meta();
     let scrub_stats = ConfigHandle::scrub_stats();
@@ -13733,8 +13758,13 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     };
     let embed_status = global_embed_status().snapshot();
     let intelligence_status = mempal::intelligence::global_intelligence_status().snapshot();
-    let queue_stats = mempal::core::queue::queue_stats(db.conn())
-        .context("failed to query pending message stats")?;
+    let queue_stats = match mempal::core::queue::queue_stats(db.conn()) {
+        Ok(stats) => stats,
+        Err(error) => {
+            print_status_availability_failure(DoctorAvailabilityUnavailableReason::QueueStats);
+            return Err(error).context("failed to query pending message stats");
+        }
+    };
     let schema_version = db
         .schema_version()
         .context("failed to read schema version")?;
@@ -13818,9 +13848,27 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
             ),
         });
     }
-    let (daemon_pid, daemon_running, daemon_pidfile_warning) = detect_daemon_status(db.path())?;
-    if let Some(warning) = daemon_pidfile_warning {
+    let daemon_pidfile = read_daemon_pid_for_status(db.path());
+    if let Some(warning) = daemon_pidfile.warning {
         runtime_warnings.push(warning);
+    }
+    let (daemon, daemon_observation) = inspect_daemon(db.path());
+    let daemon_pid = daemon.pid;
+    let daemon_running = daemon.running;
+    let availability = daemon_outage_queue_availability(
+        daemon_observation,
+        DoctorAvailabilityObservation::Known(queue_stats.pending),
+    );
+    if let Some(message) = availability.warning_message() {
+        runtime_warnings.push(mempal::core::config::RuntimeWarning {
+            level: match availability.severity {
+                DoctorAvailabilitySeverity::High => "error",
+                DoctorAvailabilitySeverity::Unavailable => "warn",
+                DoctorAvailabilitySeverity::Normal => "info",
+            },
+            source: "daemon_outage_queue",
+            message: format!("{message}. To recover, start the daemon, confirm queue claim/drain progress, then handle terminal failed operations; do not edit the database manually."),
+        });
     }
     let last_heartbeat = db
         .conn()
@@ -14606,52 +14654,6 @@ fn read_daemon_pid_for_status(db_path: &Path) -> DaemonPidfileProbe {
             )),
         },
     }
-}
-
-#[cfg(unix)]
-fn detect_daemon_status(
-    db_path: &Path,
-) -> Result<(
-    Option<i32>,
-    bool,
-    Option<mempal::core::config::RuntimeWarning>,
-)> {
-    let pidfile = read_daemon_pid_for_status(db_path);
-    let pidfile_pid = pidfile.pid;
-    if let Some(pid) = pidfile_pid
-        && process_is_live(pid).context("failed to probe daemon pid liveness")?
-    {
-        return Ok((Some(pid), true, pidfile.warning));
-    }
-
-    let (candidates, live_pidfile_pid) =
-        collect_daemon_candidates_with_pidfile(db_path, pidfile_pid)?;
-    let plan = mempal::daemon_singleton::plan_daemon_reap(&candidates, live_pidfile_pid);
-    if let Some(pid) = plan.keeper
-        && process_is_live(pid).context("failed to probe daemon singleton liveness")?
-    {
-        return Ok((Some(pid), true, pidfile.warning));
-    }
-
-    Ok((pidfile_pid, false, pidfile.warning))
-}
-
-#[cfg(not(unix))]
-fn detect_daemon_status(
-    db_path: &Path,
-) -> Result<(
-    Option<i32>,
-    bool,
-    Option<mempal::core::config::RuntimeWarning>,
-)> {
-    let pidfile = read_daemon_pid_for_status(db_path);
-    let daemon_pid = pidfile.pid;
-    let daemon_running = daemon_pid
-        .map(process_is_live)
-        .transpose()
-        .context("failed to probe daemon pid liveness")?
-        .unwrap_or(false);
-    Ok((daemon_pid, daemon_running, pidfile.warning))
 }
 
 #[cfg(unix)]
@@ -16036,18 +16038,6 @@ impl DaemonProcessOps for RealDaemonProcessOps {
 #[cfg(unix)]
 fn collect_daemon_candidates(db_path: &Path) -> Result<(Vec<i32>, Option<i32>)> {
     let pidfile_pid = read_daemon_pid(db_path)?;
-    collect_daemon_candidates_with_scan_and_pidfile(
-        db_path,
-        mempal::daemon_singleton::enumerate_daemon_pids,
-        pidfile_pid,
-    )
-}
-
-#[cfg(unix)]
-fn collect_daemon_candidates_with_pidfile(
-    db_path: &Path,
-    pidfile_pid: Option<i32>,
-) -> Result<(Vec<i32>, Option<i32>)> {
     collect_daemon_candidates_with_scan_and_pidfile(
         db_path,
         mempal::daemon_singleton::enumerate_daemon_pids,
@@ -24664,6 +24654,22 @@ fn doctor_command(format: String) -> Result<()> {
                 report.install.path_matches_current_exe
             );
             println!("daemon_running={}", report.daemon.running);
+            println!(
+                "availability_severity={}",
+                report.availability.severity.as_str()
+            );
+            println!(
+                "availability_signal={}",
+                report
+                    .availability
+                    .signal
+                    .map(|signal| signal.as_str())
+                    .unwrap_or("none")
+            );
+            println!(
+                "availability_pending_queue_threshold={}",
+                report.availability.pending_queue_threshold
+            );
             println!(
                 "daemon_pid={}",
                 report

@@ -31,6 +31,21 @@ use std::time::{Duration, Instant};
 
 use process::{DeadlineChild, DeadlineOutput, SpawnSpec, StdioMode, SupervisionError};
 
+/// References the complete path-included helper API without running a process.
+pub fn reference_shared_cli_deadline_api() {
+    let _ = CLI_HELPER_DEADLINE;
+    let _ = HANGING_FIXTURE_DEADLINE;
+    let _ = HANGING_FIXTURE_RETURN_BOUND;
+    let _ = hanging_shell_with_pipe_descendant;
+    let _ = hanging_shell_ignoring_stdin;
+    let _ = run_spec_output;
+    let _ = run_spec_output_strict;
+    let _ = run_spec_stdin_output_strict;
+    let _ = run_cli_stdin_output("api reference", |_: &mut SpawnSpec| {}, &[], Duration::ZERO);
+    let _ = panic_after_stdin_cleanup;
+    let _ = panic_stdin_write;
+}
+
 /// Default upper bound for ordinary mempal CLI integration helpers.
 ///
 /// Includes headroom for cold binary startup under a concurrent suite while

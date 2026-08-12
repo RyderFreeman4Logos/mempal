@@ -90,10 +90,152 @@ pub struct DoctorReport {
     pub daemon: DoctorDaemonReport,
     pub install: DoctorInstallReport,
     pub embedding: DoctorEmbeddingReport,
+    pub availability: DoctorAvailabilityReport,
     pub design_insights: DoctorDesignInsightReport,
     pub restart_required_config_changes: Vec<String>,
     pub warnings: Vec<String>,
     pub recommendations: Vec<String>,
+}
+
+/// Pending work at or above this count is an availability outage when the daemon is down.
+pub const DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD: u64 = 100;
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorAvailabilitySeverity {
+    Normal,
+    High,
+    Unavailable,
+}
+
+impl DoctorAvailabilitySeverity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::High => "high",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorAvailabilitySignal {
+    DaemonDownLargePendingQueue,
+    DiagnosticInputsUnavailable,
+}
+
+impl DoctorAvailabilitySignal {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DaemonDownLargePendingQueue => "daemon_down_large_pending_queue",
+            Self::DiagnosticInputsUnavailable => "diagnostic_inputs_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorAvailabilityUnavailableReason {
+    Config,
+    QueueStats,
+    DaemonIdentity,
+}
+
+impl DoctorAvailabilityUnavailableReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::QueueStats => "queue_stats",
+            Self::DaemonIdentity => "daemon_identity",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DoctorAvailabilityObservation<T> {
+    Known(T),
+    Unavailable(DoctorAvailabilityUnavailableReason),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorAvailabilityReport {
+    pub severity: DoctorAvailabilitySeverity,
+    pub signal: Option<DoctorAvailabilitySignal>,
+    pub daemon_running: Option<bool>,
+    pub pending_queue: Option<u64>,
+    pub pending_queue_threshold: u64,
+    pub unavailable_reasons: Vec<DoctorAvailabilityUnavailableReason>,
+}
+
+impl DoctorAvailabilityReport {
+    pub fn warning_message(&self) -> Option<String> {
+        match self.signal {
+            Some(DoctorAvailabilitySignal::DaemonDownLargePendingQueue) => Some(format!(
+                "daemon is down with {} pending embedding/hook queue item(s) (threshold {}); queued work cannot drain",
+                self.pending_queue.unwrap_or_default(),
+                self.pending_queue_threshold
+            )),
+            Some(DoctorAvailabilitySignal::DiagnosticInputsUnavailable) => Some(format!(
+                "availability is unavailable because diagnostic input(s) could not be observed: {}",
+                self.unavailable_reasons
+                    .iter()
+                    .map(|reason| reason.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+            None => None,
+        }
+    }
+}
+
+pub fn daemon_outage_queue_availability(
+    daemon: DoctorAvailabilityObservation<bool>,
+    queue: DoctorAvailabilityObservation<u64>,
+) -> DoctorAvailabilityReport {
+    let mut unavailable_reasons = Vec::new();
+    let daemon_running = match daemon {
+        DoctorAvailabilityObservation::Known(running) => Some(running),
+        DoctorAvailabilityObservation::Unavailable(reason) => {
+            unavailable_reasons.push(reason);
+            None
+        }
+    };
+    let pending_queue = match queue {
+        DoctorAvailabilityObservation::Known(pending) => Some(pending),
+        DoctorAvailabilityObservation::Unavailable(reason) => {
+            unavailable_reasons.push(reason);
+            None
+        }
+    };
+    let signal = if unavailable_reasons.is_empty() {
+        (daemon_running == Some(false)
+            && pending_queue
+                .is_some_and(|pending| pending >= DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD))
+        .then_some(DoctorAvailabilitySignal::DaemonDownLargePendingQueue)
+    } else {
+        Some(DoctorAvailabilitySignal::DiagnosticInputsUnavailable)
+    };
+    DoctorAvailabilityReport {
+        severity: match signal {
+            Some(DoctorAvailabilitySignal::DaemonDownLargePendingQueue) => {
+                DoctorAvailabilitySeverity::High
+            }
+            Some(DoctorAvailabilitySignal::DiagnosticInputsUnavailable) => {
+                DoctorAvailabilitySeverity::Unavailable
+            }
+            None => DoctorAvailabilitySeverity::Normal,
+        },
+        signal,
+        daemon_running,
+        pending_queue,
+        pending_queue_threshold: DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD,
+        unavailable_reasons,
+    }
+}
+
+fn daemon_outage_queue_recovery_guidance() -> &'static str {
+    "To recover, start the daemon, confirm queue claim/drain progress with `mempal status` or `mempal daemon status`, then handle terminal failed operations with `mempal queue failed`; do not edit the database manually."
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -222,10 +364,12 @@ pub fn build_doctor_report_with_daemon_status(
 ) -> DoctorReport {
     let db = inspect_db(db_path);
     let db_holders = inspect_db_holders(db_path);
-    let daemon = inspect_daemon(db_path);
+    let (daemon, daemon_observation) = inspect_daemon(db_path);
     let install = inspect_install();
     let config = Config::load().ok();
     let embedding = build_embedding_report(config.as_ref(), db_path, daemon_status);
+    let availability =
+        daemon_outage_queue_availability(daemon_observation, embedding.queue_pending);
     let design_insights = inspect_design_insights(db_path);
     let restart_required_config_changes = ConfigHandle::restart_required_pending();
     let mut warnings = Vec::new();
@@ -262,6 +406,7 @@ pub fn build_doctor_report_with_daemon_status(
     }
     push_db_holder_warnings(&mut warnings, &mut recommendations, &db_holders);
     push_daemon_warnings(&mut warnings, &mut recommendations, &daemon);
+    push_daemon_outage_queue_guidance(&mut warnings, &mut recommendations, &availability);
     if install.path_matches_current_exe == Some(false) {
         warnings
             .push("PATH resolves mempal to a different executable than this process".to_string());
@@ -279,7 +424,8 @@ pub fn build_doctor_report_with_daemon_status(
         db_holders,
         daemon,
         install,
-        embedding,
+        embedding: embedding.report,
+        availability,
         design_insights,
         restart_required_config_changes,
         warnings,
@@ -318,29 +464,47 @@ fn inspect_design_insights(db_path: &Path) -> DoctorDesignInsightReport {
     }
 }
 
+struct DoctorEmbeddingBuild {
+    report: DoctorEmbeddingReport,
+    queue_pending: DoctorAvailabilityObservation<u64>,
+}
+
 fn build_embedding_report(
     config: Option<&Config>,
     db_path: &Path,
     daemon_status: Option<&Value>,
-) -> DoctorEmbeddingReport {
+) -> DoctorEmbeddingBuild {
     let Some(config) = config else {
-        return DoctorEmbeddingReport {
-            runtime_status_source: "unavailable".to_string(),
-            ..DoctorEmbeddingReport::default()
+        return DoctorEmbeddingBuild {
+            report: DoctorEmbeddingReport {
+                runtime_status_source: "unavailable".to_string(),
+                ..DoctorEmbeddingReport::default()
+            },
+            queue_pending: DoctorAvailabilityObservation::Unavailable(
+                DoctorAvailabilityUnavailableReason::Config,
+            ),
         };
     };
     let embed_status = crate::embed::global_embed_status();
     let embed_snapshot = embed_status.snapshot();
     let endpoint_configs = config.embed.effective_endpoints().unwrap_or_default();
-    let (queue, fail_count) = match queue_stats_readonly(db_path) {
+    let (queue, fail_count, queue_pending) = match queue_stats_readonly(db_path) {
         Ok(stats) => {
             let fail_count =
                 crate::core::queue::failure_headline_count(embed_snapshot.fail_count, &stats);
-            (queue_report_from_stats(stats), fail_count)
+            let pending = stats.pending;
+            (
+                queue_report_from_stats(stats),
+                fail_count,
+                DoctorAvailabilityObservation::Known(pending),
+            )
         }
         Err(_) => (
             DoctorEmbeddingQueueReport::default(),
             embed_snapshot.fail_count,
+            DoctorAvailabilityObservation::Unavailable(
+                DoctorAvailabilityUnavailableReason::QueueStats,
+            ),
         ),
     };
     let last_error = sanitize_runtime_error(endpoint_policy_global_runtime_error(
@@ -408,7 +572,10 @@ fn build_embedding_report(
         queue,
     };
     overlay_daemon_embedding_status(&mut report, daemon_status);
-    report
+    DoctorEmbeddingBuild {
+        report,
+        queue_pending,
+    }
 }
 
 fn overlay_daemon_embedding_status(
@@ -640,6 +807,27 @@ fn push_db_holder_warnings(
     }
 }
 
+fn push_daemon_outage_queue_guidance(
+    warnings: &mut Vec<String>,
+    recommendations: &mut Vec<String>,
+    availability: &DoctorAvailabilityReport,
+) {
+    if let Some(message) = availability.warning_message() {
+        warnings.push(format!(
+            "{} availability: {message}",
+            availability.severity.as_str().to_ascii_uppercase()
+        ));
+        recommendations.push(match availability.severity {
+            DoctorAvailabilitySeverity::High => daemon_outage_queue_recovery_guidance().to_string(),
+            DoctorAvailabilitySeverity::Unavailable => {
+                "Restore access to the mempal config and database, then rerun `mempal doctor`."
+                    .to_string()
+            }
+            DoctorAvailabilitySeverity::Normal => return,
+        });
+    }
+}
+
 fn push_daemon_warnings(
     warnings: &mut Vec<String>,
     recommendations: &mut Vec<String>,
@@ -668,27 +856,52 @@ fn push_daemon_warnings(
     }
 }
 
-fn inspect_daemon(db_path: &Path) -> DoctorDaemonReport {
+pub fn inspect_daemon(db_path: &Path) -> (DoctorDaemonReport, DoctorAvailabilityObservation<bool>) {
     let mempal_home = db_path.parent().unwrap_or_else(|| Path::new("."));
     let embedder = read_embedder_status(mempal_home).ok().flatten();
-    let pid = read_daemon_pid_file(mempal_home)
+    let pidfile = read_daemon_pid_file(mempal_home);
+    let binary =
+        crate::daemon_singleton::current_binary_name().unwrap_or_else(|| "mempal".to_string());
+    let daemons = crate::daemon_singleton::enumerate_daemon_processes(&binary, db_path);
+    let matched_pid = pidfile
+        .as_ref()
         .ok()
+        .copied()
         .flatten()
+        .filter(|pid| daemons.iter().any(|daemon| daemon.pid == *pid));
+    let pid = matched_pid
+        .or_else(|| daemons.first().map(|daemon| daemon.pid))
         .or_else(|| {
-            embedder
-                .as_ref()
-                .and_then(|status| i32::try_from(status.pid).ok())
+            pidfile.as_ref().ok().copied().flatten().or_else(|| {
+                embedder
+                    .as_ref()
+                    .and_then(|status| i32::try_from(status.pid).ok())
+            })
         });
     let process = pid.map(inspect_process_memory);
-    let running = process
-        .as_ref()
-        .is_some_and(|process| process.error.is_none());
-    DoctorDaemonReport {
-        pid,
-        running,
-        embedder,
-        process,
-    }
+    let running = !daemons.is_empty();
+    let observation = if running {
+        DoctorAvailabilityObservation::Known(true)
+    } else if pidfile.is_err()
+        || process
+            .as_ref()
+            .is_some_and(|process| process.error.is_none())
+    {
+        DoctorAvailabilityObservation::Unavailable(
+            DoctorAvailabilityUnavailableReason::DaemonIdentity,
+        )
+    } else {
+        DoctorAvailabilityObservation::Known(false)
+    };
+    (
+        DoctorDaemonReport {
+            pid,
+            running,
+            embedder,
+            process,
+        },
+        observation,
+    )
 }
 
 fn read_daemon_pid_file(mempal_home: &Path) -> io::Result<Option<i32>> {
@@ -1091,6 +1304,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn daemon_outage_queue_availability_requires_daemon_down_and_large_queue() {
+        for (daemon_running, pending_queue) in [
+            (true, DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD),
+            (false, DAEMON_OUTAGE_PENDING_QUEUE_THRESHOLD - 1),
+        ] {
+            let availability = daemon_outage_queue_availability(
+                DoctorAvailabilityObservation::Known(daemon_running),
+                DoctorAvailabilityObservation::Known(pending_queue),
+            );
+
+            assert_eq!(availability.severity, DoctorAvailabilitySeverity::Normal);
+            assert_eq!(availability.signal, None);
+        }
+    }
+
+    #[test]
     fn test_db_holder_warnings_report_extra_holders_alongside_specific_roles() {
         let report = DbHolderReport {
             db_path: "/tmp/palace.db".to_string(),
@@ -1184,7 +1413,7 @@ model = "Qwen/Qwen3-Embedding-8B"
         .expect("parse config");
 
         let report =
-            build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"), None);
+            build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"), None).report;
 
         assert_eq!(report.endpoints.len(), 1);
         assert_eq!(report.endpoints[0].base_url, "http://127.0.0.1:18002");
@@ -1210,7 +1439,7 @@ api_key_env = "MEMPAL_SECRET_TOKEN_ENV"
         .expect("parse config");
 
         let report =
-            build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"), None);
+            build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"), None).report;
         let rendered = serde_json::to_string(&report).expect("serialize report");
 
         assert_eq!(report.endpoints.len(), 1);
@@ -1252,7 +1481,7 @@ model = "text-embedding-3-large"
         );
 
         let report =
-            build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"), None);
+            build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"), None).report;
         let rendered = serde_json::to_string(&report).expect("serialize report");
 
         assert_eq!(report.endpoints.len(), 1);
@@ -1303,7 +1532,8 @@ block_writes_when_degraded = true
             Some(&config),
             Path::new("/tmp/missing-palace.db"),
             Some(&daemon_status),
-        );
+        )
+        .report;
         let rendered = serde_json::to_string(&report).expect("serialize report");
 
         assert_eq!(report.runtime_status_source, "daemon_rest");

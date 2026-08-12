@@ -42,6 +42,26 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **Queue byte admission**: retry transient profile-admission lock contention when
+  opening a normal queue writer, so concurrent ingest requests retain the
+  byte-budget rejection contract under suite load (#893).
+
+- **Daemon readiness CLI tests**: use the shared Linux subprocess supervisor,
+  so CLI spawn, output drain, process-group cleanup, and reaping share one
+  deadline and timeout reports remain redacted (#892).
+
+- **MCP smoke waits**: finite `wait=true` smoke ingests process their scoped
+  queue item inline within the remaining request deadline, while timed-out
+  receipts retain a local completion consumer (#888).
+
+- **Daemon outage visibility**: `doctor`, `status`, and MCP doctor now expose a
+  high-severity typed availability signal when the daemon is down with at least
+  100 pending embedding/hook queue items. Unreadable config/queue statistics and
+  unverified PID identities instead report explicit, privacy-safe `unavailable`
+  reasons, never a synthetic normal state. Recovery guidance covers daemon
+  restart, drain confirmation, and terminal failures without database edits
+  (#871).
+
 - **Admission receipt ownership**: bind MCP holder-budget no-write receipts and
   smoke cleanup authority to the owning operation identity so saturated
   admission attempts cannot emit false write receipts or cross-operation
@@ -63,6 +83,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   fixtures at their boundary so suite load cannot race or deadlock assertions;
   the daemon lifecycle completion poll likewise retries temporary admission
   `Busy` through its existing deadline (#882, #889, #890).
+
+- **MCP delete retry fixture**: force an observed SQLite Busy result before
+  synchronized lock release, eliminating the 5.5s/9s wall-clock race (#886).
 
 - **Daemon supervisor cooldowns**: wait through active restart-budget
   cooldowns and retry bootstrap in-process; true temporary refusals retain

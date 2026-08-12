@@ -18,6 +18,10 @@ impl ConnPool {
             count,
             #[cfg(any(test, feature = "db-test-seam"))]
             reopen_delay: Mutex::new(None),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            write_busy_timeout: Mutex::new(None),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            write_busy_events: Mutex::new(None),
         })
     }
 
@@ -108,6 +112,49 @@ impl ConnPool {
             .reopen_delay
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(delay);
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub(super) fn set_write_busy_timeout_and_events(
+        &self,
+        busy_timeout: Duration,
+        busy_events: tokio::sync::mpsc::UnboundedSender<()>,
+    ) {
+        *self
+            .write_busy_timeout
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(busy_timeout);
+        *self
+            .write_busy_events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(busy_events);
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub(super) fn write_busy_timeout(&self) -> Option<Duration> {
+        *self
+            .write_busy_timeout
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub(super) fn report_busy_write_attempt<R>(&self, result: &Result<R, DbError>) {
+        if !result
+            .as_ref()
+            .err()
+            .is_some_and(crate::core::db::db_error_is_sqlite_lock)
+        {
+            return;
+        }
+        if let Some(busy_events) = self
+            .write_busy_events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = busy_events.send(());
+        }
     }
 
     pub(super) fn checkin(&self, db: Database) {

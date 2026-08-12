@@ -1,73 +1,36 @@
 #![cfg(target_os = "linux")]
 
+#[path = "common/harness/cli_deadline.rs"]
+mod cli_deadline;
+
+const _: fn() = cli_deadline::reference_shared_cli_deadline_api;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Output;
+use std::time::Duration;
 
+use cli_deadline::{push_args, run_cli_output, with_home};
 use mempal::core::db::Database;
 use tempfile::TempDir;
-
-fn mempal_bin() -> String {
-    env!("CARGO_BIN_EXE_mempal").to_string()
-}
 
 fn daemon_runtime_dir(home: &Path) -> PathBuf {
     home.join(".mempal/runtime")
 }
 
-trait DaemonCommandExt {
-    fn daemon_home(&mut self, home: &Path) -> &mut Self;
-}
-
-impl DaemonCommandExt for Command {
-    fn daemon_home(&mut self, home: &Path) -> &mut Self {
-        self.env("HOME", home).env(
-            mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
-            daemon_runtime_dir(home),
-        )
-    }
-}
-
-fn command_output_with_timeout(command: &mut Command, timeout: Duration, label: &str) -> Output {
-    let child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|error| panic!("spawn {label}: {error}"));
-    wait_child_output_with_timeout(child, timeout, label)
-}
-
-fn wait_child_output_with_timeout(mut child: Child, timeout: Duration, label: &str) -> Output {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .unwrap_or_else(|error| panic!("collect {label} output: {error}"));
-            }
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let output = child
-                    .wait_with_output()
-                    .unwrap_or_else(|error| panic!("collect timed-out {label} output: {error}"));
-                panic!(
-                    "{label} did not exit within {timeout:?}; stdout={}, stderr={}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("poll {label}: {error}");
-            }
-        }
-    }
+fn run_daemon(home: &Path, args: &[&str], role: &'static str, timeout: Duration) -> Output {
+    run_cli_output(
+        role,
+        |spec| {
+            with_home(spec, home);
+            spec.env(
+                mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
+                daemon_runtime_dir(home).into_os_string(),
+            );
+            push_args(spec, args.iter().copied());
+        },
+        timeout,
+    )
 }
 
 fn setup_daemon_home() -> (TempDir, PathBuf) {
@@ -122,12 +85,12 @@ fn registered_process_birth(home: &Path) -> (i32, u64) {
 }
 
 fn wait_for_daemon(home: &Path) -> Output {
-    let mut command = Command::new(mempal_bin());
-    command
-        .args(["daemon", "wait", "--timeout-secs", "10"])
-        .daemon_home(home)
-        .stdin(Stdio::null());
-    command_output_with_timeout(&mut command, Duration::from_secs(15), "daemon readiness")
+    run_daemon(
+        home,
+        &["daemon", "wait", "--timeout-secs", "10"],
+        "daemon readiness",
+        Duration::from_secs(15),
+    )
 }
 
 struct DaemonCleanup {
@@ -154,99 +117,73 @@ fn test_daemon_wait_after_restart_requires_status_and_write_transport_readiness(
         db_path: db_path.clone(),
     };
 
-    let mut start_command = Command::new(mempal_bin());
-    start_command
-        .args(["daemon", "start"])
-        .daemon_home(tmp.path())
-        .stdin(Stdio::null());
-    let start =
-        command_output_with_timeout(&mut start_command, Duration::from_secs(15), "daemon start");
+    let start = run_daemon(
+        tmp.path(),
+        &["daemon", "start"],
+        "daemon start",
+        Duration::from_secs(15),
+    );
     assert!(
         start.status.success(),
-        "daemon start failed: status={:?}, stdout={}, stderr={}",
-        start.status,
-        String::from_utf8_lossy(&start.stdout),
-        String::from_utf8_lossy(&start.stderr)
+        "daemon start failed: status={:?}",
+        start.status
     );
     let initial_wait = wait_for_daemon(tmp.path());
     assert!(
         initial_wait.status.success(),
-        "initial daemon wait failed: status={:?}, stdout={}, stderr={}",
-        initial_wait.status,
-        String::from_utf8_lossy(&initial_wait.stdout),
-        String::from_utf8_lossy(&initial_wait.stderr)
+        "initial daemon wait failed: status={:?}",
+        initial_wait.status
     );
     let initial_process_birth = registered_process_birth(tmp.path());
 
-    let mut restart_command = Command::new(mempal_bin());
-    restart_command
-        .args(["daemon", "restart"])
-        .daemon_home(tmp.path())
-        .stdin(Stdio::null());
-    let restart = command_output_with_timeout(
-        &mut restart_command,
-        Duration::from_secs(15),
+    let restart = run_daemon(
+        tmp.path(),
+        &["daemon", "restart"],
         "daemon restart",
+        Duration::from_secs(15),
     );
     assert!(
         restart.status.success(),
-        "daemon restart failed: status={:?}, stdout={}, stderr={}",
-        restart.status,
-        String::from_utf8_lossy(&restart.stdout),
-        String::from_utf8_lossy(&restart.stderr)
+        "daemon restart failed: status={:?}",
+        restart.status
     );
 
     let wait = wait_for_daemon(tmp.path());
     assert!(
         wait.status.success(),
-        "daemon wait failed: status={:?}, stdout={}, stderr={}",
-        wait.status,
-        String::from_utf8_lossy(&wait.stdout),
-        String::from_utf8_lossy(&wait.stderr)
+        "daemon wait failed: status={:?}",
+        wait.status
     );
     let restarted_process_birth = registered_process_birth(tmp.path());
     assert_ne!(
         restarted_process_birth, initial_process_birth,
         "restart must replace the registered daemon process birth"
     );
-    let stdout = String::from_utf8_lossy(&wait.stdout);
-    assert!(stdout.contains("daemon ready"), "{stdout}");
+    assert!(String::from_utf8_lossy(&wait.stdout).contains("daemon ready"));
     assert!(
         tmp.path().join(".mempal/daemon-hook.sock").exists(),
         "readiness must include the daemon write transport"
     );
 
-    let mut status_command = Command::new(mempal_bin());
-    status_command
-        .args(["daemon", "status"])
-        .daemon_home(tmp.path())
-        .stdin(Stdio::null());
-    let status = command_output_with_timeout(
-        &mut status_command,
-        Duration::from_secs(10),
+    let status = run_daemon(
+        tmp.path(),
+        &["daemon", "status"],
         "daemon status",
+        Duration::from_secs(10),
     );
     assert!(status.status.success());
-    assert!(
-        String::from_utf8_lossy(&status.stdout).contains("status: running"),
-        "{}",
-        String::from_utf8_lossy(&status.stdout)
-    );
+    assert!(String::from_utf8_lossy(&status.stdout).contains("status: running"));
 }
 
 #[test]
 fn test_daemon_wait_timeout_is_explicit_and_redacted() {
     let (tmp, db_path) = setup_daemon_home();
 
-    let mut wait_command = Command::new(mempal_bin());
-    wait_command
-        .args(["daemon", "wait", "--timeout-secs", "1"])
-        .daemon_home(tmp.path())
-        .stdin(Stdio::null());
-    let output = command_output_with_timeout(
-        &mut wait_command,
-        Duration::from_secs(5),
+    let output = run_daemon(
+        tmp.path(),
+        &["daemon", "wait", "--timeout-secs", "1"],
         "daemon readiness timeout",
+        Duration::from_secs(5),
     );
 
     assert!(!output.status.success(), "daemon wait should time out");
