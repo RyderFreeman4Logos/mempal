@@ -5,9 +5,9 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 9135
-baseline_lines = 646
-issue = "871"
+baseline_tokens = 9178
+baseline_lines = 650
+issue = "892"
 rationale = "#871/#886/#888/#889/#890 document outage visibility, deterministic Busy fixtures, and bounded MCP/daemon waits; exact no-growth ratchet."
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"

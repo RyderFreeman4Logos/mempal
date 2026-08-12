@@ -42,6 +42,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- **Daemon readiness CLI tests**: use the shared Linux subprocess supervisor,
+  so CLI spawn, output drain, process-group cleanup, and reaping share one
+  deadline and timeout reports remain redacted (#892).
+
 - **MCP smoke waits**: finite `wait=true` smoke ingests process their scoped
   queue item inline within the remaining request deadline, while timed-out
   receipts retain a local completion consumer (#888).
