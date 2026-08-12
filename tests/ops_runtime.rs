@@ -547,11 +547,24 @@ fn test_cli_daemon_status_reports_queue_failure_classes() {
             QueueFailureDisposition::Terminal,
         )
         .expect("mark terminal failed");
-    fs::write(
-        home.path().join(".mempal/daemon.pid"),
-        std::process::id().to_string(),
-    )
-    .expect("write daemon pid");
+    let mut command = Command::new(mempal_bin());
+    command
+        .args(["daemon", "--foreground"])
+        .env("HOME", home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    inject_embed_env(&mut command);
+    let daemon = OwnedTestChild(command.spawn().expect("start daemon"));
+    let pid_path = home.path().join(".mempal/daemon.pid");
+    let deadline = Instant::now() + CLI_TIMEOUT;
+    loop {
+        if fs::read_to_string(&pid_path).is_ok_and(|pid| pid.trim() == daemon.id().to_string()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "daemon did not write pidfile");
+        std::thread::sleep(Duration::from_millis(25));
+    }
 
     let output = run_mempal(&home, &["daemon", "status"]);
     assert_success(&output);
