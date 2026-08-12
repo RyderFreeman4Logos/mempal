@@ -523,8 +523,11 @@ fn test_cli_daemon_status_reports_queue_failure_classes() {
     let home = TempDir::new().expect("home");
     let mempal_home = home.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
-    fs::write(mempal_home.join("config.toml"), "[api]\nenabled = false\n")
-        .expect("write isolated daemon config");
+    fs::write(
+        mempal_home.join("config.toml"),
+        "[embedder]\nbackend = \"stub\"\n\n[api]\nenabled = false\n",
+    )
+    .expect("write isolated daemon config");
     let db_path = palace_db_path(&home);
     Database::open(&db_path).expect("open db");
     let store = PendingMessageStore::new_without_reclaim(&db_path);
@@ -556,22 +559,35 @@ fn test_cli_daemon_status_reports_queue_failure_classes() {
     command
         .args(["daemon", "--foreground"])
         .env("HOME", home.path())
+        .env(
+            mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
+            mempal_home.join("runtime"),
+        )
+        .env_remove("MEMPAL_EMBED_BACKEND")
+        .env_remove("MEMPAL_EMBED_BASE_URL")
+        .env_remove("MEMPAL_EMBED_MODEL")
+        .env_remove("MEMPAL_EMBED_DIM")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    inject_embed_env(&mut command);
-    let daemon = OwnedTestChild(command.spawn().expect("start daemon"));
-    let pid_path = home.path().join(".mempal/daemon.pid");
-    let deadline = Instant::now() + CLI_TIMEOUT;
-    loop {
-        if fs::read_to_string(&pid_path).is_ok_and(|pid| pid.trim() == daemon.id().to_string()) {
-            break;
-        }
-        assert!(Instant::now() < deadline, "daemon did not write pidfile");
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    let _daemon = OwnedTestChild(command.spawn().expect("start daemon"));
 
-    let output = run_mempal(&home, &["daemon", "status"]);
+    let deadline = Instant::now() + CLI_TIMEOUT;
+    let output = loop {
+        let output = run_mempal(&home, &["daemon", "status"]);
+        let status = stdout(&output);
+        if output.status.success()
+            && status.contains("status: running\npid:")
+            && status.contains("queue.failed: 2")
+        {
+            break output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not become status-visible"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
     assert_success(&output);
     let out = stdout(&output);
     assert!(out.contains("queue.failed: 2"), "{out}");
