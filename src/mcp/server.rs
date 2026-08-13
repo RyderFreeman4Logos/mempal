@@ -1585,12 +1585,10 @@ impl MempalMcpServer {
                 .await
                 {
                     if anyhow_chain_contains_sqlite_lock(&error) {
-                        let release_deadline =
-                            scoped_process_remaining(started, budget).unwrap_or_default();
                         Self::release_scoped_claim_after_timeout(
                             queue,
                             claim,
-                            release_deadline,
+                            CLAIM_LOCK_RETRY_DEADLINE,
                             self.daemon_write_observer.as_ref(),
                         )
                         .await?;
@@ -1654,12 +1652,10 @@ impl MempalMcpServer {
                 }
                 Ok(Err(error)) => {
                     Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                    let release_deadline =
-                        scoped_process_remaining(started, budget).unwrap_or_default();
                     Self::release_scoped_claim_after_timeout(
                         queue,
                         claim,
-                        release_deadline,
+                        CLAIM_LOCK_RETRY_DEADLINE,
                         self.daemon_write_observer.as_ref(),
                     )
                     .await?;
@@ -1703,12 +1699,10 @@ impl MempalMcpServer {
                 if let Some(writer_lease) = writer_lease {
                     let _ = writer_lease.release().await;
                 }
-                let release_deadline =
-                    scoped_process_remaining(started, budget).unwrap_or_default();
                 Self::release_scoped_claim_after_timeout(
                     queue,
                     claim,
-                    release_deadline,
+                    CLAIM_LOCK_RETRY_DEADLINE,
                     self.daemon_write_observer.as_ref(),
                 )
                 .await?;
@@ -1745,12 +1739,10 @@ impl MempalMcpServer {
                 if let Some(writer_lease) = writer_lease {
                     let _ = writer_lease.release().await;
                 }
-                let release_deadline =
-                    scoped_process_remaining(started, budget).unwrap_or_default();
                 Self::release_scoped_claim_after_timeout(
                     queue,
                     claim,
-                    release_deadline,
+                    CLAIM_LOCK_RETRY_DEADLINE,
                     self.daemon_write_observer.as_ref(),
                 )
                 .await?;
@@ -3067,7 +3059,7 @@ impl MempalMcpServer {
                         Self::release_scoped_claim_after_timeout(
                             &queue,
                             claim,
-                            remaining,
+                            CLAIM_LOCK_RETRY_DEADLINE,
                             self.daemon_write_observer.as_ref(),
                         )
                         .await?;
