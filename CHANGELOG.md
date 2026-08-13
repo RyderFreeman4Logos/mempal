@@ -43,6 +43,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ### Fixed
 
 - Daemon lifecycle commands now require argv and database-scoped process identity before treating `daemon.pid` as a signal target, and revalidate process birth before SIGTERM or SIGKILL (#885).
+- Timed-out scoped ingest claim release now retries SQLite locks using
+  `CLAIM_LOCK_RETRY_DEADLINE` instead of `Duration::ZERO` (#895).
 - **Queue byte admission**: retry transient profile-admission lock contention when
   opening a normal queue writer, so concurrent ingest requests retain the
   byte-budget rejection contract under suite load (#893).
