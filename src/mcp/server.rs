@@ -4435,6 +4435,17 @@ fn status_db_failure_kind(error: &(dyn std::error::Error + 'static)) -> &'static
     let mut current = Some(error);
     while let Some(error) = current {
         if matches!(
+            error.downcast_ref::<crate::core::db::DbError>(),
+            Some(crate::core::db::DbError::Admission(
+                crate::core::db_admission::DbAdmissionError::BudgetExceeded { .. }
+            ))
+        ) || matches!(
+            error.downcast_ref::<crate::core::db_admission::DbAdmissionError>(),
+            Some(crate::core::db_admission::DbAdmissionError::BudgetExceeded { .. })
+        ) {
+            return "holder_budget_exceeded";
+        }
+        if matches!(
             error.downcast_ref::<crate::core::db_admission::DbAdmissionError>(),
             Some(crate::core::db_admission::DbAdmissionError::Busy { .. })
         ) {
@@ -4457,12 +4468,6 @@ fn status_db_failure_kind(error: &(dyn std::error::Error + 'static)) -> &'static
         || summary.contains("sqlite_locked")
     {
         "locked_or_busy"
-    } else if summary.contains("holder budget exceeded")
-        || summary.contains("profile database holder budget")
-        || summary.contains("reserved_service_slots")
-        || summary.contains("pool cache budget exceeded")
-    {
-        "holder_budget_exceeded"
     } else if summary.contains("permission denied")
         || summary.contains("readonly")
         || summary.contains("read-only")
@@ -4576,8 +4581,8 @@ fn record_status_database_diagnostic(
     system_warnings.push(SystemWarning {
         level: "warn".to_string(),
         message: format!(
-            "{headline} at {}: {} ({})",
-            diagnostic.source, diagnostic.summary, diagnostic.failure_kind
+            "{headline}: {}. {}",
+            diagnostic.failure_kind, diagnostic.hint
         ),
         source: "database".to_string(),
     });
@@ -12248,8 +12253,8 @@ fn database_warning_snapshot(
     warnings.push(SystemWarning {
         level: "warn".to_string(),
         message: format!(
-            "{headline} at {}: {} ({})",
-            diagnostic.source, diagnostic.summary, diagnostic.failure_kind
+            "{headline}: {}. {}",
+            diagnostic.failure_kind, diagnostic.hint
         ),
         source: "database".to_string(),
     });
@@ -12353,8 +12358,8 @@ fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDt
             "database_locked",
             "retry_after_transient_lock",
             format!(
-                "mempal database is busy; write admission was not confirmed. {}: {} ({}). {}",
-                diagnostic.source, diagnostic.summary, diagnostic.failure_kind, diagnostic.hint
+                "mempal database is busy; write admission was not confirmed. {}",
+                diagnostic.hint
             ),
         )
     } else if diagnostic.failure_kind == "holder_budget_exceeded" {
@@ -12362,8 +12367,8 @@ fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDt
             "holder_budget_exceeded",
             "write_refused",
             format!(
-                "mempal profile holder budget is exhausted; write was refused before queueing. {}: {} ({}). {}",
-                diagnostic.source, diagnostic.summary, diagnostic.failure_kind, diagnostic.hint
+                "mempal profile holder budget is exhausted; write was refused before queueing. {}",
+                diagnostic.hint
             ),
         )
     } else {
@@ -12371,8 +12376,8 @@ fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDt
             "database_degraded",
             "write_refused",
             format!(
-                "mempal database degraded; writes are refused to preserve memory integrity. {}: {} ({}). {}",
-                diagnostic.source, diagnostic.summary, diagnostic.failure_kind, diagnostic.hint
+                "mempal database degraded; writes are refused to preserve memory integrity. {}",
+                diagnostic.hint
             ),
         )
     };
@@ -12482,15 +12487,9 @@ fn mcp_async_pool_admission_error(db_path: &Path, error: &anyhow::Error) -> Erro
     let capacity = admission.get("capacity").cloned();
     let headroom = admission.get("headroom").cloned();
     let message = if diagnostic.failure_kind == "holder_budget_exceeded" {
-        format!(
-            "MCP async pool admission refused before wait=true ingest was accepted: {}. {}",
-            diagnostic.summary, diagnostic.hint
-        )
+        "MCP async pool admission refused before wait=true ingest was accepted. Profile SQLite holder budget is exhausted after stale reaping; free live non-service holders or wait for reserved service seats, then retry.".to_string()
     } else {
-        format!(
-            "MCP async pool could not be opened before wait=true ingest was accepted: {}. {}",
-            diagnostic.summary, diagnostic.hint
-        )
+        "MCP async pool could not be opened before wait=true ingest was accepted. Retry after the database becomes available.".to_string()
     };
     ErrorData::internal_error(
         message,
@@ -12523,8 +12522,8 @@ fn mcp_query_only_pool_admission_error(
     let headroom = admission.get("headroom").cloned();
     ErrorData::internal_error(
         format!(
-            "MCP query-only pool admission refused for {operation}: {}. {}",
-            diagnostic.summary, diagnostic.hint
+            "MCP query-only pool admission refused for {operation}. Profile SQLite holder budget is exhausted after stale reaping; free live non-service holders or wait for reserved service seats, then retry. {}",
+            diagnostic.hint
         ),
         Some(serde_json::json!({
             "outcome": "admission_blocked",
@@ -12766,8 +12765,8 @@ fn push_mcp_search_database_warning(
     }
 
     let warning = format!(
-        "database diagnostic degraded at {}: {} ({}); mempal_search returned a bounded empty response instead of an internal MCP error. {}",
-        diagnostic.source, diagnostic.summary, diagnostic.failure_kind, diagnostic.hint
+        "database diagnostic degraded ({}); mempal_search returned a bounded empty response instead of an internal MCP error. {}",
+        diagnostic.failure_kind, diagnostic.hint
     );
     response_warnings.push(warning.clone());
     system_warnings.push(SystemWarning {
@@ -17775,6 +17774,12 @@ prototypes = ["keep"]
         assert_eq!(status_db_failure_kind(&protocol), "locked_or_busy");
         assert_eq!(status_db_failure_kind(&permission), "path_or_permission");
         assert_eq!(status_db_failure_kind(&invalid), "corrupt_or_invalid");
+
+        let non_budget_admission_io = crate::core::db_admission::DbAdmissionError::Io {
+            path: PathBuf::from("/tmp/profile-database-holder-budget-exceeded.db"),
+            source: std::io::Error::other("holder budget exceeded while reading metadata"),
+        };
+        assert_eq!(status_db_failure_kind(&non_budget_admission_io), "unknown");
     }
 
     #[test]
@@ -19161,7 +19166,10 @@ prototypes = ["keep"]
     #[tokio::test]
     async fn test_mcp_context_preserves_non_admission_query_open_error_when_holders_saturated() {
         let (_tempdir, db_path, server) = setup_server();
-        let server = server.with_query_only_async_db_open_error_for_test("permission denied");
+        let server = server.with_query_only_async_db_open_error_for_test(format!(
+            "permission denied for {}: profile database holder budget exceeded",
+            db_path.display()
+        ));
         let _holders = (0..15)
             .map(|_| {
                 ProfileDbAdmission::acquire(
@@ -22538,6 +22546,32 @@ prototypes = ["keep"]
             3 * 16 * 1024 * 1024
         );
         assert_eq!(data["profile_admission"]["budget_reason"], "cache_budget");
+
+        let wire_error = serde_json::json!({
+            "message": error.message,
+            "data": data,
+        });
+        assert!(
+            wire_error["data"]["database_diagnostic"]
+                .get("path")
+                .is_none(),
+            "MCP wire data must not expose the database path: {wire_error}"
+        );
+        assert!(
+            wire_error["data"]["database_diagnostic"]
+                .get("summary")
+                .is_none(),
+            "MCP wire data must not expose an unsanitized database summary: {wire_error}"
+        );
+        let wire_json = wire_error.to_string();
+        assert!(
+            !wire_json.contains(&db_path.display().to_string()),
+            "MCP wire must not expose the database path: {wire_json}"
+        );
+        assert!(
+            !wire_json.contains("profile database holder budget exceeded"),
+            "MCP wire must not expose the raw admission summary: {wire_json}"
+        );
     }
 
     #[tokio::test]

@@ -2395,9 +2395,13 @@ pub struct QueueFailureBucketDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct DatabaseDiagnosticDto {
+    #[serde(skip_serializing)]
+    #[schemars(skip)]
     pub path: String,
     pub source: String,
     pub failure_kind: String,
+    #[serde(skip_serializing)]
+    #[schemars(skip)]
     pub summary: String,
     pub hint: String,
 }
