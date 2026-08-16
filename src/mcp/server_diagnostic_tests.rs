@@ -34,6 +34,12 @@ fn test_status_database_diagnostic_classifies_sqlite_failures() {
     assert_eq!(status_db_failure_kind(&permission), "path_or_permission");
     assert_eq!(status_db_failure_kind(&invalid), "corrupt_or_invalid");
 
+    let audit_write = crate::core::db::DbError::AuditWrite {
+        path: PathBuf::from("/tmp/private-audit.log"),
+        source: std::io::Error::other("audit write failed"),
+    };
+    assert_eq!(status_db_failure_kind(&audit_write), "audit_write_failed");
+
     let non_budget_admission_io = crate::core::db_admission::DbAdmissionError::Io {
         path: PathBuf::from("/tmp/profile-database-holder-budget-exceeded.db"),
         source: std::io::Error::other("holder budget exceeded while reading metadata"),

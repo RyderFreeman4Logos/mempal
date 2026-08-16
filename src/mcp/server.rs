@@ -4460,6 +4460,15 @@ fn status_db_failure_kind(error: &(dyn std::error::Error + 'static)) -> &'static
             return "writer_lease_lost";
         }
         if matches!(
+            error.downcast_ref::<crate::core::db::DbError>(),
+            Some(
+                crate::core::db::DbError::AuditOpen { .. }
+                    | crate::core::db::DbError::AuditWrite { .. }
+            )
+        ) {
+            return "audit_write_failed";
+        }
+        if matches!(
             error.downcast_ref::<crate::core::db_admission::DbAdmissionError>(),
             Some(crate::core::db_admission::DbAdmissionError::Busy { .. })
         ) {
@@ -4474,7 +4483,9 @@ fn status_db_failure_kind(error: &(dyn std::error::Error + 'static)) -> &'static
     }
 
     let summary = status_error_summary(error).to_ascii_lowercase();
-    if summary.contains("database is locked")
+    if summary.contains("novelty_audit") {
+        "audit_write_failed"
+    } else if summary.contains("database is locked")
         || summary.contains("database locked")
         || summary.contains("database is busy")
         || summary.contains("database busy")
