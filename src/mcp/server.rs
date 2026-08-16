@@ -12402,6 +12402,15 @@ fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDt
                 diagnostic.failure_kind, diagnostic.hint
             ),
         )
+    } else if diagnostic.failure_kind == "writer_lease_lost" {
+        (
+            "database_degraded",
+            "write_refused",
+            format!(
+                "mempal SQLite writer lease was lost before {}; writes are refused to preserve memory integrity ({}). {}",
+                diagnostic.source, diagnostic.failure_kind, diagnostic.hint
+            ),
+        )
     } else {
         (
             "database_degraded",

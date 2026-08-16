@@ -74,6 +74,43 @@ fn test_mcp_ingest_database_write_refused_error_classifies_sqlite_protocol() {
 }
 
 #[test]
+fn test_mcp_writer_lease_lost_diagnostic_is_typed_and_redacted() {
+    let error = crate::core::db::DbError::RuntimeWriterLeaseLost {
+        lease_name: "sqlite-writer".to_string(),
+        owner: "mempal-daemon-test".to_string(),
+        generation: 7,
+        operation: "record MCP ingest tier2 audit",
+    };
+
+    let error = database_write_refused_error(
+        Path::new("/tmp/palace.db"),
+        "record MCP ingest tier2 audit",
+        &error,
+    );
+
+    assert!(
+        error
+            .message
+            .contains("SQLite writer lease was lost before record MCP ingest tier2 audit")
+    );
+    assert!(!error.message.contains("mempal-daemon-test"));
+    let data = error.data.expect("structured error data");
+    let diagnostic = data
+        .get("database_diagnostic")
+        .expect("database diagnostic payload");
+    assert_eq!(
+        diagnostic.get("failure_kind").and_then(Value::as_str),
+        Some("writer_lease_lost")
+    );
+    assert_eq!(
+        diagnostic.get("source").and_then(Value::as_str),
+        Some("record MCP ingest tier2 audit")
+    );
+    assert!(diagnostic.get("path").is_none());
+    assert!(diagnostic.get("summary").is_none());
+}
+
+#[test]
 fn test_mcp_search_database_warning_classifies_sqlite_busy() {
     let busy = rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error {
