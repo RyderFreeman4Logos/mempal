@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 9218
-baseline_lines = 654
-issue = "893"
-rationale = "#893 documents transient queue profile-admission lock retry while preserving byte-budget rejection semantics; exact no-growth ratchet."
+baseline_tokens = 9257
+baseline_lines = 655
+issue = "885"
+rationale = "#885 records daemon pidfile signal-identity hardening; exact no-growth ratchet."
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
 kind = "source"
@@ -356,10 +356,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/main.rs"
 kind = "source"
-baseline_tokens = 260328
-baseline_lines = 33734
-issue = "871"
-rationale = "#871 emits bounded typed availability on CLI status config, database, and queue observation failures; exact no-growth ratchet until the main CLI split lands."
+baseline_tokens = 260933
+baseline_lines = 33806
+issue = "885"
+rationale = "#885 carries daemon process birth identity through lifecycle candidate selection and signal revalidation; exact no-growth ratchet until the main CLI split lands."
 
 [[files]]
 path = "src/markdown_export.rs"
@@ -492,10 +492,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/daemon_lifecycle.rs"
 kind = "test"
-baseline_tokens = 7753
-baseline_lines = 975
-issue = "890"
-rationale = "#890 retries classified admission Busy only within the daemon lifecycle fixture's existing deadline; exact no-growth ratchet."
+baseline_tokens = 7996
+baseline_lines = 1005
+issue = "885"
+rationale = "#885 proves pidfile-only foreign processes are not lifecycle signal targets; exact no-growth ratchet."
 [[files]]
 path = "tests/embedder_reindex_scenarios.rs"
 kind = "test"

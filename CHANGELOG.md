@@ -42,9 +42,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
-- **Queue byte admission**: retry transient profile-admission lock contention when
-  opening a normal queue writer, so concurrent ingest requests retain the
-  byte-budget rejection contract under suite load (#893).
+- Daemon pidfile checks argv/DB/birth before signaling; timed-out scoped ingest claim release uses `CLAIM_LOCK_RETRY_DEADLINE` when expired, or the smaller remaining budget (#885/#895).
+- Queue byte admission retries transient profile-admission lock contention when opening a normal queue writer, preserving the byte-budget rejection contract under suite load (#893).
 
 - **Daemon readiness CLI tests**: use the shared Linux subprocess supervisor,
   so CLI spawn, output drain, process-group cleanup, and reaping share one

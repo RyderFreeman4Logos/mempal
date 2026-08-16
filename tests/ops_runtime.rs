@@ -58,6 +58,25 @@ fn run_mempal(home: &TempDir, args: &[&str]) -> std::process::Output {
     command_output_with_timeout(&mut cmd, CLI_TIMEOUT, "mempal")
 }
 
+fn run_daemon(home: &TempDir, args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(mempal_bin());
+    cmd.args(args)
+        .env("HOME", home.path())
+        .env(
+            mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
+            home.path().join(".mempal/runtime"),
+        )
+        .env_remove("MEMPAL_EMBED_BACKEND")
+        .env_remove("MEMPAL_EMBED_BASE_URL")
+        .env_remove("MEMPAL_EMBED_MODEL")
+        .env_remove("MEMPAL_EMBED_DIM");
+    command_output_with_timeout(
+        &mut cmd,
+        CLI_TIMEOUT + Duration::from_secs(5),
+        "mempal daemon",
+    )
+}
+
 fn run_mempal_with_path(home: &TempDir, args: &[&str], path_value: &str) -> std::process::Output {
     let mut cmd = Command::new(mempal_bin());
     cmd.args(args)
@@ -520,10 +539,41 @@ fn test_cli_doctor_reports_queue_failure_classes() {
 
 #[test]
 fn test_cli_daemon_status_reports_queue_failure_classes() {
-    let home = TempDir::new().expect("home");
-    fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
+    let home = TempDir::new_in("/tmp").expect("home");
+    let mempal_home = home.path().join(".mempal");
+    fs::create_dir_all(&mempal_home).expect("create mempal home");
     let db_path = palace_db_path(&home);
+    fs::write(
+        mempal_home.join("config.toml"),
+        format!(
+            "db_path = \"{}\"\n\n[embedder]\nbackend = \"stub\"\n\n[hooks]\nenabled = true\ndaemon_poll_interval_ms = 60000\n\n[daemon]\nlog_path = \"{}\"\n\n[api]\nenabled = false\n",
+            db_path.display(),
+            mempal_home.join("daemon.log").display(),
+        ),
+    )
+    .expect("write isolated daemon config");
     Database::open(&db_path).expect("open db");
+
+    let mut command = Command::new(mempal_bin());
+    command
+        .args(["daemon", "--foreground"])
+        .env("HOME", home.path())
+        .env(
+            mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
+            mempal_home.join("runtime"),
+        )
+        .env_remove("MEMPAL_EMBED_BACKEND")
+        .env_remove("MEMPAL_EMBED_BASE_URL")
+        .env_remove("MEMPAL_EMBED_MODEL")
+        .env_remove("MEMPAL_EMBED_DIM")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _daemon = OwnedTestChild(command.spawn().expect("start daemon"));
+
+    let ready = run_daemon(&home, &["daemon", "wait", "--timeout-secs", "10"]);
+    assert_success(&ready);
+
     let store = PendingMessageStore::new_without_reclaim(&db_path);
 
     let retryable = store
@@ -547,13 +597,9 @@ fn test_cli_daemon_status_reports_queue_failure_classes() {
             QueueFailureDisposition::Terminal,
         )
         .expect("mark terminal failed");
-    fs::write(
-        home.path().join(".mempal/daemon.pid"),
-        std::process::id().to_string(),
-    )
-    .expect("write daemon pid");
+    drop(store);
 
-    let output = run_mempal(&home, &["daemon", "status"]);
+    let output = run_daemon(&home, &["daemon", "status"]);
     assert_success(&output);
     let out = stdout(&output);
     assert!(out.contains("queue.failed: 2"), "{out}");
