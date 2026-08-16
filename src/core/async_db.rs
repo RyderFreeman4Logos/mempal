@@ -448,7 +448,7 @@ impl QueryOnlyAsyncDb {
         self
     }
 
-    #[cfg(any(test, feature = "db-test-seam"))]
+    #[cfg(test)]
     pub(crate) fn available_reader_permits_for_test(&self) -> usize {
         self.readers.sem.available_permits()
     }
