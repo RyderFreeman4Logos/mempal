@@ -865,14 +865,12 @@ async fn test_mcp_merge_audit_failure_rolls_back_target_update() {
         .expect("failed operation response");
 
     assert_eq!(response.state, Some(IngestOperationState::Failed));
-    assert!(
-        response
-            .failure_detail
-            .as_deref()
-            .unwrap_or_default()
-            .contains("novelty_audit"),
-        "failure detail should mention audit write failure: {response:?}"
-    );
+    assert!(matches!(
+        response.failure_detail.as_deref(),
+        Some(detail)
+            if detail.contains("\"failure_kind\":\"audit_write_failed\"")
+                && !detail.contains("novelty_audit")
+    ));
     assert_eq!(
         drawer_content(&env.db_path, "existing"),
         "Decision: keep atomic MCP merge audits"
