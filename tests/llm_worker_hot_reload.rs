@@ -21,8 +21,6 @@ use tokio::sync::Notify;
 // Serialize them to prevent cross-test config snapshot contamination.
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-// ── helpers ─────────────────────────────────────────────────────────────────
-
 fn make_store(db: &Database) -> PendingMessageStore {
     PendingMessageStore::new(db.path()).expect("open queue")
 }
@@ -60,8 +58,6 @@ fn llm_chat_response_body(content: &str) -> serde_json::Value {
         }
     })
 }
-
-// ── release_claim ────────────────────────────────────────────────────────────
 
 #[test]
 fn test_release_claim_returns_task_to_pending() {
@@ -153,8 +149,6 @@ fn test_release_claim_returns_error_for_unknown_id() {
         "release_claim on unknown id must return MessageNotFound"
     );
 }
-
-// ── LLM generation watch channel ─────────────────────────────────────────────
 
 #[test]
 fn test_llm_gen_increments_on_model_change() {
@@ -625,8 +619,6 @@ fn test_llm_client_runtime_recovers_after_invalid_initial_config() {
     assert_eq!(router.endpoint_count(), 1);
 }
 
-// ── tokio::select! cancellation ───────────────────────────────────────────────
-
 /// Simulates the worker's tokio::select! pattern: a slow async operation races
 /// against an LLM generation change signal and is cancelled when the signal fires.
 #[tokio::test]
@@ -683,7 +675,6 @@ async fn test_llm_process_refreshes_heartbeat_during_long_judge_call() {
         .expect("claim llm task")
         .expect("claimed message");
     assert_eq!(claimed.id, id);
-
     let request_started = Arc::new(Notify::new());
     let request_started_for_server = Arc::clone(&request_started);
     let app = Router::new().route(
@@ -706,7 +697,6 @@ async fn test_llm_process_refreshes_heartbeat_during_long_judge_call() {
     let server_handle = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve llm server");
     });
-
     let llm_config = LlmConfig {
         enabled: true,
         base_url: Some(format!("http://{addr}/v1")),
@@ -717,7 +707,7 @@ async fn test_llm_process_refreshes_heartbeat_during_long_judge_call() {
     };
     let client = LlmClient::from_config(&llm_config).expect("build llm client");
     let status = Arc::new(LlmStatus::new(5));
-    let judge_config = Config {
+    let mut judge_config = Config {
         ingest_gating: IngestGatingConfig {
             llm_judge: Some(LlmJudgeConfig {
                 enabled: true,
@@ -728,7 +718,8 @@ async fn test_llm_process_refreshes_heartbeat_during_long_judge_call() {
         },
         ..Default::default()
     };
-
+    judge_config.llm.retry_interval_secs = 1;
+    let heartbeat_ready = Arc::clone(&request_started);
     let heartbeat_store = store.clone();
     let heartbeat_message_id = claimed.id.clone();
     let heartbeat_worker_id = "worker-a".to_string();
@@ -740,9 +731,9 @@ async fn test_llm_process_refreshes_heartbeat_during_long_judge_call() {
                 .map_err(|error| {
                     LlmError::MissingConfiguration(format!("heartbeat failed: {error}"))
                 })?;
+            heartbeat_ready.notify_one();
             Ok(())
         });
-
         mempal::llm::process_llm_task(
             &client,
             status.as_ref(),
@@ -753,13 +744,13 @@ async fn test_llm_process_refreshes_heartbeat_during_long_judge_call() {
         )
         .await
     };
-
     let claim_probe = {
         let store = store.clone();
         async move {
             request_started.notified().await;
-            tokio::time::sleep(Duration::from_millis(2600)).await;
-
+            tokio::time::timeout(Duration::from_secs(2), request_started.notified())
+                .await
+                .expect("heartbeat refresh must complete before reclaim probe");
             let second_claim = store
                 .claim_next_by_kind("worker-b", 1, "llm_task")
                 .expect("second claim");
@@ -769,7 +760,6 @@ async fn test_llm_process_refreshes_heartbeat_during_long_judge_call() {
             );
         }
     };
-
     let (process_result, _) = tokio::join!(process, claim_probe);
     process_result.expect("process llm task");
 
@@ -812,8 +802,6 @@ fn test_llm_client_has_request_timeout_from_config() {
         config.max_concurrent.max(1)
     );
 }
-
-// ── queue release idempotency ────────────────────────────────────────────────
 
 #[test]
 fn test_release_claim_on_already_pending_is_error() {
