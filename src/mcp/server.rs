@@ -2602,10 +2602,18 @@ impl MempalMcpServer {
         match self.async_db().await {
             Ok(_) => Ok(()),
             Err(error) => {
-                let diagnostic =
+                let mut diagnostic =
                     status_database_diagnostic(&self.db_path, "async_db", error.as_ref());
+                if anyhow_chain_has_holder_budget_exceeded(&error) {
+                    diagnostic.failure_kind = "holder_budget_exceeded".to_string();
+                    diagnostic.hint = status_db_failure_hint(&diagnostic.failure_kind).to_string();
+                }
                 if diagnostic.failure_kind == "holder_budget_exceeded" {
-                    return Err(mcp_async_pool_admission_error(&self.db_path, &error));
+                    return Err(mcp_async_pool_admission_error(
+                        &self.db_path,
+                        diagnostic,
+                        &error,
+                    ));
                 }
                 Ok(())
             }
@@ -4446,6 +4454,12 @@ fn status_db_failure_kind(error: &(dyn std::error::Error + 'static)) -> &'static
             return "holder_budget_exceeded";
         }
         if matches!(
+            error.downcast_ref::<crate::core::db::DbError>(),
+            Some(crate::core::db::DbError::RuntimeWriterLeaseLost { .. })
+        ) {
+            return "writer_lease_lost";
+        }
+        if matches!(
             error.downcast_ref::<crate::core::db_admission::DbAdmissionError>(),
             Some(crate::core::db_admission::DbAdmissionError::Busy { .. })
         ) {
@@ -4486,6 +4500,20 @@ fn status_db_failure_kind(error: &(dyn std::error::Error + 'static)) -> &'static
     } else {
         "unknown"
     }
+}
+
+fn anyhow_chain_has_holder_budget_exceeded(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<crate::core::db::DbError>(),
+            Some(crate::core::db::DbError::Admission(
+                crate::core::db_admission::DbAdmissionError::BudgetExceeded { .. }
+            ))
+        ) || matches!(
+            cause.downcast_ref::<crate::core::db_admission::DbAdmissionError>(),
+            Some(crate::core::db_admission::DbAdmissionError::BudgetExceeded { .. })
+        )
+    })
 }
 
 fn status_rusqlite_failure_kind(error: &rusqlite::Error) -> Option<&'static str> {
@@ -4557,6 +4585,9 @@ fn status_database_diagnostic(
                 crate::process_diagnostics::format_db_holder_role_summary(&holder_report),
                 crate::process_diagnostics::sqlite_lock_safe_next_step(&holder_report)
             );
+        }
+        if status_error_summary(error).contains("current_mcp_server") {
+            hint.push_str(" Holder class: current_mcp_server.");
         }
     }
     DatabaseDiagnosticDto {
@@ -12335,8 +12366,8 @@ fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDt
     let warning = SystemWarning {
         level: "warn".to_string(),
         message: format!(
-            "{warning_headline} at {}: {} ({})",
-            diagnostic.source, diagnostic.summary, diagnostic.failure_kind
+            "{warning_headline}: {}. {}",
+            diagnostic.failure_kind, diagnostic.hint
         ),
         source: "database".to_string(),
     };
@@ -12358,8 +12389,8 @@ fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDt
             "database_locked",
             "retry_after_transient_lock",
             format!(
-                "mempal database is busy; write admission was not confirmed. {}",
-                diagnostic.hint
+                "mempal database is busy; write admission was not confirmed ({}). {}",
+                diagnostic.failure_kind, diagnostic.hint
             ),
         )
     } else if diagnostic.failure_kind == "holder_budget_exceeded" {
@@ -12367,8 +12398,8 @@ fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDt
             "holder_budget_exceeded",
             "write_refused",
             format!(
-                "mempal profile holder budget is exhausted; write was refused before queueing. {}",
-                diagnostic.hint
+                "mempal profile holder budget is exhausted; write was refused before queueing ({}). {}",
+                diagnostic.failure_kind, diagnostic.hint
             ),
         )
     } else {
@@ -12376,8 +12407,8 @@ fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDt
             "database_degraded",
             "write_refused",
             format!(
-                "mempal database degraded; writes are refused to preserve memory integrity. {}",
-                diagnostic.hint
+                "mempal database degraded; writes are refused to preserve memory integrity ({}). {}",
+                diagnostic.failure_kind, diagnostic.hint
             ),
         )
     };
@@ -12432,17 +12463,24 @@ fn profile_admission_snapshot(db_path: &Path, pool_loaded_key: &str) -> serde_js
 }
 
 fn budget_exceeded_profile_admission(error: &anyhow::Error) -> Option<serde_json::Value> {
-    let admission = match error.downcast_ref::<crate::core::db::DbError>() {
-        Some(crate::core::db::DbError::Admission(
-            admission @ crate::core::db_admission::DbAdmissionError::BudgetExceeded { .. },
-        )) => admission,
-        _ => match error.downcast_ref::<crate::core::db_admission::DbAdmissionError>() {
-            Some(
-                admission @ crate::core::db_admission::DbAdmissionError::BudgetExceeded { .. },
-            ) => admission,
-            _ => return None,
-        },
-    };
+    let admission =
+        error.chain().find_map(
+            |cause| match cause.downcast_ref::<crate::core::db::DbError>() {
+                Some(crate::core::db::DbError::Admission(
+                    admission @ crate::core::db_admission::DbAdmissionError::BudgetExceeded {
+                        ..
+                    },
+                )) => Some(admission),
+                _ => cause
+                    .downcast_ref::<crate::core::db_admission::DbAdmissionError>()
+                    .filter(|cause| {
+                        matches!(
+                            cause,
+                            crate::core::db_admission::DbAdmissionError::BudgetExceeded { .. }
+                        )
+                    }),
+            },
+        )?;
     let crate::core::db_admission::DbAdmissionError::BudgetExceeded {
         active_holders,
         max_holders,
@@ -12476,8 +12514,11 @@ fn budget_exceeded_profile_admission(error: &anyhow::Error) -> Option<serde_json
     }))
 }
 
-fn mcp_async_pool_admission_error(db_path: &Path, error: &anyhow::Error) -> ErrorData {
-    let diagnostic = status_database_diagnostic(db_path, "async_db", error.as_ref());
+fn mcp_async_pool_admission_error(
+    db_path: &Path,
+    diagnostic: DatabaseDiagnosticDto,
+    error: &anyhow::Error,
+) -> ErrorData {
     let mut admission = profile_admission_snapshot(db_path, "async_pool_loaded");
     if let Some(fields) = budget_exceeded_profile_admission(error)
         && let (Some(admission), Some(fields)) = (admission.as_object_mut(), fields.as_object())
@@ -13560,7 +13601,10 @@ mod tests {
             Ok(_) => panic!("stale MCP writer generation mutated after takeover"),
             Err(error) => error,
         };
-        assert!(error.message.contains("generation"), "error={error:?}");
+        assert!(
+            error.message.contains("writer_lease_lost"),
+            "error={error:?}"
+        );
 
         let entries = Database::open(&db_path)
             .expect("open database after rejected write")
@@ -17739,188 +17783,7 @@ prototypes = ["keep"]
         assert!(json.get("system_warnings").is_some());
     }
 
-    #[test]
-    fn test_status_database_diagnostic_classifies_sqlite_failures() {
-        let busy = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::DatabaseBusy,
-                extended_code: rusqlite::ffi::SQLITE_BUSY,
-            },
-            Some("database is locked".to_string()),
-        );
-        let permission = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::PermissionDenied,
-                extended_code: rusqlite::ffi::SQLITE_PERM,
-            },
-            Some("permission denied".to_string()),
-        );
-        let invalid = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::NotADatabase,
-                extended_code: rusqlite::ffi::SQLITE_NOTADB,
-            },
-            Some("file is not a database".to_string()),
-        );
-        let protocol = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::FileLockingProtocolFailed,
-                extended_code: rusqlite::ffi::SQLITE_PROTOCOL,
-            },
-            Some("Database lock protocol error".to_string()),
-        );
-
-        assert_eq!(status_db_failure_kind(&busy), "locked_or_busy");
-        assert_eq!(status_db_failure_kind(&protocol), "locked_or_busy");
-        assert_eq!(status_db_failure_kind(&permission), "path_or_permission");
-        assert_eq!(status_db_failure_kind(&invalid), "corrupt_or_invalid");
-
-        let non_budget_admission_io = crate::core::db_admission::DbAdmissionError::Io {
-            path: PathBuf::from("/tmp/profile-database-holder-budget-exceeded.db"),
-            source: std::io::Error::other("holder budget exceeded while reading metadata"),
-        };
-        assert_eq!(status_db_failure_kind(&non_budget_admission_io), "unknown");
-    }
-
-    #[test]
-    fn test_mcp_ingest_database_write_refused_error_classifies_sqlite_protocol() {
-        let protocol = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::FileLockingProtocolFailed,
-                extended_code: rusqlite::ffi::SQLITE_PROTOCOL,
-            },
-            Some("Database lock protocol error".to_string()),
-        );
-
-        let error =
-            database_write_refused_error(Path::new("/tmp/palace.db"), "async_db", &protocol);
-
-        assert!(error.message.contains("locked_or_busy"));
-        let data = error.data.expect("structured error data");
-        assert_eq!(
-            data.get("reason").and_then(Value::as_str),
-            Some("database_locked")
-        );
-        assert_eq!(
-            data.get("action").and_then(Value::as_str),
-            Some("retry_after_transient_lock")
-        );
-        let diagnostic = data
-            .get("database_diagnostic")
-            .expect("database diagnostic payload");
-        assert_eq!(
-            diagnostic.get("failure_kind").and_then(Value::as_str),
-            Some("locked_or_busy")
-        );
-    }
-
-    #[test]
-    fn test_mcp_search_database_warning_classifies_sqlite_busy() {
-        let busy = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::DatabaseBusy,
-                extended_code: rusqlite::ffi::SQLITE_BUSY,
-            },
-            Some("database is locked".to_string()),
-        );
-        let mut response_warnings = Vec::new();
-        let mut system_warnings = Vec::new();
-
-        let handled = push_mcp_search_database_warning(
-            &mut response_warnings,
-            &mut system_warnings,
-            Path::new("/tmp/palace.db"),
-            "BM25 fallback search",
-            &busy,
-        );
-
-        assert!(handled);
-        assert!(
-            response_warnings
-                .iter()
-                .any(|warning| warning.contains("locked_or_busy")
-                    && warning.contains("bounded empty response")),
-            "response warning should expose locked DB diagnostic: {response_warnings:?}"
-        );
-        assert!(system_warnings.iter().any(|warning| {
-            warning.source == "database" && warning.message.contains("locked_or_busy")
-        }));
-    }
-
-    #[test]
-    fn test_mcp_ingest_database_write_refused_error_classifies_sqlite_busy() {
-        let busy = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::DatabaseBusy,
-                extended_code: rusqlite::ffi::SQLITE_BUSY,
-            },
-            Some("database is locked".to_string()),
-        );
-
-        let error = database_write_refused_error(Path::new("/tmp/palace.db"), "async_db", &busy);
-
-        assert!(error.message.contains("write admission was not confirmed"));
-        assert!(error.message.contains("locked_or_busy"));
-        let data = error.data.expect("structured error data");
-        assert_eq!(
-            data.get("reason").and_then(Value::as_str),
-            Some("database_locked")
-        );
-        assert_eq!(
-            data.get("action").and_then(Value::as_str),
-            Some("retry_after_transient_lock")
-        );
-        let diagnostic = data
-            .get("database_diagnostic")
-            .expect("database diagnostic payload");
-        assert_eq!(
-            diagnostic.get("path").and_then(Value::as_str),
-            Some("/tmp/palace.db")
-        );
-        assert_eq!(
-            diagnostic.get("source").and_then(Value::as_str),
-            Some("async_db")
-        );
-        assert_eq!(
-            diagnostic.get("failure_kind").and_then(Value::as_str),
-            Some("locked_or_busy")
-        );
-        assert!(
-            diagnostic
-                .get("summary")
-                .and_then(Value::as_str)
-                .is_some_and(|summary| summary.contains("database is locked")),
-            "diagnostic summary should include the SQLite lock message: {diagnostic}"
-        );
-        assert!(
-            diagnostic
-                .get("hint")
-                .and_then(Value::as_str)
-                .is_some_and(|hint| hint.contains("wait for the writer to finish")),
-            "diagnostic hint should guide retry: {diagnostic}"
-        );
-        assert!(
-            data.get("db_holder_summary").is_some(),
-            "structured lock error should include holder summary: {data}"
-        );
-        assert!(
-            data.get("safe_next_step").is_some(),
-            "structured lock error should include safe next step: {data}"
-        );
-        assert!(
-            data.get("system_warnings")
-                .and_then(Value::as_array)
-                .is_some_and(|warnings| warnings.iter().any(|warning| {
-                    warning.get("source").and_then(Value::as_str) == Some("database")
-                        && warning
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .is_some_and(|message| message.contains("locked_or_busy"))
-                })),
-            "structured data should include database system warning: {data}"
-        );
-    }
-
+    include!("server_diagnostic_tests.rs");
     #[tokio::test]
     async fn test_mcp_search_returns_diagnostic_when_database_cannot_open() {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -18042,13 +17905,17 @@ prototypes = ["keep"]
         let diagnostic = data
             .get("database_diagnostic")
             .expect("database diagnostic payload");
-        assert_eq!(
-            diagnostic.get("path").and_then(Value::as_str),
-            Some(db_path.display().to_string()).as_deref()
+        assert!(
+            diagnostic.get("path").is_none(),
+            "database path must stay off the MCP wire"
         );
         assert_eq!(
             diagnostic.get("failure_kind").and_then(Value::as_str),
             Some("path_or_permission")
+        );
+        assert!(
+            diagnostic.get("summary").is_none(),
+            "backend summary must stay off the MCP wire: {diagnostic}"
         );
         assert!(
             data.get("system_warnings")
@@ -22419,10 +22286,26 @@ prototypes = ["keep"]
 
     #[tokio::test]
     async fn test_mcp_ingest_wait_true_refuses_when_holder_budget_blocks_async_pool() {
-        let (_tempdir, db_path, server) = setup_server();
-        let server = server.with_async_db_open_error_for_test(
-            "failed to open MCP async database pool for /tmp/palace.db: profile database holder budget exceeded: active_holders=16/16, active_cache_bytes=155189248/268435456, requested_cache_bytes=50331648, reaped_stale_holders=0, reserved_service_holders=2, service_holders=16, reason=holder_limit",
-        );
+        let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        Database::open(&db_path).expect("open database");
+        let server = MempalMcpServer::new_with_factory(
+            db_path.clone(),
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+        .expect("create MCP server")
+        .with_query_only_async_db_open_error_for_test("query-only warning fixture");
+        let _holders = (0..14)
+            .map(|_| {
+                ProfileDbAdmission::acquire(
+                    &db_path,
+                    DbAdmissionRequest::new(DbHolderClass::Mcp, 1, 16 * 1024 * 1024),
+                )
+                .expect("fill service holder baseline")
+            })
+            .collect::<Vec<_>>();
 
         let error = match server
             .mempal_ingest(Parameters(IngestRequest {
@@ -22463,7 +22346,8 @@ prototypes = ["keep"]
         assert_eq!(data["created_drawer_ids"], serde_json::json!([]));
         assert_eq!(data["cleanup_drawer_ids"], serde_json::json!([]));
         assert_eq!(data["capacity"]["holders"], 16);
-        assert_eq!(data["headroom"]["holders"], 15);
+        assert_eq!(data["headroom"]["holders"], 2);
+        drop(_holders);
         let stats = PendingMessageStore::new_without_reclaim(&db_path)
             .stats()
             .expect("queue stats");
