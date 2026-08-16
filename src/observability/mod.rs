@@ -31,6 +31,10 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+#[cfg(test)]
+#[path = "test_support.rs"]
+pub(crate) mod test_support;
+
 const FOLLOW_POLL_SECS: u64 = 2;
 const FOLLOW_DEBOUNCE_MS: u64 = 250;
 const FOLLOW_SILENCE_TIMEOUT_MS: u64 = 3_000;
@@ -325,13 +329,6 @@ pub fn classify_io_operation_path(operation: &str, call_site: &str) -> IoOperati
     }
 }
 
-pub fn reset_io_burst_for_tests() {
-    global_io_burst()
-        .lock()
-        .expect("io burst mutex poisoned")
-        .clear();
-}
-
 fn global_io_burst() -> &'static Mutex<BTreeMap<IoOperationPath, IoBurstAccumulator>> {
     static IO_BURST: OnceLock<Mutex<BTreeMap<IoOperationPath, IoBurstAccumulator>>> =
         OnceLock::new();
@@ -406,13 +403,6 @@ pub fn ingest_worker_backoff_snapshot() -> IngestWorkerBackoffSnapshot {
         .lock()
         .expect("ingest worker backoff mutex poisoned")
         .clone()
-}
-
-#[cfg(test)]
-pub fn reset_ingest_worker_backoff_for_tests() {
-    *global_ingest_worker_backoff()
-        .lock()
-        .expect("ingest worker backoff mutex poisoned") = IngestWorkerBackoffSnapshot::default();
 }
 
 fn global_ingest_worker_backoff() -> &'static Mutex<IngestWorkerBackoffSnapshot> {

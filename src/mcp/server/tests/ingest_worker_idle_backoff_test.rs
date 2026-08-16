@@ -20,8 +20,11 @@ async fn wait_for_io_burst_path_sample_count(
 
 #[tokio::test(start_paused = true, flavor = "current_thread")]
 async fn test_mcp_async_ingest_worker_backs_off_when_idle() {
-    crate::observability::reset_ingest_worker_backoff_for_tests();
-    crate::observability::reset_io_burst_for_tests();
+    let _observability_lock = crate::observability::test_support::global_observability_test_lock()
+        .lock_owned()
+        .await;
+    crate::observability::test_support::reset_ingest_worker_backoff_for_tests();
+    crate::observability::test_support::reset_io_burst_for_tests();
     let (_tempdir, db_path, server) = setup_server();
     let queue = AsyncPendingMessageStore::from_store(
         crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path),

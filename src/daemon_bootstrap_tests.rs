@@ -169,7 +169,10 @@ async fn write_observer_record_queue_error_non_lock_still_allows_recovery() {
 
 #[tokio::test(start_paused = true, flavor = "current_thread")]
 async fn daemon_ingest_claim_contention_suppresses_stall_restart() {
-    crate::observability::reset_ingest_worker_backoff_for_tests();
+    let _observability_lock = crate::observability::test_support::global_observability_test_lock()
+        .lock_owned()
+        .await;
+    crate::observability::test_support::reset_ingest_worker_backoff_for_tests();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("initialize database");
