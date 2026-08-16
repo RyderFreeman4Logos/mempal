@@ -203,7 +203,6 @@ pub(super) const MCP_SEARCH_DB_DEADLINE: Duration = Duration::from_secs(60);
 const MCP_SEARCH_STALE_INDEX_DEADLINE: Duration = Duration::from_secs(2);
 const MCP_INGEST_ADMISSION_DEADLINE: Duration = Duration::from_secs(10);
 const MCP_OPERATION_STATUS_DEADLINE: Duration = Duration::from_secs(5);
-const MCP_SQLITE_INTERRUPT_GRACE: Duration = Duration::from_millis(100);
 const MCP_INGEST_QUEUE_LOCK_RETRY_DEADLINE: Duration = Duration::from_secs(5);
 const MCP_INGEST_SELF_HOLDER_QUEUE_LOCK_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 const MCP_DAEMON_INGEST_ENQUEUE_IPC_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2427,6 +2426,24 @@ impl MempalMcpServer {
         Duration::from_secs(config.embed.retry.search_deadline_secs)
     }
 
+    fn search_request_deadline(&self, config: &Config) -> Instant {
+        let deadline = self
+            .search_route_deadline
+            .max(self.search_db_deadline)
+            .max(self.search_stale_index_deadline)
+            .max(self.search_embed_deadline_for_request(config));
+        Instant::now()
+            .checked_add(deadline)
+            .unwrap_or_else(Instant::now)
+    }
+
+    fn search_stage_deadline(request_deadline: Instant, stage_deadline: Duration) -> Instant {
+        Instant::now()
+            .checked_add(stage_deadline)
+            .map(|deadline| deadline.min(request_deadline))
+            .unwrap_or(request_deadline)
+    }
+
     async fn run_query_only_read_anyhow_bounded<F, R>(
         &self,
         stage: &'static str,
@@ -3282,24 +3299,20 @@ impl MempalMcpServer {
     async fn run_read_anyhow_bounded<F, R>(
         &self,
         f: F,
-        deadline: Duration,
+        deadline: Instant,
     ) -> anyhow::Result<Option<R>>
     where
         F: FnOnce(&Database) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
         let reader = self.reader_db().await?;
-        let sqlite_deadline = Instant::now() + deadline;
-        match tokio::time::timeout(
-            deadline + MCP_SQLITE_INTERRUPT_GRACE,
-            reader.run_read_anyhow_until(sqlite_deadline, f),
-        )
-        .await
-        {
-            Ok(Ok(result)) => Ok(Some(result)),
-            Ok(Err(error)) if anyhow_error_is_read_deadline_exceeded(&error) => Ok(None),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Ok(None),
+        match reader.run_read_anyhow_until(deadline, f).await {
+            Ok(result) => Ok(Some(result)),
+            Err(error) if anyhow_error_is_read_deadline_exceeded(&error) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -3310,13 +3323,14 @@ impl MempalMcpServer {
         scope: ProjectSearchScope,
         search_options: SearchOptions,
         top_k: usize,
+        deadline: Instant,
     ) -> anyhow::Result<Option<Vec<SearchResult>>> {
         self.run_read_anyhow_bounded(
             move |db| {
                 search_bm25_only_with_options(db, &query, route, &scope, search_options, top_k)
                     .map_err(|error| anyhow::anyhow!("BM25 search failed: {error}"))
             },
-            self.search_db_deadline,
+            deadline,
         )
         .await
     }
@@ -5889,6 +5903,7 @@ impl MempalMcpServer {
         Parameters(request): Parameters<SearchRequest>,
     ) -> std::result::Result<Json<SearchResponse>, ErrorData> {
         let config = ConfigHandle::current();
+        let request_deadline = self.search_request_deadline(config.as_ref());
         let request_scope = effective_search_scope(&request)?;
         let project_id = self
             .resolve_mcp_project_id(request_scope.project_id.as_deref(), config.as_ref())
@@ -5930,7 +5945,7 @@ impl MempalMcpServer {
                         resolve_route(db, &query, wing.as_deref(), room.as_deref())
                             .map_err(|error| anyhow::anyhow!("routing failed: {error}"))
                     },
-                    self.search_route_deadline,
+                    Self::search_stage_deadline(request_deadline, self.search_route_deadline),
                 )
                 .await
             {
@@ -5970,7 +5985,14 @@ impl MempalMcpServer {
             let scope = scope.clone();
             let search_options = search_options.clone();
             match self
-                .run_bm25_search_bounded(query, route, scope, search_options, top_k)
+                .run_bm25_search_bounded(
+                    query,
+                    route,
+                    scope,
+                    search_options,
+                    top_k,
+                    Self::search_stage_deadline(request_deadline, self.search_db_deadline),
+                )
                 .await
             {
                 Ok(Some(results)) => results,
@@ -6017,11 +6039,10 @@ impl MempalMcpServer {
             };
             if let Some(embedder) = embedder {
                 let embed_deadline = self.search_embed_deadline_for_request(config.as_ref());
-                match tokio::time::timeout(
-                    embed_deadline,
-                    embedder.embed(&[request.query.as_str()]),
-                )
-                .await
+                let embed_timeout = Self::search_stage_deadline(request_deadline, embed_deadline)
+                    .saturating_duration_since(Instant::now());
+                match tokio::time::timeout(embed_timeout, embedder.embed(&[request.query.as_str()]))
+                    .await
                 {
                     Ok(Ok(vectors)) => {
                         let query_vector = vectors.into_iter().next().ok_or_else(|| {
@@ -6045,7 +6066,10 @@ impl MempalMcpServer {
                                     )
                                     .map_err(|error| anyhow::anyhow!("search failed: {error}"))
                                 },
-                                self.search_db_deadline,
+                                Self::search_stage_deadline(
+                                    request_deadline,
+                                    self.search_db_deadline,
+                                ),
                             )
                             .await
                         {
@@ -6069,6 +6093,10 @@ impl MempalMcpServer {
                                         scope,
                                         search_options,
                                         top_k,
+                                        Self::search_stage_deadline(
+                                            request_deadline,
+                                            self.search_db_deadline,
+                                        ),
                                     )
                                     .await
                                 {
@@ -6120,7 +6148,17 @@ impl MempalMcpServer {
                         let scope = scope.clone();
                         let search_options = search_options.clone();
                         match self
-                            .run_bm25_search_bounded(query, route, scope, search_options, top_k)
+                            .run_bm25_search_bounded(
+                                query,
+                                route,
+                                scope,
+                                search_options,
+                                top_k,
+                                Self::search_stage_deadline(
+                                    request_deadline,
+                                    self.search_db_deadline,
+                                ),
+                            )
                             .await
                         {
                             Ok(Some(results)) => results,
@@ -6162,7 +6200,17 @@ impl MempalMcpServer {
                         let scope = scope.clone();
                         let search_options = search_options.clone();
                         match self
-                            .run_bm25_search_bounded(query, route, scope, search_options, top_k)
+                            .run_bm25_search_bounded(
+                                query,
+                                route,
+                                scope,
+                                search_options,
+                                top_k,
+                                Self::search_stage_deadline(
+                                    request_deadline,
+                                    self.search_db_deadline,
+                                ),
+                            )
                             .await
                         {
                             Ok(Some(results)) => results,
@@ -6195,7 +6243,14 @@ impl MempalMcpServer {
                 let scope = scope.clone();
                 let search_options = search_options.clone();
                 match self
-                    .run_bm25_search_bounded(query, route, scope, search_options, top_k)
+                    .run_bm25_search_bounded(
+                        query,
+                        route,
+                        scope,
+                        search_options,
+                        top_k,
+                        Self::search_stage_deadline(request_deadline, self.search_db_deadline),
+                    )
                     .await
                 {
                     Ok(Some(results)) => results,
@@ -6259,7 +6314,7 @@ impl MempalMcpServer {
         match self
             .run_read_anyhow_bounded(
                 |db| Ok(db.vector_index_is_stale().unwrap_or(false)),
-                self.search_stale_index_deadline,
+                Self::search_stage_deadline(request_deadline, self.search_stale_index_deadline),
             )
             .await
         {
@@ -16251,15 +16306,15 @@ pattern_boost = 0.2
             "bounded-search.md",
             3,
         );
-        let async_db = QueryOnlyAsyncDb::open(&db_path, 4)
+        let async_db = QueryOnlyAsyncDb::open(&db_path, 1)
             .expect("open query-only async db")
             .with_read_delay(Duration::from_millis(150));
         let server = server
-            .with_query_only_async_db_for_test(async_db)
+            .with_query_only_async_db_for_test(async_db.clone())
             .with_mcp_deadline_for_test(Duration::from_millis(20));
 
         let response = tokio::time::timeout(
-            Duration::from_millis(500),
+            Duration::from_millis(200),
             server.mempal_search(Parameters(SearchRequest {
                 query: "bounded search marker".to_string(),
                 wing: Some("mcp".to_string()),
@@ -16300,7 +16355,11 @@ pattern_boost = 0.2
             "system warning should expose bounded MCP timeout"
         );
 
-        tokio::time::sleep(Duration::from_millis(180)).await;
+        assert_eq!(
+            async_db.available_reader_permits_for_test(),
+            1,
+            "MCP search must return after its blocking read releases the only permit"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

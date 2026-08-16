@@ -42,6 +42,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- MCP search shares a deadline and releases reads before responding (#881).
 - Typed/redacted MCP admission and audit-write diagnostics (#879).
 - Daemon pidfile validates identity; scoped ingest release honors remaining retry budget (#885/#895).
 - Queue byte admission retries transient profile-admission lock contention when opening a normal queue writer, preserving the byte-budget rejection contract under suite load (#893).

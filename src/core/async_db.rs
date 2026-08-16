@@ -448,6 +448,11 @@ impl QueryOnlyAsyncDb {
         self
     }
 
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub(crate) fn available_reader_permits_for_test(&self) -> usize {
+        self.readers.sem.available_permits()
+    }
+
     /// Run a read-only closure against a pooled reader connection off the
     /// runtime.
     pub async fn run_read<F, R>(&self, f: F) -> Result<R, DbError>
@@ -750,7 +755,14 @@ where
         let _admission = _admission; // keep admission alive until closure ends
         tracing::dispatcher::with_default(&dispatch, || {
             if let Some(d) = delay {
-                std::thread::sleep(d);
+                let delay = deadline
+                    .map(|deadline| d.min(deadline.saturating_duration_since(Instant::now())))
+                    .unwrap_or(d);
+                std::thread::sleep(delay);
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                checkin_pool.checkin(conn);
+                return Err(anyhow::Error::new(ReadDeadlineExceeded));
             }
             if let Some(deadline) = deadline {
                 conn.conn().progress_handler(
@@ -764,6 +776,9 @@ where
             }
             checkin_pool.checkin(conn);
             match out {
+                Ok(_) if deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
+                    Err(anyhow::Error::new(ReadDeadlineExceeded))
+                }
                 Err(error) if should_map_read_deadline_error(deadline, &error) => {
                     Err(anyhow::Error::new(ReadDeadlineExceeded))
                 }
