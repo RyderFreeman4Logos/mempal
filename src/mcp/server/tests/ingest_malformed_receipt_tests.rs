@@ -157,6 +157,42 @@ async fn test_mcp_scoped_expired_malformed_payload_retries_claim_release() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_mcp_scoped_post_claim_expiry_retries_release_lock() {
+    let (_tempdir, db_path, server) = setup_server();
+    let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+        .with_claim_blocking_delay(Duration::from_millis(1500))
+        .with_release_lock_failures_for_test(1);
+    let server = server.with_async_queue_for_test(async_queue);
+    let operation_id = enqueue_prepared_test_ingest_operation(
+        &server,
+        &db_path,
+        "post-claim expiry must release after a transient lock",
+        "post-claim-expiry-release-lock",
+    )
+    .await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        server.wait_for_operation_status_with_scoped_worker_until_terminal(
+            &operation_id,
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        ),
+    )
+    .await
+    .expect("post-claim cleanup must not outlive the caller budget")
+    .expect("expired post-claim cleanup must retry a transient release lock");
+
+    assert!(result.is_none());
+    let record = PendingMessageStore::new_without_reclaim(&db_path)
+        .operation_status(&operation_id)
+        .expect("load operation status")
+        .expect("operation must stay queryable");
+    assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
+    assert!(record.claimed_at.is_none(), "expired post-claim must be released");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_mcp_scoped_finite_malformed_payload_real_sqlite_lock_respects_budget() {
     let (_tempdir, db_path, server) = setup_server();
     let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);

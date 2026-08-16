@@ -3065,7 +3065,11 @@ impl MempalMcpServer {
                         Self::release_scoped_claim_after_timeout(
                             &queue,
                             claim,
-                            remaining.min(CLAIM_LOCK_RETRY_DEADLINE),
+                            if remaining.is_zero() {
+                                CLAIM_LOCK_RETRY_DEADLINE
+                            } else {
+                                remaining.min(CLAIM_LOCK_RETRY_DEADLINE)
+                            },
                             self.daemon_write_observer.as_ref(),
                         )
                         .await?;
