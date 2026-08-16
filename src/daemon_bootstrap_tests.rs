@@ -287,13 +287,18 @@ fn daemon_storage_open_skips_queue_reclaim_while_writer_is_busy() {
         .expect("hold SQLite write lock");
 
     let (sender, receiver) = std::sync::mpsc::channel();
+    // Schedule the opener before starting the busy-window guard.
+    let opener_started = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let opener_start_gate = std::sync::Arc::clone(&opener_started);
     let open_path = db_path.clone();
     let opener = std::thread::spawn(move || {
+        opener_start_gate.wait();
         let outcome = open_daemon_storage_once(&open_path)
             .map(drop)
             .map_err(|error| format!("{error:#}"));
         sender.send(outcome).expect("send daemon storage result");
     });
+    opener_started.wait();
     let outcome = receiver.recv_timeout(Duration::from_secs(2)).ok();
     let opened_while_busy = outcome.is_some();
 

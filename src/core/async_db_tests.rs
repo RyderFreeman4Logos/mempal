@@ -448,14 +448,16 @@ async fn deadline_write_preserves_committed_success_after_real_lock_releases() {
     let deadline = Instant::now() + Duration::from_secs(1);
     let result = tokio::time::timeout(
         Duration::from_secs(3),
-        adb.run_write_until(deadline, |db| {
+        adb.run_write_until(deadline, move |db| {
             db.conn().execute(
                 "INSERT INTO deadline_lock_boundary_success (value) VALUES (1)",
                 [],
             )?;
-            // The lock release lets this insert commit before expiry. The
-            // closure returns later, so its durable success must remain success.
-            std::thread::sleep(Duration::from_millis(300));
+            // Wait from the actual mutation, not fixture setup, so suite load
+            // cannot make this committed closure return before its deadline.
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(50),
+            );
             Ok::<(), DbError>(())
         }),
     )
