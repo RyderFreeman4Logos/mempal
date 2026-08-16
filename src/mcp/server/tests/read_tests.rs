@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -191,7 +191,7 @@ async fn test_bounded_mcp_read_bypasses_writer_capable_async_db_open_failure() {
                     .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
                     .map_err(anyhow::Error::from)
             },
-            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(1),
         )
         .await
         .expect("bounded MCP reads should not open the writer-capable pool");
