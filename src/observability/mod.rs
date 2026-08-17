@@ -2503,9 +2503,9 @@ mod tests {
 
     #[test]
     fn test_io_burst_snapshot_aggregates_path_counters_and_rates() {
+        let _lock = super::test_support::global_observability_test_lock().blocking_lock_owned();
         let before = io_burst_snapshot();
         let before_search = io_burst_path(&before, IoOperationPath::Search);
-
         record_io_burst_sample(
             IoOperationPath::Search,
             20 * 1024 * 1024,

@@ -253,8 +253,11 @@ async fn write_observer_ignores_empty_queue() {
 }
 
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn write_observer_stall_checks_record_queue_io_burst() {
+    let _observability_lock = crate::observability::test_support::global_observability_test_lock()
+        .lock_owned()
+        .await;
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");

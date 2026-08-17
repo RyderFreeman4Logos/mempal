@@ -17724,8 +17724,12 @@ prototypes = ["keep"]
             .unwrap_or_default()
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mempal_status_compact_default_omits_protocol_but_keeps_health() {
+        let _observability_lock =
+            crate::observability::test_support::global_observability_test_lock()
+                .lock_owned()
+                .await;
         let (_tempdir, db_path, server) = setup_server();
         insert_drawer_with_project(
             &db_path,
