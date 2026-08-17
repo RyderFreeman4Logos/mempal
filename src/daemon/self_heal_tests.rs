@@ -302,10 +302,27 @@ async fn test_hook_ipc_rejects_sqlite_lock_without_waiting_for_persistence() {
     let payload = request.payload.clone();
     let idempotency_key = request.idempotency_key.clone();
 
-    let response = tokio::time::timeout(
-        crate::hook_ipc::HOOK_IPC_TIMEOUT,
-        send_hook_ipc_request(store, observer, request),
-    )
+    let (mut client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
+    let handler = tokio::spawn(super::handle_hook_ipc_connection(server, store, observer));
+    wait_for_active_handler_count(1, "starting locked SQLite enqueue").await;
+    let mut frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
+    frame.push(b'\n');
+    tokio::io::AsyncWriteExt::write_all(&mut client, &frame)
+        .await
+        .expect("write request");
+    tokio::io::AsyncWriteExt::flush(&mut client)
+        .await
+        .expect("flush request");
+
+    let response = tokio::time::timeout(crate::hook_ipc::HOOK_IPC_TIMEOUT, async {
+        let mut reader = tokio::io::BufReader::new(client);
+        let mut line = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        handler.await.expect("handler task");
+        serde_json::from_str(line.trim()).expect("hook IPC response")
+    })
     .await
     .expect("locked SQLite enqueue must fail fast enough for client fallback");
     match response {

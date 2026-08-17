@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 
 use mempal::core::{
@@ -322,37 +322,59 @@ fn test_concurrent_case_backed_proposals_reuse_single_live_skill() {
     close_success(&db, &case_b, "drawer_verify_concurrent_b");
     drop(db);
 
-    let barrier = Arc::new(Barrier::new(2));
+    let barrier = Arc::new(Barrier::new(3));
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
     let mut handles = Vec::new();
     for _ in 0..2 {
         let db_path = db_path.clone();
         let barrier = Arc::clone(&barrier);
+        let ready_tx = ready_tx.clone();
+        let result_tx = result_tx.clone();
         handles.push(thread::spawn(move || {
             let db = Database::open(&db_path).expect("open concurrent db");
+            ready_tx
+                .send(())
+                .expect("report concurrent proposal readiness");
             barrier.wait();
-            propose_skills_from_cases(
-                &db,
-                SkillProposalOptions {
-                    from_cases: true,
-                    min_support: 2,
-                    min_verification_refs: 1,
-                    wing: Some("mempal".to_string()),
-                    project_id: None,
-                    dry_run: false,
-                },
-            )
-            .expect("concurrent proposal")
+            result_tx
+                .send(propose_skills_from_cases(
+                    &db,
+                    SkillProposalOptions {
+                        from_cases: true,
+                        min_support: 2,
+                        min_verification_refs: 1,
+                        wing: Some("mempal".to_string()),
+                        project_id: None,
+                        dry_run: false,
+                    },
+                ))
+                .expect("report concurrent proposal result");
         }));
     }
+    drop(ready_tx);
+    drop(result_tx);
+    for _ in 0..2 {
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("concurrent proposal workers must reach the proposal boundary");
+    }
+    barrier.wait();
 
     let mut skill_ids = Vec::new();
     let mut pattern_ids = Vec::new();
-    for handle in handles {
-        let batch = handle.join().expect("proposal thread");
+    for _ in 0..2 {
+        let batch = result_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("concurrent proposal must complete")
+            .expect("concurrent proposal");
         assert_eq!(batch.proposals.len(), 1);
         let proposal = &batch.proposals[0];
         skill_ids.push(proposal.skill_id.clone().expect("skill id"));
         pattern_ids.push(proposal.pattern_id.clone());
+    }
+    for handle in handles {
+        handle.join().expect("proposal thread");
     }
     assert_eq!(pattern_ids[0], pattern_ids[1]);
     assert_eq!(

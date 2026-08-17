@@ -14,8 +14,11 @@ async fn test_worker_successful_claim_clears_observed_contention() {
     let db_path = tmp.path().join("palace.db");
     let request_count = Arc::new(AtomicUsize::new(0));
     let request_notify = Arc::new(Notify::new());
-    let (base_url, server) =
-        spawn_counting_llm_server(Arc::clone(&request_count), request_notify).await;
+    let (base_url, server) = spawn_counting_llm_server(
+        Arc::clone(&request_count),
+        Arc::clone(&request_notify),
+    )
+    .await;
     std::fs::write(&config_path, worker_test_config(&base_url)).expect("write worker config");
     ConfigHandle::bootstrap_quiet(&config_path).expect("bootstrap worker config");
 
@@ -77,14 +80,14 @@ async fn test_worker_successful_claim_clears_observed_contention() {
     .expect("first claim lock should reach the observer");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if store.stats().expect("queue stats").claimed == 1 {
+            if observer.last_error_for_test().is_none() {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("worker should claim the task after contention clears");
+    .expect("successful claim should clear observed contention");
     assert_eq!(
         observer.last_error_for_test(),
         None,
@@ -97,6 +100,9 @@ async fn test_worker_successful_claim_clears_observed_contention() {
     runtime_holder
         .join()
         .expect("LLM client runtime holder should exit");
+    tokio::time::timeout(Duration::from_secs(5), request_notify.notified())
+        .await
+        .expect("worker should start the claimed LLM request");
     tokio::time::timeout(Duration::from_secs(20), completion)
         .await
         .expect("worker should complete the claimed task")

@@ -169,7 +169,10 @@ async fn write_observer_record_queue_error_non_lock_still_allows_recovery() {
 
 #[tokio::test(start_paused = true, flavor = "current_thread")]
 async fn daemon_ingest_claim_contention_suppresses_stall_restart() {
-    crate::observability::reset_ingest_worker_backoff_for_tests();
+    let _observability_lock = crate::observability::test_support::global_observability_test_lock()
+        .lock_owned()
+        .await;
+    crate::observability::test_support::reset_ingest_worker_backoff_for_tests();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("initialize database");
@@ -250,8 +253,11 @@ async fn write_observer_ignores_empty_queue() {
 }
 
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn write_observer_stall_checks_record_queue_io_burst() {
+    let _observability_lock = crate::observability::test_support::global_observability_test_lock()
+        .lock_owned()
+        .await;
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
@@ -287,18 +293,20 @@ fn daemon_storage_open_skips_queue_reclaim_while_writer_is_busy() {
         .expect("hold SQLite write lock");
 
     let (sender, receiver) = std::sync::mpsc::channel();
-    // Schedule the opener before starting the busy-window guard.
-    let opener_started = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let opener_start_gate = std::sync::Arc::clone(&opener_started);
+    let (opener_started_tx, opener_started_rx) = std::sync::mpsc::sync_channel(1);
     let open_path = db_path.clone();
     let opener = std::thread::spawn(move || {
-        opener_start_gate.wait();
+        opener_started_tx
+            .send(())
+            .expect("report daemon storage opener readiness");
         let outcome = open_daemon_storage_once(&open_path)
             .map(drop)
             .map_err(|error| format!("{error:#}"));
         sender.send(outcome).expect("send daemon storage result");
     });
-    opener_started.wait();
+    opener_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("daemon storage opener must reach the busy-window boundary");
     let outcome = receiver.recv_timeout(Duration::from_secs(2)).ok();
     let opened_while_busy = outcome.is_some();
 

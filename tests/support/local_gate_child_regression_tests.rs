@@ -38,6 +38,7 @@ mod regression_tests {
 
     fn spawn_non_pipe_setsid_escape_after_release(
         release_file: &Path,
+        started_file: &Path,
         ready_file: &Path,
         pid_file: &Path,
     ) -> OwnedGateChild {
@@ -46,6 +47,7 @@ mod regression_tests {
             .args([
                 "-c",
                 r#"
+                    : >"${STARTED_FILE:?}"
                     while [[ ! -e "${RELEASE_FILE:?}" ]]; do /bin/sleep 0.01; done
                     setsid /bin/bash -c '
                         trap "" TERM
@@ -62,6 +64,7 @@ mod regression_tests {
                 "#,
             ])
             .env("RELEASE_FILE", release_file)
+            .env("STARTED_FILE", started_file)
             .env("READY_FILE", ready_file)
             .env("PID_FILE", pid_file)
             .stdin(Stdio::null())
@@ -112,7 +115,11 @@ mod regression_tests {
         spawn_in_own_session(&mut command).expect("spawn TERM-observing session")
     }
 
-    fn spawn_term_handler_setsid_escape(pid_file: &Path, ready_file: &Path) -> OwnedGateChild {
+    fn spawn_term_handler_setsid_escape(
+        pid_file: &Path,
+        armed_file: &Path,
+        ready_file: &Path,
+    ) -> OwnedGateChild {
         let mut command = Command::new("/bin/bash");
         command
             .args([
@@ -129,10 +136,12 @@ mod regression_tests {
                     trap 'setsid /bin/bash -c escape </dev/null >/dev/null 2>&1 &
                           while [[ ! -e "${READY_FILE:?}" ]]; do :; done
                           /bin/sleep 0.02' TERM
+                    : >"${ARMED_FILE:?}"
                     /bin/sleep 60
                 "#,
             ])
             .env("PID_FILE", pid_file)
+            .env("ARMED_FILE", armed_file)
             .env("READY_FILE", ready_file)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -142,7 +151,9 @@ mod regression_tests {
 
     fn spawn_closing_pipe_escape_after_release(
         release_file: &Path,
+        started_file: &Path,
         ready_file: &Path,
+        parent_ready_file: &Path,
         close_file: &Path,
         closed_file: &Path,
         pid_file: &Path,
@@ -152,24 +163,32 @@ mod regression_tests {
             .args([
                 "-c",
                 r#"
+                    : >"${STARTED_FILE:?}"
                     while [[ ! -e "${RELEASE_FILE:?}" ]]; do /bin/sleep 0.01; done
-                    setsid /bin/bash -c '
-                        trap "" TERM
-                        pid="${BASHPID}"
-                        start_time="$(awk "{print \$22}" "/proc/${pid}/stat")"
-                        printf "%s %s\n" "${pid}" "${start_time}" >"${PID_FILE:?}"
-                        : >"${READY_FILE:?}"
-                        while [[ ! -e "${CLOSE_FILE:?}" ]]; do /bin/sleep 0.01; done
-                        exec </dev/null >/dev/null 2>&1
-                        : >"${CLOSED_FILE:?}"
-                        while true; do /bin/sleep 60; done
-                    ' &
-                    while [[ ! -e "${READY_FILE:?}" ]]; do /bin/sleep 0.01; done
+                    exec 3>&1 4>&2
+                    IFS= read -r _ < <(
+                        setsid /bin/bash -c '
+                            trap "" TERM
+                            pid="${BASHPID}"
+                            start_time="$(awk "{print \$22}" "/proc/${pid}/stat")"
+                            printf "%s %s\n" "${pid}" "${start_time}" >"${PID_FILE:?}"
+                            : >"${READY_FILE:?}"
+                            printf "ready\n"
+                            exec >&3 2>&4
+                            while [[ ! -e "${CLOSE_FILE:?}" ]]; do /bin/sleep 0.01; done
+                            exec </dev/null >/dev/null 2>&1 3>&- 4>&-
+                            : >"${CLOSED_FILE:?}"
+                            while true; do /bin/sleep 60; done
+                        ' 3>&3 4>&4
+                    )
+                    : >"${PARENT_READY_FILE:?}"
                     exit 0
                 "#,
             ])
             .env("RELEASE_FILE", release_file)
+            .env("STARTED_FILE", started_file)
             .env("READY_FILE", ready_file)
+            .env("PARENT_READY_FILE", parent_ready_file)
             .env("CLOSE_FILE", close_file)
             .env("CLOSED_FILE", closed_file)
             .env("PID_FILE", pid_file)
@@ -183,10 +202,12 @@ mod regression_tests {
     fn gate_child_terminates_post_reap_non_pipe_setsid_descendant() {
         let fixture = tempfile::tempdir().expect("create non-pipe escaped-descendant fixture");
         let release_file = fixture.path().join("release");
+        let started_file = fixture.path().join("started");
         let ready_file = fixture.path().join("ready");
         let pid_file = fixture.path().join("pid");
         let mut gate = GateChild::new(spawn_non_pipe_setsid_escape_after_release(
             &release_file,
+            &started_file,
             &ready_file,
             &pid_file,
         ))
@@ -199,6 +220,11 @@ mod regression_tests {
             )
             .expect("stop descendant monitor before exercising ownership fallback");
 
+        wait_for_file(
+            &started_file,
+            Duration::from_secs(2),
+            "non-pipe escaped descendant release waiter",
+        );
         fs::write(&release_file, "release\n").expect("release escaped descendant creation");
         wait_for_file(
             &ready_file,
@@ -243,13 +269,17 @@ mod regression_tests {
     fn gate_child_terminates_closed_pipe_descendant_by_ownership_token() {
         let fixture = tempfile::tempdir().expect("create closed-pipe descendant fixture");
         let release_file = fixture.path().join("release");
+        let started_file = fixture.path().join("started");
         let ready_file = fixture.path().join("ready");
+        let parent_ready_file = fixture.path().join("parent-ready");
         let close_file = fixture.path().join("close");
         let closed_file = fixture.path().join("closed");
         let pid_file = fixture.path().join("pid");
         let mut gate = GateChild::new(spawn_closing_pipe_escape_after_release(
             &release_file,
+            &started_file,
             &ready_file,
+            &parent_ready_file,
             &close_file,
             &closed_file,
             &pid_file,
@@ -262,11 +292,22 @@ mod regression_tests {
                 Instant::now() + Duration::from_secs(1),
             )
             .expect("stop descendant monitor before exercising ownership fallback");
+
+        wait_for_file(
+            &started_file,
+            Duration::from_secs(2),
+            "closing-pipe escaped descendant release waiter",
+        );
         fs::write(&release_file, "release\n").expect("release escaped descendant creation");
         wait_for_file(
             &ready_file,
             Duration::from_secs(2),
             "closing-pipe escaped descendant",
+        );
+        wait_for_file(
+            &parent_ready_file,
+            Duration::from_secs(2),
+            "closing-pipe escaped descendant parent readiness",
         );
         let escaped = escaped_identity(&pid_file);
         assert!(
@@ -398,9 +439,20 @@ mod regression_tests {
     fn gate_child_terminates_setsid_descendant_created_by_term_handler() {
         let fixture = tempfile::tempdir().expect("create TERM-handler escape fixture");
         let pid_file = fixture.path().join("escaped.pid");
+        let armed_file = fixture.path().join("term-handler-armed");
         let ready_file = fixture.path().join("escaped-ready");
-        let mut gate = GateChild::new(spawn_term_handler_setsid_escape(&pid_file, &ready_file))
-            .expect("capture TERM-handler escape leader");
+        let mut gate = GateChild::new(spawn_term_handler_setsid_escape(
+            &pid_file,
+            &armed_file,
+            &ready_file,
+        ))
+        .expect("capture TERM-handler escape leader");
+
+        wait_for_file(
+            &armed_file,
+            Duration::from_secs(1),
+            "TERM-handler escape fixture arming",
+        );
 
         let started = Instant::now();
         let error = gate

@@ -4,6 +4,7 @@ use std::net::TcpListener;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::thread;
+use std::time::Duration;
 
 use mempal::core::db::{CURRENT_SCHEMA_VERSION, Database};
 use mempal::core::types::{
@@ -13,6 +14,10 @@ use mempal::core::types::{
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
+
+#[path = "common/harness/cli_deadline.rs"]
+mod cli_deadline;
+const _: fn() = cli_deadline::reference_shared_cli_deadline_api;
 
 fn mempal_bin() -> String {
     env!("CARGO_BIN_EXE_mempal").to_string()
@@ -50,20 +55,6 @@ fn run_mempal(home: &TempDir, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(mempal_bin());
     cmd.args(args).env("HOME", home.path());
     inject_embed_env(&mut cmd);
-    cmd.output().expect("run mempal")
-}
-
-fn run_mempal_with_env(
-    home: &TempDir,
-    args: &[&str],
-    envs: &[(&str, String)],
-) -> std::process::Output {
-    let mut cmd = Command::new(mempal_bin());
-    cmd.args(args).env("HOME", home.path());
-    inject_embed_env(&mut cmd);
-    for (key, value) in envs {
-        cmd.env(key, value);
-    }
     cmd.output().expect("run mempal")
 }
 
@@ -207,6 +198,7 @@ fn start_openai_embedding_stub(query: &str) -> (String, thread::JoinHandle<()>) 
         .expect("set embedding stub nonblocking");
     let address = listener.local_addr().expect("local addr");
     let query = query.to_string();
+
     let handle = thread::spawn(move || {
         let (mut stream, _) = (0..50)
             .find_map(|_| match listener.accept() {
@@ -227,6 +219,7 @@ fn start_openai_embedding_stub(query: &str) -> (String, thread::JoinHandle<()>) 
             .expect("request should contain JSON body");
         let payload: Value = serde_json::from_str(body).expect("parse embedding request");
         assert_eq!(payload["input"][0], query);
+
         let body = serde_json::to_string(&json!({
             "data": [{ "embedding": vec![0.25; 384] }]
         }))
@@ -608,15 +601,17 @@ fn test_cli_phase3_default_proposal_keeps_context_cards_opt_in() {
     let query = "card-aware";
     let (endpoint, handle) = start_openai_embedding_stub(query);
     let base_url = endpoint.trim_end_matches("/embeddings").to_string();
-    let context = run_mempal_with_env(
-        &home,
-        &["context", query, "--format", "json"],
-        &[
-            ("MEMPAL_EMBED_BACKEND", "openai_compat".to_string()),
-            ("MEMPAL_EMBED_BASE_URL", base_url),
-            ("MEMPAL_EMBED_MODEL", "test-model".to_string()),
-            ("MEMPAL_EMBED_DIM", "384".to_string()),
-        ],
+    let context = cli_deadline::run_cli_output(
+        "phase3 context cards",
+        |spec| {
+            cli_deadline::with_home(spec, home.path());
+            cli_deadline::push_args(spec, ["context", query, "--format", "json"]);
+            spec.env("MEMPAL_EMBED_BACKEND", "openai_compat");
+            spec.env("MEMPAL_EMBED_BASE_URL", base_url.clone());
+            spec.env("MEMPAL_EMBED_MODEL", "test-model");
+            spec.env("MEMPAL_EMBED_DIM", "384");
+        },
+        Duration::from_secs(5),
     );
     assert!(
         context.status.success(),

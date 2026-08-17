@@ -16987,7 +16987,11 @@ pattern_boost = 0.2
 
     #[tokio::test(start_paused = true, flavor = "current_thread")]
     async fn test_mcp_async_ingest_worker_backs_off_when_claim_is_locked() {
-        crate::observability::reset_ingest_worker_backoff_for_tests();
+        let _observability_lock =
+            crate::observability::test_support::global_observability_test_lock()
+                .lock_owned()
+                .await;
+        crate::observability::test_support::reset_ingest_worker_backoff_for_tests();
         let (_tempdir, db_path, server) = setup_server();
         let queue = AsyncPendingMessageStore::from_store(
             crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path),
@@ -17067,7 +17071,11 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_async_ingest_worker_stops_on_terminal_claim_failure() {
-        crate::observability::reset_ingest_worker_backoff_for_tests();
+        let _observability_lock =
+            crate::observability::test_support::global_observability_test_lock()
+                .lock_owned()
+                .await;
+        crate::observability::test_support::reset_ingest_worker_backoff_for_tests();
         let (_tempdir, db_path, server) = setup_server();
         let db = Database::open(&db_path).expect("open db");
         db.conn()
@@ -17093,7 +17101,11 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_async_ingest_transient_write_lock_requeues_instead_of_failing() {
-        crate::observability::reset_ingest_worker_backoff_for_tests();
+        let _observability_lock =
+            crate::observability::test_support::global_observability_test_lock()
+                .lock_owned()
+                .await;
+        crate::observability::test_support::reset_ingest_worker_backoff_for_tests();
         let (_tempdir, db_path, server) = setup_server();
         let server = server.with_sync_db_open_lock_failures_for_test(1);
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
@@ -17712,8 +17724,12 @@ prototypes = ["keep"]
             .unwrap_or_default()
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mempal_status_compact_default_omits_protocol_but_keeps_health() {
+        let _observability_lock =
+            crate::observability::test_support::global_observability_test_lock()
+                .lock_owned()
+                .await;
         let (_tempdir, db_path, server) = setup_server();
         insert_drawer_with_project(
             &db_path,
