@@ -2353,18 +2353,11 @@ mod tests {
         configure_record_access(tmp.path(), &db_path, true).await;
 
         dispatch_access_update(db_path.clone(), vec![drawer.id.clone()]);
+        tokio::task::spawn_blocking(|| {})
+            .await
+            .expect("drain access writeback task");
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            if access_count(&db_path, &drawer.id) == 1 {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "access writeback did not complete"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        assert_eq!(access_count(&db_path, &drawer.id), 1);
         let counters = crate::observability::resource_counters();
         assert_eq!(counters.access_writeback_scheduled_total, 1);
         assert_eq!(counters.access_writeback_skipped_total, 0);
