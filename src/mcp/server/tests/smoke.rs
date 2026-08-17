@@ -70,12 +70,21 @@ enabled = false
             field: Some("smoke".to_string()),
             smoke: Some(true),
             wait: Some(true),
-            wait_timeout_secs: Some(5),
+            wait_timeout_secs: Some(0),
             ..IngestRequest::default()
         }))
         .await
         .expect("smoke ingest should complete")
         .0;
+
+    let operation_id = response.operation_id.as_deref().expect("operation id");
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        server.wait_for_operation_completion(operation_id),
+    )
+    .await
+    .expect("smoke operation should complete")
+    .expect("smoke operation should return a completion receipt");
 
     assert_eq!(response.state, Some(IngestOperationState::Completed));
     assert!(
