@@ -153,6 +153,7 @@ mod regression_tests {
         release_file: &Path,
         started_file: &Path,
         ready_file: &Path,
+        parent_ready_file: &Path,
         close_file: &Path,
         closed_file: &Path,
         pid_file: &Path,
@@ -164,24 +165,30 @@ mod regression_tests {
                 r#"
                     : >"${STARTED_FILE:?}"
                     while [[ ! -e "${RELEASE_FILE:?}" ]]; do /bin/sleep 0.01; done
-                    setsid /bin/bash -c '
-                        trap "" TERM
-                        pid="${BASHPID}"
-                        start_time="$(awk "{print \$22}" "/proc/${pid}/stat")"
-                        printf "%s %s\n" "${pid}" "${start_time}" >"${PID_FILE:?}"
-                        : >"${READY_FILE:?}"
-                        while [[ ! -e "${CLOSE_FILE:?}" ]]; do /bin/sleep 0.01; done
-                        exec </dev/null >/dev/null 2>&1
-                        : >"${CLOSED_FILE:?}"
-                        while true; do /bin/sleep 60; done
-                    ' &
-                    while [[ ! -e "${READY_FILE:?}" ]]; do /bin/sleep 0.01; done
+                    exec 3>&1 4>&2
+                    IFS= read -r _ < <(
+                        setsid /bin/bash -c '
+                            trap "" TERM
+                            pid="${BASHPID}"
+                            start_time="$(awk "{print \$22}" "/proc/${pid}/stat")"
+                            printf "%s %s\n" "${pid}" "${start_time}" >"${PID_FILE:?}"
+                            : >"${READY_FILE:?}"
+                            printf "ready\n"
+                            exec >&3 2>&4
+                            while [[ ! -e "${CLOSE_FILE:?}" ]]; do /bin/sleep 0.01; done
+                            exec </dev/null >/dev/null 2>&1 3>&- 4>&-
+                            : >"${CLOSED_FILE:?}"
+                            while true; do /bin/sleep 60; done
+                        ' 3>&3 4>&4
+                    )
+                    : >"${PARENT_READY_FILE:?}"
                     exit 0
                 "#,
             ])
             .env("RELEASE_FILE", release_file)
             .env("STARTED_FILE", started_file)
             .env("READY_FILE", ready_file)
+            .env("PARENT_READY_FILE", parent_ready_file)
             .env("CLOSE_FILE", close_file)
             .env("CLOSED_FILE", closed_file)
             .env("PID_FILE", pid_file)
@@ -264,6 +271,7 @@ mod regression_tests {
         let release_file = fixture.path().join("release");
         let started_file = fixture.path().join("started");
         let ready_file = fixture.path().join("ready");
+        let parent_ready_file = fixture.path().join("parent-ready");
         let close_file = fixture.path().join("close");
         let closed_file = fixture.path().join("closed");
         let pid_file = fixture.path().join("pid");
@@ -271,6 +279,7 @@ mod regression_tests {
             &release_file,
             &started_file,
             &ready_file,
+            &parent_ready_file,
             &close_file,
             &closed_file,
             &pid_file,
@@ -294,6 +303,11 @@ mod regression_tests {
             &ready_file,
             Duration::from_secs(2),
             "closing-pipe escaped descendant",
+        );
+        wait_for_file(
+            &parent_ready_file,
+            Duration::from_secs(2),
+            "closing-pipe escaped descendant parent readiness",
         );
         let escaped = escaped_identity(&pid_file);
         assert!(
