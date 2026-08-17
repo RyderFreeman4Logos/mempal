@@ -42,7 +42,6 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
-- Test isolation for process-global ingest-worker and I/O-burst observability, restoring `reset_io_burst_for_tests` for integrations (#861).
 - MCP search shares a deadline and releases reads before responding (#881).
 - Typed/redacted MCP admission and audit-write diagnostics (#879).
 - Daemon pidfile validates identity; scoped ingest release honors remaining retry budget (#885/#895).
@@ -145,8 +144,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   between admission and SQLite open (#797).
 - **Mind-model bootstrap tests**: use isolated SQLite/config fixtures and a
   fail-closed REST fallback address so they cannot reach a live daemon (#807).
-- **MCP ingest worker tests**: wait for the idle queue claim's I/O-burst sample
-  before asserting telemetry, removing the concurrent scheduling race (#808).
+- MCP ingest-worker tests: wait for I/O-burst telemetry before assertions; integration-visible `reset_io_burst_for_tests` isolates process-global observability (#808/#861).
 - **Path-sensitive tests**: create daemon IPC, SQLite admission, and symlink
   identity fixtures below a bounded `/tmp` root (#810).
 - **CLI integration tests**: route `ingest`/`delete` helpers through one
