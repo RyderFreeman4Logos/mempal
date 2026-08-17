@@ -1,6 +1,7 @@
 //! Spawn and supervise `mempal daemon` child processes for integration tests.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use tokio::sync::Mutex;
 pub struct DaemonSupervisor {
     child: Child,
     pid: i32,
+    db_path: PathBuf,
     stdout_lines: Arc<Mutex<Vec<String>>>,
     stderr_lines: Arc<Mutex<Vec<String>>>,
     stdout_task: Option<tokio::task::JoinHandle<()>>,
@@ -30,6 +32,14 @@ impl DaemonSupervisor {
                 runtime_root.display().to_string(),
             );
         }
+        let db_path = match env_vars
+            .get("HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        {
+            Some(home) => home.join(".mempal").join("palace.db"),
+            None => bail!("daemon supervisor requires HOME for readiness"),
+        };
         let mut command = Command::new(env!("CARGO_BIN_EXE_mempal"));
         command.arg("daemon");
         command.args(args);
@@ -74,6 +84,7 @@ impl DaemonSupervisor {
         Ok(Self {
             child,
             pid,
+            db_path,
             stdout_lines,
             stderr_lines,
             stdout_task: Some(stdout_task),
@@ -82,22 +93,14 @@ impl DaemonSupervisor {
     }
 
     pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        while tokio::time::Instant::now() < deadline {
-            if self
-                .stderr_lines
-                .lock()
-                .await
-                .iter()
-                .any(|line| line.contains("daemon log path:"))
-            {
-                return Ok(());
-            }
-
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        let db_path = self.db_path.clone();
+        let daemon_pid =
+            tokio::task::spawn_blocking(move || mempal::daemon_readiness::wait(&db_path, timeout))
+                .await??;
+        if daemon_pid != self.pid {
+            bail!("readiness probe identified a different daemon process");
         }
-
-        bail!("daemon did not report readiness within {timeout:?}")
+        Ok(())
     }
 
     pub fn sigterm(&self) {
@@ -134,8 +137,36 @@ impl DaemonSupervisor {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn smoke_binary_path_is_available() {
         assert!(env!("CARGO_BIN_EXE_mempal").contains("mempal"));
+    }
+
+    #[tokio::test]
+    async fn wait_ready_rejects_log_path_without_lifecycle_readiness() -> Result<()> {
+        let child = Command::new("sleep").arg("60").spawn()?;
+        let pid = child.id().expect("sleep pid") as i32;
+        let stdout_lines = Arc::new(Mutex::new(Vec::new()));
+        let stderr_lines = Arc::new(Mutex::new(vec!["daemon log path: test".to_string()]));
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("palace.db");
+        let mut supervisor = DaemonSupervisor {
+            child,
+            pid,
+            db_path,
+            stdout_lines,
+            stderr_lines,
+            stdout_task: None,
+            stderr_task: None,
+        };
+
+        let readiness = supervisor.wait_ready(Duration::from_millis(100)).await;
+        supervisor.child.kill().await?;
+        let status = supervisor.wait().await?;
+        assert!(!status.success());
+        readiness.expect_err("a log-path diagnostic is not daemon readiness");
+        Ok(())
     }
 }
