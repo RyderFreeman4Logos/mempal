@@ -1,7 +1,10 @@
-use serde_json::Value;
+use std::collections::HashSet;
 
-use crate::xurl::XurlResult;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
 use crate::xurl::model::{Provenance, RawTurn, Role, Tool, TurnMetadata};
+use crate::xurl::{XurlError, XurlResult};
 
 /// Parse a Codex rollout JSONL file into screen-visible turns.
 ///
@@ -22,6 +25,8 @@ pub fn parse_codex_jsonl(
     let mut project_path: Option<String> = None;
     let mut turns = Vec::new();
     let mut turn_index: u32 = 0;
+    let mut source_ids = HashSet::new();
+    let mut replaced_source_ids = HashSet::new();
 
     for raw_line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let obj: Value = match serde_json::from_str(raw_line) {
@@ -73,19 +78,28 @@ pub fn parse_codex_jsonl(
                         if text.is_empty() {
                             continue;
                         }
-                        turns.push(RawTurn {
-                            session_id: session_id.clone(),
-                            tool: Tool::Codex,
-                            role: Role::User,
-                            content: text,
-                            timestamp_epoch,
-                            project_path: project_path.clone(),
-                            git_branch: None,
-                            is_csa_delegated,
-                            provenance: Provenance::Human,
-                            turn_index,
-                            metadata: TurnMetadata::default(),
-                        });
+                        push_turn(
+                            &mut turns,
+                            &mut source_ids,
+                            &mut replaced_source_ids,
+                            RawTurn {
+                                session_id: session_id.clone(),
+                                tool: Tool::Codex,
+                                role: Role::User,
+                                content: text,
+                                timestamp_epoch,
+                                project_path: project_path.clone(),
+                                git_branch: None,
+                                is_csa_delegated,
+                                provenance: Provenance::Human,
+                                turn_index,
+                                metadata: TurnMetadata {
+                                    message_id: Some(codex_source_id(&obj, payload, raw_line)),
+                                    ..TurnMetadata::default()
+                                },
+                            },
+                            replacement_target(payload)?,
+                        )?;
                         turn_index += 1;
                     }
                     "agent_message" => {
@@ -98,23 +112,97 @@ pub fn parse_codex_jsonl(
                         if text.is_empty() {
                             continue;
                         }
-                        turns.push(RawTurn {
-                            session_id: session_id.clone(),
-                            tool: Tool::Codex,
-                            role: Role::Assistant,
-                            content: text,
-                            timestamp_epoch,
-                            project_path: project_path.clone(),
-                            git_branch: None,
-                            is_csa_delegated,
-                            provenance: Provenance::Human,
-                            turn_index,
-                            metadata: TurnMetadata::default(),
-                        });
+                        push_turn(
+                            &mut turns,
+                            &mut source_ids,
+                            &mut replaced_source_ids,
+                            RawTurn {
+                                session_id: session_id.clone(),
+                                tool: Tool::Codex,
+                                role: Role::Assistant,
+                                content: text,
+                                timestamp_epoch,
+                                project_path: project_path.clone(),
+                                git_branch: None,
+                                is_csa_delegated,
+                                provenance: Provenance::Human,
+                                turn_index,
+                                metadata: TurnMetadata {
+                                    message_id: Some(codex_source_id(&obj, payload, raw_line)),
+                                    ..TurnMetadata::default()
+                                },
+                            },
+                            replacement_target(payload)?,
+                        )?;
+                        turn_index += 1;
+                    }
+                    "context_compacted" | "continuation_summary" => {
+                        let text = continuation_text(payload).ok_or_else(|| {
+                            XurlError::Parse(
+                                "Codex continuation snapshot has no visible summary text"
+                                    .to_string(),
+                            )
+                        })?;
+                        push_turn(
+                            &mut turns,
+                            &mut source_ids,
+                            &mut replaced_source_ids,
+                            RawTurn {
+                                session_id: session_id.clone(),
+                                tool: Tool::Codex,
+                                role: Role::Assistant,
+                                content: text,
+                                timestamp_epoch,
+                                project_path: project_path.clone(),
+                                git_branch: None,
+                                is_csa_delegated,
+                                provenance: Provenance::Human,
+                                turn_index,
+                                metadata: TurnMetadata {
+                                    message_id: Some(codex_source_id(&obj, payload, raw_line)),
+                                    ..TurnMetadata::default()
+                                },
+                            },
+                            replacement_target(payload)?,
+                        )?;
                         turn_index += 1;
                     }
                     _ => continue,
                 }
+            }
+
+            "context_compacted" | "continuation_summary" => {
+                let payload = obj.get("payload").ok_or_else(|| {
+                    XurlError::Parse("Codex continuation snapshot has no payload".to_string())
+                })?;
+                let text = continuation_text(payload).ok_or_else(|| {
+                    XurlError::Parse(
+                        "Codex continuation snapshot has no visible summary text".to_string(),
+                    )
+                })?;
+                push_turn(
+                    &mut turns,
+                    &mut source_ids,
+                    &mut replaced_source_ids,
+                    RawTurn {
+                        session_id: session_id.clone(),
+                        tool: Tool::Codex,
+                        role: Role::Assistant,
+                        content: text,
+                        timestamp_epoch: parse_timestamp(&obj),
+                        project_path: project_path.clone(),
+                        git_branch: None,
+                        is_csa_delegated,
+                        provenance: Provenance::Human,
+                        turn_index,
+                        metadata: TurnMetadata {
+                            message_id: Some(codex_source_id(&obj, payload, raw_line)),
+                            ..TurnMetadata::default()
+                        },
+                    },
+                    replacement_target(payload)?,
+                )?;
+                turn_index += 1;
             }
 
             "response_item" => {
@@ -148,19 +236,28 @@ pub fn parse_codex_jsonl(
                 }
 
                 let timestamp_epoch = parse_timestamp(&obj);
-                turns.push(RawTurn {
-                    session_id: session_id.clone(),
-                    tool: Tool::Codex,
-                    role: Role::Assistant,
-                    content: text,
-                    timestamp_epoch,
-                    project_path: project_path.clone(),
-                    git_branch: None,
-                    is_csa_delegated,
-                    provenance: Provenance::Human,
-                    turn_index,
-                    metadata: TurnMetadata::default(),
-                });
+                push_turn(
+                    &mut turns,
+                    &mut source_ids,
+                    &mut replaced_source_ids,
+                    RawTurn {
+                        session_id: session_id.clone(),
+                        tool: Tool::Codex,
+                        role: Role::Assistant,
+                        content: text,
+                        timestamp_epoch,
+                        project_path: project_path.clone(),
+                        git_branch: None,
+                        is_csa_delegated,
+                        provenance: Provenance::Human,
+                        turn_index,
+                        metadata: TurnMetadata {
+                            message_id: Some(codex_source_id(&obj, payload, raw_line)),
+                            ..TurnMetadata::default()
+                        },
+                    },
+                    replacement_target(payload)?,
+                )?;
                 turn_index += 1;
             }
 
@@ -168,13 +265,98 @@ pub fn parse_codex_jsonl(
         }
     }
 
-    if let Some(path) = project_path {
-        for turn in &mut turns {
+    turns.retain(|turn| {
+        !replaced_source_ids.contains(
+            turn.metadata
+                .message_id
+                .as_deref()
+                .expect("Codex source ID was assigned"),
+        )
+    });
+    for (index, turn) in turns.iter_mut().enumerate() {
+        turn.turn_index = index as u32;
+    }
+
+    for turn in &mut turns {
+        turn.session_id = session_id.clone();
+        if let Some(path) = &project_path {
             turn.project_path = Some(path.clone());
         }
     }
 
     Ok(turns)
+}
+
+fn continuation_text(payload: &Value) -> Option<String> {
+    payload
+        .get("summary")
+        .or_else(|| payload.get("message"))
+        .or_else(|| payload.get("content"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+fn codex_source_id(obj: &Value, payload: &Value, raw_line: &str) -> String {
+    payload
+        .get("message_id")
+        .or_else(|| payload.get("id"))
+        .or_else(|| obj.get("message_id"))
+        .or_else(|| obj.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("codex-line-{:x}", Sha256::digest(raw_line.as_bytes())))
+}
+
+fn replacement_target(payload: &Value) -> XurlResult<Option<String>> {
+    let Some(value) = payload
+        .get("replaces")
+        .or_else(|| payload.get("supersedes"))
+    else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .map(Some)
+        .ok_or_else(|| {
+            XurlError::Parse(
+                "Codex continuation snapshot has an ambiguous replacement identity".to_string(),
+            )
+        })
+}
+
+fn push_turn(
+    turns: &mut Vec<RawTurn>,
+    source_ids: &mut HashSet<String>,
+    replaced_source_ids: &mut HashSet<String>,
+    turn: RawTurn,
+    replacement: Option<String>,
+) -> XurlResult<()> {
+    let source_id = turn
+        .metadata
+        .message_id
+        .as_deref()
+        .expect("Codex source ID was assigned");
+    if !source_ids.insert(source_id.to_string()) {
+        return Err(XurlError::Parse(
+            "Codex continuation snapshot contains duplicate source identities".to_string(),
+        ));
+    }
+    if let Some(replacement) = replacement {
+        if replacement == source_id || !replaced_source_ids.insert(replacement) {
+            return Err(XurlError::Parse(
+                "Codex continuation snapshot has an ambiguous replacement identity".to_string(),
+            ));
+        }
+    }
+    turns.push(turn);
+    Ok(())
 }
 
 pub(crate) fn extract_session_cwd(obj: &Value) -> Option<String> {
@@ -299,6 +481,34 @@ mod tests {
 
         let turns_user = parse_codex_jsonl(jsonl, "s", false).unwrap();
         assert!(!turns_user[0].is_csa_delegated);
+    }
+
+    #[test]
+    fn codex_parser_keeps_only_canonical_compacted_continuation_turns() {
+        let jsonl = concat!(
+            "{\"timestamp\":\"2026-08-17T12:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-session\",\"cwd\":\"/project/one\"}}\n",
+            "{\"timestamp\":\"2026-08-17T12:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"id\":\"original\",\"message\":\"obsolete answer\"}}\n",
+            "{\"timestamp\":\"2026-08-17T12:00:02Z\",\"type\":\"context_compacted\",\"payload\":{\"id\":\"compact\",\"summary\":\"continuation summary\"}}\n",
+            "{\"timestamp\":\"2026-08-17T12:00:03Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"id\":\"rewritten\",\"replaces\":\"original\",\"message\":\"canonical answer\"}}\n",
+        );
+
+        let turns = parse_codex_jsonl(jsonl, "fallback", false).unwrap();
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].content, "continuation summary");
+        assert_eq!(turns[0].metadata.message_id.as_deref(), Some("compact"));
+        assert_eq!(turns[1].content, "canonical answer");
+        assert_eq!(turns[1].metadata.message_id.as_deref(), Some("rewritten"));
+    }
+
+    #[test]
+    fn codex_parser_rejects_ambiguous_continuation_snapshot() {
+        let jsonl = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-session\"}}\n",
+            "{\"type\":\"context_compacted\",\"payload\":{\"id\":\"compact\"}}\n",
+        );
+
+        assert!(parse_codex_jsonl(jsonl, "fallback", false).is_err());
     }
 
     #[test]

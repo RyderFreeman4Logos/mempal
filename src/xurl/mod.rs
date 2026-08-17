@@ -1,4 +1,5 @@
 pub mod backfill;
+pub(crate) mod codex_identity;
 pub mod embed;
 pub mod ingest;
 pub mod model;

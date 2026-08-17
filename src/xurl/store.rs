@@ -130,10 +130,7 @@ fn generate_turn_id(session_id: &str, tool: &str, turn_index: u32) -> String {
     generate_turn_id_from_parts(&[session_id, tool, &turn_index])
 }
 
-/// Deterministic turn ID for newly inserted raw turns.
-///
-/// Existing legacy rows may keep their historical IDs when `insert_turns`
-/// updates them; use `InsertStats::turn_ids` when callers need actual row IDs.
+/// Deterministic turn ID; callers should use `InsertStats::turn_ids` for legacy rows.
 pub fn turn_id_for(turn: &RawTurn) -> String {
     if turn.tool == Tool::Hermes {
         if let (Some(profile), Some(message_id)) = (
@@ -147,6 +144,9 @@ pub fn turn_id_for(turn: &RawTurn) -> String {
                 message_id,
             ]);
         }
+    }
+    if let Some(id) = crate::xurl::codex_identity::stable_turn_id(turn) {
+        return id;
     }
     generate_turn_id(&turn.session_id, turn.tool.as_str(), turn.turn_index)
 }
@@ -177,6 +177,9 @@ fn storage_turn_index(turn: &RawTurn) -> u32 {
             let digest = hasher.finalize();
             return u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]);
         }
+    }
+    if let Some(index) = crate::xurl::codex_identity::stable_turn_index(turn) {
+        return index;
     }
     turn.turn_index
 }
@@ -383,13 +386,7 @@ token_count, project_path, git_branch, is_csa_delegated, provenance, \
 hermes_profile, session_title, session_source, message_id, tool_name, \
 tool_call_id, previous_message_id, next_message_id";
 
-/// Insert or update a batch of turns. For each turn:
-/// - If no row with the tool-specific identity exists: INSERT.
-/// - If a row exists with identical content and metadata: skip (no write).
-/// - If a row exists with identical content but changed metadata: UPDATE metadata only.
-/// - If a row exists with different content: UPDATE content and metadata fields.
-///
-/// Returns stats for the batch.
+/// Insert or update turns by tool-specific identity and return batch stats.
 pub fn insert_turns(conn: &Connection, turns: &[RawTurn]) -> XurlResult<InsertStats> {
     let mut stats = InsertStats::default();
 
