@@ -42,6 +42,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- Test isolation for process-global ingest-worker and I/O-burst observability, restoring `reset_io_burst_for_tests` for integrations (#861).
 - MCP search shares a deadline and releases reads before responding (#881).
 - Typed/redacted MCP admission and audit-write diagnostics (#879).
 - Daemon pidfile validates identity; scoped ingest release honors remaining retry budget (#885/#895).
