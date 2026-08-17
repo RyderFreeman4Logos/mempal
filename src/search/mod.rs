@@ -22,6 +22,8 @@ use crate::search::filter::{
 };
 use rusqlite::{OptionalExtension, params_from_iter};
 
+#[cfg(test)]
+mod access_writeback_busy_tests;
 pub mod filter;
 pub mod preview;
 pub mod rerank;
@@ -902,11 +904,34 @@ fn rerank_by_effective_importance(results: &mut [SearchResult]) {
     crate::algo::ranking::rerank_by_effective_importance(results);
 }
 
+#[cfg(test)]
+type AccessWritebackCompletion = tokio::sync::oneshot::Sender<()>;
+#[cfg(not(test))]
+type AccessWritebackCompletion = ();
+
 /// Dispatch an async task to update access tracking fields for the given drawer IDs.
 ///
 /// This must not block the search response path. The update runs on the current
 /// tokio runtime as a detached `spawn_blocking` task.
 pub fn dispatch_access_update(db_path: std::path::PathBuf, drawer_ids: Vec<String>) {
+    dispatch_access_update_inner(db_path, drawer_ids, None);
+}
+
+#[cfg(test)]
+fn dispatch_access_update_for_tests(
+    db_path: std::path::PathBuf,
+    drawer_ids: Vec<String>,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let (completion, receiver) = tokio::sync::oneshot::channel();
+    dispatch_access_update_inner(db_path, drawer_ids, Some(completion));
+    receiver
+}
+
+fn dispatch_access_update_inner(
+    db_path: std::path::PathBuf,
+    drawer_ids: Vec<String>,
+    _completion: Option<AccessWritebackCompletion>,
+) {
     if drawer_ids.is_empty() {
         return;
     }
@@ -941,6 +966,10 @@ pub fn dispatch_access_update(db_path: std::path::PathBuf, drawer_ids: Vec<Strin
                 crate::observability::record_access_writeback_failed();
                 tracing::warn!(error = %err, "failed to open db for access update");
             }
+        }
+        #[cfg(test)]
+        if let Some(completion) = _completion {
+            let _ = completion.send(());
         }
     });
 }
@@ -2123,7 +2152,7 @@ mod tests {
     use crate::core::types::{Drawer, RouteDecision, SearchResult, SourceType};
     use tempfile::TempDir;
 
-    fn make_drawer(id: &str, wing: &str, room: &str) -> Drawer {
+    pub(super) fn make_drawer(id: &str, wing: &str, room: &str) -> Drawer {
         Drawer {
             id: id.to_string(),
             content: format!("content for {id}"),
@@ -2225,7 +2254,7 @@ mod tests {
         ProjectSearchScope::from_request(Some("proj-a".to_string()), false, false, false)
     }
 
-    fn access_count(db_path: &std::path::Path, drawer_id: &str) -> i64 {
+    pub(super) fn access_count(db_path: &std::path::Path, drawer_id: &str) -> i64 {
         let db = Database::open(db_path).expect("open db");
         db.conn()
             .query_row(
@@ -2236,7 +2265,7 @@ mod tests {
             .expect("read access count")
     }
 
-    async fn configure_record_access(
+    pub(super) async fn configure_record_access(
         dir: &std::path::Path,
         db_path: &std::path::Path,
         enabled: bool,
@@ -2352,82 +2381,14 @@ mod tests {
         db.insert_drawer(&drawer).expect("insert drawer");
         configure_record_access(tmp.path(), &db_path, true).await;
 
-        dispatch_access_update(db_path.clone(), vec![drawer.id.clone()]);
-        tokio::task::spawn_blocking(|| {})
-            .await
-            .expect("drain access writeback task");
+        let completion = dispatch_access_update_for_tests(db_path.clone(), vec![drawer.id.clone()]);
+        completion.await.expect("access writeback completed");
 
         assert_eq!(access_count(&db_path, &drawer.id), 1);
         let counters = crate::observability::resource_counters();
         assert_eq!(counters.access_writeback_scheduled_total, 1);
         assert_eq!(counters.access_writeback_skipped_total, 0);
         assert_eq!(counters.access_writeback_failed_total, 0);
-    }
-
-    #[test]
-    fn dispatch_access_update_skips_when_sqlite_writer_is_busy() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .max_blocking_threads(1)
-            .enable_all()
-            .build()
-            .expect("build test runtime");
-        runtime.block_on(async {
-            let lock = crate::core::config::global_config_test_lock();
-            let _guard = lock.lock().await;
-            let tmp = TempDir::new().expect("tempdir");
-            let db_path = tmp.path().join("test.db");
-            let db = Database::open(&db_path).expect("db");
-            let drawer = make_drawer("access-busy", "alpha", "decision");
-            db.insert_drawer(&drawer).expect("insert drawer");
-            configure_record_access(tmp.path(), &db_path, true).await;
-
-            let lock_holder = rusqlite::Connection::open(&db_path).expect("open lock holder");
-            lock_holder
-                .busy_timeout(std::time::Duration::ZERO)
-                .expect("set fail-fast lock holder timeout");
-            lock_holder
-                .execute_batch("BEGIN IMMEDIATE;")
-                .expect("hold writer lock");
-
-            let (pool_started_tx, pool_started_rx) = tokio::sync::oneshot::channel();
-            let (pool_release_tx, pool_release_rx) = tokio::sync::oneshot::channel();
-            let pool_guard = tokio::task::spawn_blocking(move || {
-                pool_started_tx
-                    .send(())
-                    .expect("signal blocking pool guard");
-                pool_release_rx
-                    .blocking_recv()
-                    .expect("release blocking pool guard");
-            });
-            pool_started_rx.await.expect("blocking pool guard started");
-
-            dispatch_access_update(db_path.clone(), vec![drawer.id.clone()]);
-            pool_release_tx.send(()).expect("release blocking pool");
-            pool_guard.await.expect("join blocking pool guard");
-            tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                while crate::observability::resource_counters().access_writeback_failed_total == 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("access writeback should reach the busy writer");
-            tokio::task::spawn_blocking(|| {})
-                .await
-                .expect("drain access writeback task");
-            lock_holder
-                .execute_batch("COMMIT;")
-                .expect("release writer lock");
-
-            let counters = crate::observability::resource_counters();
-            assert_eq!(counters.access_writeback_scheduled_total, 1);
-            assert_eq!(counters.access_writeback_failed_total, 1);
-            assert_eq!(
-                access_count(&db_path, &drawer.id),
-                0,
-                "access writeback is best-effort and must not wait behind ingest-critical writes"
-            );
-        });
     }
 
     #[test]
