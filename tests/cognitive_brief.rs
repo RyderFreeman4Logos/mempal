@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -79,6 +79,7 @@ fn run_mempal_with_env_timeout(
     home: &TempDir,
     args: &[&str],
     envs: &[(&str, String)],
+    ready: mpsc::Receiver<()>,
     timeout: Duration,
 ) -> Output {
     let mut cmd = Command::new(mempal_bin());
@@ -91,6 +92,11 @@ fn run_mempal_with_env_timeout(
         cmd.env(key, value);
     }
     let mut child = cmd.spawn().expect("spawn mempal");
+    if ready.recv_timeout(timeout).is_err() {
+        child.kill().expect("kill unready mempal");
+        let _ = child.wait_with_output();
+        panic!("embedding request should start before the command deadline");
+    }
     let started = Instant::now();
     loop {
         if child.try_wait().expect("poll mempal").is_some() {
@@ -279,13 +285,14 @@ fn start_openai_embedding_stub_with_vector(
 fn start_slow_openai_embedding_stub(
     expected_query: &str,
     delay: Duration,
-) -> (String, thread::JoinHandle<()>) {
+) -> (String, mpsc::Receiver<()>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow embedding stub");
     listener
         .set_nonblocking(true)
         .expect("set slow embedding stub nonblocking");
     let address = listener.local_addr().expect("local addr");
     let expected_query = expected_query.to_string();
+    let (request_started_tx, request_started_rx) = mpsc::channel();
     let handle = thread::spawn(move || {
         let (mut stream, _) = (0..50)
             .find_map(|_| match listener.accept() {
@@ -305,6 +312,9 @@ fn start_slow_openai_embedding_stub(
             .expect("request should contain JSON body");
         let payload: Value = serde_json::from_str(body).expect("parse embedding request");
         assert_eq!(payload["input"][0], expected_query);
+        request_started_tx
+            .send(())
+            .expect("signal embedding request started");
         thread::sleep(delay);
         let body = serde_json::to_string(&json!({
             "data": [{ "embedding": vector() }]
@@ -317,7 +327,11 @@ fn start_slow_openai_embedding_stub(
         );
         let _ = stream.write_all(response.as_bytes());
     });
-    (format!("http://{address}/v1/embeddings"), handle)
+    (
+        format!("http://{address}/v1/embeddings"),
+        request_started_rx,
+        handle,
+    )
 }
 
 fn write_brief_deadline_config(home: &TempDir, bm25_fallback: bool, deadline_secs: u64) {
@@ -487,7 +501,8 @@ fn test_cli_brief_embedding_deadline_falls_back_to_bm25_json() {
     );
     db.insert_drawer(&drawer).expect("insert drawer");
     let query = "Synthetic deadline query";
-    let (endpoint, handle) = start_slow_openai_embedding_stub(query, Duration::from_millis(1500));
+    let (endpoint, request_started, handle) =
+        start_slow_openai_embedding_stub(query, Duration::from_millis(1500));
     let base_url = endpoint.trim_end_matches("/embeddings").to_string();
 
     let output = run_mempal_with_env_timeout(
@@ -499,6 +514,7 @@ fn test_cli_brief_embedding_deadline_falls_back_to_bm25_json() {
             ("MEMPAL_EMBED_MODEL", "test-model".to_string()),
             ("MEMPAL_EMBED_DIM", "384".to_string()),
         ],
+        request_started,
         Duration::from_secs(5),
     );
     assert!(
