@@ -329,6 +329,13 @@ pub fn classify_io_operation_path(operation: &str, call_site: &str) -> IoOperati
     }
 }
 
+pub fn reset_io_burst_for_tests() {
+    global_io_burst()
+        .lock()
+        .expect("io burst mutex poisoned")
+        .clear();
+}
+
 fn global_io_burst() -> &'static Mutex<BTreeMap<IoOperationPath, IoBurstAccumulator>> {
     static IO_BURST: OnceLock<Mutex<BTreeMap<IoOperationPath, IoBurstAccumulator>>> =
         OnceLock::new();
