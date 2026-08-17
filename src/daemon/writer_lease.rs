@@ -78,6 +78,26 @@ async fn acquire_daemon_writer_lease_with_bounded_wait(
     wait_max: Duration,
     retry_delay: Duration,
 ) -> Result<RuntimeWriterLeaseHandle> {
+    acquire_daemon_writer_lease_with_holder_observed(
+        db,
+        db_path,
+        recovery_faults,
+        wait_max,
+        retry_delay,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn acquire_daemon_writer_lease_with_holder_observed(
+    db: &SharedDatabase,
+    db_path: &Path,
+    recovery_faults: crate::daemon_recovery::DaemonRecoveryFaultReporter,
+    wait_max: Duration,
+    retry_delay: Duration,
+    #[cfg(test)] holder_observed: Option<&std::sync::mpsc::SyncSender<()>>,
+) -> Result<RuntimeWriterLeaseHandle> {
     let metadata = json!({
         "command": "daemon",
         "db_path": db_path.to_string_lossy(),
@@ -118,6 +138,10 @@ async fn acquire_daemon_writer_lease_with_bounded_wait(
                 Err(_) => "holder status unavailable".to_string(),
             }
         };
+        #[cfg(test)]
+        if let Some(holder_observed) = holder_observed {
+            let _ = holder_observed.try_send(());
+        }
         let now = Instant::now();
         let deadline = *deadline.get_or_insert_with(|| {
             eprintln!(
@@ -138,6 +162,21 @@ fn spawn_runtime_writer_lease_heartbeat(
     lease: RuntimeWriterLease,
     recovery_faults: crate::daemon_recovery::DaemonRecoveryFaultReporter,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_runtime_writer_lease_heartbeat_with_renewal_finished_signal(
+        db_path,
+        lease,
+        recovery_faults,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn spawn_runtime_writer_lease_heartbeat_with_renewal_finished_signal(
+    db_path: PathBuf,
+    lease: RuntimeWriterLease,
+    recovery_faults: crate::daemon_recovery::DaemonRecoveryFaultReporter,
+    #[cfg(test)] renewal_finished: Option<std::sync::mpsc::SyncSender<()>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(DAEMON_WRITER_LEASE_RENEW_INTERVAL);
         loop {
@@ -148,6 +187,10 @@ fn spawn_runtime_writer_lease_heartbeat(
                 renew_daemon_writer_lease_with_retry(&db_path, &lease_for_renew)
             })
             .await;
+            #[cfg(test)]
+            if let Some(renewal_finished) = &renewal_finished {
+                let _ = renewal_finished.try_send(());
+            }
             match result {
                 Ok(Ok(true)) => {}
                 Ok(Ok(false)) => {
@@ -271,10 +314,13 @@ mod tests {
         let daemon_db = std::sync::Arc::new(tokio::sync::Mutex::new(
             Database::open(&db_path).expect("open daemon database"),
         ));
+        let (holder_observed_tx, holder_observed_rx) = std::sync::mpsc::sync_channel(1);
         let release_path = db_path.clone();
         let release_lease = held.clone();
         let releaser = tokio::task::spawn_blocking(move || {
-            std::thread::sleep(Duration::from_millis(20));
+            holder_observed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("daemon admission must observe the live holder before release");
             Database::open(&release_path)
                 .expect("open releaser database")
                 .runtime_writer_lease_release(&release_lease)
@@ -282,12 +328,13 @@ mod tests {
         });
 
         let recovery = crate::daemon_recovery::DaemonRecovery::new(tempdir.path());
-        let acquired = acquire_daemon_writer_lease_with_bounded_wait(
+        let acquired = acquire_daemon_writer_lease_with_holder_observed(
             &daemon_db,
             &db_path,
             crate::daemon_recovery::DaemonRecoveryFaultReporter::new(recovery),
             Duration::from_secs(1),
             Duration::from_millis(5),
+            Some(&holder_observed_tx),
         )
         .await
         .expect("daemon admission continues after holder releases");
@@ -327,17 +374,20 @@ mod tests {
         let daemon_db = std::sync::Arc::new(tokio::sync::Mutex::new(
             Database::open(&db_path).expect("open daemon database"),
         ));
+        let (holder_observed_tx, holder_observed_rx) = std::sync::mpsc::sync_channel(1);
         let release_path = db_path.clone();
         let release_lease = held.clone();
         let releaser = tokio::task::spawn_blocking(move || {
-            std::thread::sleep(Duration::from_millis(20));
+            holder_observed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("daemon admission must observe the live expired holder before release");
             Database::open(&release_path)
                 .expect("open releaser database")
                 .runtime_writer_lease_release(&release_lease)
                 .expect("release live expired holder lease")
         });
 
-        let acquired = acquire_daemon_writer_lease_with_bounded_wait(
+        let acquired = acquire_daemon_writer_lease_with_holder_observed(
             &daemon_db,
             &db_path,
             crate::daemon_recovery::DaemonRecoveryFaultReporter::new(
@@ -345,6 +395,7 @@ mod tests {
             ),
             Duration::from_secs(1),
             Duration::from_millis(5),
+            Some(&holder_observed_tx),
         )
         .await;
         assert!(releaser.await.expect("join lease releaser"));
@@ -386,9 +437,23 @@ mod tests {
         db.conn()
             .execute_batch("BEGIN IMMEDIATE;")
             .expect("hold CRUD writer lock");
-        let heartbeat =
-            spawn_runtime_writer_lease_heartbeat(db_path.clone(), lease.clone(), recovery_faults);
-        tokio::time::sleep(DAEMON_WRITER_LEASE_RENEW_RETRY_DEADLINE + Duration::from_secs(1)).await;
+        let (renewal_finished_tx, renewal_finished_rx) = std::sync::mpsc::sync_channel(1);
+        let heartbeat = spawn_runtime_writer_lease_heartbeat_with_renewal_finished_signal(
+            db_path.clone(),
+            lease.clone(),
+            recovery_faults,
+            Some(renewal_finished_tx),
+        );
+        tokio::task::spawn_blocking(move || {
+            renewal_finished_rx.recv_timeout(
+                DAEMON_WRITER_LEASE_RENEW_RETRY_DEADLINE
+                    + DAEMON_WRITER_LEASE_RENEW_BUSY_TIMEOUT
+                    + Duration::from_secs(1),
+            )
+        })
+        .await
+        .expect("join renewal completion checkpoint")
+        .expect("writer lease renewal must finish its bounded retry while CRUD is locked");
 
         assert!(
             !super::super::shutdown_requested(),
