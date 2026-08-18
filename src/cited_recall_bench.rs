@@ -25,23 +25,22 @@ const SUPERSEDED_MARKER: &str = "YAML files";
 const FOREIGN_MARKER: &str = "Redis";
 const CURRENT_DECISION: &str =
     "Current decision: MempalAlpha uses SQLite for durable memory storage.";
-const CORRECTION: &str =
-    "Correction: keep SQLite; do not switch MempalAlpha durable storage to ad-hoc notes.";
+const CORRECTION: &str = "Correction: keep SQLite; do not switch MempalAlpha durable memory storage decision to ad-hoc notes after resume.";
 const CONTINUATION: &str =
     "Continuation after compaction: resume MempalAlpha with the SQLite storage decision.";
 const SUPERSEDED: &str = "Old decision: MempalAlpha uses YAML files for durable memory storage.";
 const FOREIGN: &str = "MempalAlpha-notes uses Redis for memory storage in a different project.";
 const PINNED: &str = "Pinned: MempalAlpha answers must cite drawer_id and source_file.";
-const CURRENT_SOURCE: &str = "fixture://cited-recall/mempal-alpha/sqlite-current.md";
-const CORRECTION_SOURCE: &str = "fixture://cited-recall/mempal-alpha/sqlite-correction.md";
-const CONTINUATION_SOURCE: &str = "fixture://cited-recall/mempal-alpha/continuation.md";
+pub const CURRENT_SOURCE: &str = "fixture://cited-recall/mempal-alpha/sqlite-current.md";
+pub const CORRECTION_SOURCE: &str = "fixture://cited-recall/mempal-alpha/sqlite-correction.md";
+pub const CONTINUATION_SOURCE: &str = "fixture://cited-recall/mempal-alpha/continuation.md";
 const SUPERSEDED_SOURCE: &str = "fixture://cited-recall/mempal-alpha/yaml-stale.md";
 const FOREIGN_SOURCE: &str = "fixture://cited-recall/mempal-alpha-notes/redis.md";
-const PINNED_SOURCE: &str = "fixture://cited-recall/mempal-alpha/citation-policy.md";
-const CURRENT_ID: &str = "cited_recall_sqlite_current";
-const CORRECTION_ID: &str = "cited_recall_sqlite_correction";
-const CONTINUATION_ID: &str = "cited_recall_continuation";
-const SUPERSEDED_ID: &str = "cited_recall_yaml_stale";
+pub const PINNED_SOURCE: &str = "fixture://cited-recall/mempal-alpha/citation-policy.md";
+pub const CURRENT_ID: &str = "cited_recall_sqlite_current";
+pub const CORRECTION_ID: &str = "cited_recall_sqlite_correction";
+pub const CONTINUATION_ID: &str = "cited_recall_continuation";
+pub const SUPERSEDED_ID: &str = "cited_recall_yaml_stale";
 const FOREIGN_ID: &str = "cited_recall_foreign_redis";
 const PINNED_ID: &str = "cited_recall_citation_policy";
 const BUDGET_TOKENS: usize = 8_000;
@@ -154,14 +153,14 @@ pub fn run_cited_recall_bench() -> Result<CitedRecallBenchReport> {
 
     let latest_decision = check(
         "latest_decision",
-        [&brief_text, &hermes_text]
+        [&brief_text, &context_text]
             .iter()
             .filter(|text| leaks_superseded(text))
             .count(),
     );
     let citations = check(
         "citations",
-        usize::from(!has_required_citations(&brief, &surfaces)),
+        usize::from(!has_required_citations(&brief, &brief_text, &context_text)),
     );
     let foreign_project = check(
         "foreign_project",
@@ -210,12 +209,7 @@ pub fn run_cited_recall_bench() -> Result<CitedRecallBenchReport> {
         context_budget,
         no_evidence_fallback,
         remote_calls: 0,
-        surfaces: vec![
-            "mempal_brief",
-            "codex_hook",
-            "hermes_prefetch",
-            "mempal_context",
-        ],
+        surfaces: vec!["mempal_brief", "codex_hook", "mempal_context"],
     })
 }
 
@@ -255,7 +249,7 @@ fn context_request(query: &str, cwd: PathBuf) -> ContextRequest {
     }
 }
 
-fn seed_resume_fixture(db: &Database) -> Result<()> {
+pub fn seed_resume_fixture(db: &Database) -> Result<()> {
     FixtureEvidence {
         id: SUPERSEDED_ID,
         content: SUPERSEDED,
@@ -370,7 +364,7 @@ impl FixtureEvidence {
     }
 }
 
-fn leaks_superseded(text: &str) -> bool {
+pub fn leaks_superseded(text: &str) -> bool {
     text.contains(SUPERSEDED_MARKER)
         || text.contains(SUPERSEDED_ID)
         || text.contains(SUPERSEDED_SOURCE)
@@ -380,7 +374,11 @@ fn leaks_foreign(text: &str) -> bool {
     text.contains(FOREIGN_MARKER) || text.contains(FOREIGN_ID) || text.contains(FOREIGN_SOURCE)
 }
 
-fn has_required_citations(brief: &CognitiveBrief, surfaces: &[&str]) -> bool {
+pub fn has_required_citations(
+    brief: &CognitiveBrief,
+    brief_text: &str,
+    context_text: &str,
+) -> bool {
     let cited_sources = brief
         .evidence
         .iter()
@@ -392,18 +390,14 @@ fn has_required_citations(brief: &CognitiveBrief, surfaces: &[&str]) -> bool {
                 .map(|item| item.citation.source_file.as_str()),
         )
         .collect::<Vec<_>>();
-    let has_live_source = [
-        CURRENT_SOURCE,
-        CORRECTION_SOURCE,
-        CONTINUATION_SOURCE,
-        PINNED_SOURCE,
-    ]
-    .iter()
-    .any(|source| {
-        cited_sources.contains(source) || surfaces.iter().any(|text| text.contains(source))
-    });
-    has_live_source
-        && surfaces
+    let live = |text: &str| text.contains(CORRECTION_SOURCE) || text.contains(CONTINUATION_SOURCE);
+    let brief_has_live = [CORRECTION_SOURCE, CONTINUATION_SOURCE]
+        .iter()
+        .any(|source| cited_sources.contains(source))
+        || live(brief_text);
+    brief_has_live
+        && live(context_text)
+        && [brief_text, context_text]
             .iter()
             .all(|text| text.contains("drawer:") || text.contains("drawer_id"))
 }

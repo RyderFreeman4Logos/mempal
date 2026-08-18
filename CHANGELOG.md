@@ -24,6 +24,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- Cited-recall latest-decision walks the full successor chain, filters context the same way, and requires a live correction/continuation citation (#898).
 - Codex snapshots atomically remove superseded turns/vectors and fail closed on ambiguity (#896).
 - MCP search shares a deadline and releases reads before responding (#881).
 - Typed/redacted MCP admission and audit-write diagnostics (#879).

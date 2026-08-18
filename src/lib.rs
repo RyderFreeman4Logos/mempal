@@ -64,6 +64,7 @@ pub mod search;
 pub mod session_review;
 pub mod sleep;
 pub(crate) mod stale_daemon;
+pub mod supersede;
 pub mod system_memory;
 pub mod wiki;
 pub mod xurl;
