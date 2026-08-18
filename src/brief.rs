@@ -378,7 +378,8 @@ fn assemble_bm25_context(
         confidence: 0.0,
         reason: "brief BM25-only fallback".to_string(),
     };
-    let scope = ProjectSearchScope::from_request(project_id, false, false, true);
+    let strict = project_id.is_some();
+    let scope = ProjectSearchScope::from_request(project_id, false, false, strict);
     let filters = SearchFilters {
         domain: Some(domain_slug(&request.domain).to_string()),
         field: Some(request.field.clone()),
