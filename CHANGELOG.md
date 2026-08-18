@@ -10,35 +10,16 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
-- Optional ADK-Rust v1.0.0 post-retrieval evidence workflow with RRF-calibrated
-  relevance gating, typed score provenance, exact drawer/source citations,
-  raw-hit-backed hash/span verification, bounded fallback, and an additive
-  `mempal_search` MCP response (#742).
-- The daemon can run configured sleep/consolidation phases on an interval while
-  reusing its process-wide SQLite writer lease (#726).
-- Baseline-aware `find-monolith-files` preflight gate that rejects new files
-  above 800 lines or 8000 tokens and ratchets existing monolith debt (#695).
-- `mempal_projects_list` MCP tool to discover all projects with memory,
-  their evidence/knowledge counts, last activity, and worktree path.
-  Ported from upstream P109 (70727f0).
-- `mempal_projects_resume` MCP tool to resume any project from any
-  directory, returning recent evidence, candidate knowledge, and the
-  next-step command. Ported from upstream P109.
-- `cowork_peek_command` cwd flag (CLI) and `mempal_peek_partner` cwd parameter
-  (MCP) to peek a partner's live session per-project by working directory.
-  Relative cwd paths are canonicalized to absolute. Ported from upstream P108
-  (b227afc).
-- Evidence/knowledge ingest boundary discoverability improvements in tool
-  descriptions and protocol docs, so agents steer knowledge-only fields to
-  the distill tool before rejection. Ported from upstream P107 (3cb979a).
-- `upstream-sync` skill with `.upstream-sync.json` tracking file for
-  selectively porting upstream features to the heavily diverged fork.
-- Full smoke conformance coverage for enabled search rerankers, including
-  endpoint reachability, scored reordering evidence, and fallback-warning
-  unit coverage.
-- Search latency investigation note for Issue #652, documenting the current
-  hybrid search pipeline, sqlite-vec query shape, brute-force vector-scan
-  behavior, and prioritized optimization path.
+- Codex submit/resume hooks inject a bounded citation-first project brief (#897).
+- Optional ADK-Rust v1.0.0 post-retrieval evidence workflow for `mempal_search` (#742).
+- Interval daemon sleep/consolidation reuses the process-wide SQLite writer lease (#726).
+- Baseline-aware `find-monolith-files` rejects new files above 800/8000 and ratchets monolith debt (#695).
+- `mempal_projects_list`/`mempal_projects_resume` MCP tools for project discovery and resume (P109).
+- `cowork_peek_command`/`mempal_peek_partner` cwd flag peeks a partner session per project (P108).
+- Ingest tool/protocol text steers knowledge-only fields to distill before rejection (P107).
+- `upstream-sync` skill with `.upstream-sync.json` for selective upstream ports.
+- Full smoke coverage for enabled search rerankers, including fallback-warning units.
+- Search latency note for #652: hybrid pipeline, sqlite-vec shape, brute-force scan path.
 
 ### Fixed
 

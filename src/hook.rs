@@ -45,6 +45,12 @@ pub enum HookCommands {
     /// Capture a SessionEnd hook payload.
     #[command(name = "SessionEnd", alias = "hook_session_end")]
     SessionEnd,
+    /// Inject a bounded citation-first project brief as Codex hook JSON.
+    Brief {
+        /// Read `cwd` from Codex hook stdin JSON (`cwd` field).
+        #[arg(long, value_name = "SOURCE")]
+        cwd_source: Option<String>,
+    },
     /// Install or uninstall passive capture hooks.
     Install {
         #[arg(long, value_enum)]
@@ -99,6 +105,7 @@ pub fn run_command(command: HookCommands) -> Result<()> {
         HookCommands::UserPromptSubmit => run_capture_command(HookEvent::UserPromptSubmit),
         HookCommands::SessionStart => run_capture_command(HookEvent::SessionStart),
         HookCommands::SessionEnd => run_capture_command(HookEvent::SessionEnd),
+        HookCommands::Brief { cwd_source } => run_brief_inject(cwd_source.as_deref()),
         HookCommands::Install {
             target,
             dry_run,
@@ -107,6 +114,142 @@ pub fn run_command(command: HookCommands) -> Result<()> {
         } => hook_install::install(target, dry_run, uninstall, skip_mcp),
         HookCommands::RetainPayloads { execute } => run_retain_payloads(execute),
     }
+}
+
+fn run_brief_inject(cwd_source: Option<&str>) -> Result<()> {
+    if let Err(error) = try_run_brief_inject(cwd_source) {
+        tracing::debug!(error = %error, "codex hook brief failed open");
+    }
+    Ok(())
+}
+
+fn try_run_brief_inject(cwd_source: Option<&str>) -> Result<()> {
+    ConfigHandle::bootstrap_quiet(default_config_path()).context("failed to bootstrap config")?;
+    let payload = parse_hook_stdin_json()?;
+    let cwd = resolve_brief_cwd(cwd_source, &payload)?;
+    let event = payload
+        .get("hook_event_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(HookEvent::UserPromptSubmit.display_name());
+    let query = payload
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .unwrap_or("project brief")
+        .to_string();
+    let config = ConfigHandle::current();
+    let project_id = crate::core::project::resolve_project_id(None, config.as_ref(), Some(&cwd))
+        .context("failed to resolve project scope")?;
+    let db_path = expand_home_path(&config.db_path);
+    let db = Database::open(&db_path).context("failed to open palace db")?;
+    let budget_chars = config.context.budget.total_tokens.saturating_mul(4).max(1);
+    let pinned = db
+        .get_pinned_facts(project_id.as_deref(), budget_chars)
+        .context("failed to load pinned facts")?;
+    let request = crate::brief::BriefRequest {
+        query,
+        domain: crate::core::types::MemoryDomain::Project,
+        field: "general".to_string(),
+        cwd,
+        max_items: 12,
+        dao_tian_limit: 4,
+    };
+    let warning = crate::search::bm25_fallback_warning_embed_error("codex hook brief uses BM25");
+    let brief =
+        crate::brief::assemble_brief_from_bm25_for_project(&db, request, warning, project_id)
+            .context("failed to assemble hook brief")?;
+    print!("{}", format_codex_brief_hook_json(event, &pinned, &brief)?);
+    Ok(())
+}
+
+fn parse_hook_stdin_json() -> Result<serde_json::Value> {
+    let bytes = stdin_bytes()?;
+    serde_json::from_slice(&bytes).context("invalid hook stdin JSON")
+}
+
+fn resolve_brief_cwd(cwd_source: Option<&str>, payload: &serde_json::Value) -> Result<PathBuf> {
+    match cwd_source {
+        Some("stdin-json") => payload
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .filter(|cwd| !cwd.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("stdin JSON payload missing `cwd` string field")),
+        Some(other) => Err(anyhow::anyhow!("unsupported --cwd-source: {other}")),
+        None => env::current_dir().context("failed to resolve current working directory"),
+    }
+}
+
+fn format_codex_brief_hook_json(
+    event: &str,
+    pinned: &[crate::core::types::Drawer],
+    brief: &crate::brief::CognitiveBrief,
+) -> Result<String> {
+    Ok(serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": event,
+            "additionalContext": render_hook_brief_context(pinned, brief),
+        }
+    })
+    .to_string())
+}
+
+fn render_hook_brief_context(
+    pinned: &[crate::core::types::Drawer],
+    brief: &crate::brief::CognitiveBrief,
+) -> String {
+    let mut out = String::from("## Project brief\n");
+    if !pinned.is_empty() {
+        out.push_str("## Pinned facts\n");
+        for drawer in pinned {
+            let source = drawer.source_file.as_deref().unwrap_or(&drawer.id);
+            out.push_str(&format!(
+                "- {}\n  drawer: {}\n  source: {}\n",
+                drawer.content, drawer.id, source
+            ));
+        }
+        out.push('\n');
+    }
+    if !brief.warnings.is_empty() {
+        out.push_str("## Warnings\n");
+        for warning in &brief.warnings {
+            out.push_str(&format!("- {warning}\n"));
+        }
+        out.push('\n');
+    }
+    out.push_str(&format!("## Summary\n{}\n", brief.summary.narrative));
+    if !brief.key_facts.is_empty() {
+        out.push_str("\n## Key Facts\n");
+        for fact in &brief.key_facts {
+            out.push_str(&format!(
+                "- {}\n  drawer: {}\n  source: {}\n",
+                fact.text, fact.citation.drawer_id, fact.citation.source_file
+            ));
+        }
+    }
+    if !brief.evidence.is_empty() {
+        out.push_str("\n## Evidence\n");
+        for ev in &brief.evidence {
+            out.push_str(&format!(
+                "- {}\n  drawer: {}\n  source: {}\n",
+                ev.text, ev.citation.drawer_id, ev.citation.source_file
+            ));
+        }
+    }
+    if !brief.uncertainty.is_empty() {
+        out.push_str("\n## Uncertainty\n");
+        for item in &brief.uncertainty {
+            out.push_str(&format!("- [{}] {}\n", item.kind, item.message));
+        }
+    }
+    if !brief.next_actions.is_empty() {
+        out.push_str("\n## Next Actions\n");
+        for action in &brief.next_actions {
+            out.push_str(&format!("- {action}\n"));
+        }
+    }
+    out
 }
 
 fn run_retain_payloads(execute: bool) -> Result<()> {

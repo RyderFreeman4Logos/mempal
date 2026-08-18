@@ -240,7 +240,16 @@ pub fn assemble_brief_from_bm25(
     request: BriefRequest,
     warning: String,
 ) -> Result<CognitiveBrief> {
-    let context = assemble_bm25_context(db, request)?;
+    assemble_brief_from_bm25_for_project(db, request, warning, None)
+}
+
+pub fn assemble_brief_from_bm25_for_project(
+    db: &crate::core::db::Database,
+    request: BriefRequest,
+    warning: String,
+    project_id: Option<String>,
+) -> Result<CognitiveBrief> {
+    let context = assemble_bm25_context(db, request, project_id)?;
     Ok(brief_from_context_with_metadata(
         context,
         SearchMode::Bm25Only,
@@ -361,6 +370,7 @@ fn context_request_from_brief(request: BriefRequest) -> ContextRequest {
 fn assemble_bm25_context(
     db: &crate::core::db::Database,
     request: BriefRequest,
+    project_id: Option<String>,
 ) -> Result<ContextPack> {
     let route = RouteDecision {
         wing: None,
@@ -368,7 +378,7 @@ fn assemble_bm25_context(
         confidence: 0.0,
         reason: "brief BM25-only fallback".to_string(),
     };
-    let scope = ProjectSearchScope::from_request(None, false, false, false);
+    let scope = ProjectSearchScope::from_request(project_id, false, false, true);
     let filters = SearchFilters {
         domain: Some(domain_slug(&request.domain).to_string()),
         field: Some(request.field.clone()),
