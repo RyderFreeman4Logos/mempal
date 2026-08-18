@@ -15,7 +15,9 @@ use crate::xurl::parser::{
         parse_hermes_jsonl_export,
     },
 };
-use crate::xurl::reconcile::{HermesReconcileScope, reconcile_hermes_snapshot};
+use crate::xurl::reconcile::{
+    CodexReconcileScope, HermesReconcileScope, reconcile_codex_snapshot, reconcile_hermes_snapshot,
+};
 use crate::xurl::store;
 use crate::xurl::{XurlError, XurlResult};
 
@@ -145,8 +147,8 @@ fn parse_and_store_file(
         && !turns.is_empty()
         && turns.iter().all(|turn| turn.session_id == fallback))
     .then_some(fallback.as_str());
-    let insert_stats = if tool == Tool::Hermes {
-        reconcile_hermes_snapshot(
+    let insert_stats = match tool {
+        Tool::Hermes => reconcile_hermes_snapshot(
             db.conn(),
             &turns,
             HermesReconcileScope {
@@ -154,9 +156,16 @@ fn parse_and_store_file(
                 session_id: fallback_session_scope,
                 cwd: None,
             },
-        )?
-    } else {
-        store::insert_turns(db.conn(), &turns)?
+        )?,
+        Tool::Codex if !turns.is_empty() => reconcile_codex_snapshot(
+            db.conn(),
+            &turns,
+            CodexReconcileScope {
+                session_id: &turns[0].session_id,
+                cwd: turns[0].project_path.as_deref(),
+            },
+        )?,
+        _ => store::insert_turns(db.conn(), &turns)?,
     };
     let turn_ids = insert_stats.turn_ids.clone();
     Ok((filename, turns_parsed, insert_stats, turn_ids))

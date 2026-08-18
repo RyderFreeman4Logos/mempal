@@ -42,14 +42,13 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- Codex snapshots atomically remove superseded turns/vectors and fail closed on ambiguity (#896).
 - MCP search shares a deadline and releases reads before responding (#881).
 - Typed/redacted MCP admission and audit-write diagnostics (#879).
 - Daemon pidfile validates identity; scoped ingest release honors remaining retry budget (#885/#895).
 - Queue byte admission retries transient profile-admission lock contention when opening a normal queue writer, preserving the byte-budget rejection contract under suite load (#893).
 
-- **Daemon readiness CLI tests**: use the shared Linux subprocess supervisor,
-  so CLI spawn, output drain, process-group cleanup, and reaping share one
-  deadline and timeout reports remain redacted (#892).
+- **Daemon readiness CLI tests**: use the shared Linux supervisor for bounded, redacted lifecycle handling (#892).
 
 - **MCP smoke waits**: finite `wait=true` smoke ingests process their scoped
   queue item inline within the remaining request deadline, while timed-out
