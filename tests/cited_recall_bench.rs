@@ -160,10 +160,7 @@ fn pinned_only_citations_are_not_sufficient() {
 fn cited_recall_surfaces_omit_hermes_prefetch() {
     let report = run_cited_recall_bench().expect("cited recall bench should run");
     assert!(
-        !report
-            .surfaces
-            .iter()
-            .any(|surface| *surface == "hermes_prefetch"),
+        !report.surfaces.contains(&"hermes_prefetch"),
         "hermes_prefetch is a local clone, not a production surface: {:?}",
         report.surfaces
     );
