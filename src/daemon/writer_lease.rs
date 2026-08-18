@@ -20,6 +20,12 @@ const DAEMON_WRITER_LEASE_RENEW_RETRY_DEADLINE: Duration = Duration::from_secs(5
 const DAEMON_WRITER_LEASE_RENEW_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DAEMON_WRITER_LEASE_ADMISSION_WAIT_MAX: Duration = Duration::from_secs(5);
 const DAEMON_WRITER_LEASE_ADMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Ceiling on the in-lease admission wait extension. A live heartbeating holder
+/// renews against a bounded TTL (maintenance/daemon leases are 120s), so its
+/// observed remaining_secs is already capped to that horizon; this ceiling only
+/// guards a pathological/stale holder reporting a huge remaining_secs and keeps
+/// the extended in-process wait bounded.
+const DAEMON_WRITER_LEASE_ADMISSION_WAIT_EXTENDED_MAX: Duration = Duration::from_secs(180);
 
 pub(super) struct RuntimeWriterLeaseHandle {
     db_path: PathBuf,
@@ -131,11 +137,14 @@ async fn acquire_daemon_writer_lease_with_holder_observed(
             ));
         }
 
-        let holders = {
+        let (holders, live_remaining_secs) = {
             let db = db.lock().await;
             match db.runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME)) {
-                Ok(active) => format_runtime_writer_leases(&active),
-                Err(_) => "holder status unavailable".to_string(),
+                Ok(active) => (
+                    format_runtime_writer_leases(&active),
+                    active.iter().map(|lease| lease.remaining_secs).collect(),
+                ),
+                Err(_) => ("holder status unavailable".to_string(), Vec::new()),
             }
         };
         #[cfg(test)]
@@ -143,18 +152,43 @@ async fn acquire_daemon_writer_lease_with_holder_observed(
             let _ = holder_observed.try_send(());
         }
         let now = Instant::now();
-        let deadline = *deadline.get_or_insert_with(|| {
+        let target = now + effective_admission_wait(live_remaining_secs, wait_max);
+        if deadline.is_none() {
             eprintln!(
                 "daemon SQLite writer lease is held by {holders}; waiting up to {}ms before temporary refusal",
-                wait_max.as_millis()
+                target.saturating_duration_since(now).as_millis()
             );
-            now + wait_max
-        });
-        if now >= deadline {
+        }
+        // Re-arm the deadline each iteration while a live holder is present: the
+        // in-process wait tracks the holder's observed remaining_secs horizon so the
+        // daemon stays in a non-failed waiting state and acquires the instant the
+        // holder releases, instead of exiting 75 and stranding the user unit under
+        // RestartPreventExitStatus=75 (#916).
+        let dl = deadline.get_or_insert(target);
+        if target > *dl {
+            *dl = target;
+        }
+        if now >= *dl {
             return Err(anyhow::Error::new(DaemonWriterLeaseHeld::new(holders)));
         }
-        tokio::time::sleep(deadline.saturating_duration_since(now).min(retry_delay)).await;
+        tokio::time::sleep(dl.saturating_duration_since(now).min(retry_delay)).await;
     }
+}
+
+/// Admission wait budget: at least `wait_max` and, when a live holder is
+/// present, up to its observed `remaining_secs` (capped) so bootstrap does not
+/// exit 75 while a legitimate maintenance holder is still working (#916).
+fn effective_admission_wait(
+    live_remaining_secs: impl IntoIterator<Item = i64>,
+    wait_max: Duration,
+) -> Duration {
+    let extend = live_remaining_secs
+        .into_iter()
+        .map(|secs| Duration::from_secs(secs.max(0) as u64))
+        .max()
+        .unwrap_or(Duration::ZERO)
+        .min(DAEMON_WRITER_LEASE_ADMISSION_WAIT_EXTENDED_MAX);
+    wait_max.max(extend)
 }
 
 fn spawn_runtime_writer_lease_heartbeat(
@@ -338,6 +372,84 @@ mod tests {
         )
         .await
         .expect("daemon admission continues after holder releases");
+        assert_eq!(acquired.lease().mode, "daemon");
+        assert!(releaser.await.expect("join lease releaser"));
+    }
+
+    #[test]
+    fn effective_admission_wait_floors_at_base_and_caps_extension() {
+        let base = Duration::from_millis(5);
+        // No live holder -> the fixed base bounded wait (legacy #847 behavior).
+        assert_eq!(effective_admission_wait(Vec::<i64>::new(), base), base);
+        // 0 remaining -> base wait.
+        assert_eq!(effective_admission_wait([0i64], base), base);
+        // Live holder below the cap -> the observed remaining_secs extends the wait
+        // so bootstrap does not exit 75 and strand the unit while the holder releases.
+        assert_eq!(
+            effective_admission_wait([109i64], base),
+            Duration::from_secs(109)
+        );
+        // The extension is capped so a pathological/stale holder never wedges forever.
+        assert_eq!(
+            effective_admission_wait([240_000i64], base),
+            DAEMON_WRITER_LEASE_ADMISSION_WAIT_EXTENDED_MAX
+        );
+        // Only the longest live holder drives the wait.
+        assert_eq!(
+            effective_admission_wait([10i64, 40i64], base),
+            Duration::from_secs(40)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_writer_lease_waits_out_a_live_holder_before_admission_not_75() {
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let holder_db = Database::open(&db_path).expect("open holder database");
+        let held = holder_db
+            .runtime_writer_lease_acquire(
+                SQLITE_WRITER_LEASE_NAME,
+                "maintenance-owner",
+                "maintenance",
+                DAEMON_WRITER_LEASE_TTL_SECS,
+                None,
+            )
+            .expect("acquire holder lease")
+            .expect("holder lease available");
+
+        let daemon_db = std::sync::Arc::new(tokio::sync::Mutex::new(
+            Database::open(&db_path).expect("open daemon database"),
+        ));
+        let (holder_observed_tx, holder_observed_rx) = std::sync::mpsc::sync_channel(1);
+        let release_path = db_path.clone();
+        let release_lease = held.clone();
+        let releaser = tokio::task::spawn_blocking(move || {
+            // The daemon must observe the live holder, then stay alive long past the
+            // nominal 300ms base wait before the holder releases.
+            holder_observed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("daemon must observe the live holder");
+            std::thread::sleep(Duration::from_millis(700));
+            Database::open(&release_path)
+                .expect("open releaser database")
+                .runtime_writer_lease_release(&release_lease)
+                .expect("release holder lease")
+        });
+
+        let recovery = crate::daemon_recovery::DaemonRecovery::new(tempdir.path());
+        let acquired = acquire_daemon_writer_lease_with_holder_observed(
+            &daemon_db,
+            &db_path,
+            crate::daemon_recovery::DaemonRecoveryFaultReporter::new(recovery),
+            Duration::from_millis(300),
+            Duration::from_millis(20),
+            Some(&holder_observed_tx),
+        )
+        .await
+        .expect(
+            "live upstream holder must extend bootstrap admission past the base wait \
+             instead of exiting 75 and stranding the user unit (RestartPreventExitStatus=75)",
+        );
         assert_eq!(acquired.lease().mode, "daemon");
         assert!(releaser.await.expect("join lease releaser"));
     }
