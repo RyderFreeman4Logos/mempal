@@ -397,6 +397,16 @@ fn assemble_bm25_context(
         request.max_items,
     )
     .map_err(BriefError::Search)?;
+    let hit_ids = results
+        .iter()
+        .map(|result| result.drawer_id.as_str())
+        .collect::<Vec<_>>();
+    let superseded = crate::supersede::superseded_drawer_ids(db, &hit_ids)
+        .map_err(|error| BriefError::Search(SearchError::KeywordSearch(error)))?;
+    let results = results
+        .into_iter()
+        .filter(|result| !superseded.contains(&result.drawer_id))
+        .collect::<Vec<_>>();
 
     let mut knowledge_items = Vec::new();
     let mut evidence_items = Vec::new();
@@ -633,6 +643,8 @@ fn is_entity_stopword(token: &str) -> bool {
         "The" | "This" | "That" | "No" | "Brief" | "Use" | "Review"
     )
 }
+
+pub use crate::supersede::superseded_drawer_ids;
 
 fn domain_slug(value: &MemoryDomain) -> &'static str {
     match value {

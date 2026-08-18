@@ -226,22 +226,12 @@ pub fn assemble_context_with_vector(
     request: ContextRequest,
     query_vector: &[f32],
 ) -> Result<ContextPack> {
-    // Determine effective context config (override → global → default).
-    let cfg = request
-        .context_cfg_override
-        .clone()
-        .unwrap_or_else(|| crate::core::config::ConfigHandle::current().context.clone());
-
-    if cfg.tiered_retrieval_enabled {
-        assemble_tiered(db, request, query_vector, &cfg)
-    } else {
-        assemble_flat(db, request, query_vector)
-    }
+    crate::supersede::assemble_with_vector(db, request, query_vector)
 }
 
 // --- Tiered path (tiered_retrieval_enabled = true) ---
 
-fn assemble_tiered(
+pub(crate) fn assemble_tiered(
     db: &Database,
     request: ContextRequest,
     query_vector: &[f32],
@@ -582,7 +572,7 @@ fn tiered_to_context_item(
 
 // --- Flat path (tiered_retrieval_enabled = false, legacy behavior) ---
 
-fn assemble_flat(
+pub(crate) fn assemble_flat(
     db: &Database,
     request: ContextRequest,
     query_vector: &[f32],
