@@ -11,6 +11,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ### Added
 
 - Codex submit/resume hooks inject a bounded citation-first project brief; unscoped BM25 briefs stay AllProjects (#897).
+- Deterministic cited-recall bench gates resume/compaction briefs for latest decision, citations, project isolation, and empty-evidence fallback (#898).
 - Optional ADK-Rust v1.0.0 post-retrieval evidence workflow for `mempal_search` (#742).
 - Interval daemon sleep/consolidation reuses the process-wide SQLite writer lease (#726).
 - Baseline-aware `find-monolith-files` rejects new files above 800/8000 and ratchets monolith debt (#695).

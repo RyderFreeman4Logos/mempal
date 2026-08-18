@@ -195,7 +195,7 @@ fn format_codex_brief_hook_json(
     .to_string())
 }
 
-fn render_hook_brief_context(
+pub fn render_hook_brief_context(
     pinned: &[crate::core::types::Drawer],
     brief: &crate::brief::CognitiveBrief,
 ) -> String {

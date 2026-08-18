@@ -11,7 +11,9 @@ use crate::context::{
     assemble_context_with_vector,
 };
 use crate::core::project::ProjectSearchScope;
-use crate::core::types::{AnchorKind, KnowledgeEvidenceRole, MemoryDomain, RouteDecision};
+use crate::core::types::{
+    AnchorKind, KnowledgeEvidenceRole, MemoryDomain, RouteDecision, SearchResult,
+};
 use crate::embed::{EmbedError, Embedder};
 use crate::search::{
     SearchError, SearchFilters, SearchMode, SearchOptions, VectorSearchCircuit,
@@ -397,6 +399,11 @@ fn assemble_bm25_context(
         request.max_items,
     )
     .map_err(BriefError::Search)?;
+    let superseded = superseded_drawer_ids(db, &results)?;
+    let results = results
+        .into_iter()
+        .filter(|result| !superseded.contains(&result.drawer_id))
+        .collect::<Vec<_>>();
 
     let mut knowledge_items = Vec::new();
     let mut evidence_items = Vec::new();
@@ -632,6 +639,25 @@ fn is_entity_stopword(token: &str) -> bool {
         token,
         "The" | "This" | "That" | "No" | "Brief" | "Use" | "Review"
     )
+}
+
+fn superseded_drawer_ids(
+    db: &crate::core::db::Database,
+    results: &[SearchResult],
+) -> Result<BTreeSet<String>> {
+    let mut superseded = BTreeSet::new();
+    for result in results {
+        let Some(drawer) = db
+            .get_drawer(&result.drawer_id)
+            .map_err(|error| BriefError::Search(SearchError::KeywordSearch(error)))?
+        else {
+            continue;
+        };
+        if let Some(old_id) = drawer.supersedes {
+            superseded.insert(old_id);
+        }
+    }
+    Ok(superseded)
 }
 
 fn domain_slug(value: &MemoryDomain) -> &'static str {
