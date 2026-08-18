@@ -30,6 +30,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Typed/redacted MCP admission and audit-write diagnostics (#879).
 - Daemon pidfile validates identity; scoped ingest release honors remaining retry budget (#885/#895).
 - Queue byte admission retries transient profile-admission lock contention when opening a normal queue writer, preserving the byte-budget rejection contract under suite load (#893).
+- Diagnostic readonly queue stats no longer inherit SQLite's default 5s busy wait: a plain `queue_stats_readonly` read under a held writer lock now returns a bounded lock diagnostic instead of stalling the default busy timeout (#911).
 
 - **Daemon readiness CLI tests**: use the shared Linux supervisor for bounded, redacted lifecycle handling (#892).
 

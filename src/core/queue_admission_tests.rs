@@ -132,6 +132,39 @@ fn readonly_stats_with_diagnostic_busy_timeout_returns_without_default_busy_wait
     );
 }
 
+/// The plain readonly diagnostic path passes no explicit busy timeout, so it
+/// must not silently inherit SQLite's default long (5s) busy wait. A held
+/// writer lock must surface as a bounded lock diagnostic, not a 5s stall.
+#[cfg(unix)]
+#[test]
+fn readonly_stats_plain_does_not_inherit_default_busy_wait() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("palace.db");
+    drop(Database::open(&db_path).expect("initialize database"));
+
+    let lock = Connection::open(&db_path).expect("open SQLite lock connection");
+    lock.pragma_update(None, "journal_mode", "DELETE")
+        .expect("disable WAL for exclusive diagnostic lock");
+    lock.execute_batch("BEGIN EXCLUSIVE;")
+        .expect("hold SQLite exclusive lock");
+
+    let started = Instant::now();
+    let error = queue_stats_readonly(&db_path)
+        .expect_err("readonly queue stats must report the held writer lock");
+    let elapsed = started.elapsed();
+
+    lock.execute_batch("ROLLBACK;")
+        .expect("release SQLite write lock");
+    assert!(
+        error.is_sqlite_lock(),
+        "expected SQLite lock diagnostic, got {error}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "plain readonly stats inherited the default SQLite busy wait: {elapsed:?}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn write_admission_preflight_returns_without_default_busy_wait() {

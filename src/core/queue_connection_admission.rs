@@ -77,6 +77,11 @@ pub fn queue_write_admission_preflight(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Diagnostic readonly queue stat reads must never inherit SQLite's default
+/// long (5s) busy wait. When a caller supplies no explicit timeout, use this
+/// short bounded default so a held writer lock surfaces as a quick diagnostic.
+pub(super) const QUEUE_STATS_READONLY_DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// Read queue statistics without startup reclamation or a writable connection.
 pub fn queue_stats_readonly(path: &Path) -> Result<QueueStats> {
     queue_stats_readonly_with_optional_busy_timeout(path, None, |resolved_path| {
@@ -121,9 +126,7 @@ fn queue_stats_readonly_with_optional_busy_timeout(
         DbAdmissionRequest::new(DbHolderClass::current_process(), 1, 2 * 1024 * 1024),
     )?;
     let connection = open(admission.database_path())?;
-    if let Some(busy_timeout) = busy_timeout {
-        connection.busy_timeout(busy_timeout)?;
-    }
+    connection.busy_timeout(busy_timeout.unwrap_or(QUEUE_STATS_READONLY_DEFAULT_BUSY_TIMEOUT))?;
     connection.pragma_update(None, "cache_size", QUEUE_SQLITE_CACHE_SIZE_KIB)?;
     compute_queue_stats(&connection, DEFAULT_MAX_INGEST_ACTIVE_BYTES)
 }
