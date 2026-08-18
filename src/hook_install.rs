@@ -22,6 +22,7 @@ const HOOK_COMMAND_EVENTS: [(&str, &str); 4] = [
     ("SessionStart", "SessionStart"),
     ("SessionEnd", "SessionEnd"),
 ];
+const CODEX_BRIEF_EVENTS: [&str; 2] = ["UserPromptSubmit", "SessionStart"];
 const LEGACY_ALIASES: [(&str, &str); 4] = [
     ("hook_post_tool", "PostToolUse"),
     ("hook_user_prompt", "UserPromptSubmit"),
@@ -297,6 +298,31 @@ pub fn install_codex(
             }));
         }
 
+        changed |= removed > 0 || inserted;
+    }
+
+    let brief_command = format!(
+        "{} hook brief --cwd-source stdin-json",
+        shell_escape_path(&resolve_mempal_binary()?)
+    );
+    for event_name in CODEX_BRIEF_EVENTS {
+        let event_array = ensure_hook_event_array(&mut root, event_name)?;
+        let before_len = event_array.len();
+        event_array.retain(|entry| !entry_contains_command(entry, &brief_command));
+        let removed = before_len.saturating_sub(event_array.len());
+        removed_commands += removed;
+        let inserted = !uninstall
+            && !event_array
+                .iter()
+                .any(|entry| entry_contains_command(entry, &brief_command));
+        if inserted {
+            event_array.push(json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": brief_command
+                }]
+            }));
+        }
         changed |= removed > 0 || inserted;
     }
 
