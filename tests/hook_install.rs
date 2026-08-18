@@ -560,8 +560,8 @@ fn test_hook_install_codex_merges_existing() {
         .as_array()
         .expect("prompt array");
 
-    // Should have 2 entries in UserPromptSubmit array
-    assert_eq!(entries.len(), 2);
+    // 1 preexisting drain entry + hook UserPromptSubmit + hook brief
+    assert_eq!(entries.len(), 3);
     let commands: Vec<&str> = entries
         .iter()
         .flat_map(|entry| entry["hooks"].as_array().expect("hook array").iter())
