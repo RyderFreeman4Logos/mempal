@@ -31,13 +31,11 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Typed/redacted MCP admission and audit-write diagnostics (#879).
 - Daemon pidfile validates identity; scoped ingest release honors remaining retry budget (#885/#895).
 - Queue byte admission retries transient profile-admission lock contention when opening a normal queue writer, preserving the byte-budget rejection contract under suite load (#893).
-- Diagnostic readonly queue stats no longer inherit SQLite's default 5s busy wait: a plain `queue_stats_readonly` read under a held writer lock now returns a bounded lock diagnostic instead of stalling the default busy timeout (#911).
+- Diagnostic readonly queue stats no longer inherit SQLite's default 5s busy wait: a `queue_stats_readonly` read under a held writer lock now returns a bounded lock diagnostic instead of stalling (#911).
 
-- **Daemon readiness CLI tests**: use the shared Linux supervisor for bounded, redacted lifecycle handling (#892).
+- **Daemon readiness CLI tests**: shared Linux supervisor for bounded redacted lifecycle handling (#892).
 
-- **MCP smoke waits**: finite `wait=true` smoke ingests process their scoped
-  queue item inline within the remaining request deadline, while timed-out
-  receipts retain a local completion consumer (#888).
+- **MCP ingest waits**: `wait=true` smoke ingests process inline; live-daemon follow polls, not claims, until `created_drawer_ids`; lease-probe failure with no live owner completes locally in an unbounded scoped wait (#888, #918).
 
 - **Daemon outage visibility**: `doctor`, `status`, and MCP doctor now expose a
   high-severity typed availability signal when the daemon is down with at least
