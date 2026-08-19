@@ -36,19 +36,11 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - **Daemon readiness CLI tests**: shared Linux supervisor for bounded redacted lifecycle handling (#892).
 
 - **MCP ingest waits**: `wait=true` smoke ingests process inline; live-daemon follow polls, not claims, until `created_drawer_ids`; lease-probe failure with no live owner completes locally in an unbounded scoped wait (#888, #918).
+- **MCP delete receipts**: `mempal_delete` returns a success receipt when the drawer is already soft-deleted; a completed cleanup is never `delete_false` (#921).
 
-- **Daemon outage visibility**: `doctor`, `status`, and MCP doctor now expose a
-  high-severity typed availability signal when the daemon is down with at least
-  100 pending embedding/hook queue items. Unreadable config/queue statistics and
-  unverified PID identities instead report explicit, privacy-safe `unavailable`
-  reasons, never a synthetic normal state. Recovery guidance covers daemon
-  restart, drain confirmation, and terminal failures without database edits
-  (#871).
+- **Daemon outage visibility**: `doctor`, `status`, and MCP doctor expose a high-severity typed availability signal when the daemon is down with ≥100 pending items; unreadable config/queue stats and unverified PID identities report privacy-safe `unavailable`, never synthetic normal; recovery: restart, drain, terminal failures, no DB edits (#871).
 
-- **Admission receipt ownership**: bind MCP holder-budget no-write receipts and
-  smoke cleanup authority to the owning operation identity so saturated
-  admission attempts cannot emit false write receipts or cross-operation
-  cleanup/delete IDs (#876).
+- **Admission receipt ownership**: bind MCP holder-budget no-write receipts and smoke cleanup authority to the owning operation so saturated admission cannot emit false receipts or cross-operation cleanup IDs (#876).
 
 - **Daemon writer-lease renew**: treat profile admission lock `Busy` as the same
   retryable contention class as SQLite busy/locked so lease heartbeat recovery
