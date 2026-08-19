@@ -35,7 +35,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - **Daemon readiness CLI tests**: shared Linux supervisor for bounded redacted lifecycle handling (#892).
 
-- **MCP ingest waits**: finite `wait=true` smoke ingests process scoped work inline; live-daemon follow waits poll instead of claiming so a timeout receipt stays followable until the completed operation yields `created_drawer_ids` (#888, #918).
+- **MCP ingest waits**: `wait=true` smoke ingests process inline; live-daemon follow polls, not claims, until `created_drawer_ids`; lease-probe failure with no live owner completes locally in an unbounded scoped wait (#888, #918).
 
 - **Daemon outage visibility**: `doctor`, `status`, and MCP doctor now expose a
   high-severity typed availability signal when the daemon is down with at least

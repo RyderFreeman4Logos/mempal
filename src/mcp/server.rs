@@ -3060,8 +3060,16 @@ impl MempalMcpServer {
                 tokio::time::sleep(poll_interval.min(remaining)).await;
                 continue;
             }
+            // InlineUntilTerminal commits this process to finishing the
+            // operation. A lease-probe failure cannot prove a live daemon
+            // owner, so take the local/inline path instead of following an
+            // unbounded, owner-less wait (#918). Bounded live-daemon follows
+            // keep the follow-on-error default so an already-queued receipt
+            // is not claimed away from a possibly-live daemon (#918).
+            let follow_on_lease_probe_error =
+                !matches!(claim_policy, ScopedIngestClaimPolicy::InlineUntilTerminal);
             if self
-                .daemon_writer_lease_visible_for_ingest_wait(remaining, true)
+                .daemon_writer_lease_visible_for_ingest_wait(remaining, follow_on_lease_probe_error)
                 .await
             {
                 let remaining = deadline.saturating_duration_since(Instant::now());
