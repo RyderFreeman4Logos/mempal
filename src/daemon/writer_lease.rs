@@ -137,19 +137,29 @@ async fn acquire_daemon_writer_lease_with_holder_observed(
             ));
         }
 
-        let (holders, live_remaining_secs) = {
+        let (holders, disjoint_holder, live_remaining_secs) = {
             let db = db.lock().await;
             match db.runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME)) {
                 Ok(active) => (
                     format_runtime_writer_leases(&active),
+                    active
+                        .iter()
+                        .any(|lease| writer_lease_holder_refuses_immediately(&lease.mode)),
                     active.iter().map(|lease| lease.remaining_secs).collect(),
                 ),
-                Err(_) => ("holder status unavailable".to_string(), Vec::new()),
+                Err(_) => (
+                    "holder status unavailable".to_string(),
+                    false,
+                    Vec::<i64>::new(),
+                ),
             }
         };
         #[cfg(test)]
         if let Some(holder_observed) = holder_observed {
             let _ = holder_observed.try_send(());
+        }
+        if disjoint_holder {
+            return Err(anyhow::Error::new(DaemonWriterLeaseHeld::new(holders)));
         }
         let now = Instant::now();
         let target = now + effective_admission_wait(live_remaining_secs, wait_max);
@@ -189,6 +199,15 @@ fn effective_admission_wait(
         .unwrap_or(Duration::ZERO)
         .min(DAEMON_WRITER_LEASE_ADMISSION_WAIT_EXTENDED_MAX);
     wait_max.max(extend)
+}
+
+/// Live writer modes the daemon must not wait out or displace during admission:
+/// a live `mcp-ingest-worker` holds the writer lease for independent durable
+/// ingestion, so daemon start refuses immediately (temporary refusal, no
+/// takeover) instead of blocking, and must not let the admission wait extension
+/// keep it alive past the holder's horizon (#849, #916-successor).
+fn writer_lease_holder_refuses_immediately(mode: &str) -> bool {
+    matches!(mode, "mcp-ingest-worker")
 }
 
 fn spawn_runtime_writer_lease_heartbeat(
@@ -399,6 +418,17 @@ mod tests {
             effective_admission_wait([10i64, 40i64], base),
             Duration::from_secs(40)
         );
+    }
+
+    #[test]
+    fn writer_lease_holder_refuses_immediately_discriminates_wait_modes() {
+        // Compatibility boundaries, never rewritten to wait 180s for an
+        // incompatible live durable ingest worker (#916 successor).
+        assert!(writer_lease_holder_refuses_immediately("mcp-ingest-worker"));
+        // Maintenance/rejudge/daemon-family holders are waited out (#916).
+        for compatible in ["maintenance", "rejudge", "daemon", "mcp"] {
+            assert!(!writer_lease_holder_refuses_immediately(compatible));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
