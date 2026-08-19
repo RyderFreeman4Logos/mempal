@@ -2505,14 +2505,18 @@ impl MempalMcpServer {
         }
     }
 
-    async fn daemon_writer_lease_visible_for_ingest_wait(&self, remaining: Duration) -> bool {
+    async fn daemon_writer_lease_visible_for_ingest_wait(
+        &self,
+        remaining: Duration,
+        fail_closed: bool,
+    ) -> bool {
         #[cfg(any(test, feature = "db-test-seam"))]
         if let Some(error) = self.daemon_writer_lease_check_error.as_deref() {
             tracing::warn!(
                 error,
                 "failed to check daemon writer lease before MCP ingest wait; daemon ownership is not proven"
             );
-            return false;
+            return fail_closed;
         }
 
         let deadline = remaining
@@ -2533,9 +2537,9 @@ impl MempalMcpServer {
                     error = %error,
                     "failed to check daemon writer lease before MCP ingest wait; daemon ownership is not proven"
                 );
-                false
+                fail_closed
             }
-            Err(_) => false,
+            Err(_) => fail_closed,
         }
     }
 
@@ -3057,7 +3061,7 @@ impl MempalMcpServer {
                 continue;
             }
             if self
-                .daemon_writer_lease_visible_for_ingest_wait(remaining)
+                .daemon_writer_lease_visible_for_ingest_wait(remaining, true)
                 .await
             {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -7339,7 +7343,7 @@ impl MempalMcpServer {
                 } else {
                     self.operation_status_deadline
                 };
-                self.daemon_writer_lease_visible_for_ingest_wait(lease_check_budget)
+                self.daemon_writer_lease_visible_for_ingest_wait(lease_check_budget, false)
                     .await
             } else {
                 false
@@ -7617,7 +7621,7 @@ impl MempalMcpServer {
         // reconciliation path or a REST retry could create a duplicate drawer.
         if allow_daemon_rest_fallback
             && self
-                .daemon_writer_lease_visible_for_ingest_wait(self.operation_status_deadline)
+                .daemon_writer_lease_visible_for_ingest_wait(self.operation_status_deadline, false)
                 .await
         {
             let config = self.status_config_snapshot();
@@ -13988,7 +13992,10 @@ mod tests {
 
         assert!(
             !server
-                .daemon_writer_lease_visible_for_ingest_wait(server.operation_status_deadline)
+                .daemon_writer_lease_visible_for_ingest_wait(
+                    server.operation_status_deadline,
+                    false
+                )
                 .await,
             "lease visibility check failures must not silently prove daemon ownership"
         );

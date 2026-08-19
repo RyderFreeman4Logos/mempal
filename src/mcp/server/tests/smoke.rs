@@ -429,7 +429,7 @@ async fn test_mcp_scoped_smoke_wait_bounds_lease_check_to_remaining_budget() {
     let started = Instant::now();
     let visible = tokio::time::timeout(
         Duration::from_millis(200),
-        server.daemon_writer_lease_visible_for_ingest_wait(Duration::from_millis(25)),
+        server.daemon_writer_lease_visible_for_ingest_wait(Duration::from_millis(25), false),
     )
     .await
     .expect("scoped smoke wait lease check must use the residual wait budget");
