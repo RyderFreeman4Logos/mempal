@@ -2299,7 +2299,11 @@ impl MempalMcpServer {
                     &db_path,
                     MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DELAY,
                 )?;
-                db.soft_delete_drawer(&drawer_id_for_write)
+                if db.soft_delete_drawer(&drawer_id_for_write)? {
+                    Ok(true)
+                } else {
+                    db.drawer_is_soft_deleted(&drawer_id_for_write)
+                }
             })
             .await
             .map_err(|error| {
@@ -13508,6 +13512,7 @@ mod tests {
 
     mod context_scope_schema_tests;
     mod delete_busy_retry_836_tests;
+    mod delete_receipt_921_tests;
     mod ingest_receipt_tests;
     mod read_tests;
     #[derive(Clone)]

@@ -9,11 +9,21 @@ pub(super) async fn run(async_db: AsyncDb, drawer_id: String) -> Result<bool, Db
             let drawer_id = drawer_id.clone();
             async move {
                 async_db
-                    .run_write_until(retry_deadline, move |db| db.soft_delete_drawer(&drawer_id))
+                    .run_write_until(retry_deadline, move |db| delete_receipt(db, &drawer_id))
                     .await
             }
         },
         db_error_is_sqlite_lock,
     )
     .await
+}
+
+/// MCP delete receipt: true when the drawer is soft-deleted after the attempt
+/// (whether flipped by this call or already soft-deleted by an earlier
+/// operation), false only when the drawer does not exist as a row at all.
+fn delete_receipt(db: &crate::core::db::Database, drawer_id: &str) -> Result<bool, DbError> {
+    if db.soft_delete_drawer(drawer_id)? {
+        return Ok(true);
+    }
+    db.drawer_is_soft_deleted(drawer_id)
 }

@@ -1294,6 +1294,17 @@ impl Database {
         Ok(exists == 1)
     }
 
+    /// True when the drawer row exists and carries a `deleted_at` (soft-deleted),
+    /// false when the drawer does not exist as any row at all.
+    pub(crate) fn drawer_is_soft_deleted(&self, drawer_id: &str) -> Result<bool, DbError> {
+        let exists = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM drawers WHERE id = ?1 AND deleted_at IS NOT NULL)",
+            [drawer_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(exists == 1)
+    }
+
     pub fn drawer_exists_exact(
         &self,
         content: &str,
