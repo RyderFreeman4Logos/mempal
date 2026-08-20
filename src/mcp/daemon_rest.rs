@@ -213,7 +213,7 @@ mod tests {
             serde_json::json!({
                 "drawer_id": "created-drawer",
                 "created_drawer_ids": ["created-drawer"],
-                "cleanup_drawer_ids": ["created-drawer"],
+                "cleanup_drawer_ids": ["cleanup-drawer"],
                 "chunk_count": 1,
             })
             .to_string()
