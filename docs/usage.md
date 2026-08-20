@@ -858,13 +858,9 @@ mempal bench longmemeval /path/to/longmemeval_s_cleaned.json \
 
 ## MCP Server
 
-Run stdio MCP explicitly:
+Daemon MCP: `http://127.0.0.1:<daemon-api-port>/mcp` (loopback REST).
 
-```bash
-mempal serve --mcp
-```
-
-If `mempal` was built without the `rest` feature, plain `mempal serve` behaves the same way.
+Stdio: `mempal serve --mcp`; without `rest`, plain `mempal serve` is equivalent.
 
 The smoke-tested MCP baseline currently documents 19 verified tools. The
 [architecture overview](architecture.md#mcp-tool-profiles) groups them into

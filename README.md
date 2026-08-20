@@ -245,9 +245,12 @@ Default profile reads `~/.hermes/state.db`; named profiles read `~/.hermes/profi
 
 ## MCP Server (19 verified baseline tools)
 
-`mempal serve --mcp` exposes at least this smoke-tested MCP baseline via Model
-Context Protocol. Use `mempal doctor` or protocol-level `tools/list` against
-`mempal serve --mcp` for the runtime-advertised surface in a specific build:
+The long-lived daemon exposes the same surface on its loopback REST listener at
+`http://127.0.0.1:<daemon-api-port>/mcp`; configure agents with that URL so they
+reuse daemon-owned SQLite resources. `mempal serve --mcp` remains the stdio
+entry point for clients that do not use the daemon. Use `mempal doctor` or
+protocol-level `tools/list` against either entry point for the runtime-advertised
+surface in a specific build:
 
 | Tool | Purpose |
 |------|---------|

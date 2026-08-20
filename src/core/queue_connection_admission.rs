@@ -19,12 +19,14 @@ pub(super) const QUEUE_CONNECTION_CACHE_BYTES: u64 =
 #[derive(Clone)]
 pub(super) struct QueueConnectionAdmission {
     guard: Arc<Mutex<Option<ProfileDbAdmission>>>,
+    holder_class: Arc<Mutex<DbHolderClass>>,
 }
 
 impl QueueConnectionAdmission {
     pub(super) fn new() -> Self {
         Self {
             guard: Arc::new(Mutex::new(None)),
+            holder_class: Arc::new(Mutex::new(DbHolderClass::current_process())),
         }
     }
 
@@ -34,10 +36,14 @@ impl QueueConnectionAdmission {
             .lock()
             .map_err(|_| QueueError::ClaimConnectionMutexPoisoned)?;
         if admission.is_none() {
+            let holder_class = self
+                .holder_class
+                .lock()
+                .map_err(|_| QueueError::ClaimConnectionMutexPoisoned)?;
             *admission = Some(ProfileDbAdmission::acquire(
                 db_path,
                 DbAdmissionRequest::new(
-                    DbHolderClass::current_process(),
+                    *holder_class,
                     QUEUE_CONNECTIONS_PER_CACHE,
                     QUEUE_CONNECTION_CACHE_BYTES,
                 ),

@@ -151,6 +151,7 @@ use super::tools::{
     TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
+mod daemon_owned;
 mod schema_ready;
 
 fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool {
@@ -306,6 +307,7 @@ pub struct MempalMcpServer {
     initial_config: Arc<Config>,
     async_db: Arc<OnceCell<AsyncDb>>,
     query_only_async_db: Arc<OnceCell<QueryOnlyAsyncDb>>,
+    daemon_owned_async_db: bool,
     async_queue: AsyncPendingMessageStore,
     gating_runtime: Arc<GatingRuntime>,
     embedder_factory: Arc<dyn EmbedderFactory>,
@@ -639,6 +641,7 @@ impl MempalMcpServer {
             initial_config,
             async_db: Arc::new(OnceCell::new()),
             query_only_async_db: Arc::new(OnceCell::new()),
+            daemon_owned_async_db: false,
             async_queue,
             gating_runtime: Arc::new(GatingRuntime::new(config, Arc::clone(&embedder_factory))),
             embedder_factory,
@@ -698,14 +701,6 @@ impl MempalMcpServer {
 
     pub fn with_external_ingest_writer_lease(mut self, lease: RuntimeWriterLease) -> Self {
         self.external_ingest_writer_lease = Some(lease);
-        self
-    }
-
-    pub(crate) fn with_daemon_write_observer(
-        mut self,
-        observer: crate::daemon_bootstrap::DaemonWriteObserver,
-    ) -> Self {
-        self.daemon_write_observer = Some(observer);
         self
     }
 
@@ -5492,10 +5487,12 @@ impl MempalMcpServer {
         };
         let mut system_warnings = current_system_warnings();
         let mut database_diagnostic = None;
-        let queue_stats = match self.async_queue.stats().await {
+        let queue_stats_result = self.queue_stats_for_status().await;
+        let queue_stats = match queue_stats_result {
             Ok(stats) => stats,
             Err(error) => {
-                let diagnostic = status_database_diagnostic(&self.db_path, "queue_stats", &error);
+                let diagnostic =
+                    status_database_diagnostic(&self.db_path, "queue_stats", error.root_cause());
                 record_status_database_diagnostic(
                     &mut system_warnings,
                     &mut database_diagnostic,

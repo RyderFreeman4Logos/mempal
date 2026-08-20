@@ -78,8 +78,36 @@ pub async fn serve_with_shutdown<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    serve_with_optional_mcp(listener, state, None, shutdown).await
+}
+
+pub async fn serve_with_mcp<F>(
+    listener: tokio::net::TcpListener,
+    state: ApiState,
+    server: crate::mcp::MempalMcpServer,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    serve_with_optional_mcp(listener, state, Some(server), shutdown).await
+}
+
+pub async fn serve_with_optional_mcp<F>(
+    listener: tokio::net::TcpListener,
+    state: ApiState,
+    server: Option<crate::mcp::MempalMcpServer>,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let drain_state = state.clone();
-    axum::serve(listener, router(state))
+    let app = match server {
+        Some(server) => router_with_mcp(state, server),
+        None => router(state),
+    };
+    axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown.await;
             if !drain_state.drain_write_queue().await {
@@ -131,6 +159,10 @@ pub fn router(state: ApiState) -> Router {
         ))
         .with_state(state)
         .layer(cors_layer())
+}
+
+pub fn router_with_mcp(state: ApiState, server: crate::mcp::MempalMcpServer) -> Router {
+    router(state).nest_service("/mcp", super::mcp::service(server))
 }
 
 async fn rest_operation_telemetry(

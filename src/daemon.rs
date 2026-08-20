@@ -50,6 +50,8 @@ use crate::session_review::{
     split_session_metadata, validate_linked_drawer_ids,
 };
 
+#[cfg(feature = "rest")]
+mod mcp;
 #[path = "daemon/self_heal.rs"]
 mod self_heal;
 mod sleep_scheduler;
@@ -166,44 +168,8 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     // Start REST API before the hooks check so the API remains available
     // even when hooks are disabled.
     #[cfg(feature = "rest")]
-    let _rest_task: Option<tokio::task::JoinHandle<_>> = if context.config.api.enabled {
-        use crate::api::{ApiState, serve_with_shutdown as serve_rest_api};
-        use std::sync::Arc;
-
-        let addr = context.config.api.addr.clone();
-        let db_path_rest = {
-            let db = context.db.lock().await;
-            db.path().to_path_buf()
-        };
-        let config_for_rest = context.config.as_ref().clone();
-        match tokio::net::TcpListener::bind(&addr).await {
-            Ok(listener) => {
-                let local_addr = listener
-                    .local_addr()
-                    .context("failed to resolve REST server address")?;
-                tracing::info!("daemon REST listening on http://{local_addr}");
-                eprintln!("daemon REST listening on http://{local_addr}");
-                let factory =
-                    crate::embed::ConfiguredEmbedderFactory::new_for_daemon(config_for_rest);
-                let state = ApiState::new(db_path_rest, Arc::new(factory));
-                Some(tokio::spawn(async move {
-                    if let Err(error) = serve_rest_api(listener, state, async {
-                        while !shutdown_requested() {
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                        }
-                    })
-                    .await
-                    {
-                        tracing::error!("daemon REST server error: {error}");
-                    }
-                }))
-            }
-            Err(error) => {
-                tracing::warn!("daemon REST server failed to bind {addr}: {error}");
-                eprintln!("warning: daemon REST server failed to bind {addr}: {error}");
-                None
-            }
-        }
+    let _rest_task = if context.config.api.enabled {
+        mcp::spawn_rest(context, &db_path, &writer_lease).await?
     } else {
         None
     };

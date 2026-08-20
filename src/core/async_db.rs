@@ -200,6 +200,16 @@ impl AsyncDb {
         }
     }
 
+    /// Share this daemon-owned reader pool without admitting another holder.
+    pub(crate) fn query_only_view(&self) -> QueryOnlyAsyncDb {
+        QueryOnlyAsyncDb {
+            readers: Arc::clone(&self.readers),
+            _admission: Arc::clone(&self._admission),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            read_delay: self.read_delay,
+        }
+    }
+
     /// Inject a synthetic cold-read delay into every `run_read` (tests only).
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_read_delay(mut self, delay: Duration) -> Self {
