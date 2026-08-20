@@ -8,6 +8,7 @@ use std::fmt;
 use std::time::Duration;
 
 use super::tools::{IngestRequest, IngestResponse};
+use serde_json::Value;
 
 const REST_INGEST_PATH: &str = "/api/ingest";
 const MAX_REST_INGEST_RESPONSE_BYTES: u64 = 1024 * 1024;
@@ -90,6 +91,18 @@ pub(super) fn unsupported_fields(request: &IngestRequest) -> Vec<&'static str> {
     fields
 }
 
+fn decode_ingest_response(body: &[u8]) -> Result<IngestResponse, serde_json::Error> {
+    let mut value: Value = serde_json::from_slice(body)?;
+    if let Some(object) = value.as_object_mut() {
+        if object.contains_key("created_drawer_ids") {
+            object.remove("cleanup_drawer_ids");
+        } else if let Some(cleanup_ids) = object.remove("cleanup_drawer_ids") {
+            object.insert("created_drawer_ids".to_string(), cleanup_ids);
+        }
+    }
+    serde_json::from_value(value)
+}
+
 pub(super) async fn ingest(
     api_addr: &str,
     request: &IngestRequest,
@@ -143,7 +156,7 @@ pub(super) async fn ingest(
         ));
     }
 
-    serde_json::from_slice(&body).map_err(|error| {
+    decode_ingest_response(&body).map_err(|error| {
         DaemonRestIngestError::new(
             endpoint,
             format!("invalid successful response body: {error}"),
@@ -176,6 +189,39 @@ mod tests {
             ..IngestRequest::default()
         };
         assert!(unsupported_fields(&request).is_empty());
+    }
+
+    #[test]
+    fn rest_response_maps_cleanup_ids_to_created_ids() {
+        let response = decode_ingest_response(
+            serde_json::json!({
+                "drawer_id": "created-drawer",
+                "cleanup_drawer_ids": ["created-drawer"],
+                "chunk_count": 1,
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("cleanup-only receipt should decode");
+
+        assert_eq!(response.created_drawer_ids, ["created-drawer"]);
+    }
+
+    #[test]
+    fn rest_response_prefers_created_ids_when_both_fields_exist() {
+        let response = decode_ingest_response(
+            serde_json::json!({
+                "drawer_id": "created-drawer",
+                "created_drawer_ids": ["created-drawer"],
+                "cleanup_drawer_ids": ["created-drawer"],
+                "chunk_count": 1,
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("current receipt should decode");
+
+        assert_eq!(response.created_drawer_ids, ["created-drawer"]);
     }
 
     #[test]

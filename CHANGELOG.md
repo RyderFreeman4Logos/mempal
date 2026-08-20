@@ -35,8 +35,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - **Daemon readiness CLI tests**: shared Linux supervisor for bounded redacted lifecycle handling (#892).
 
-- **MCP ingest waits**: `wait=true` smoke ingests process inline; live-daemon follow polls, not claims, until `created_drawer_ids`; lease-probe failure with no live owner completes locally in an unbounded scoped wait (#888, #918).
-- **MCP delete receipts**: `mempal_delete` returns a success receipt when the drawer is already soft-deleted; a completed cleanup is never `delete_false` (#921).
+- **MCP waits**: scoped smoke ingest is inline; live-daemon waits poll until `created_drawer_ids` (#888, #918).
+- **MCP delete receipts**: `mempal_delete` succeeds when already soft-deleted (#921).
+- **Create receipts**: cleanup IDs survive CLI/MCP/REST decoding (#923).
 
 - **Daemon outage visibility**: `doctor`, `status`, and MCP doctor expose a high-severity typed availability signal when the daemon is down with ≥100 pending items; unreadable config/queue stats and unverified PID identities report privacy-safe `unavailable`, never synthetic normal; recovery: restart, drain, terminal failures, no DB edits (#871).
 

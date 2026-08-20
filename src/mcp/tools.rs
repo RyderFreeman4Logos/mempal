@@ -2011,7 +2011,11 @@ pub struct IngestResponse {
     pub drawer_ids: Vec<String>,
     /// Drawer IDs newly created by this operation. This is the only response
     /// list safe for cleanup/delete automation.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        alias = "cleanup_drawer_ids",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub created_drawer_ids: Vec<String>,
     /// Number of chunks the content was split into. Always >= 1 for
     /// successful ingests; 0 while queued/running, during dry-run previews,
