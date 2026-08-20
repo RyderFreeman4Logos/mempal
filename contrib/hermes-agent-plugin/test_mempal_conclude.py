@@ -113,6 +113,16 @@ class BrokenSpool:
         raise OSError("SECRET_LOCAL_SPOOL_BODY")
 
 
+class TransitioningBreakerProvider(RecordingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.breaker_checks = 0
+
+    def _is_breaker_open(self) -> bool:
+        self.breaker_checks += 1
+        return self.breaker_checks >= 3
+
+
 class DurableConcludeTests(unittest.TestCase):
     def test_completed_receipt_with_drawer_reports_success(self) -> None:
         provider = ControlledConcludeProvider("completed", drawer_id="drawer-terminal")
@@ -333,6 +343,38 @@ class DurableConcludeTests(unittest.TestCase):
         serialized = json.dumps(result)
         self.assertNotIn("SECRET_LOCAL_CONCLUSION", serialized)
         self.assertNotIn("SECRET_LOCAL_SPOOL_BODY", serialized)
+
+    def test_replay_breaker_deferral_returns_pending_success(self) -> None:
+        provider = TransitioningBreakerProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
+
+        first = self._conclude(provider, "SECRET_REPLAY_CONCLUSION")
+        retry_key = first["operation_key"]
+        second = self._conclude(
+            provider,
+            "SECRET_REPLAY_CONCLUSION",
+            operation_key=retry_key,
+        )
+
+        for result in (first, second):
+            self.assertEqual(result["result"], "Fact admitted locally; durable storage pending.")
+            self.assertEqual(result["state"], "local_admitted")
+            self.assertEqual(result["operation_key"], retry_key)
+            self.assertEqual(result["retry_operation_id"], retry_key)
+            self.assertTrue(result["retry_safe"])
+            self.assertEqual(
+                result["durability"],
+                {
+                    "state": "pending",
+                    "kind": "durable_replay_deferred",
+                    "deferred_reason": "breaker_open",
+                },
+            )
+            self.assertNotIn("error", result)
+        self.assertEqual(provider._write_spool.count(), 1)
+        self.assertEqual(provider.posts, [])
+        self.assertNotIn("SECRET_REPLAY_CONCLUSION", json.dumps(second))
 
     def test_open_breaker_returns_local_admission_success_without_transport(self) -> None:
         provider = RecordingProvider()

@@ -402,12 +402,19 @@ class WriteSpool:
         self,
         post: Callable[[str, Dict[str, Any]], Any],
         get: Callable[[str], Any],
+        *,
+        replay_allowed: Optional[Callable[[], bool]] = None,
     ) -> Optional[ReplayOutcome]:
         """Attempt the earliest eligible operation without surrendering ambiguity."""
         operation = self.next_replayable_operation()
         if operation is None:
             return None
-        return self._replay_operation(operation, post, get)
+        return self._replay_operation(
+            operation,
+            post,
+            get,
+            replay_allowed=replay_allowed,
+        )
 
     def replay_operation_key(
         self,
@@ -416,6 +423,7 @@ class WriteSpool:
         get: Callable[[str], Any],
         *,
         ignore_retry_delay: bool = False,
+        replay_allowed: Optional[Callable[[], bool]] = None,
     ) -> Optional[ReplayOutcome]:
         """Attempt one specific operation, preserving its producer-owned key."""
         operation = self.get(operation_key)
@@ -436,13 +444,20 @@ class WriteSpool:
                 error_class=operation.last_error_class or "retry_not_due",
                 operation_id=operation.receipt_operation_id,
             )
-        return self._replay_operation(operation, post, get)
+        return self._replay_operation(
+            operation,
+            post,
+            get,
+            replay_allowed=replay_allowed,
+        )
 
     def _replay_operation(
         self,
         operation: SpoolOperation,
         post: Callable[[str, Dict[str, Any]], Any],
         get: Callable[[str], Any],
+        *,
+        replay_allowed: Optional[Callable[[], bool]] = None,
     ) -> ReplayOutcome:
         request = dict(operation.body)
         if operation.track_key and operation.action in {"replace", "delete"}:
@@ -463,6 +478,13 @@ class WriteSpool:
         operation_id = operation.receipt_operation_id
         route = "/api/ingest/durable"
         try:
+            if replay_allowed is not None and not replay_allowed():
+                return ReplayOutcome(
+                    operation,
+                    completed=False,
+                    error_class="breaker_open",
+                    operation_id=operation_id,
+                )
             if operation_id:
                 route = f"/api/operations/{operation_id}"
                 status = get(route)
