@@ -608,7 +608,6 @@ fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
         .collect::<Vec<_>>()
         .join("; ")
 }
-
 impl MempalMcpServer {
     pub fn new(db_path: PathBuf, config: crate::core::config::Config) -> anyhow::Result<Self> {
         Self::new_with_factory_and_config(
@@ -617,7 +616,6 @@ impl MempalMcpServer {
             Arc::new(crate::embed::ConfiguredEmbedderFactory::new(config)),
         )
     }
-
     pub fn new_with_factory(
         db_path: PathBuf,
         embedder_factory: Arc<dyn EmbedderFactory>,
@@ -628,7 +626,6 @@ impl MempalMcpServer {
             embedder_factory,
         )
     }
-
     pub fn new_with_factory_and_config(
         db_path: PathBuf,
         config: Config,
@@ -698,12 +695,19 @@ impl MempalMcpServer {
             operation_status_json_within_probe_attempts: Arc::new(AtomicUsize::new(0)),
         })
     }
-
+    #[doc(hidden)]
+    pub fn new_http_session(&self) -> Self {
+        let mut session = self.clone();
+        session.client_name = Arc::new(Mutex::new(None));
+        session.client_project_id = Arc::new(Mutex::new(None));
+        session.client_peer = Arc::new(Mutex::new(None));
+        session.session_hit_drawers = Arc::new(Mutex::new(HashSet::new()));
+        session
+    }
     pub fn with_external_ingest_writer_lease(mut self, lease: RuntimeWriterLease) -> Self {
         self.external_ingest_writer_lease = Some(lease);
         self
     }
-
     fn status_config_snapshot(&self) -> Arc<Config> {
         let current = ConfigHandle::current();
         if config_db_path_matches_server(current.as_ref(), &self.db_path) {

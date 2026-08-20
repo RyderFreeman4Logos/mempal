@@ -1,5 +1,5 @@
 use std::{
-    net::ToSocketAddrs,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -41,15 +41,8 @@ pub(super) async fn spawn_rest(
             config.clone(),
         )),
     );
-    let loopback = addr.to_socket_addrs().ok().is_some_and(|mut addresses| {
-        addresses
-            .next()
-            .is_some_and(|first| first.ip().is_loopback())
-            && addresses.all(|address| address.ip().is_loopback())
-    });
     let mcp_server = server_for_rest(
-        loopback,
-        &addr,
+        local_addr,
         db_path.to_path_buf(),
         config,
         context.async_db.clone(),
@@ -70,16 +63,17 @@ pub(super) async fn spawn_rest(
 }
 
 pub(super) fn server_for_rest(
-    loopback: bool,
-    addr: &str,
+    local_addr: SocketAddr,
     db_path: PathBuf,
     config: Config,
     async_db: AsyncDb,
     writer_lease: &RuntimeWriterLeaseHandle,
     write_observer: DaemonWriteObserver,
 ) -> Result<Option<MempalMcpServer>> {
-    if !loopback {
-        tracing::warn!("daemon MCP endpoint disabled because REST address is not loopback: {addr}");
+    if !local_addr.ip().is_loopback() {
+        tracing::warn!(
+            "daemon MCP endpoint disabled because REST listener is not loopback: {local_addr}"
+        );
         return Ok(None);
     }
     Ok(Some(

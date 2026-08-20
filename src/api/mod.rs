@@ -17,8 +17,8 @@ mod state;
 
 #[cfg(feature = "rest")]
 pub use handlers::{
-    DEFAULT_REST_ADDR, MAX_REST_INGEST_BODY_BYTES, router, router_with_mcp, serve, serve_with_mcp,
-    serve_with_optional_mcp, serve_with_shutdown,
+    DEFAULT_REST_ADDR, MAX_REST_INGEST_BODY_BYTES, router, router_with_mcp, router_with_mcp_at,
+    serve, serve_with_mcp, serve_with_optional_mcp, serve_with_shutdown,
 };
 #[cfg(feature = "rest")]
 pub use state::ApiState;
