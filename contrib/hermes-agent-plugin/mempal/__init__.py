@@ -323,7 +323,11 @@ class MempalMemoryProvider:
         if spool is None or self._is_breaker_open():
             return
         try:
-            outcome = spool.replay_one(self._post, self._get)
+            outcome = spool.replay_one(
+                self._post,
+                self._get,
+                replay_allowed=lambda: not self._is_breaker_open(),
+            )
         except Exception:
             logger.error("mempal durable spool metadata update failed")
             self._record_failure()
@@ -983,6 +987,7 @@ class MempalMemoryProvider:
                     operation_key=args.get("operation_key"),
                     wait_timeout=self._conclude_wait_timeout,
                     transport_allowed=not self._is_breaker_open(),
+                    replay_allowed=lambda: not self._is_breaker_open(),
                 )
                 if result.stored:
                     try:

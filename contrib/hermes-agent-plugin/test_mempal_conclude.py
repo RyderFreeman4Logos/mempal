@@ -6,7 +6,6 @@ import tempfile
 import time
 import unittest
 import urllib.error
-from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 
@@ -114,21 +113,14 @@ class BrokenSpool:
         raise OSError("SECRET_LOCAL_SPOOL_BODY")
 
 
-class BreakerDeferredSpool:
+class TransitioningBreakerProvider(RecordingProvider):
     def __init__(self) -> None:
-        self.admitted_keys = []
+        super().__init__()
+        self.breaker_checks = 0
 
-    def admit(self, *_args: Any, operation_key: str, **_kwargs: Any) -> None:
-        self.admitted_keys.append(operation_key)
-
-    def replay_operation_key(self, *_args: Any, **_kwargs: Any) -> Any:
-        return SimpleNamespace(
-            completed=False,
-            drawer_id=None,
-            operation_id=None,
-            error_class="breaker_open",
-            error_details=None,
-        )
+    def _is_breaker_open(self) -> bool:
+        self.breaker_checks += 1
+        return self.breaker_checks >= 3
 
 
 class DurableConcludeTests(unittest.TestCase):
@@ -353,10 +345,8 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertNotIn("SECRET_LOCAL_SPOOL_BODY", serialized)
 
     def test_replay_breaker_deferral_returns_pending_success(self) -> None:
-        provider = RecordingProvider()
+        provider = TransitioningBreakerProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
-        spool = BreakerDeferredSpool()
-        provider._write_spool = spool
         provider._start_write_worker = lambda: None
 
         first = self._conclude(provider, "SECRET_REPLAY_CONCLUSION")
@@ -382,7 +372,7 @@ class DurableConcludeTests(unittest.TestCase):
                 },
             )
             self.assertNotIn("error", result)
-        self.assertEqual(spool.admitted_keys, [retry_key, retry_key])
+        self.assertEqual(provider._write_spool.count(), 1)
         self.assertEqual(provider.posts, [])
         self.assertNotIn("SECRET_REPLAY_CONCLUSION", json.dumps(second))
 

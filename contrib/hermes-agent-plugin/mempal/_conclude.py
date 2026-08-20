@@ -47,6 +47,7 @@ def submit_conclusion(
     operation_key: Optional[str],
     wait_timeout: float,
     transport_allowed: bool = True,
+    replay_allowed: Optional[Callable[[], bool]] = None,
 ) -> ConcludeResult:
     """Admit once and report success only after authoritative completion."""
     key = operation_key or secrets.token_urlsafe(32)
@@ -81,6 +82,7 @@ def submit_conclusion(
             post,
             get,
             ignore_retry_delay=True,
+            replay_allowed=replay_allowed,
         )
         if outcome is None:
             return ConcludeResult(False, _retry_payload(
