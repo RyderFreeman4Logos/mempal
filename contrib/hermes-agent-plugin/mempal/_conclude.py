@@ -70,18 +70,7 @@ def submit_conclusion(
         ))
 
     if not transport_allowed:
-        return ConcludeResult(False, {
-            "result": "Fact admitted locally; durable storage pending.",
-            "operation_key": key,
-            "retry_operation_id": key,
-            "state": "local_admitted",
-            "retry_safe": True,
-            "durability": {
-                "state": "pending",
-                "kind": "durable_replay_deferred",
-                "deferred_reason": "breaker_open",
-            },
-        })
+        return ConcludeResult(False, _local_admission_pending_payload(key))
 
     deadline = time.monotonic() + max(0.0, wait_timeout)
     operation_id: Optional[str] = None
@@ -101,6 +90,14 @@ def submit_conclusion(
                 state,
             ))
         operation_id = outcome.operation_id or operation_id
+        if outcome.error_class == "breaker_open":
+            return ConcludeResult(
+                False,
+                _local_admission_pending_payload(
+                    key,
+                    operation_id=operation_id,
+                ),
+            )
         if outcome.completed and outcome.drawer_id:
             return ConcludeResult(True, {
                 "result": "Fact stored.",
@@ -131,6 +128,28 @@ def submit_conclusion(
                 outcome.error_details,
             ))
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def _local_admission_pending_payload(
+    operation_key: str,
+    *,
+    operation_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload = {
+        "result": "Fact admitted locally; durable storage pending.",
+        "operation_key": operation_key,
+        "retry_operation_id": operation_key,
+        "state": "local_admitted",
+        "retry_safe": True,
+        "durability": {
+            "state": "pending",
+            "kind": "durable_replay_deferred",
+            "deferred_reason": "breaker_open",
+        },
+    }
+    if operation_id:
+        payload["operation_id"] = operation_id
+    return payload
 
 
 def _retry_payload(

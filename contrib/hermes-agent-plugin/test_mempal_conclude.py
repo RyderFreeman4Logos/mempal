@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 import urllib.error
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 
@@ -111,6 +112,23 @@ class SharedConcludeProvider(RecordingProvider):
 class BrokenSpool:
     def admit(self, *_args: Any, **_kwargs: Any) -> None:
         raise OSError("SECRET_LOCAL_SPOOL_BODY")
+
+
+class BreakerDeferredSpool:
+    def __init__(self) -> None:
+        self.admitted_keys = []
+
+    def admit(self, *_args: Any, operation_key: str, **_kwargs: Any) -> None:
+        self.admitted_keys.append(operation_key)
+
+    def replay_operation_key(self, *_args: Any, **_kwargs: Any) -> Any:
+        return SimpleNamespace(
+            completed=False,
+            drawer_id=None,
+            operation_id=None,
+            error_class="breaker_open",
+            error_details=None,
+        )
 
 
 class DurableConcludeTests(unittest.TestCase):
@@ -333,6 +351,40 @@ class DurableConcludeTests(unittest.TestCase):
         serialized = json.dumps(result)
         self.assertNotIn("SECRET_LOCAL_CONCLUSION", serialized)
         self.assertNotIn("SECRET_LOCAL_SPOOL_BODY", serialized)
+
+    def test_replay_breaker_deferral_returns_pending_success(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        spool = BreakerDeferredSpool()
+        provider._write_spool = spool
+        provider._start_write_worker = lambda: None
+
+        first = self._conclude(provider, "SECRET_REPLAY_CONCLUSION")
+        retry_key = first["operation_key"]
+        second = self._conclude(
+            provider,
+            "SECRET_REPLAY_CONCLUSION",
+            operation_key=retry_key,
+        )
+
+        for result in (first, second):
+            self.assertEqual(result["result"], "Fact admitted locally; durable storage pending.")
+            self.assertEqual(result["state"], "local_admitted")
+            self.assertEqual(result["operation_key"], retry_key)
+            self.assertEqual(result["retry_operation_id"], retry_key)
+            self.assertTrue(result["retry_safe"])
+            self.assertEqual(
+                result["durability"],
+                {
+                    "state": "pending",
+                    "kind": "durable_replay_deferred",
+                    "deferred_reason": "breaker_open",
+                },
+            )
+            self.assertNotIn("error", result)
+        self.assertEqual(spool.admitted_keys, [retry_key, retry_key])
+        self.assertEqual(provider.posts, [])
+        self.assertNotIn("SECRET_REPLAY_CONCLUSION", json.dumps(second))
 
     def test_open_breaker_returns_local_admission_success_without_transport(self) -> None:
         provider = RecordingProvider()

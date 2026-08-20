@@ -38,6 +38,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - **MCP waits**: scoped smoke ingest is inline; live-daemon waits poll until `created_drawer_ids` (#888, #918).
 - **MCP delete receipts**: `mempal_delete` succeeds when already soft-deleted (#921).
 - **Create receipts**: cleanup IDs survive CLI/MCP/REST decoding (#923).
+- **Hermes conclude receipts**: local admission with breaker-open replay returns structured pending success, not a tool error (#924).
 
 - **Daemon outage visibility**: `doctor`, `status`, and MCP doctor expose a high-severity typed availability signal when the daemon is down with ≥100 pending items; unreadable config/queue stats and unverified PID identities report privacy-safe `unavailable`, never synthetic normal; recovery: restart, drain, terminal failures, no DB edits (#871).
 
