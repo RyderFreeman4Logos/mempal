@@ -5492,7 +5492,7 @@ impl MempalMcpServer {
             Ok(stats) => stats,
             Err(error) => {
                 let diagnostic =
-                    status_database_diagnostic(&self.db_path, "queue_stats", error.root_cause());
+                    status_database_diagnostic(&self.db_path, "queue_stats", error.as_ref());
                 record_status_database_diagnostic(
                     &mut system_warnings,
                     &mut database_diagnostic,
