@@ -104,7 +104,7 @@ use anyhow::Context;
 use rmcp::{
     ErrorData, Json, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{ClientResult, ServerCapabilities, ServerInfo, ServerRequest},
     service::Peer,
     tool, tool_router,
 };
@@ -2733,39 +2733,37 @@ impl MempalMcpServer {
                 ErrorData::invalid_params(format!("invalid project scope: {error}"), None)
             });
         }
-
         if let Some(configured) = config.project.id.as_deref() {
             return validate_project_id(configured).map(Some).map_err(|error| {
                 ErrorData::invalid_params(format!("invalid project scope: {error}"), None)
             });
         }
-
         if let Ok(guard) = self.client_project_id.lock()
             && let Some(project_id) = guard.clone()
         {
             return Ok(Some(project_id));
         }
-
         let peer = self.client_peer.lock().ok().and_then(|guard| guard.clone());
         let client_supports_roots = peer
             .as_ref()
             .and_then(|p| p.peer_info())
             .and_then(|info| info.capabilities.roots.clone())
             .is_some();
-        if let Some(peer) = peer
-            && client_supports_roots
-            // Roots is deprecated by SEP-2577; retain until rmcp ships a replacement.
-            && let Ok(result) = {
-                #[allow(deprecated)]
-                {
-                    peer.list_roots().await
-                }
-            }
-            && let Some(project_id) = result
+        if client_supports_roots && let Some(peer) = peer {
+            let result = peer
+                .send_request(ServerRequest::ListRootsRequest(Default::default()))
+                .await
+                .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+            let ClientResult::ListRootsResult(result) = result else {
+                return Err(ErrorData::internal_error("invalid roots response", None));
+            };
+            let project_id = result
                 .roots
                 .into_iter()
                 .find_map(|root| infer_project_id_from_root_uri(&root.uri).ok().flatten())
-        {
+                .ok_or_else(|| {
+                    ErrorData::internal_error("MCP roots did not contain a valid project", None)
+                })?;
             if let Ok(mut guard) = self.client_project_id.lock() {
                 *guard = Some(project_id.clone());
             }
