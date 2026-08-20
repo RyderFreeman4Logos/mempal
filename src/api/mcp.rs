@@ -51,28 +51,30 @@ fn bad_request(message: &'static str) -> Response {
 fn validate_host(
     headers: &axum::http::HeaderMap,
     bound_addr: Option<SocketAddr>,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     let Some(value) = headers.get(header::HOST) else {
-        return Err(bad_request("MCP request requires a Host header"));
+        return Err(Box::new(bad_request("MCP request requires a Host header")));
     };
     let value = value
         .to_str()
-        .map_err(|_| bad_request("MCP Host header is not valid UTF-8"))?;
+        .map_err(|_| Box::new(bad_request("MCP Host header is not valid UTF-8")))?;
     let authority = value
         .parse::<axum::http::uri::Authority>()
-        .map_err(|_| bad_request("MCP Host header is malformed"))?;
+        .map_err(|_| Box::new(bad_request("MCP Host header is malformed")))?;
     let host = authority.host();
     let local_host = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1";
     if !local_host {
-        return Err(bad_request("MCP Host header is not loopback"));
+        return Err(Box::new(bad_request("MCP Host header is not loopback")));
     }
     if let Some(port) = authority.port_u16() {
         if bound_addr.is_none_or(|addr| addr.port() != port || !addr.ip().is_loopback()) {
-            return Err(bad_request("MCP Host port is not the bound loopback port"));
+            return Err(Box::new(bad_request(
+                "MCP Host port is not the bound loopback port",
+            )));
         }
     }
     if bound_addr.is_some_and(|addr| !addr.ip().is_loopback()) {
-        return Err(bad_request("MCP listener is not loopback"));
+        return Err(Box::new(bad_request("MCP listener is not loopback")));
     }
     Ok(())
 }
@@ -94,19 +96,21 @@ fn new_session_id(state: &HttpState) -> String {
 fn session_server(
     state: &HttpState,
     requested_id: Option<&str>,
-) -> Result<(String, MempalMcpServer), Response> {
+) -> Result<(String, MempalMcpServer), Box<Response>> {
     let session_id = requested_id
         .map(str::to_string)
         .unwrap_or_else(|| new_session_id(state));
     if session_id.is_empty() {
-        return Err(bad_request("MCP session id must not be empty"));
+        return Err(Box::new(bad_request("MCP session id must not be empty")));
     }
     let mut sessions = state.sessions.lock().map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MCP session state unavailable",
+        Box::new(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "MCP session state unavailable",
+            )
+                .into_response(),
         )
-            .into_response()
     })?;
     let server = sessions
         .entry(session_id.clone())
@@ -124,7 +128,7 @@ fn with_session_header(mut response: Response, session_id: &str) -> Response {
 
 async fn handle(State(state): State<HttpState>, request: Request<Body>) -> Response {
     if let Err(response) = validate_host(request.headers(), state.bound_addr) {
-        return response;
+        return *response;
     }
     let requested_session_id = match request.headers().get(MCP_SESSION_ID_HEADER) {
         None => None,
@@ -135,7 +139,7 @@ async fn handle(State(state): State<HttpState>, request: Request<Body>) -> Respo
     };
     let (session_id, server) = match session_server(&state, requested_session_id) {
         Ok(session) => session,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let accepts = request
         .headers()
