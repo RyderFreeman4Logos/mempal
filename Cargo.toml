@@ -63,7 +63,7 @@ percent-encoding = "2"
 quick-xml = "0.41"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rmcp = { version = "1.4.0", features = ["client", "server", "macros", "schemars", "transport-async-rw", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "1.4.0", features = ["client", "server", "macros", "schemars", "transport-async-rw", "transport-io"] }
 rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
@@ -92,7 +92,6 @@ panic = "abort"        # no unwinding — smaller binary, faster panic
 dotenvy = "0.15"
 filetime = "0.2"
 axum = "0.8"
-http-body-util = "0.1"
 hyper = { version = "0.14", features = ["http1", "server", "tcp"] }
 mockito = "1"
 safetensors = "0.5"

@@ -1,8 +1,14 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
-use axum::{body::Body, http::Request};
-use http_body_util::BodyExt;
+use axum::{
+    Router,
+    body::{Body, to_bytes},
+    extract::State,
+    http::{Request, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::post as post_route,
+};
 use mempal::{
     core::{
         AsyncDb,
@@ -13,9 +19,8 @@ use mempal::{
     embed::ConfiguredEmbedderFactory,
     mcp::MempalMcpServer,
 };
-use rmcp::transport::{
-    StreamableHttpServerConfig, StreamableHttpService,
-    streamable_http_server::session::never::NeverSessionManager,
+use rmcp::{
+    RoleServer, model::ClientJsonRpcMessage, service::serve_directly, transport::OneshotTransport,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -35,21 +40,75 @@ fn fixture() -> Result<(TempDir, PathBuf, MempalMcpServer)> {
         ..Config::default()
     };
     let factory = Arc::new(ConfiguredEmbedderFactory::new(config.clone()));
-    let server = MempalMcpServer::new_with_factory_and_config(db_path.clone(), config, factory)
-        .context("create MCP HTTP server")?;
+    let server =
+        MempalMcpServer::new_with_factory_and_config(db_path.clone(), config, factory.clone())
+            .context("create MCP HTTP server")?;
     Ok((tempdir, db_path, server))
 }
 
-type HttpMcp = StreamableHttpService<MempalMcpServer, NeverSessionManager>;
+type HttpMcp = Router;
 
 fn service(server: MempalMcpServer) -> HttpMcp {
-    StreamableHttpService::new(
-        move || Ok(server.clone()),
-        Arc::new(NeverSessionManager::default()),
-        StreamableHttpServerConfig::default()
-            .with_stateful_mode(false)
-            .with_json_response(true),
-    )
+    Router::new()
+        .route("/mcp", post_route(handle))
+        .with_state(server)
+}
+
+async fn handle(State(server): State<MempalMcpServer>, request: Request<Body>) -> Response {
+    let accepts = request
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.contains("application/json") && value.contains("text/event-stream")
+        });
+    if !accepts {
+        return (
+            StatusCode::NOT_ACCEPTABLE,
+            "MCP client must accept JSON and SSE",
+        )
+            .into_response();
+    }
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if !content_type {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "MCP content type must be application/json",
+        )
+            .into_response();
+    }
+    let (_, body) = request.into_parts();
+    let body = match to_bytes(body, 4 * 1024 * 1024).await {
+        Ok(body) => body,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let message = match serde_json::from_slice::<ClientJsonRpcMessage>(&body) {
+        Ok(message) => message,
+        Err(error) => {
+            return (StatusCode::UNSUPPORTED_MEDIA_TYPE, error.to_string()).into_response();
+        }
+    };
+    let ClientJsonRpcMessage::Request(request) = message else {
+        return StatusCode::ACCEPTED.into_response();
+    };
+    let (transport, mut receiver) =
+        OneshotTransport::<RoleServer>::new(ClientJsonRpcMessage::Request(request));
+    let running = serve_directly(server, transport, None);
+    tokio::spawn(async move {
+        let _ = running.waiting().await;
+    });
+    match receiver.recv().await {
+        Some(message) => axum::Json(message).into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MCP handler returned no response",
+        )
+            .into_response(),
+    }
 }
 
 async fn post(app: &HttpMcp, id: u64, method: &str, params: Value) -> Result<Value> {
@@ -69,12 +128,9 @@ async fn post(app: &HttpMcp, id: u64, method: &str, params: Value) -> Result<Val
         .await
         .map_err(|error| anyhow!("MCP HTTP request failed: {error}"))?;
     let status = response.status();
-    let body = response
-        .into_body()
-        .collect()
+    let body = to_bytes(response.into_body(), usize::MAX)
         .await
-        .context("read MCP HTTP response")?
-        .to_bytes();
+        .context("read MCP HTTP response")?;
     if !status.is_success() {
         return Err(anyhow!(
             "MCP HTTP status {status}: {}",
@@ -105,10 +161,10 @@ async fn initialize(app: &HttpMcp) -> Result<()> {
 
 #[tokio::test]
 async fn daemon_mcp_listen_port_serves_status_and_search() -> Result<()> {
-    let (_tempdir, db_path, state) = fixture()?;
+    let (_tempdir, db_path, server) = fixture()?;
     let daemon_db =
         AsyncDb::open_for(&db_path, 4, DbHolderClass::Daemon).context("open daemon-owned pool")?;
-    let app = service(state.with_daemon_owned_async_db(daemon_db));
+    let app = service(server.with_daemon_owned_async_db(daemon_db));
     initialize(&app).await?;
 
     let tools = post(&app, 2, "tools/list", json!({})).await?;
