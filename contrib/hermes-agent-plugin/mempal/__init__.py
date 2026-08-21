@@ -874,7 +874,10 @@ class MempalMemoryProvider:
                 except (ValueError, TypeError):
                     limit = 20
                 entries = self._get("/api/timeline", self._retrieval_params({"wing": self._wing, "limit": limit}))
-                self._record_success()
+                try:
+                    self._record_success()
+                except Exception:
+                    logger.warning("mempal profile success bookkeeping failed")
                 if not entries:
                     return json.dumps({"result": "No memories stored yet."})
                 items = [
@@ -891,7 +894,10 @@ class MempalMemoryProvider:
                 ]
                 return json.dumps({"results": items, "count": len(items)})
             except Exception as exc:
-                self._record_failure()
+                try:
+                    self._record_failure()
+                except Exception:
+                    logger.warning("mempal profile failure bookkeeping failed")
                 return json.dumps(_rest_error_payload(
                     "Mempal profile lookup failed.",
                     "/api/timeline",
@@ -913,10 +919,16 @@ class MempalMemoryProvider:
                     correlation_id,
                 )
                 if degraded_reason:
-                    self._record_failure()
+                    try:
+                        self._record_failure()
+                    except Exception:
+                        logger.warning("mempal search failure bookkeeping failed")
                     logger.debug("mempal search degraded: %s", degraded_reason)
                 else:
-                    self._record_success()
+                    try:
+                        self._record_success()
+                    except Exception:
+                        logger.warning("mempal search success bookkeeping failed")
                 if not results:
                     payload = {"result": "No relevant memories found."}
                     if metadata and (metadata["partial"] or metadata["fallback_used"]):
@@ -928,7 +940,10 @@ class MempalMemoryProvider:
                     payload["search_metadata"] = metadata
                 return json.dumps(payload)
             except Exception as exc:
-                self._record_failure()
+                try:
+                    self._record_failure()
+                except Exception:
+                    logger.warning("mempal search failure bookkeeping failed")
                 daemon_timeout = search_timeout_metadata_from_http_error(
                     exc,
                     correlation_id,
