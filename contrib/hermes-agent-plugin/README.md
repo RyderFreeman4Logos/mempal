@@ -203,17 +203,17 @@ After allowlisted tool calls (bash, web_search, python, etc.), the `post_tool_ca
 
 These low-importance observations enrich future searches without cluttering high-priority memory.
 
-## Path 3: MCP server (debug-only full tool access)
+## Path 3: MCP server (full tool access)
 
 For routine Hermes use, prefer Path 1 (MemoryProvider) and Path 2 (hooks) against
 the daemon REST API. That path is daemon-owned, keeps automatic searches scoped,
 and does not create extra SQLite holders.
 
 Direct MCP registration gives the LLM access to **all** mempal tools (context,
-knowledge cards, timeline, kg, etc.), but it is currently a debug/admin path:
-long-lived stdio MCP servers can hold `palace.db` open, and Hermes HTTP MCP
-against the daemon `/mcp` endpoint is not treated as production-supported until
-that transport has dedicated coverage.
+knowledge cards, timeline, kg, etc.). The supported agent path is daemon-owned
+loopback HTTP MCP at `/mcp` (build with `rest`, then run the daemon). Long-lived
+stdio MCP is an extra holder/debug path: use it only for short debugging sessions
+because it can hold `palace.db` open in a second mempal process.
 
 ### Temporary stdio setup
 

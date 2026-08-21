@@ -86,7 +86,7 @@ struct SessionActivity {
 }
 
 impl SessionActivity {
-    fn start(
+    fn reserve(
         session: &HttpSession,
         sessions: Arc<Mutex<HashMap<String, HttpSession>>>,
         session_id: &str,
@@ -107,9 +107,11 @@ impl SessionActivity {
 
 impl Drop for SessionActivity {
     fn drop(&mut self) {
-        self.active_requests.fetch_sub(1, Ordering::AcqRel);
-        if !self.completed.load(Ordering::Acquire) {
-            remove_session(&self.sessions, &self.session_id);
+        if let Ok(mut sessions) = self.sessions.lock() {
+            let remaining = self.active_requests.fetch_sub(1, Ordering::AcqRel) - 1;
+            if remaining == 0 && !self.completed.load(Ordering::Acquire) {
+                sessions.remove(&self.session_id);
+            }
         }
     }
 }
@@ -221,6 +223,16 @@ fn remove_session(sessions: &Arc<Mutex<HashMap<String, HttpSession>>>, session_i
     }
 }
 
+fn reserve_http_session(
+    sessions: &Arc<Mutex<HashMap<String, HttpSession>>>,
+    session_id: &str,
+) -> Option<(HttpSession, SessionActivity)> {
+    let sessions_guard = sessions.lock().ok()?;
+    let session = sessions_guard.get(session_id)?;
+    let activity = SessionActivity::reserve(session, Arc::clone(sessions), session_id);
+    Some((session.clone(), activity))
+}
+
 fn touch_session(session: &HttpSession) {
     if let Ok(mut last_used) = session.last_used.lock() {
         *last_used = Instant::now();
@@ -330,6 +342,7 @@ async fn dispatch_http_session(
     session: HttpSession,
     message: ClientJsonRpcMessage,
     session_id: &str,
+    activity: SessionActivity,
 ) -> Response {
     let request_id = match &message {
         ClientJsonRpcMessage::Request(request) => request.id.clone(),
@@ -341,11 +354,13 @@ async fn dispatch_http_session(
                     .await
                     .is_ok_and(|result| result.is_ok());
             if !delivered {
+                drop(activity);
                 remove_session(&sessions, session_id);
                 return (StatusCode::NOT_FOUND, "MCP session is no longer available")
                     .into_response();
             }
             touch_session(&session);
+            activity.complete();
             return with_session_header(StatusCode::ACCEPTED.into_response(), session_id);
         }
     };
@@ -358,6 +373,7 @@ async fn dispatch_http_session(
     {
         Ok(guard) => guard,
         Err(_) => {
+            drop(activity);
             remove_session(&sessions, session_id);
             return with_session_header(
                 (StatusCode::GATEWAY_TIMEOUT, "MCP request timed out").into_response(),
@@ -365,7 +381,6 @@ async fn dispatch_http_session(
             );
         }
     };
-    let activity = SessionActivity::start(&session, Arc::clone(&sessions), session_id);
     let delivered = tokio::time::timeout(HTTP_MESSAGE_SEND_TIMEOUT, session.incoming.send(message))
         .await
         .is_ok_and(|result| result.is_ok());
@@ -475,14 +490,16 @@ async fn handle(State(state): State<HttpState>, request: Request<Body>) -> Respo
     };
 
     if let Some(session_id) = requested_session_id {
-        let session = state
-            .sessions
-            .lock()
-            .ok()
-            .and_then(|sessions| sessions.get(&session_id).cloned());
-        return match session {
-            Some(session) => {
-                dispatch_http_session(state.sessions.clone(), session, message, &session_id).await
+        return match reserve_http_session(&state.sessions, &session_id) {
+            Some((session, activity)) => {
+                dispatch_http_session(
+                    state.sessions.clone(),
+                    session,
+                    message,
+                    &session_id,
+                    activity,
+                )
+                .await
             }
             None => StatusCode::NOT_FOUND.into_response(),
         };
