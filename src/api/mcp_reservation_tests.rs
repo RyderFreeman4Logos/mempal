@@ -46,6 +46,7 @@ async fn daemon_mcp_listen_port_reserves_session_activity_before_eviction() -> R
         next_session_id: Arc::new(AtomicU64::new(0)),
         pending_sessions: Arc::new(AtomicUsize::new(0)),
         bound_addr: Some(address),
+        initialize_gate: None,
     };
     let _request_lock_guard = request_lock.lock_owned().await;
     let request = Request::builder()
@@ -93,5 +94,70 @@ async fn daemon_mcp_listen_port_reserves_session_activity_before_eviction() -> R
     drop(incoming_rx);
     dispatch.abort();
     let _ = dispatch.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_mcp_listen_port_releases_pending_session_on_initialize_cancel() -> Result<()> {
+    let (_tempdir, db_path, _config, server) = fixture()?;
+    let daemon_db =
+        AsyncDb::open_for(&db_path, 4, DbHolderClass::Daemon).context("open daemon-owned pool")?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    drop(listener);
+    let initialize_gate = Arc::new(Notify::new());
+    let mut state = HttpState {
+        base_server: server.with_daemon_owned_async_db(daemon_db),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        next_session_id: Arc::new(AtomicU64::new(0)),
+        pending_sessions: Arc::new(AtomicUsize::new(0)),
+        bound_addr: Some(address),
+        initialize_gate: Some(Arc::clone(&initialize_gate)),
+    };
+
+    let initialize = || {
+        Request::builder()
+            .uri("/")
+            .header(header::HOST, address.to_string())
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"cancel","version":"0.1"}}}"#,
+            ))
+            .expect("build initialize request")
+    };
+
+    for _ in 0..MAX_PENDING_HTTP_SESSIONS {
+        let pending_sessions = Arc::clone(&state.pending_sessions);
+        let task = tokio::spawn(handle(State(state.clone()), initialize()));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if pending_sessions.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("initialize did not reach its cancellable session start")?;
+        task.abort();
+        let _ = task.await;
+        anyhow::ensure!(
+            pending_sessions.load(Ordering::Acquire) == 0,
+            "cancelled initialize leaked pending admission"
+        );
+    }
+
+    state.initialize_gate = None;
+    let response = handle(State(state.clone()), initialize()).await;
+    anyhow::ensure!(
+        response.status() == StatusCode::OK,
+        "valid initialize was rejected after cancelled requests: {}",
+        response.status()
+    );
+    anyhow::ensure!(
+        state.pending_sessions.load(Ordering::Acquire) == 0,
+        "valid initialize left pending admission occupied"
+    );
     Ok(())
 }

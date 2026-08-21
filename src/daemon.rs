@@ -181,6 +181,8 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     .context("invalid daemon embedded sleep scheduler configuration")?;
 
     let sleep_scheduler_enabled = sleep_scheduler_handle.is_some();
+    let ingest_drain_worker = spawn_daemon_ingest_drain_worker(context, &db_path, &writer_lease)
+        .context("failed to start daemon async ingest worker")?;
 
     if !context.config.hooks.enabled {
         recovery
@@ -199,7 +201,19 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                 #[cfg(unix)]
                 request_shutdown_and_notify();
             }
+            // In a no-rest build, an enabled API still exercises the daemon-owned
+            // MCP queue in production-path tests; keep the daemon lifecycle alive
+            // until shutdown so its single drain worker can claim queued writes.
+            #[cfg(not(feature = "rest"))]
+            if context.config.api.enabled {
+                while !shutdown_requested() {
+                    wait_for_shutdown_or_sleep(Duration::from_secs(3600)).await;
+                }
+            }
         }
+        ingest_drain_worker
+            .shutdown_and_drain_with_budget(Some(DAEMON_DRAIN_BUDGET))
+            .await;
         sleep_scheduler::drain(sleep_scheduler_handle).await;
         return Ok(());
     }
@@ -248,8 +262,6 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     let worker_id = writer_lease.lease().owner.clone();
     let claim_ttl_secs = context.config.hooks.daemon_claim_ttl_secs as i64;
     let poll_interval = Duration::from_millis(context.config.hooks.daemon_poll_interval_ms);
-    let ingest_drain_worker = spawn_daemon_ingest_drain_worker(context, &db_path, &writer_lease)
-        .context("failed to start daemon async ingest worker")?;
     let stall_watchdog_handle = spawn_stall_watchdog(
         context.write_observer.clone(),
         context.store.clone(),
@@ -463,6 +475,7 @@ fn spawn_daemon_ingest_drain_worker(
             config,
         )),
     )?
+    .with_daemon_owned_async_db(context.async_db.clone())
     .with_external_ingest_writer_lease(writer_lease.lease().clone())
     .with_daemon_write_observer(context.write_observer.clone());
     let handle = server.spawn_scoped_ingest_drain_worker();
@@ -3697,6 +3710,9 @@ fn write_daemon_embedder_status_path(
     };
     write_daemon_embedder_status(mempal_home, status);
 }
+
+#[cfg(test)]
+mod mcp_ingest_tests;
 
 #[cfg(test)]
 mod tests {

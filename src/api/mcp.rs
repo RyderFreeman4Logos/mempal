@@ -116,6 +116,29 @@ impl Drop for SessionActivity {
     }
 }
 
+struct PendingHttpSessionAdmission {
+    pending_sessions: Arc<AtomicUsize>,
+}
+
+impl PendingHttpSessionAdmission {
+    fn try_acquire(pending_sessions: &Arc<AtomicUsize>) -> Option<Self> {
+        let pending = pending_sessions.fetch_add(1, Ordering::Relaxed);
+        if pending >= MAX_PENDING_HTTP_SESSIONS {
+            pending_sessions.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(Self {
+            pending_sessions: Arc::clone(pending_sessions),
+        })
+    }
+}
+
+impl Drop for PendingHttpSessionAdmission {
+    fn drop(&mut self) {
+        self.pending_sessions.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 struct HttpState {
     base_server: MempalMcpServer,
@@ -123,6 +146,8 @@ struct HttpState {
     next_session_id: Arc<AtomicU64>,
     pending_sessions: Arc<AtomicUsize>,
     bound_addr: Option<SocketAddr>,
+    #[cfg(test)]
+    initialize_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 pub(super) fn service(server: MempalMcpServer, bound_addr: Option<SocketAddr>) -> Router {
@@ -134,6 +159,8 @@ pub(super) fn service(server: MempalMcpServer, bound_addr: Option<SocketAddr>) -
             next_session_id: Arc::new(AtomicU64::new(0)),
             pending_sessions: Arc::new(AtomicUsize::new(0)),
             bound_addr,
+            #[cfg(test)]
+            initialize_gate: None,
         })
 }
 
@@ -516,17 +543,20 @@ async fn handle(State(state): State<HttpState>, request: Request<Body>) -> Respo
     if !is_initialize {
         return bad_request("MCP session requires initialize request");
     }
-    let pending = state.pending_sessions.fetch_add(1, Ordering::Relaxed);
-    if pending >= MAX_PENDING_HTTP_SESSIONS {
-        state.pending_sessions.fetch_sub(1, Ordering::Relaxed);
+    let Some(_pending_admission) =
+        PendingHttpSessionAdmission::try_acquire(&state.pending_sessions)
+    else {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             "MCP session admission limit reached",
         )
             .into_response();
+    };
+    #[cfg(test)]
+    if let Some(gate) = state.initialize_gate.as_ref() {
+        gate.notified().await;
     }
     let started = start_http_session(state.base_server.new_http_session(), message).await;
-    state.pending_sessions.fetch_sub(1, Ordering::Relaxed);
     let Some((session, response)) = started else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
