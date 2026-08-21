@@ -262,10 +262,11 @@ failures, the plugin pauses for 120 seconds to avoid hammering a down server.
 
 ## Readiness suite
 
-Run the provider test suite to verify MemoryProvider features:
+Run the Hermes plugin test suite, including the provider and split breaker
+read-probe tests:
 
 ```bash
-python3 contrib/hermes-agent-plugin/test_mempal_provider.py -v
+python3 -m unittest discover -s contrib/hermes-agent-plugin -p 'test_mempal_*.py' -v
 ```
 
 ## Future: authoritative mode

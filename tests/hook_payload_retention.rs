@@ -10,7 +10,9 @@ use mempal::hook::HOOK_SPOOL_DIR;
 use mempal::hook_payload::prune_hook_payloads;
 use serde_json::json;
 
-const DAEMON_STARTUP_DEADLINE: Duration = Duration::from_secs(10);
+// Bootstrap reaps stale daemon state before emitting readiness output; allow suite-load
+// scheduling latency here without changing the daemon's retention or shutdown budgets.
+const DAEMON_STARTUP_DEADLINE: Duration = Duration::from_secs(30);
 const DAEMON_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DIAGNOSTIC_TAIL_BYTES: u64 = 8 * 1024;

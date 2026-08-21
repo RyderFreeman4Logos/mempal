@@ -943,16 +943,6 @@ class ReadinessActivationTests(unittest.TestCase):
         names = {s["name"] for s in schemas}
         self.assertEqual(names, {"mempal_profile", "mempal_search", "mempal_conclude"})
 
-    def test_breaker_open_blocks_tool_calls(self) -> None:
-        provider = RecordingProvider()
-        provider.initialize("session-a", user_id="alice", profile="work")
-        provider._consecutive_failures = 10
-        provider._breaker_open_until = time.monotonic() + 999
-
-        result = json.loads(provider.handle_tool_call("mempal_search", {"query": "test"}))
-        self.assertIn("error", result)
-        self.assertIn("unavailable", result["error"])
-
     def test_breaker_resets_after_cooldown(self) -> None:
         provider = RecordingProvider()
         provider.initialize("session-a", user_id="alice", profile="work")

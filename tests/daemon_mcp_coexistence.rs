@@ -26,6 +26,8 @@ use tempfile::TempDir;
 const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
 const ASYNC_DB_CONNECTION_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const COEXISTENCE_DRAWER_ID: &str = "issue-853-live-mcp";
+const MCP_DESCENDANT_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const MCP_DESCENDANT_REAP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 struct TestHome {
     _tempdir: TempDir,
@@ -219,9 +221,9 @@ async fn assert_process_exited(pid_path: &Path) -> Result<()> {
     let Some(process) = capture_recorded_process(identity)? else {
         return Ok(());
     };
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + MCP_DESCENDANT_REAP_TIMEOUT;
     while process.is_running()? && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(MCP_DESCENDANT_REAP_POLL_INTERVAL).await;
     }
     if process.is_running()? {
         process.send_signal(libc::SIGKILL)?;

@@ -36,13 +36,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - **Daemon readiness CLI tests**: shared Linux supervisor for bounded redacted lifecycle handling (#892).
 
-- **MCP waits**: scoped smoke ingest is inline; live-daemon waits poll until `created_drawer_ids` (#888, #918).
-- **MCP delete receipts**: `mempal_delete` succeeds when already soft-deleted (#921).
-- **Create receipts**: cleanup IDs survive CLI/MCP/REST decoding; Hermes conclude receipts admit local breaker-open replay as structured pending success, not a tool error (#923, #924).
-
-- **Daemon outage visibility**: `doctor`, `status`, and MCP doctor expose a high-severity typed availability signal when the daemon is down with ≥100 pending items; unreadable config/queue stats and unverified PID identities report privacy-safe `unavailable`, never synthetic normal; recovery: restart, drain, terminal failures, no DB edits (#871).
-
-- **Admission receipt ownership**: bind MCP holder-budget no-write receipts and smoke cleanup authority to the owning operation so saturated admission cannot emit false receipts or cross-operation cleanup IDs (#876).
+- **Hermes receipts**: scoped smoke ingest inline; live-daemon polls `created_drawer_ids`; already-soft-deleted `mempal_delete` succeeds; cleanup IDs survive CLI/MCP/REST decode; breaker-open conclude replay is structured pending success, not tool error; open REST/Hermes breakers admit `mempal_search`/`mempal_profile` probes with typed/redacted payloads despite expired persisted-breaker reset failures, not temporary-unavailable; daemon down with ≥100 pending → `doctor`/`status`/MCP doctor emit high-severity typed availability signal; unreadable config/queue stats/unverified PIDs → privacy-safe `unavailable`, never synthetic normal; recovery: restart, drain, terminal failures, no DB edits; saturated MCP holder-budget no-write receipts and owner-bound smoke cleanup prevent false receipts/cross-operation cleanup IDs (#871, #876, #888, #918, #921, #923, #924, #927).
 
 - **Daemon writer-lease renew**: treat profile admission lock `Busy` as the same
   retryable contention class as SQLite busy/locked so lease heartbeat recovery
