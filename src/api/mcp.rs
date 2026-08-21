@@ -254,8 +254,20 @@ fn reserve_http_session(
     sessions: &Arc<Mutex<HashMap<String, HttpSession>>>,
     session_id: &str,
 ) -> Option<(HttpSession, SessionActivity)> {
-    let sessions_guard = sessions.lock().ok()?;
+    let mut sessions_guard = sessions.lock().ok()?;
+    let now = Instant::now();
     let session = sessions_guard.get(session_id)?;
+    if session.active_requests.load(Ordering::Acquire) == 0 {
+        let expired = session
+            .last_used
+            .lock()
+            .map(|last_used| now.duration_since(*last_used) >= HTTP_SESSION_TTL)
+            .unwrap_or(true);
+        if expired {
+            sessions_guard.remove(session_id);
+            return None;
+        }
+    }
     let activity = SessionActivity::reserve(session, Arc::clone(sessions), session_id);
     Some((session.clone(), activity))
 }
