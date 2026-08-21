@@ -22357,14 +22357,14 @@ prototypes = ["keep"]
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("palace.db");
         Database::open(&db_path).expect("open db");
-
+        let started = Arc::new(Notify::new());
         let gate = Arc::new(Notify::new());
         let server = MempalMcpServer::new_with_factory(
             db_path.clone(),
             Arc::new(BlockingEmbedderFactory {
                 vector: vec![0.1, 0.2, 0.3],
                 call_count: Arc::new(AtomicUsize::new(0)),
-                started: Arc::new(Notify::new()),
+                started: Arc::clone(&started),
                 gate: Arc::clone(&gate),
                 released: Arc::new(AtomicBool::new(false)),
             }),
@@ -22389,7 +22389,9 @@ prototypes = ["keep"]
         assert_eq!(response.state, Some(IngestOperationState::Queued));
         assert!(response.timed_out);
         let operation_id = response.operation_id.expect("operation id");
-
+        tokio::time::timeout(Duration::from_secs(30), started.notified())
+            .await
+            .expect("embedder should signal entry before release");
         gate.notify_one();
         let completed = server
             .wait_for_operation_completion(&operation_id)

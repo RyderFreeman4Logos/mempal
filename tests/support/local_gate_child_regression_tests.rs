@@ -286,18 +286,17 @@ mod regression_tests {
         ))
         .expect("capture closing-pipe escape leader");
 
+        wait_for_file(
+            &started_file,
+            Duration::from_secs(5),
+            "closing-pipe escaped descendant release waiter",
+        );
         gate.descendant_monitor
             .stop_and_drain(
                 &mut gate.tracked_processes,
                 Instant::now() + Duration::from_secs(1),
             )
             .expect("stop descendant monitor before exercising ownership fallback");
-
-        wait_for_file(
-            &started_file,
-            Duration::from_secs(2),
-            "closing-pipe escaped descendant release waiter",
-        );
         fs::write(&release_file, "release\n").expect("release escaped descendant creation");
         wait_for_file(
             &ready_file,
