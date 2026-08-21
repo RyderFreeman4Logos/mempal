@@ -861,7 +861,11 @@ class MempalMemoryProvider:
         return [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]
 
     def handle_tool_call(self, tool_name, args, **kwargs):
-        if self._is_breaker_open() and tool_name != "mempal_conclude":
+        if self._is_breaker_open() and tool_name not in {
+            "mempal_conclude",
+            "mempal_profile",
+            "mempal_search",
+        }:
             return json.dumps({"error": "mempal temporarily unavailable. Will retry automatically."})
         if tool_name == "mempal_profile":
             try:
@@ -888,7 +892,11 @@ class MempalMemoryProvider:
                 return json.dumps({"results": items, "count": len(items)})
             except Exception as exc:
                 self._record_failure()
-                return json.dumps({"error": f"Failed to fetch profile: {exc}"})
+                return json.dumps(_rest_error_payload(
+                    "Mempal profile lookup failed.",
+                    "/api/timeline",
+                    exc,
+                ))
         elif tool_name == "mempal_search":
             q = args.get("query", "")
             if not q:
