@@ -163,10 +163,6 @@ pub fn router(state: ApiState) -> Router {
         .layer(cors_layer())
 }
 
-pub fn router_with_mcp(state: ApiState, server: crate::mcp::MempalMcpServer) -> Router {
-    router(state).nest_service("/mcp", super::mcp::service(server, None))
-}
-
 pub fn router_with_mcp_at(
     state: ApiState,
     server: crate::mcp::MempalMcpServer,

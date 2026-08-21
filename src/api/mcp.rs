@@ -1,9 +1,10 @@
 use std::{
     collections::HashMap,
+    convert::Infallible,
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -14,12 +15,15 @@ use axum::{
     body::{Body, to_bytes},
     extract::State,
     http::{Request, StatusCode, header},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, Sse},
+    },
     routing::post,
 };
 use rmcp::{
     RoleServer,
-    model::{ClientJsonRpcMessage, ServerJsonRpcMessage},
+    model::{ClientJsonRpcMessage, RequestId, ServerJsonRpcMessage},
     service::serve_directly,
     transport::Transport,
 };
@@ -30,6 +34,9 @@ const MCP_BODY_LIMIT: usize =
 const MAX_HTTP_SESSIONS: usize = 64;
 const MAX_PENDING_HTTP_SESSIONS: usize = 64;
 const HTTP_SESSION_TTL: Duration = Duration::from_secs(10 * 60);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_MESSAGE_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+const HTTP_SSE_BUFFER: usize = 16;
 
 struct HttpSessionTransport {
     incoming: tokio::sync::mpsc::Receiver<ClientJsonRpcMessage>,
@@ -67,7 +74,44 @@ struct HttpSession {
     incoming: tokio::sync::mpsc::Sender<ClientJsonRpcMessage>,
     outgoing: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<ServerJsonRpcMessage>>>,
     request_lock: Arc<tokio::sync::Mutex<()>>,
+    active_requests: Arc<AtomicUsize>,
     last_used: Arc<Mutex<Instant>>,
+}
+
+struct SessionActivity {
+    active_requests: Arc<AtomicUsize>,
+    sessions: Arc<Mutex<HashMap<String, HttpSession>>>,
+    session_id: String,
+    completed: AtomicBool,
+}
+
+impl SessionActivity {
+    fn start(
+        session: &HttpSession,
+        sessions: Arc<Mutex<HashMap<String, HttpSession>>>,
+        session_id: &str,
+    ) -> Self {
+        session.active_requests.fetch_add(1, Ordering::AcqRel);
+        Self {
+            active_requests: Arc::clone(&session.active_requests),
+            sessions,
+            session_id: session_id.to_string(),
+            completed: AtomicBool::new(false),
+        }
+    }
+
+    fn complete(&self) {
+        self.completed.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for SessionActivity {
+    fn drop(&mut self) {
+        self.active_requests.fetch_sub(1, Ordering::AcqRel);
+        if !self.completed.load(Ordering::Acquire) {
+            remove_session(&self.sessions, &self.session_id);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -143,6 +187,9 @@ fn new_session_id(state: &HttpState) -> String {
 fn reap_expired_sessions(sessions: &mut HashMap<String, HttpSession>) {
     let now = Instant::now();
     sessions.retain(|_, session| {
+        if session.active_requests.load(Ordering::Acquire) != 0 {
+            return true;
+        }
         session
             .last_used
             .lock()
@@ -154,6 +201,7 @@ fn reap_expired_sessions(sessions: &mut HashMap<String, HttpSession>) {
     }
     let oldest = sessions
         .iter()
+        .filter(|(_, session)| session.active_requests.load(Ordering::Acquire) == 0)
         .min_by_key(|(_, session)| {
             session
                 .last_used
@@ -164,6 +212,18 @@ fn reap_expired_sessions(sessions: &mut HashMap<String, HttpSession>) {
         .map(|(session_id, _)| session_id.clone());
     if let Some(session_id) = oldest {
         sessions.remove(&session_id);
+    }
+}
+
+fn remove_session(sessions: &Arc<Mutex<HashMap<String, HttpSession>>>, session_id: &str) {
+    if let Ok(mut sessions) = sessions.lock() {
+        sessions.remove(session_id);
+    }
+}
+
+fn touch_session(session: &HttpSession) {
+    if let Ok(mut last_used) = session.last_used.lock() {
+        *last_used = Instant::now();
     }
 }
 
@@ -186,44 +246,184 @@ async fn start_http_session(
     });
     incoming.send(initialize).await.ok()?;
     let mut outgoing_rx = outgoing_rx;
-    let response = outgoing_rx.recv().await?;
+    let response = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, outgoing_rx.recv())
+        .await
+        .ok()??;
     Some((
         HttpSession {
             incoming,
             outgoing: Arc::new(tokio::sync::Mutex::new(outgoing_rx)),
             request_lock: Arc::new(tokio::sync::Mutex::new(())),
+            active_requests: Arc::new(AtomicUsize::new(0)),
             last_used: Arc::new(Mutex::new(Instant::now())),
         },
         response,
     ))
 }
 
+fn terminal_response(message: &ServerJsonRpcMessage, request_id: &RequestId) -> bool {
+    match message {
+        ServerJsonRpcMessage::Response(response) => &response.id == request_id,
+        ServerJsonRpcMessage::Error(error) => &error.id == request_id,
+        _ => false,
+    }
+}
+
+async fn send_sse_message(
+    sender: &tokio::sync::mpsc::Sender<String>,
+    message: &ServerJsonRpcMessage,
+) -> bool {
+    let Ok(payload) = serde_json::to_string(message) else {
+        return false;
+    };
+    sender.send(payload).await.is_ok()
+}
+
+struct HttpForward {
+    outgoing: tokio::sync::OwnedMutexGuard<tokio::sync::mpsc::Receiver<ServerJsonRpcMessage>>,
+    first: ServerJsonRpcMessage,
+    request_id: RequestId,
+    deadline: Instant,
+    sender: tokio::sync::mpsc::Sender<String>,
+    sessions: Arc<Mutex<HashMap<String, HttpSession>>>,
+    session_id: String,
+    _request_guard: tokio::sync::OwnedMutexGuard<()>,
+    activity: SessionActivity,
+}
+
+async fn forward_http_session(forward: HttpForward) {
+    let HttpForward {
+        mut outgoing,
+        first,
+        request_id,
+        deadline,
+        sender,
+        sessions,
+        session_id,
+        _request_guard,
+        activity,
+    } = forward;
+    if !send_sse_message(&sender, &first).await {
+        remove_session(&sessions, &session_id);
+        return;
+    }
+    loop {
+        let next = tokio::time::timeout_at(deadline.into(), outgoing.recv()).await;
+        let Some(message) = next.ok().flatten() else {
+            remove_session(&sessions, &session_id);
+            return;
+        };
+        let is_terminal = terminal_response(&message, &request_id);
+        if !send_sse_message(&sender, &message).await {
+            remove_session(&sessions, &session_id);
+            return;
+        }
+        if is_terminal {
+            activity.complete();
+            return;
+        }
+    }
+}
+
 async fn dispatch_http_session(
+    sessions: Arc<Mutex<HashMap<String, HttpSession>>>,
     session: HttpSession,
     message: ClientJsonRpcMessage,
     session_id: &str,
 ) -> Response {
-    let _request_guard = session.request_lock.lock().await;
-    let expects_response = !matches!(message, ClientJsonRpcMessage::Notification(_));
-    if session.incoming.send(message).await.is_err() {
+    let request_id = match &message {
+        ClientJsonRpcMessage::Request(request) => request.id.clone(),
+        ClientJsonRpcMessage::Notification(_)
+        | ClientJsonRpcMessage::Response(_)
+        | ClientJsonRpcMessage::Error(_) => {
+            let delivered =
+                tokio::time::timeout(HTTP_MESSAGE_SEND_TIMEOUT, session.incoming.send(message))
+                    .await
+                    .is_ok_and(|result| result.is_ok());
+            if !delivered {
+                remove_session(&sessions, session_id);
+                return (StatusCode::NOT_FOUND, "MCP session is no longer available")
+                    .into_response();
+            }
+            touch_session(&session);
+            return with_session_header(StatusCode::ACCEPTED.into_response(), session_id);
+        }
+    };
+
+    let request_guard = match tokio::time::timeout(
+        HTTP_REQUEST_TIMEOUT,
+        Arc::clone(&session.request_lock).lock_owned(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(_) => {
+            remove_session(&sessions, session_id);
+            return with_session_header(
+                (StatusCode::GATEWAY_TIMEOUT, "MCP request timed out").into_response(),
+                session_id,
+            );
+        }
+    };
+    let activity = SessionActivity::start(&session, Arc::clone(&sessions), session_id);
+    let delivered = tokio::time::timeout(HTTP_MESSAGE_SEND_TIMEOUT, session.incoming.send(message))
+        .await
+        .is_ok_and(|result| result.is_ok());
+    if !delivered {
+        drop(request_guard);
+        drop(activity);
+        remove_session(&sessions, session_id);
         return (StatusCode::NOT_FOUND, "MCP session is no longer available").into_response();
     }
-    if let Ok(mut last_used) = session.last_used.lock() {
-        *last_used = Instant::now();
-    }
-    if !expects_response {
-        return with_session_header(StatusCode::ACCEPTED.into_response(), session_id);
-    }
-    let message = session.outgoing.lock().await.recv().await;
-    let response = match message {
-        Some(message) => axum::Json(message).into_response(),
-        None => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MCP handler returned no response",
-        )
-            .into_response(),
+    touch_session(&session);
+
+    let mut outgoing = Arc::clone(&session.outgoing).lock_owned().await;
+    let deadline = Instant::now() + HTTP_REQUEST_TIMEOUT;
+    let Some(first) = tokio::time::timeout_at(deadline.into(), outgoing.recv())
+        .await
+        .ok()
+        .flatten()
+    else {
+        drop(request_guard);
+        drop(activity);
+        remove_session(&sessions, session_id);
+        return with_session_header(
+            (StatusCode::GATEWAY_TIMEOUT, "MCP request timed out").into_response(),
+            session_id,
+        );
     };
-    with_session_header(response, session_id)
+    if terminal_response(&first, &request_id) {
+        activity.complete();
+        drop(outgoing);
+        drop(request_guard);
+        drop(activity);
+        return with_session_header(axum::Json(first).into_response(), session_id);
+    }
+
+    let (sender, receiver) = tokio::sync::mpsc::channel(HTTP_SSE_BUFFER);
+    let sessions_for_task = Arc::clone(&sessions);
+    let session_id_for_task = session_id.to_string();
+    let request_id_for_task = request_id.clone();
+    tokio::spawn(forward_http_session(HttpForward {
+        outgoing,
+        first,
+        request_id: request_id_for_task,
+        deadline,
+        sender,
+        sessions: sessions_for_task,
+        session_id: session_id_for_task,
+        _request_guard: request_guard,
+        activity,
+    }));
+    let stream = futures::stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|payload| {
+            (
+                Ok::<Event, Infallible>(Event::default().data(payload)),
+                receiver,
+            )
+        })
+    });
+    with_session_header(Sse::new(stream).into_response(), session_id)
 }
 
 fn with_session_header(mut response: Response, session_id: &str) -> Response {
@@ -281,7 +481,9 @@ async fn handle(State(state): State<HttpState>, request: Request<Body>) -> Respo
             .ok()
             .and_then(|sessions| sessions.get(&session_id).cloned());
         return match session {
-            Some(session) => dispatch_http_session(session, message, &session_id).await,
+            Some(session) => {
+                dispatch_http_session(state.sessions.clone(), session, message, &session_id).await
+            }
             None => StatusCode::NOT_FOUND.into_response(),
         };
     }
@@ -321,6 +523,13 @@ async fn handle(State(state): State<HttpState>, request: Request<Body>) -> Respo
     let session_id = new_session_id(&state);
     if let Ok(mut sessions) = state.sessions.lock() {
         reap_expired_sessions(&mut sessions);
+        if sessions.len() >= MAX_HTTP_SESSIONS {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "MCP session admission limit reached",
+            )
+                .into_response();
+        }
         sessions.insert(session_id.clone(), session);
     } else {
         return (

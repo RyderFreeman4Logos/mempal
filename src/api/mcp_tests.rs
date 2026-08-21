@@ -262,6 +262,60 @@ async fn initialize(live: &LiveMcp) -> Result<String> {
 }
 
 #[tokio::test]
+async fn daemon_mcp_listen_port_rejects_unmatched_client_response_without_session_leak()
+-> Result<()> {
+    let (_tempdir, live) = live_mcp().await?;
+    let result = async {
+        let session_id = initialize(&live).await?;
+        let host = live.address.to_string();
+        for body in [
+            r#"{"jsonrpc":"2.0","id":999,"result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":999,"result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":999,"error":{"code":-32603,"message":"duplicate"}}"#,
+        ] {
+            let (status, _, _) = tokio::time::timeout(
+                Duration::from_secs(1),
+                post_raw(
+                    &live,
+                    999,
+                    "ignored",
+                    json!({}),
+                    Some(&host),
+                    Some(&session_id),
+                    Some(body),
+                ),
+            )
+            .await
+            .context("unmatched client response/error hung")??;
+            anyhow::ensure!(status == 202, "unmatched client message status: {status}");
+        }
+
+        for id in 0..=MAX_HTTP_SESSIONS {
+            let session_id = initialize_session(&live, &format!("bounded-{id}")).await?;
+            let (status, _, _) = tokio::time::timeout(
+                Duration::from_secs(1),
+                post_raw(
+                    &live,
+                    id as u64 + 10,
+                    "ignored",
+                    json!({}),
+                    Some(&host),
+                    Some(&session_id),
+                    Some(r#"{"jsonrpc":"2.0","id":999,"result":{}}"#),
+                ),
+            )
+            .await
+            .context("evicted-session ownership escaped its bound")??;
+            anyhow::ensure!(status == 202, "bounded unmatched response status: {status}");
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    stop(live).await;
+    result
+}
+
+#[tokio::test]
 async fn daemon_mcp_listen_port_rejects_dns_rebinding_host() -> Result<()> {
     let (_tempdir, live) = live_mcp().await?;
     let result = async {
@@ -392,6 +446,28 @@ async fn daemon_mcp_listen_port_admits_only_valid_initialized_sessions() -> Resu
     result
 }
 
+fn take_sse_event(buffer: &mut Vec<u8>) -> Option<Value> {
+    let end = buffer.windows(2).position(|window| window == b"\n\n")?;
+    let event = buffer.drain(..end + 2).collect::<Vec<_>>();
+    String::from_utf8_lossy(&event).lines().find_map(|line| {
+        line.strip_prefix("data:")
+            .and_then(|data| serde_json::from_str(data.trim()).ok())
+    })
+}
+
+async fn next_sse_event(response: &mut reqwest::Response, buffer: &mut Vec<u8>) -> Result<Value> {
+    loop {
+        if let Some(event) = take_sse_event(buffer) {
+            return Ok(event);
+        }
+        let chunk = response
+            .chunk()
+            .await?
+            .context("MCP SSE stream ended before the next event")?;
+        buffer.extend_from_slice(&chunk);
+    }
+}
+
 async fn search_with_roots(
     live: &LiveMcp,
     session_id: &str,
@@ -400,19 +476,29 @@ async fn search_with_roots(
     project_id: &str,
 ) -> Result<Value> {
     let host = live.address.to_string();
-    let (status, _, body) = post_raw(
-            live,
-            id,
-            "tools/call",
-            json!({"name":"mempal_search","arguments":{"query":format!("memory for {project_id}"),"top_k":1}}),
-            Some(&host),
-            Some(session_id),
-            None,
-        )
+    let body = json!({
+        "jsonrpc":"2.0",
+        "id":id,
+        "method":"tools/call",
+        "params":{"name":"mempal_search","arguments":{"query":format!("memory for {project_id}"),"top_k":1}}
+    });
+    let mut response = live
+        .client
+        .post(format!("http://{}/mcp", live.address))
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .header("host", &host)
+        .header(MCP_SESSION_ID_HEADER, session_id)
+        .json(&body)
+        .send()
         .await?;
-    anyhow::ensure!(status / 100 == 2, "search request failed: {status}");
-    let roots_request: Value =
-        serde_json::from_slice(&body).context("decode roots/list request")?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "search request failed: {}",
+        response.status()
+    );
+    let mut buffer = Vec::new();
+    let roots_request = next_sse_event(&mut response, &mut buffer).await?;
     anyhow::ensure!(
         roots_request["method"] == "roots/list",
         "search did not dispatch roots/list: {roots_request}"
@@ -423,7 +509,7 @@ async fn search_with_roots(
         "result":{"roots":[{"uri":root_uri,"name":"test-root"}]}
     })
     .to_string();
-    let (status, _, body) = post_raw(
+    let (status, _, _) = post_raw(
         live,
         id + 1,
         "ignored",
@@ -433,8 +519,8 @@ async fn search_with_roots(
         Some(&roots_response),
     )
     .await?;
-    anyhow::ensure!(status / 100 == 2, "roots response failed: {status}");
-    serde_json::from_slice(&body).context("decode search response")
+    anyhow::ensure!(status == 202, "roots response failed: {status}");
+    next_sse_event(&mut response, &mut buffer).await
 }
 
 #[tokio::test]
