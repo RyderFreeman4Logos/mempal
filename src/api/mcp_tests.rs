@@ -711,6 +711,15 @@ async fn daemon_mcp_listen_port_reuses_daemon_holder() -> Result<()> {
             Some(&session_id),
         )
         .await?;
+        let live_snapshot =
+            ProfileDbAdmission::snapshot(&db_path).context("snapshot while MCP HTTP is live")?;
+        anyhow::ensure!(
+            live_snapshot
+                .holders
+                .iter()
+                .all(|holder| holder.holder_class != DbHolderClass::Mcp),
+            "daemon MCP HTTP admitted an MCP holder while live: {live_snapshot:?}"
+        );
         Ok::<(), anyhow::Error>(())
     }
     .await;

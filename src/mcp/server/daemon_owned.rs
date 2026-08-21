@@ -7,9 +7,13 @@ impl super::MempalMcpServer {
         self.daemon_owned_async_db = true;
         let query_only = async_db.query_only_view();
         self.async_db = Arc::new(tokio::sync::OnceCell::new());
-        debug_assert!(self.async_db.set(async_db).is_ok());
+        if self.async_db.set(async_db).is_err() {
+            unreachable!("daemon-owned async DB cell must be empty");
+        }
         self.query_only_async_db = Arc::new(tokio::sync::OnceCell::new());
-        debug_assert!(self.query_only_async_db.set(query_only).is_ok());
+        if self.query_only_async_db.set(query_only).is_err() {
+            unreachable!("daemon-owned query-only async DB cell must be empty");
+        }
         self
     }
 
