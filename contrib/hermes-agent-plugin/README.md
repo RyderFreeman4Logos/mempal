@@ -6,7 +6,7 @@ Three complementary integration paths — use any combination:
 |------|-------------|-------------|------|
 | **MemoryProvider** | Memory plugin | Mirror/sync hermes built-in memory to mempal, expose search/conclude tools | No |
 | **Hooks** | General plugin | Inject deep mempal context per turn, capture tool observations | No |
-| **MCP** | Config entry | Debug-only direct access to all mempal tools | No |
+| **MCP** | Config entry | Supported daemon-owned loopback HTTP MCP; long-lived stdio MCP is debug-only/extra-holder | No |
 
 All three work without forking hermes-agent. When hermes upstream resolves
 [#25526](https://github.com/NousResearch/hermes-agent/issues/25526) and

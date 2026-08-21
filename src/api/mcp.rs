@@ -23,8 +23,8 @@ use axum::{
 };
 use rmcp::{
     RoleServer,
-    model::{ClientJsonRpcMessage, RequestId, ServerJsonRpcMessage},
-    service::serve_directly,
+    model::{ClientJsonRpcMessage, ProtocolVersion, RequestId, ServerJsonRpcMessage},
+    service::ServiceExt,
     transport::Transport,
 };
 
@@ -288,26 +288,46 @@ fn touch_session(session: &HttpSession) {
 async fn start_http_session(
     server: MempalMcpServer,
     initialize: ClientJsonRpcMessage,
-) -> Option<(HttpSession, ServerJsonRpcMessage)> {
+) -> Result<Option<(HttpSession, ServerJsonRpcMessage)>, &'static str> {
+    let requested_version = match &initialize {
+        ClientJsonRpcMessage::Request(request) => match &request.request {
+            rmcp::model::ClientRequest::InitializeRequest(request) => {
+                &request.params.protocol_version
+            }
+            _ => return Err("MCP initialize request is malformed"),
+        },
+        _ => return Err("MCP initialize request is malformed"),
+    };
+    if !ProtocolVersion::KNOWN_VERSIONS.contains(requested_version) {
+        return Err("MCP protocol version is unsupported");
+    }
+
     let (incoming, incoming_rx) = tokio::sync::mpsc::channel(32);
     let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::channel(32);
-    let running = serve_directly(
-        server,
-        HttpSessionTransport {
-            incoming: incoming_rx,
-            outgoing: outgoing_tx,
-        },
-        None,
-    );
     tokio::spawn(async move {
+        let Ok(running) = server
+            .serve(HttpSessionTransport {
+                incoming: incoming_rx,
+                outgoing: outgoing_tx,
+            })
+            .await
+        else {
+            return;
+        };
         let _ = running.waiting().await;
     });
-    incoming.send(initialize).await.ok()?;
+    if incoming.send(initialize).await.is_err() {
+        return Ok(None);
+    }
     let mut outgoing_rx = outgoing_rx;
-    let response = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, outgoing_rx.recv())
+    let Some(response) = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, outgoing_rx.recv())
         .await
-        .ok()??;
-    Some((
+        .ok()
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
         HttpSession {
             incoming,
             outgoing: Arc::new(tokio::sync::Mutex::new(outgoing_rx)),
@@ -316,7 +336,7 @@ async fn start_http_session(
             last_used: Arc::new(Mutex::new(Instant::now())),
         },
         response,
-    ))
+    )))
 }
 
 fn terminal_response(message: &ServerJsonRpcMessage, request_id: &RequestId) -> bool {
@@ -575,7 +595,10 @@ async fn handle(State(state): State<HttpState>, request: Request<Body>) -> Respo
     if let Some(gate) = state.initialize_gate.as_ref() {
         gate.notified().await;
     }
-    let started = start_http_session(state.base_server.new_http_session(), message).await;
+    let started = match start_http_session(state.base_server.new_http_session(), message).await {
+        Ok(started) => started,
+        Err(message) => return bad_request(message),
+    };
     let Some((session, response)) = started else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

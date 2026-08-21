@@ -322,6 +322,9 @@ async fn daemon_mcp_listen_port_rejects_unmatched_client_response_without_sessio
 #[path = "mcp_reservation_tests.rs"]
 mod reservation_tests;
 
+#[path = "mcp_protocol_tests.rs"]
+mod protocol_tests;
+
 #[tokio::test]
 async fn daemon_mcp_listen_port_rejects_dns_rebinding_host() -> Result<()> {
     let (_tempdir, live) = live_mcp().await?;
