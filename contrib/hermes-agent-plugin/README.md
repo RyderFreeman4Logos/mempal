@@ -6,7 +6,7 @@ Three complementary integration paths — use any combination:
 |------|-------------|-------------|------|
 | **MemoryProvider** | Memory plugin | Mirror/sync hermes built-in memory to mempal, expose search/conclude tools | No |
 | **Hooks** | General plugin | Inject deep mempal context per turn, capture tool observations | No |
-| **MCP** | Config entry | Debug-only direct access to all mempal tools | No |
+| **MCP** | Config entry | Supported daemon-owned loopback HTTP MCP; long-lived stdio MCP is debug-only/extra-holder | No |
 
 All three work without forking hermes-agent. When hermes upstream resolves
 [#25526](https://github.com/NousResearch/hermes-agent/issues/25526) and
@@ -203,17 +203,17 @@ After allowlisted tool calls (bash, web_search, python, etc.), the `post_tool_ca
 
 These low-importance observations enrich future searches without cluttering high-priority memory.
 
-## Path 3: MCP server (debug-only full tool access)
+## Path 3: MCP server (full tool access)
 
 For routine Hermes use, prefer Path 1 (MemoryProvider) and Path 2 (hooks) against
 the daemon REST API. That path is daemon-owned, keeps automatic searches scoped,
 and does not create extra SQLite holders.
 
 Direct MCP registration gives the LLM access to **all** mempal tools (context,
-knowledge cards, timeline, kg, etc.), but it is currently a debug/admin path:
-long-lived stdio MCP servers can hold `palace.db` open, and Hermes HTTP MCP
-against the daemon `/mcp` endpoint is not treated as production-supported until
-that transport has dedicated coverage.
+knowledge cards, timeline, kg, etc.). The supported agent path is daemon-owned
+loopback HTTP MCP at `/mcp` (build with `rest`, then run the daemon). Long-lived
+stdio MCP is an extra holder/debug path: use it only for short debugging sessions
+because it can hold `palace.db` open in a second mempal process.
 
 ### Temporary stdio setup
 

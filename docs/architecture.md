@@ -171,7 +171,7 @@ covered by the current LongMemEval harness:
 ## Key Surfaces
 
 - **CLI**: `src/main.rs` exposes the broad operator surface: init, ingest, search, context, brief, timeline, status, daemon, doctor, reindex, KG, tunnels, taxonomy, cards, lifecycle, phase3, cowork, xurl, hook, sleep, repair, patterns, skills, benchmarks, and export/wiki workflows. The current CLI has 80+ subcommand paths across these families.
-- **MCP**: `mempal serve --mcp` exposes the smoke-tested baseline of 19 documented MCP tools grouped below as conceptual profiles for agent discovery. Some builds or newer code paths may register additional governed or diagnostic tools; treat README/usage as the baseline compatibility contract.
+- **MCP**: the long-lived daemon exposes the smoke-tested baseline of 19 documented MCP tools at `/mcp` on its loopback REST listener; `mempal serve --mcp` remains the stdio entry point. Some builds or newer code paths may register additional governed or diagnostic tools; treat README/usage as the baseline compatibility contract.
 - **REST**: With the `rest` feature and daemon configuration enabled, the daemon serves loopback REST/Hermes-compatible endpoints from `src/api/`. REST search and writes run inside the daemon process and share daemon-owned database/embedder state.
 
 Compatibility expectations for these entry points are defined in the next section.
@@ -237,7 +237,7 @@ Stable surfaces are the core product contract. Command names, MCP tool names, ra
 
 | Surface | Compatibility expectation |
 | --- | --- |
-| `mempal serve --mcp` | The stdio MCP server remains the stable protocol entry point; individual tools follow the classification in this table. |
+| `mempal serve --mcp` / daemon `/mcp` | The stdio and loopback HTTP MCP entry points remain stable; individual tools follow the classification in this table. |
 | `mempal status` / `mempal_status` | System status, warnings, schema/config/runtime diagnostics, and protocol discovery remain a stable entry point. |
 | `mempal search` / `mempal_search` | Hybrid retrieval with citations, drawer IDs, source files, project scoping, and fallback warnings remains stable. |
 | `mempal_read_drawer` / `mempal_read_drawers` | Full raw drawer reads remain stable companion tools for search preview expansion. |

@@ -11,6 +11,12 @@ mod stale_daemon;
 mod timeline;
 mod tools;
 
+// The REST feature is optional, but the default test tier still exercises the
+// production MCP HTTP adapter rather than maintaining a second test handler.
+#[cfg(all(test, not(feature = "rest")))]
+#[path = "../api/mcp.rs"]
+mod daemon_http;
+
 pub use resource_usage::{
     DaemonRecoveryDto, MemoryPressureDto, ProcessResourceUsageDto, ProfileDbAdmissionDto,
     ProfileDbHolderDto, ResourceCounterDto, ResourceUsageDto, SqliteResourceUsageDto,

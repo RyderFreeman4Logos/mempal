@@ -245,9 +245,12 @@ Default profile reads `~/.hermes/state.db`; named profiles read `~/.hermes/profi
 
 ## MCP Server (19 verified baseline tools)
 
-`mempal serve --mcp` exposes at least this smoke-tested MCP baseline via Model
-Context Protocol. Use `mempal doctor` or protocol-level `tools/list` against
-`mempal serve --mcp` for the runtime-advertised surface in a specific build:
+The long-lived daemon exposes the same surface on its loopback REST listener at
+`http://127.0.0.1:<daemon-api-port>/mcp`; configure agents with that URL so they
+reuse daemon-owned SQLite resources. `mempal serve --mcp` remains the stdio
+entry point for clients that do not use the daemon. Use `mempal doctor` or
+protocol-level `tools/list` against either entry point for the runtime-advertised
+surface in a specific build:
 
 | Tool | Purpose |
 |------|---------|
@@ -328,7 +331,7 @@ mempal cowork-status --cwd "$PWD"
 - **Two Claude-side artifacts**: Claude Code does not auto-discover hook scripts by filename. Both `.claude/hooks/user-prompt-submit.sh` and the matching entry in `.claude/settings.json` are required. `install-hooks` writes both; do not remove either by hand.
 - **TUI restart needed after config changes on the Codex side**: Codex reads `config.toml` + `hooks.json` at process startup only. After enabling the feature flag or running `install-hooks`, fully quit and relaunch the Codex TUI before expecting hooks to fire.
 - **MCP server re-spawn**: Claude Code spawns the mempal MCP server at client startup. After upgrading the mempal binary (`cargo install ...`), restart Claude Code so the MCP server respawns and exposes newly added tools like `mempal_cowork_push` or `mempal_fact_check`.
-- **Hermes production path**: prefer the Hermes MemoryProvider/hooks integration against the daemon REST API. Avoid long-lived stdio MCP registrations for routine Hermes use because they create additional SQLite holders; direct HTTP MCP at `/mcp` is not the supported Hermes path until that transport has production coverage.
+- **Hermes client boundary**: prefer the Hermes MemoryProvider/hooks integration against the daemon REST API. Direct HTTP MCP at `/mcp` is supported when the `rest` feature is enabled and the daemon-owned loopback listener exposes the endpoint; avoid long-lived stdio MCP registrations for routine Hermes use because they create additional SQLite holders.
 - **Bidirectional scope**: `mempal_cowork_push` currently requires an MCP client identifying itself as `claude-code` or `codex` (or their aliases). Generic MCP clients cannot push because caller identity is required to fill the `from` field and enforce self-push rejection. This is by design for the Claude ↔ Codex pair.
 
 ## Concurrent Ingest Safety (P9-B)

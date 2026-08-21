@@ -104,7 +104,7 @@ use anyhow::Context;
 use rmcp::{
     ErrorData, Json, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{ClientResult, ServerCapabilities, ServerInfo, ServerRequest},
     service::Peer,
     tool, tool_router,
 };
@@ -151,6 +151,7 @@ use super::tools::{
     TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
+mod daemon_owned;
 mod schema_ready;
 
 fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool {
@@ -306,6 +307,7 @@ pub struct MempalMcpServer {
     initial_config: Arc<Config>,
     async_db: Arc<OnceCell<AsyncDb>>,
     query_only_async_db: Arc<OnceCell<QueryOnlyAsyncDb>>,
+    daemon_owned_async_db: bool,
     async_queue: AsyncPendingMessageStore,
     gating_runtime: Arc<GatingRuntime>,
     embedder_factory: Arc<dyn EmbedderFactory>,
@@ -606,7 +608,6 @@ fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
         .collect::<Vec<_>>()
         .join("; ")
 }
-
 impl MempalMcpServer {
     pub fn new(db_path: PathBuf, config: crate::core::config::Config) -> anyhow::Result<Self> {
         Self::new_with_factory_and_config(
@@ -615,7 +616,6 @@ impl MempalMcpServer {
             Arc::new(crate::embed::ConfiguredEmbedderFactory::new(config)),
         )
     }
-
     pub fn new_with_factory(
         db_path: PathBuf,
         embedder_factory: Arc<dyn EmbedderFactory>,
@@ -626,7 +626,6 @@ impl MempalMcpServer {
             embedder_factory,
         )
     }
-
     pub fn new_with_factory_and_config(
         db_path: PathBuf,
         config: Config,
@@ -639,6 +638,7 @@ impl MempalMcpServer {
             initial_config,
             async_db: Arc::new(OnceCell::new()),
             query_only_async_db: Arc::new(OnceCell::new()),
+            daemon_owned_async_db: false,
             async_queue,
             gating_runtime: Arc::new(GatingRuntime::new(config, Arc::clone(&embedder_factory))),
             embedder_factory,
@@ -695,20 +695,19 @@ impl MempalMcpServer {
             operation_status_json_within_probe_attempts: Arc::new(AtomicUsize::new(0)),
         })
     }
-
+    #[doc(hidden)]
+    pub fn new_http_session(&self) -> Self {
+        let mut session = self.clone();
+        session.client_name = Arc::new(Mutex::new(None));
+        session.client_project_id = Arc::new(Mutex::new(None));
+        session.client_peer = Arc::new(Mutex::new(None));
+        session.session_hit_drawers = Arc::new(Mutex::new(HashSet::new()));
+        session
+    }
     pub fn with_external_ingest_writer_lease(mut self, lease: RuntimeWriterLease) -> Self {
         self.external_ingest_writer_lease = Some(lease);
         self
     }
-
-    pub(crate) fn with_daemon_write_observer(
-        mut self,
-        observer: crate::daemon_bootstrap::DaemonWriteObserver,
-    ) -> Self {
-        self.daemon_write_observer = Some(observer);
-        self
-    }
-
     fn status_config_snapshot(&self) -> Arc<Config> {
         let current = ConfigHandle::current();
         if config_db_path_matches_server(current.as_ref(), &self.db_path) {
@@ -2734,39 +2733,37 @@ impl MempalMcpServer {
                 ErrorData::invalid_params(format!("invalid project scope: {error}"), None)
             });
         }
-
         if let Some(configured) = config.project.id.as_deref() {
             return validate_project_id(configured).map(Some).map_err(|error| {
                 ErrorData::invalid_params(format!("invalid project scope: {error}"), None)
             });
         }
-
         if let Ok(guard) = self.client_project_id.lock()
             && let Some(project_id) = guard.clone()
         {
             return Ok(Some(project_id));
         }
-
         let peer = self.client_peer.lock().ok().and_then(|guard| guard.clone());
         let client_supports_roots = peer
             .as_ref()
             .and_then(|p| p.peer_info())
             .and_then(|info| info.capabilities.roots.clone())
             .is_some();
-        if let Some(peer) = peer
-            && client_supports_roots
-            // Roots is deprecated by SEP-2577; retain until rmcp ships a replacement.
-            && let Ok(result) = {
-                #[allow(deprecated)]
-                {
-                    peer.list_roots().await
-                }
-            }
-            && let Some(project_id) = result
+        if client_supports_roots && let Some(peer) = peer {
+            let result = peer
+                .send_request(ServerRequest::ListRootsRequest(Default::default()))
+                .await
+                .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+            let ClientResult::ListRootsResult(result) = result else {
+                return Err(ErrorData::internal_error("invalid roots response", None));
+            };
+            let project_id = result
                 .roots
                 .into_iter()
                 .find_map(|root| infer_project_id_from_root_uri(&root.uri).ok().flatten())
-        {
+                .ok_or_else(|| {
+                    ErrorData::internal_error("MCP roots did not contain a valid project", None)
+                })?;
             if let Ok(mut guard) = self.client_project_id.lock() {
                 *guard = Some(project_id.clone());
             }
@@ -5492,10 +5489,12 @@ impl MempalMcpServer {
         };
         let mut system_warnings = current_system_warnings();
         let mut database_diagnostic = None;
-        let queue_stats = match self.async_queue.stats().await {
+        let queue_stats_result = self.queue_stats_for_status().await;
+        let queue_stats = match queue_stats_result {
             Ok(stats) => stats,
             Err(error) => {
-                let diagnostic = status_database_diagnostic(&self.db_path, "queue_stats", &error);
+                let diagnostic =
+                    status_database_diagnostic(&self.db_path, "queue_stats", error.as_ref());
                 record_status_database_diagnostic(
                     &mut system_warnings,
                     &mut database_diagnostic,
