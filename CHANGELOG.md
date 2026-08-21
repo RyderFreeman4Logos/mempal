@@ -26,7 +26,6 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ### Fixed
 
 - Daemon SQLite writer-lease admission now waits out a live maintenance holder past its observed `remaining_secs` (capped), so bootstrap stays in a non-failed waiting state and acquires once the holder releases instead of exiting 75 and stranding the user unit under `RestartPreventExitStatus=75`; a live incompatible `mcp-ingest-worker` holder is still refused immediately without takeover (#916, #849).
-- Hermes plugin read-tool breaker admission tolerates expired persisted-breaker reset failures while preserving typed, redacted `mempal_profile` and `mempal_search` payloads (#927).
 - Cited-recall latest-decision walks the full successor chain, filters context the same way, and requires a live correction/continuation citation (#898).
 - Codex snapshots atomically remove superseded turns/vectors and fail closed on ambiguity (#896).
 - MCP search shares a deadline and releases reads before responding (#881).
@@ -37,7 +36,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - **Daemon readiness CLI tests**: shared Linux supervisor for bounded redacted lifecycle handling (#892).
 
-- **Hermes receipts**: scoped smoke ingest inline; live-daemon waits poll to `created_drawer_ids`; already-soft-deleted `mempal_delete` succeeds; cleanup IDs survive CLI/MCP/REST decoding; breaker-open conclude replay is structured pending success, not tool error; open REST breakers admit `mempal_search`/`mempal_profile` read probes yielding typed/redacted results, not generic temporary-unavailable; daemon down with ≥100 pending → `doctor`/`status`/MCP doctor emit high-severity typed availability signal; unreadable config/queue stats or unverified PIDs → privacy-safe `unavailable`, never synthetic normal; recovery: restart, drain, terminal failures, no DB edits; saturated MCP holder-budget no-write receipts and smoke cleanup authority stay owner-bound, preventing false receipts/cross-operation cleanup IDs (#871, #876, #888, #918, #921, #923, #924, #927).
+- **Hermes receipts**: scoped smoke ingest inline; live-daemon polls `created_drawer_ids`; already-soft-deleted `mempal_delete` succeeds; cleanup IDs survive CLI/MCP/REST decode; breaker-open conclude replay is structured pending success, not tool error; open REST/Hermes breakers admit `mempal_search`/`mempal_profile` probes with typed/redacted payloads despite expired persisted-breaker reset failures, not temporary-unavailable; daemon down with ≥100 pending → `doctor`/`status`/MCP doctor emit high-severity typed availability signal; unreadable config/queue stats/unverified PIDs → privacy-safe `unavailable`, never synthetic normal; recovery: restart, drain, terminal failures, no DB edits; saturated MCP holder-budget no-write receipts and owner-bound smoke cleanup prevent false receipts/cross-operation cleanup IDs (#871, #876, #888, #918, #921, #923, #924, #927).
 
 - **Daemon writer-lease renew**: treat profile admission lock `Busy` as the same
   retryable contention class as SQLite busy/locked so lease heartbeat recovery
