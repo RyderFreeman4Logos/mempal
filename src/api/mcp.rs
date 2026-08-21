@@ -182,7 +182,14 @@ fn validate_host(
         .parse::<axum::http::uri::Authority>()
         .map_err(|_| Box::new(bad_request("MCP Host header is malformed")))?;
     let host = authority.host();
-    let local_host = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1";
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let local_host = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|addr| addr.is_loopback());
     if !local_host {
         return Err(Box::new(bad_request("MCP Host header is not loopback")));
     }

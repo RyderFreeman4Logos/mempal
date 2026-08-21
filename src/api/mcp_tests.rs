@@ -45,10 +45,14 @@ fn fixture() -> Result<(TempDir, PathBuf, Config, MempalMcpServer)> {
 }
 
 async fn live_mcp() -> Result<(TempDir, LiveMcp)> {
+    live_mcp_at("127.0.0.1:0").await
+}
+
+async fn live_mcp_at(bind_addr: &str) -> Result<(TempDir, LiveMcp)> {
     let (tempdir, db_path, _config, server) = fixture()?;
     let daemon_db =
         AsyncDb::open_for(&db_path, 4, DbHolderClass::Daemon).context("open daemon-owned pool")?;
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listener = TcpListener::bind(bind_addr).await?;
     let address = listener.local_addr()?;
     let server = server.with_daemon_owned_async_db(daemon_db);
     #[cfg(feature = "rest")]
@@ -395,6 +399,9 @@ async fn daemon_mcp_listen_port_rejects_dns_rebinding_host() -> Result<()> {
     stop(live).await;
     result
 }
+
+#[path = "mcp_ipv6_tests.rs"]
+mod ipv6_tests;
 
 #[tokio::test]
 async fn daemon_mcp_listen_port_admits_only_valid_initialized_sessions() -> Result<()> {
