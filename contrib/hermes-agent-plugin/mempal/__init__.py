@@ -861,11 +861,11 @@ class MempalMemoryProvider:
         return [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]
 
     def handle_tool_call(self, tool_name, args, **kwargs):
-        if self._is_breaker_open() and tool_name not in {
-            "mempal_conclude",
-            "mempal_profile",
-            "mempal_search",
-        }:
+        if (
+            tool_name not in {"mempal_profile", "mempal_search"}
+            and self._is_breaker_open()
+            and tool_name != "mempal_conclude"
+        ):
             return json.dumps({"error": "mempal temporarily unavailable. Will retry automatically."})
         if tool_name == "mempal_profile":
             try:

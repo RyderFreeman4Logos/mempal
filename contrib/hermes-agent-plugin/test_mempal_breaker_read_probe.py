@@ -23,7 +23,7 @@ class RaisingBackoff(SharedPluginBackoff):
 
     def record_success(self):
         if self.method == "success":
-            raise OSError("backoff persistence unavailable")
+            raise OSError("SECRET_BACKOFF_PATH")
         return super().record_success()
 
     def record_failure(self):
@@ -113,6 +113,38 @@ class BreakerReadProbeTests(unittest.TestCase):
 
             self.assertEqual(result["error_details"]["kind"], "search_transport_failure")
             self.assertNotIn("SECRET_SEARCH_ENDPOINT", json.dumps(result))
+
+    def test_expired_persisted_breaker_reset_failure_allows_typed_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, ".plugin_backoff")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "failure_count": 5,
+                    "open_until_epoch": time.time() - 1,
+                }, handle)
+
+            provider = RecordingProvider()
+            provider._backoff = RaisingBackoff(path, "success")
+            provider.initialize("session-a", user_id="alice", profile="work")
+            provider.responses["/api/timeline"] = [{"content": "profile memory"}]
+            provider.responses["/api/search"] = [{"content": "search memory"}]
+
+            cases = (
+                ("mempal_profile", {"limit": 5}, "content", "profile memory"),
+                ("mempal_search", {"query": "test"}, "memory", "search memory"),
+            )
+            for tool_name, args, field, expected in cases:
+                with self.subTest(tool_name=tool_name):
+                    try:
+                        payload = provider.handle_tool_call(tool_name, args)
+                    except Exception as exc:
+                        self.fail(
+                            f"{tool_name} escaped breaker admission: "
+                            f"{exc.__class__.__name__}"
+                        )
+                    result = json.loads(payload)
+                    self.assertEqual(result["results"][0][field], expected)
+                    self.assertNotIn("SECRET_BACKOFF_PATH", payload)
 
     def test_open_breaker_allows_read_probe_to_return_typed_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
