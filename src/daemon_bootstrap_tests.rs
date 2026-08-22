@@ -328,6 +328,36 @@ fn daemon_storage_open_skips_queue_reclaim_while_writer_is_busy() {
 }
 
 #[test]
+fn sqlite_busy_start_failure_uses_temporary_refusal_status() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    drop(Database::open(&db_path).expect("initialize database"));
+
+    let holder = rusqlite::Connection::open(&db_path).expect("open SQLite lock holder");
+    holder
+        .busy_timeout(Duration::ZERO)
+        .expect("make lock holder fail fast");
+    holder
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold SQLite write lock");
+
+    let witness = rusqlite::Connection::open(&db_path).expect("open SQLite busy witness");
+    witness
+        .busy_timeout(Duration::ZERO)
+        .expect("make busy witness fail fast");
+    let busy_error = witness
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect_err("the startup witness must observe the holder's SQLite busy error");
+    let error = anyhow::Error::new(busy_error).context("failed to open daemon database");
+
+    assert_eq!(
+        temporary_refusal_exit_status(&error),
+        Some(DAEMON_TEMPORARY_ADMISSION_REFUSAL_EXIT_STATUS),
+        "a persistent startup SQLite busy must fail closed instead of entering a restart loop"
+    );
+}
+
+#[test]
 fn test_sqlite_lock_detection_checks_context_chain() {
     let error = anyhow::anyhow!("database is locked: Error code 5")
         .context("failed to open daemon database");
