@@ -38,7 +38,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - **Hermes receipts**: scoped smoke ingest inline; live-daemon polls `created_drawer_ids`; already-soft-deleted `mempal_delete` succeeds; cleanup IDs survive CLI/MCP/REST decode; breaker-open conclude replay is structured pending success, not tool error; open REST/Hermes breakers admit `mempal_search`/`mempal_profile` probes with typed/redacted payloads despite expired persisted-breaker reset failures, not temporary-unavailable; daemon down with ≥100 pending → `doctor`/`status`/MCP doctor emit high-severity typed availability signal; unreadable config/queue stats/unverified PIDs → privacy-safe `unavailable`, never synthetic normal; recovery: restart, drain, terminal failures, no DB edits; saturated MCP holder-budget no-write receipts and owner-bound smoke cleanup prevent false receipts/cross-operation cleanup IDs (#871, #876, #888, #918, #921, #923, #924, #927).
 
-- **Daemon writer-lease renew**: retry SQLite Busy/locked so renew waits through contention; daemon stays active (#929); post-merge REST install recycles daemon (#928, #940).
+- **Daemon SQLite busy**: lease renew retries Busy/locked (#929); startup busy/lock exits 75 so systemd does not churn beside extra MCP holders (#931); post-merge REST install recycles daemon (#928, #940).
 
 - **MCP search test deadlines**: `with_mcp_deadline_for_test` bounds embed and
   DB/route paths so deadline-diagnostic fixtures cannot hang on 240s embed
