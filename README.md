@@ -40,18 +40,12 @@ cargo install mempal
 Current repository checkout:
 
 ```bash
-cargo install --path . --locked
+cargo install --path . --locked --features rest
 
 mempal init ~/code/myapp
 mempal ingest ~/code/myapp --wing myapp
 mempal search "auth decision clerk"
 mempal wake-up
-```
-
-With REST support:
-
-```bash
-cargo install --path . --locked --features rest
 ```
 
 ## Configuration
