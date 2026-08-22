@@ -860,6 +860,129 @@ class MempalMemoryProvider:
     def get_tool_schemas(self):
         return [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]
 
+    def authoritative_memory_write(self, request, **kwargs):
+        """Persist one Hermes core memory operation through the durable spool."""
+        del kwargs
+        if not isinstance(request, dict):
+            return json.dumps({
+                "success": False,
+                "error_class": "invalid_request",
+                "retryable": False,
+            })
+        action = request.get("action")
+        target = str(request.get("target") or "memory")
+        content = request.get("content")
+        old_text = request.get("old_text")
+        if action not in {"add", "replace", "remove"}:
+            return json.dumps({
+                "success": False,
+                "error_class": "invalid_action",
+                "retryable": False,
+            })
+        if action in {"add", "replace"} and (not isinstance(content, str) or not content):
+            return json.dumps({
+                "success": False,
+                "error_class": "missing_content",
+                "retryable": False,
+            })
+        if action in {"replace", "remove"} and (not isinstance(old_text, str) or not old_text):
+            return json.dumps({
+                "success": False,
+                "error_class": "missing_old_text",
+                "retryable": False,
+            })
+
+        track_key = f"{target}:{self._wing}"
+        room = self._memory_room_for_target(target)
+        if action == "remove":
+            body = self._with_project_id({})
+            kind = "delete"
+        else:
+            body = self._with_project_id({
+                "content": content,
+                "wing": self._wing,
+                "room": room,
+            })
+            if action == "replace":
+                body["replace_text"] = old_text
+            if room == self._facts_room:
+                body.update({
+                    "memory_kind": "profile_fact",
+                    "importance": self._safe_min_importance,
+                    "source_type": "user_explicit",
+                })
+            kind = "ingest"
+
+        try:
+            operation = self._spool_write(
+                kind,
+                body,
+                track_key=track_key,
+                action=action,
+                wake=False,
+            )
+        except Exception:
+            return json.dumps({
+                "success": False,
+                "error_class": "local_durable_admission_failed",
+                "retryable": True,
+            })
+
+        key = operation.operation_key
+        if self._is_breaker_open():
+            try:
+                self._wake_spool_worker()
+            except Exception:
+                logger.warning("mempal authoritative write replay wake failed")
+            return json.dumps({
+                "success": False,
+                "error_class": "breaker_open",
+                "retryable": True,
+                "operation_key": key,
+            })
+        try:
+            outcome = self._write_spool.replay_operation_key(
+                key,
+                self._post,
+                self._get,
+                ignore_retry_delay=True,
+                replay_allowed=lambda: not self._is_breaker_open(),
+            )
+        except Exception:
+            outcome = None
+        if outcome is not None and outcome.completed and outcome.drawer_id:
+            try:
+                self._record_success()
+            except Exception:
+                logger.warning("mempal authoritative write success bookkeeping failed")
+            return json.dumps({
+                "success": True,
+                "drawer_id": outcome.drawer_id,
+                "operation_id": outcome.operation_id or "",
+                "operation_key": key,
+            })
+        error_class = (
+            outcome.error_class if outcome is not None and outcome.error_class
+            else "durable_write_pending"
+        )
+        if error_class == "breaker_open":
+            retryable = True
+        else:
+            retryable = not error_class.startswith("terminal_") and error_class != "target_unresolved"
+            try:
+                self._record_failure()
+            except Exception:
+                logger.warning("mempal authoritative write failure bookkeeping failed")
+        payload = {
+            "success": False,
+            "error_class": error_class,
+            "retryable": retryable,
+            "operation_key": key,
+        }
+        if outcome is not None and outcome.operation_id:
+            payload["operation_id"] = outcome.operation_id
+        return json.dumps(payload)
+
     def handle_tool_call(self, tool_name, args, **kwargs):
         if (
             tool_name not in {"mempal_profile", "mempal_search"}
@@ -1018,11 +1141,18 @@ class MempalMemoryProvider:
                     except Exception:
                         logger.warning("mempal conclude success bookkeeping failed")
                 else:
-                    try:
-                        self._record_failure()
-                    except Exception:
-                        logger.warning("mempal conclude failure bookkeeping failed")
                     details = result.payload.get("error_details", {})
+                    local_admission = (
+                        result.payload.get("state") == "local_admitted"
+                        or result.payload.get("durability", {}).get("kind")
+                        == "durable_replay_deferred"
+                        or details.get("kind") == "durable_replay_deferred"
+                    )
+                    if not local_admission:
+                        try:
+                            self._record_failure()
+                        except Exception:
+                            logger.warning("mempal conclude failure bookkeeping failed")
                     if details.get("kind") != "local_durable_admission_failed":
                         try:
                             self._wake_spool_worker()

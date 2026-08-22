@@ -1009,6 +1009,42 @@ class ReadinessDurableMemoryTests(unittest.TestCase):
         self.assertEqual(provider.posts[-1][1]["request"]["content"], "exact text")
         self.assertIn("drawer_id", result)
 
+    def test_authoritative_memory_write_returns_durable_crud_receipts(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+
+        added = json.loads(provider.authoritative_memory_write({
+            "action": "add",
+            "target": "user",
+            "content": "old preference",
+        }))
+        replaced = json.loads(provider.authoritative_memory_write({
+            "action": "replace",
+            "target": "user",
+            "old_text": "old preference",
+            "content": "new preference",
+        }))
+        removed = json.loads(provider.authoritative_memory_write({
+            "action": "remove",
+            "target": "user",
+            "old_text": "new preference",
+        }))
+
+        for receipt in (added, replaced, removed):
+            self.assertTrue(receipt["success"])
+            self.assertTrue(receipt["operation_key"])
+            self.assertTrue(receipt["operation_id"])
+        self.assertTrue(added["drawer_id"])
+        self.assertTrue(replaced["drawer_id"])
+        self.assertTrue(removed["drawer_id"])
+        durable_requests = [
+            body["request"]
+            for path, body in provider.posts
+            if path in {"/api/ingest/durable", "/api/delete/durable"}
+        ]
+        self.assertEqual(durable_requests[1]["replace_text"], "old preference")
+        self.assertNotIn("supersedes", durable_requests[1])
+
 
 class ReadinessReliabilityTests(unittest.TestCase):
     """Reliability: degradation, rapid writes, session switch draining."""

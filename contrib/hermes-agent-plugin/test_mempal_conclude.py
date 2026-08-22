@@ -381,8 +381,10 @@ class DurableConcludeTests(unittest.TestCase):
         provider.initialize("session-a", user_id="alice", profile="work")
         for _ in range(5):
             provider._backoff.record_failure()
+        before = provider._backoff._read_state()
 
         result = self._conclude(provider, "SECRET_BREAKER_CONCLUSION")
+        after = provider._backoff._read_state()
 
         self.assertEqual(result["result"], "Fact admitted locally; durable storage pending.")
         self.assertEqual(result["state"], "local_admitted")
@@ -400,6 +402,8 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertNotIn("error", result)
         self.assertEqual(provider.posts, [])
         self.assertEqual(provider._write_spool.count(), 1)
+        self.assertEqual(after.failure_count, before.failure_count)
+        self.assertEqual(after.open_until_epoch, before.open_until_epoch)
         self.assertNotIn("SECRET_BREAKER_CONCLUSION", json.dumps(result))
 
     @staticmethod

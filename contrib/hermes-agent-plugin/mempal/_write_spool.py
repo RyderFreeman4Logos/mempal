@@ -461,20 +461,21 @@ class WriteSpool:
     ) -> ReplayOutcome:
         request = dict(operation.body)
         if operation.track_key and operation.action in {"replace", "delete"}:
-            target = self.drawer_for_track(operation.track_key)
-            if not target:
-                quarantined = self.record_attempt(
-                    operation.operation_key,
-                    "target_unresolved",
-                    retryable=False,
-                )
-                return ReplayOutcome(
-                    operation,
-                    completed=False,
-                    error_class="target_unresolved",
-                    quarantined=quarantined,
-                )
-            request["supersedes" if operation.action == "replace" else "drawer_id"] = target
+            if not (operation.action == "replace" and request.get("replace_text")):
+                target = self.drawer_for_track(operation.track_key)
+                if not target:
+                    quarantined = self.record_attempt(
+                        operation.operation_key,
+                        "target_unresolved",
+                        retryable=False,
+                    )
+                    return ReplayOutcome(
+                        operation,
+                        completed=False,
+                        error_class="target_unresolved",
+                        quarantined=quarantined,
+                    )
+                request["supersedes" if operation.action == "replace" else "drawer_id"] = target
         operation_id = operation.receipt_operation_id
         route = "/api/ingest/durable"
         try:
