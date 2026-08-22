@@ -1,5 +1,7 @@
 use super::*;
 
+use std::time::Duration;
+
 #[test]
 fn takeover_after_preflight_rejects_stale_generation_mutation() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -56,4 +58,40 @@ fn takeover_after_preflight_rejects_stale_generation_mutation() {
     })
     .expect("current generation may mutate");
     assert_eq!(count(), 1);
+}
+
+#[test]
+fn writer_lease_renew_retries_sqlite_busy_until_live_holder_releases() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("palace.db");
+    let db = Database::open(&db_path).expect("database");
+    let lease = db
+        .runtime_writer_lease_acquire("sqlite-writer", "daemon", "daemon", 120, None)
+        .expect("acquire daemon lease")
+        .expect("daemon lease available");
+    let holder = rusqlite::Connection::open(&db_path).expect("open SQLite lock holder");
+    holder
+        .busy_timeout(Duration::ZERO)
+        .expect("make lock holder fail fast");
+    holder
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold SQLite writer lock");
+
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        holder
+            .execute_batch("ROLLBACK;")
+            .expect("release SQLite writer lock");
+    });
+
+    let renew_db = Database::open_lease_control_with_timeout(&db_path, Duration::ZERO)
+        .expect("open renewal database");
+    let renewed = renew_db
+        .runtime_writer_lease_renew(&lease, 120)
+        .expect("renewal must retry transient SQLite busy");
+    assert!(
+        renewed,
+        "live daemon lease must remain renewable after contention"
+    );
+    releaser.join().expect("join SQLite lock releaser");
 }

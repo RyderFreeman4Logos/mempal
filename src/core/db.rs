@@ -11,7 +11,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, functions::FunctionFlags, params,
@@ -58,6 +58,7 @@ pub const VECTOR_DISTANCE_METRIC: &str = "cosine";
 pub(crate) const SQLITE_CACHE_SIZE_KIB_DEFAULT: i64 = -16_384;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+const RUNTIME_WRITER_LEASE_TRANSACTION_RETRY_DEADLINE: Duration = Duration::from_secs(5);
 
 const CONTENT_HASH_BACKFILL_BATCH: usize = 1_000;
 
@@ -5106,7 +5107,15 @@ impl Database {
     where
         F: FnOnce() -> Result<T, DbError>,
     {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        crate::core::sqlite_retry::retry_content_mutation_sqlite_lock_until(
+            Instant::now() + RUNTIME_WRITER_LEASE_TRANSACTION_RETRY_DEADLINE,
+            || {
+                self.conn
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .map_err(DbError::from)
+            },
+            db_error_is_sqlite_lock,
+        )?;
         match work() {
             Ok(value) => {
                 self.conn.execute_batch("COMMIT")?;
