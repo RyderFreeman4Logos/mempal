@@ -873,22 +873,84 @@ class MempalMemoryProvider:
         target = str(request.get("target") or "memory")
         content = request.get("content")
         old_text = request.get("old_text")
-        if action not in {"add", "replace", "remove"}:
+        operations = request.get("operations")
+
+        def validation_error(item_action, item_content, item_old_text):
+            if item_action not in {"add", "replace", "remove"}:
+                return "invalid_action"
+            if item_action in {"add", "replace"} and (
+                not isinstance(item_content, str) or not item_content
+            ):
+                return "missing_content"
+            if item_action in {"replace", "remove"} and (
+                not isinstance(item_old_text, str) or not item_old_text
+            ):
+                return "missing_old_text"
+            return None
+
+        if operations is not None:
+            if not isinstance(operations, list) or not operations:
+                return json.dumps({
+                    "success": False,
+                    "error_class": "invalid_operations",
+                    "retryable": False,
+                })
+            normalized = []
+            for item in operations:
+                if not isinstance(item, dict):
+                    return json.dumps({
+                        "success": False,
+                        "error_class": "invalid_request",
+                        "retryable": False,
+                    })
+                item_action = item.get("action")
+                item_content = item.get("content")
+                item_old_text = item.get("old_text")
+                error_class = validation_error(item_action, item_content, item_old_text)
+                if error_class is not None:
+                    return json.dumps({
+                        "success": False,
+                        "error_class": error_class,
+                        "retryable": False,
+                    })
+                normalized.append({
+                    "action": item_action,
+                    "target": target,
+                    "content": item_content,
+                    "old_text": item_old_text,
+                })
+
+            completed_ids = []
+            operation_keys = []
+            for item in normalized:
+                receipt = json.loads(self.authoritative_memory_write(item))
+                if receipt.get("operation_key"):
+                    operation_keys.append(receipt["operation_key"])
+                if receipt.get("success"):
+                    if receipt.get("operation_id"):
+                        completed_ids.append(receipt["operation_id"])
+                    continue
+                error_class = receipt.get("error_class") or "durable_write_pending"
+                return json.dumps({
+                    "success": False,
+                    "partial_write": bool(completed_ids),
+                    "operation_ids": completed_ids,
+                    "operation_keys": operation_keys,
+                    "error_class": error_class,
+                    "last_error_class": error_class,
+                    "retryable": receipt.get("retryable", True),
+                })
             return json.dumps({
-                "success": False,
-                "error_class": "invalid_action",
-                "retryable": False,
+                "success": True,
+                "partial_write": False,
+                "operation_ids": completed_ids,
+                "operation_keys": operation_keys,
             })
-        if action in {"add", "replace"} and (not isinstance(content, str) or not content):
+        error_class = validation_error(action, content, old_text)
+        if error_class is not None:
             return json.dumps({
                 "success": False,
-                "error_class": "missing_content",
-                "retryable": False,
-            })
-        if action in {"replace", "remove"} and (not isinstance(old_text, str) or not old_text):
-            return json.dumps({
-                "success": False,
-                "error_class": "missing_old_text",
+                "error_class": error_class,
                 "retryable": False,
             })
 
@@ -918,7 +980,7 @@ class MempalMemoryProvider:
                 kind,
                 body,
                 track_key=track_key,
-                action=action,
+                action="delete" if action == "remove" else str(action),
                 wake=False,
             )
         except Exception:
