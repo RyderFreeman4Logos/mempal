@@ -42,12 +42,6 @@ cargo install mempal
 Install from the current repository checkout:
 
 ```bash
-cargo install --path . --locked
-```
-
-Install with REST support:
-
-```bash
 cargo install --path . --locked --features rest
 ```
 
