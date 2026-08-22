@@ -38,16 +38,14 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - **Hermes receipts**: scoped smoke ingest inline; live-daemon polls `created_drawer_ids`; already-soft-deleted `mempal_delete` succeeds; cleanup IDs survive CLI/MCP/REST decode; breaker-open conclude replay is structured pending success, not tool error; open REST/Hermes breakers admit `mempal_search`/`mempal_profile` probes with typed/redacted payloads despite expired persisted-breaker reset failures, not temporary-unavailable; daemon down with ≥100 pending → `doctor`/`status`/MCP doctor emit high-severity typed availability signal; unreadable config/queue stats/unverified PIDs → privacy-safe `unavailable`, never synthetic normal; recovery: restart, drain, terminal failures, no DB edits; saturated MCP holder-budget no-write receipts and owner-bound smoke cleanup prevent false receipts/cross-operation cleanup IDs (#871, #876, #888, #918, #921, #923, #924, #927).
 
-- **Daemon writer-lease renew**: treat profile admission lock `Busy` as the same
-  retryable contention class as SQLite busy/locked so lease heartbeat recovery
-  can wait through short admission waits under suite load.
+- **Daemon writer-lease renew**: retry transient SQLite `DatabaseBusy`/locked (`extended_code: 5`) in writer-lease transactions; profile-admission `Busy` retries let lease renew/heartbeat wait through short suite-load contention; daemon stays `ActiveState=active` (#929).
 
-- **MCP search test deadlines**: `with_mcp_deadline_for_test` also bounds the
-  embed path (not only DB/route deadlines) so deadline-diagnostic fixtures
-  cannot hang on the production 240s embed timeout under suite load.
+- **MCP search test deadlines**: `with_mcp_deadline_for_test` bounds embed and
+  DB/route paths so deadline-diagnostic fixtures cannot hang on 240s embed
+  timeout under suite load.
 
-- **Admission budget concurrent fixture**: retry profile admission `Busy` lock
-  contention in the oversubscribe test so suite-load flock waits are not
+- **Admission budget concurrent fixture**: retry profile admission `Busy`
+  contention in oversubscribe test so suite-load flock waits aren't
   miscounted as budget rejections.
 
 - **Fixture readiness**: synchronize SQLite, MCP, and queue byte-admission
@@ -55,8 +53,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   the daemon lifecycle completion poll likewise retries temporary admission
   `Busy` through its existing deadline (#882, #889, #890).
 
-- **MCP delete retry fixture**: force an observed SQLite Busy result before
-  synchronized lock release, eliminating the 5.5s/9s wall-clock race (#886).
+- **MCP delete retry fixture**: force observed SQLite Busy before synchronized
+  lock release, eliminating the 5.5s/9s race (#886).
 
 - **Daemon supervisor cooldowns**: wait through active restart-budget
   cooldowns and retry bootstrap in-process; true temporary refusals retain
