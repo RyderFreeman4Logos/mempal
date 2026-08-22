@@ -212,10 +212,16 @@ impl Database {
             return write();
         }
 
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(DbError::from)
-            .map_err(E::from)?;
+        crate::core::sqlite_retry::retry_content_mutation_sqlite_lock_until(
+            std::time::Instant::now() + super::RUNTIME_WRITER_LEASE_TRANSACTION_RETRY_DEADLINE,
+            || {
+                self.conn
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .map_err(DbError::from)
+            },
+            super::db_error_is_sqlite_lock,
+        )
+        .map_err(E::from)?;
         let result = (|| {
             if let Some(lease) = lease {
                 self.runtime_writer_lease_cleanup_expired_tx(true)

@@ -55,7 +55,7 @@ where
     retry_content_mutation_sqlite_lock_until(retry_deadline, operation, is_transient_lock)
 }
 
-fn retry_content_mutation_sqlite_lock_until<T, E>(
+pub(crate) fn retry_content_mutation_sqlite_lock_until<T, E>(
     retry_deadline: Instant,
     mut operation: impl FnMut() -> Result<T, E>,
     is_transient_lock: impl Fn(&E) -> bool,
