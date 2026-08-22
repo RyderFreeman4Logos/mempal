@@ -32,10 +32,21 @@ install_bin=$3
 printf "\n[%s] post-merge install started in %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo_root"
 cd "$repo_root"
 CARGO_INSTALL_ROOT="$install_root" just install
-if systemctl --user is-active --quiet mempal-daemon.service; then
-  systemctl --user try-restart mempal-daemon.service
+probe_state=""
+if probe_state=$(systemctl --user show -p ActiveState --value mempal-daemon.service); then
+  case "$probe_state" in
+    active)
+      systemctl --user try-restart mempal-daemon.service
+      ;;
+    inactive)
+      "$install_bin" daemon restart
+      ;;
+    *)
+      printf "[mempal] Daemon recycle skipped: unexpected systemd state %q\n" "$probe_state" >&2
+      ;;
+  esac
 else
-  "$install_bin" daemon restart
+  printf "[mempal] Daemon recycle skipped: systemd state probe failed\n" >&2
 fi
 printf "[%s] post-merge install and daemon restart finished\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ' mempal-post-merge-install "$repo_root" "$install_root" "$install_bin_dir/mempal" >>"$log_file" 2>&1 </dev/null &
