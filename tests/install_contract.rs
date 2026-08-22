@@ -1,6 +1,7 @@
 use std::{
     env, fs, io,
     os::unix::{fs::PermissionsExt, process::CommandExt},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     process::{Command, Output, Stdio},
     thread,
@@ -8,6 +9,7 @@ use std::{
 };
 
 const FIXTURE_SUBPROCESS_DEADLINE: Duration = Duration::from_secs(30);
+const CLEANUP_DEADLINE: Duration = Duration::from_millis(250);
 
 fn repo_file(path: &str) -> String {
     fs::read_to_string(format!("{}/{}", env!("CARGO_MANIFEST_DIR"), path))
@@ -36,6 +38,16 @@ fn run_bounded_output(mut command: Command, timeout: Duration) -> Output {
     }
     let mut child = command.spawn().expect("spawn bounded fixture subprocess");
     let process_group = -(child.id() as libc::pid_t);
+    let kill_process_group = || -> io::Result<()> {
+        // SAFETY: pre_exec assigned this child a private process group.
+        if unsafe { libc::kill(process_group, libc::SIGKILL) } == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    };
     let deadline = Instant::now() + timeout;
     loop {
         if child
@@ -43,16 +55,29 @@ fn run_bounded_output(mut command: Command, timeout: Duration) -> Output {
             .expect("poll bounded fixture subprocess")
             .is_some()
         {
-            // SAFETY: pre_exec assigned this child a private process group.
-            unsafe { libc::kill(process_group, libc::SIGKILL) };
+            kill_process_group().expect("kill bounded fixture process group");
             return child
                 .wait_with_output()
                 .expect("collect bounded fixture subprocess");
         }
         if Instant::now() >= deadline {
-            // SAFETY: pre_exec assigned this child a private process group.
-            unsafe { libc::kill(process_group, libc::SIGKILL) };
-            let _ = child.wait();
+            let kill_error = kill_process_group().err();
+            let cleanup_deadline = Instant::now() + CLEANUP_DEADLINE;
+            loop {
+                if Instant::now() >= cleanup_deadline {
+                    panic!("bounded fixture subprocess cleanup exceeded {CLEANUP_DEADLINE:?}");
+                }
+                match child
+                    .try_wait()
+                    .expect("poll bounded fixture subprocess cleanup")
+                {
+                    Some(_) => break,
+                    None => thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            if let Some(error) = kill_error {
+                panic!("kill bounded fixture process group: {error}");
+            }
             panic!("bounded fixture subprocess exceeded {timeout:?}");
         }
         thread::sleep(Duration::from_millis(10));
@@ -237,5 +262,39 @@ fn probe_error_install_contract_aborts_recycle_without_cli_or_systemd_restart() 
     assert!(
         !events.iter().any(|event| event.contains("mempal.service")),
         "mempal.service must never be invoked: {events:?}"
+    );
+}
+
+#[test]
+fn install_contract_timeout_cleanup_is_bounded() {
+    let mut command = Command::new("python3");
+    command
+        .args([
+            "-c",
+            "import os; os.setpgid(0, os.getpgid(os.getppid())); os.execlp('sleep', 'sleep', '5')",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let timeout = Duration::from_millis(50);
+    let started = Instant::now();
+    let result = catch_unwind(AssertUnwindSafe(|| run_bounded_output(command, timeout)));
+    let elapsed = started.elapsed();
+    let cleanup_budget = timeout + CLEANUP_DEADLINE + Duration::from_millis(500);
+
+    assert!(
+        result.is_err(),
+        "long-lived fixture subprocess must time out"
+    );
+    assert!(
+        elapsed < cleanup_budget,
+        "timeout cleanup exceeded its bounded budget: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "timeout cleanup must remain well below one second: {elapsed:?}"
+    );
+    assert!(
+        elapsed < FIXTURE_SUBPROCESS_DEADLINE + CLEANUP_DEADLINE,
+        "timeout cleanup exceeded fixture plus cleanup deadlines: {elapsed:?}"
     );
 }
