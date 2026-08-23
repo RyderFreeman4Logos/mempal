@@ -62,8 +62,7 @@ trait DaemonCommandExt {
 
 impl DaemonCommandExt for Command {
     fn daemon_home(&mut self, home: &Path) -> &mut Self {
-        // Isolate daemon children from host/dotenv MEMPAL_EMBED_* overrides so
-        // fixture configs (especially paused openai_compat mocks) are honored.
+        // Isolate daemon children from ambient embedder overrides.
         self.env("HOME", home)
             .env(
                 mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
@@ -75,7 +74,6 @@ impl DaemonCommandExt for Command {
             .env_remove("MEMPAL_EMBED_DIM")
     }
 }
-
 #[cfg(unix)]
 #[test]
 fn status_commands_exit_successfully_when_stdout_pipe_is_closed() {
@@ -118,8 +116,7 @@ struct EnvVarGuard {
 impl EnvVarGuard {
     fn set_path(key: &'static str, value: &Path) -> Self {
         let previous = std::env::var_os(key);
-        // SAFETY: daemon lifecycle tests serialize process-wide environment
-        // mutation with ENV_LOCK and restore the previous value on drop.
+        // SAFETY: ENV_LOCK serializes this mutation; the guard restores it.
         unsafe {
             std::env::set_var(key, value);
         }
@@ -129,8 +126,7 @@ impl EnvVarGuard {
 
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
-        // SAFETY: daemon lifecycle tests serialize process-wide environment
-        // mutation with ENV_LOCK and this restores the captured previous value.
+        // SAFETY: ENV_LOCK serializes this restore.
         unsafe {
             if let Some(previous) = &self.previous {
                 std::env::set_var(self.key, previous);
@@ -250,12 +246,10 @@ log_path = "{}"
     )
     .expect("write openai daemon config");
 }
-
 #[cfg(unix)]
 struct DaemonHomeCleanup {
     db_path: PathBuf,
 }
-
 #[cfg(unix)]
 impl Drop for DaemonHomeCleanup {
     fn drop(&mut self) {
@@ -281,7 +275,6 @@ impl Drop for DaemonHomeCleanup {
         }
     }
 }
-
 #[cfg(unix)]
 fn process_is_running_for_test(pid: i32) -> bool {
     // SAFETY: kill(2) with signal 0 probes liveness without delivering a
@@ -292,7 +285,6 @@ fn process_is_running_for_test(pid: i32) -> bool {
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
-
 #[cfg(unix)]
 fn wait_for_pid_file(pid_path: &std::path::Path, timeout: Duration) -> Option<i32> {
     let deadline = Instant::now() + timeout;
@@ -306,7 +298,6 @@ fn wait_for_pid_file(pid_path: &std::path::Path, timeout: Duration) -> Option<i3
     }
     None
 }
-
 #[cfg(unix)]
 fn wait_for_child_exit(child: &mut CapturedChild, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
@@ -345,18 +336,21 @@ fn spawn_placeholder_daemon(home: &Path, label: &str) -> std::io::Result<Capture
     CapturedChild::spawn(&mut command, &daemon_runtime_dir(home), label, None)
 }
 
-fn spawn_db_backed_orphan_daemon(
-    home: &std::path::Path,
-    db_path: &std::path::Path,
-) -> CapturedChild {
-    let mempal_home = db_path.parent().expect("db parent");
-    let pid_path = mempal_home.join("daemon.pid");
+fn spawn_db_backed_orphan_daemon(home: &Path, db_path: &Path) -> CapturedChild {
+    let pid_path = db_path.parent().expect("parent").join("daemon.pid");
     let child = spawn_foreground_daemon(home, "db-backed-orphan");
     let pid = child.id() as i32;
-    let pidfile_pid =
-        wait_for_pid_file(&pid_path, Duration::from_secs(10)).expect("daemon pidfile");
+    let pidfile_pid = wait_for_pid_file(&pid_path, Duration::from_secs(10)).expect("pidfile");
     assert_eq!(pidfile_pid, pid);
-    fs::remove_file(&pid_path).expect("remove pidfile to make orphan");
+    assert!(
+        Command::new(mempal_bin())
+            .args(["daemon", "wait"])
+            .daemon_home(home)
+            .status()
+            .expect("wait")
+            .success()
+    );
+    fs::remove_file(&pid_path).expect("remove pidfile");
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         let pids = mempal::daemon_singleton::enumerate_daemon_pids("mempal", db_path);
@@ -456,7 +450,6 @@ fn test_duplicate_daemon_bootstrap_is_rejected_before_work_begins() {
         "duplicate daemon must fail before writing pidfile"
     );
 }
-
 #[cfg(unix)]
 #[test]
 fn test_daemon_restart_reaps_orphan_without_pidfile() {
@@ -504,7 +497,6 @@ fn test_daemon_restart_reaps_orphan_without_pidfile() {
         "restarted daemon pid {restarted_pid} should be running"
     );
 }
-
 #[cfg(unix)]
 #[test]
 fn test_daemon_start_repairs_orphan_pidfile_before_reporting_running() {
@@ -539,7 +531,6 @@ fn test_daemon_start_repairs_orphan_pidfile_before_reporting_running() {
     orphan.kill().expect("kill orphan daemon");
     orphan.wait().expect("wait orphan daemon");
 }
-
 #[cfg(unix)]
 #[test]
 fn test_daemon_stop_does_not_terminate_pidfile_only_process() {
@@ -572,7 +563,6 @@ fn test_daemon_stop_does_not_terminate_pidfile_only_process() {
     child.kill().expect("kill placeholder");
     child.wait().expect("wait placeholder");
 }
-
 #[cfg(unix)]
 #[test]
 fn test_daemon_status_does_not_report_pidfile_only_process_as_running() {
@@ -600,7 +590,6 @@ fn test_daemon_status_does_not_report_pidfile_only_process_as_running() {
     child.kill().expect("kill placeholder");
     child.wait().expect("wait placeholder");
 }
-
 #[cfg(unix)]
 #[test]
 fn test_daemon_restart_does_not_terminate_pidfile_only_process_and_restarts() {
@@ -640,7 +629,6 @@ fn test_daemon_restart_does_not_terminate_pidfile_only_process_and_restarts() {
     child.kill().expect("kill placeholder");
     child.wait().expect("wait placeholder");
 }
-
 #[cfg(unix)]
 #[test]
 fn test_daemon_reap_repairs_single_orphan_pidfile() {
@@ -678,7 +666,6 @@ fn test_daemon_reap_repairs_single_orphan_pidfile() {
     orphan.kill().expect("kill orphan daemon");
     orphan.wait().expect("wait orphan daemon");
 }
-
 #[cfg(unix)]
 #[test]
 fn test_status_full_treats_single_orphan_as_running() {
@@ -712,7 +699,6 @@ fn test_status_full_treats_single_orphan_as_running() {
     orphan.kill().expect("kill orphan daemon");
     orphan.wait().expect("wait orphan daemon");
 }
-
 #[cfg(unix)]
 #[test]
 fn test_daemon_reap_does_not_keep_pidfile_only_process() {
@@ -752,7 +738,6 @@ fn test_daemon_reap_does_not_keep_pidfile_only_process() {
     child.kill().expect("kill placeholder");
     child.wait().expect("wait placeholder");
 }
-
 #[cfg(unix)]
 #[test]
 fn test_daemon_processes_ingest_async_queue_rows() {
@@ -808,7 +793,6 @@ fn test_daemon_processes_ingest_async_queue_rows() {
     let db = Database::open(&db_path).expect("open db");
     assert_eq!(db.drawer_count().expect("drawer count"), 1);
 }
-
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
@@ -910,7 +894,6 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
         "completed async ingest must not be reprocessed after restart"
     );
 }
-
 #[cfg(unix)]
 #[test]
 fn test_daemon_sigterm_graceful() {

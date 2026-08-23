@@ -5,13 +5,15 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use mempal::core::{
     case_skill::{
         CaseCloseRequest, CaseOpenRequest, CaseSkillError, CaseVerdict, SkillProposalOptions,
         close_case, open_case, propose_skills_from_cases,
     },
-    db::Database,
+    db::{Database, DbError},
+    db_admission::DbAdmissionError,
     skills::{SkillStatus, adopt_skill, list_skills, load_active_skills_for_context},
     types::{BootstrapEvidenceArgs, Drawer, KnowledgeStatus, MemoryKind, SourceType},
 };
@@ -25,6 +27,19 @@ fn new_db() -> (TempDir, Database) {
     let tmp = TempDir::new().expect("tempdir");
     let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
     (tmp, db)
+}
+
+fn open_db_retrying_admission_busy(path: &Path) -> Database {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match Database::open(path) {
+            Ok(db) => return db,
+            Err(DbError::Admission(DbAdmissionError::Busy { .. })) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => panic!("open concurrent db: {error}"),
+        }
+    }
 }
 
 fn insert_evidence(db: &Database, id: &str, content: &str) {
@@ -332,7 +347,7 @@ fn test_concurrent_case_backed_proposals_reuse_single_live_skill() {
         let ready_tx = ready_tx.clone();
         let result_tx = result_tx.clone();
         handles.push(thread::spawn(move || {
-            let db = Database::open(&db_path).expect("open concurrent db");
+            let db = open_db_retrying_admission_busy(&db_path);
             ready_tx
                 .send(())
                 .expect("report concurrent proposal readiness");

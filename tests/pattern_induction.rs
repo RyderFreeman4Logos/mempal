@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use mempal::core::config::{Config, ConfigHandle};
@@ -27,6 +28,10 @@ use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
 use mempal::mcp::{IngestRequest, MempalMcpServer};
 use serde_json::json;
 use tempfile::TempDir;
+use tokio::time::{sleep, timeout};
+
+#[rustfmt::skip]
+macro_rules! retry_busy { ($s:expr, $q:expr, $t:expr) => {{ timeout(Duration::from_secs(2), async { loop { match $s.context_json_for_test(json!({ "query": $q, "cwd": ($t).to_str().unwrap() })).await { Ok(v) => break Ok(v), Err(e) if e.message.contains("database admission state is busy after 250ms:") => sleep(Duration::from_millis(2)).await, Err(e) => break Err(e), } } }).await.expect("timeout").unwrap() }}; }
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -234,9 +239,7 @@ async fn do_ingest(server: &MempalMcpServer, content: &str, source: &str) {
         .expect("ingest");
 }
 
-// ---------------------------------------------------------------------------
-// Test: schema migration creates patterns table
-// ---------------------------------------------------------------------------
+// schema
 
 #[test]
 fn test_fork_ext_migration_v6_to_v7_creates_patterns_table() {
@@ -293,9 +296,7 @@ fn test_fork_ext_migration_v6_to_v7_creates_patterns_table() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Test: 3 different sessions → pattern candidate created
-// ---------------------------------------------------------------------------
+// candidate
 
 #[test]
 fn test_pattern_candidate_created_from_three_sessions() {
@@ -360,9 +361,7 @@ fn test_pattern_candidate_created_from_three_sessions() {
     assert!(!p.signature.is_empty(), "signature blob must be non-empty");
 }
 
-// ---------------------------------------------------------------------------
-// Test: same session drawers don't create a pattern
-// ---------------------------------------------------------------------------
+// session
 
 #[test]
 fn test_same_session_drawers_dont_create_pattern() {
@@ -413,9 +412,7 @@ fn test_same_session_drawers_dont_create_pattern() {
     assert_eq!(count, 0, "single-session cluster must not create a pattern");
 }
 
-// ---------------------------------------------------------------------------
-// Test: pattern auto-promotes when session_count reaches promote_threshold
-// ---------------------------------------------------------------------------
+// promote
 
 #[test]
 fn test_pattern_promotes_to_active_at_threshold() {
@@ -487,9 +484,7 @@ fn test_pattern_promotes_to_active_at_threshold() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Test: active pattern boosts exemplar results in search
-// ---------------------------------------------------------------------------
+// boost
 
 // model_id that apply_pattern_boost derives for config backend = "stub".
 const STUB_MODEL_ID: &str = "";
@@ -588,9 +583,7 @@ async fn test_active_pattern_boosts_exemplar_results() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Test: mempal_context includes active patterns as recurring_themes
-// ---------------------------------------------------------------------------
+// themes
 
 #[tokio::test]
 async fn test_context_includes_recurring_themes() {
@@ -631,13 +624,7 @@ async fn test_context_includes_recurring_themes() {
     }
 
     let server = env.server(&[], near_vec(&base, 0.0));
-    let ctx = server
-        .context_json_for_test(json!({
-            "query": "test context query",
-            "cwd": env._tmp.path().to_str().unwrap(),
-        }))
-        .await
-        .expect("context");
+    let ctx = retry_busy!(server, "test context query", env._tmp.path());
 
     assert_eq!(
         ctx.recurring_themes.len(),
@@ -681,13 +668,7 @@ async fn test_context_excludes_candidate_patterns() {
     }
 
     let server = env.server(&[], base.clone());
-    let ctx = server
-        .context_json_for_test(json!({
-            "query": "context query",
-            "cwd": env._tmp.path().to_str().unwrap(),
-        }))
-        .await
-        .expect("context");
+    let ctx = retry_busy!(server, "context query", env._tmp.path());
 
     assert!(
         ctx.recurring_themes.is_empty(),
