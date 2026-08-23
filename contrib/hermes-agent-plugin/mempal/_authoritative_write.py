@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
+__all__ = ["authoritative_memory_write"]
 
-def authoritative_memory_write(provider, request, **kwargs):
+
+def authoritative_memory_write(provider: Any, request: Any, **kwargs: Any) -> str:
     """Persist one Hermes core memory operation through the durable spool."""
     self = provider
-    del kwargs
+    retry_operation_key = kwargs.get("operation_key")
     if not isinstance(request, dict):
         return json.dumps({
             "success": False,
@@ -23,6 +26,8 @@ def authoritative_memory_write(provider, request, **kwargs):
     content = request.get("content")
     old_text = request.get("old_text")
     operations = request.get("operations")
+    retry_operation_key = request.get("operation_key") or retry_operation_key
+    batch_operation_keys = request.get("operation_keys")
 
     def validation_error(item_action, item_content, item_old_text):
         if item_action not in {"add", "replace", "remove"}:
@@ -44,8 +49,17 @@ def authoritative_memory_write(provider, request, **kwargs):
                 "error_class": "invalid_operations",
                 "retryable": False,
             })
+        if batch_operation_keys is not None and (
+            not isinstance(batch_operation_keys, list)
+            or len(batch_operation_keys) != len(operations)
+        ):
+            return json.dumps({
+                "success": False,
+                "error_class": "invalid_operations",
+                "retryable": False,
+            })
         normalized = []
-        for item in operations:
+        for index, item in enumerate(operations):
             if not isinstance(item, dict):
                 return json.dumps({
                     "success": False,
@@ -62,11 +76,15 @@ def authoritative_memory_write(provider, request, **kwargs):
                     "error_class": error_class,
                     "retryable": False,
                 })
+            item_operation_key = item.get("operation_key")
+            if item_operation_key is None and batch_operation_keys is not None:
+                item_operation_key = batch_operation_keys[index]
             normalized.append({
                 "action": item_action,
                 "target": target,
                 "content": item_content,
                 "old_text": item_old_text,
+                "operation_key": item_operation_key,
             })
 
         completed_ids = []
@@ -103,7 +121,7 @@ def authoritative_memory_write(provider, request, **kwargs):
             "retryable": False,
         })
 
-    track_key = f"{target}:{self._wing}"
+    track_key = self._track_key(target)
     room = self._memory_room_for_target(target)
     if action == "remove":
         body = self._with_project_id({})
@@ -130,6 +148,7 @@ def authoritative_memory_write(provider, request, **kwargs):
             body,
             track_key=track_key,
             action="delete" if action == "remove" else str(action),
+            operation_key=retry_operation_key,
             wake=False,
         )
     except Exception:
@@ -176,6 +195,31 @@ def authoritative_memory_write(provider, request, **kwargs):
         outcome.error_class if outcome is not None and outcome.error_class
         else "durable_write_pending"
     )
+    if error_class.startswith("status_") or error_class == "fifo_blocked":
+        try:
+            self._wake_spool_worker()
+        except Exception:
+            logger.warning("mempal authoritative write replay wake failed")
+        payload = {
+            "success": True,
+            "state": "local_admitted",
+            "retryable": True,
+            "retry_safe": True,
+            "operation_key": key,
+            "retry_operation_id": key,
+            "durability": {
+                "state": "pending",
+                "kind": "durable_replay_deferred",
+                "deferred_reason": (
+                    error_class.removeprefix("status_")
+                    if error_class.startswith("status_")
+                    else error_class
+                ) or "pending",
+            },
+        }
+        if outcome is not None and outcome.operation_id:
+            payload["operation_id"] = outcome.operation_id
+        return json.dumps(payload)
     if error_class == "breaker_open":
         retryable = True
     else:

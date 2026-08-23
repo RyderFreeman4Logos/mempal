@@ -11,6 +11,7 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 import time
 import urllib.error
 from contextlib import closing
@@ -87,6 +88,7 @@ class WriteSpool:
         if not hermes_home:
             raise ValueError("hermes_home is required for durable mempal writes")
         self.path = os.path.abspath(os.path.join(hermes_home, _DB_RELATIVE_PATH))
+        self._replay_lock = threading.RLock()
         self._prepare_parent()
         self._initialize_schema()
 
@@ -406,15 +408,16 @@ class WriteSpool:
         replay_allowed: Optional[Callable[[], bool]] = None,
     ) -> Optional[ReplayOutcome]:
         """Attempt the earliest eligible operation without surrendering ambiguity."""
-        operation = self.next_replayable_operation()
-        if operation is None:
-            return None
-        return self._replay_operation(
-            operation,
-            post,
-            get,
-            replay_allowed=replay_allowed,
-        )
+        with self._replay_lock:
+            operation = self.next_replayable_operation()
+            if operation is None:
+                return None
+            return self._replay_operation_locked(
+                operation,
+                post,
+                get,
+                replay_allowed=replay_allowed,
+            )
 
     def replay_operation_key(
         self,
@@ -426,32 +429,80 @@ class WriteSpool:
         replay_allowed: Optional[Callable[[], bool]] = None,
     ) -> Optional[ReplayOutcome]:
         """Attempt one specific operation, preserving its producer-owned key."""
-        operation = self.get(operation_key)
-        if operation is None:
-            return None
-        if operation.quarantined_at is not None:
-            return ReplayOutcome(
+        with self._replay_lock:
+            operation = self.get(operation_key)
+            if operation is None:
+                return None
+            if operation.quarantined_at is not None:
+                return ReplayOutcome(
+                    operation,
+                    completed=False,
+                    error_class=operation.quarantine_reason or operation.last_error_class,
+                    operation_id=operation.receipt_operation_id,
+                    quarantined=True,
+                )
+            if not ignore_retry_delay and operation.next_attempt_at > time.time():
+                return ReplayOutcome(
+                    operation,
+                    completed=False,
+                    error_class=operation.last_error_class or "retry_not_due",
+                    operation_id=operation.receipt_operation_id,
+                )
+            if not self._is_replayable(operation_key, ignore_retry_delay):
+                return ReplayOutcome(
+                    operation,
+                    completed=False,
+                    error_class="fifo_blocked",
+                    operation_id=operation.receipt_operation_id,
+                )
+            return self._replay_operation_locked(
                 operation,
-                completed=False,
-                error_class=operation.quarantine_reason or operation.last_error_class,
-                operation_id=operation.receipt_operation_id,
-                quarantined=True,
+                post,
+                get,
+                replay_allowed=replay_allowed,
             )
-        if not ignore_retry_delay and operation.next_attempt_at > time.time():
-            return ReplayOutcome(
-                operation,
-                completed=False,
-                error_class=operation.last_error_class or "retry_not_due",
-                operation_id=operation.receipt_operation_id,
-            )
-        return self._replay_operation(
-            operation,
-            post,
-            get,
-            replay_allowed=replay_allowed,
-        )
+
+    def _is_replayable(self, operation_key: str, ignore_retry_delay: bool) -> bool:
+        now = time.time()
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM write_operations AS candidate
+                WHERE candidate.operation_key = ?1
+                  AND candidate.quarantined_at IS NULL
+                  AND (?2 OR candidate.next_attempt_at <= ?3)
+                  AND (
+                    candidate.track_key IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM write_operations AS earlier
+                        WHERE earlier.track_key = candidate.track_key
+                          AND earlier.sequence < candidate.sequence
+                    )
+                  )
+                """,
+                (operation_key, ignore_retry_delay, now),
+            ).fetchone()
+        return row is not None
 
     def _replay_operation(
+        self,
+        operation: SpoolOperation,
+        post: Callable[[str, Dict[str, Any]], Any],
+        get: Callable[[str], Any],
+        *,
+        replay_allowed: Optional[Callable[[], bool]] = None,
+    ) -> ReplayOutcome:
+        with self._replay_lock:
+            return self._replay_operation_locked(
+                operation,
+                post,
+                get,
+                replay_allowed=replay_allowed,
+            )
+
+    def _replay_operation_locked(
         self,
         operation: SpoolOperation,
         post: Callable[[str, Dict[str, Any]], Any],

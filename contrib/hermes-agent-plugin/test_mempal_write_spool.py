@@ -355,6 +355,103 @@ class DurableSchedulingTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_direct_replay_respects_same_track_fifo(self) -> None:
+        with tempfile.TemporaryDirectory() as hermes_home:
+            spool = WriteSpool(hermes_home)
+            seed = spool.admit(
+                "ingest",
+                {"content": "old", "wing": "wing", "room": "facts"},
+                track_key="profile:wing",
+                action="add",
+            )
+            spool.complete(seed.operation_key, track_key="profile:wing", drawer_id="drawer-old")
+            replace = spool.admit(
+                "ingest",
+                {
+                    "content": "new",
+                    "replace_text": "old",
+                    "wing": "wing",
+                    "room": "facts",
+                },
+                track_key="profile:wing",
+                action="replace",
+            )
+            remove = spool.admit(
+                "delete",
+                {},
+                track_key="profile:wing",
+                action="delete",
+            )
+            calls = []
+
+            outcome = spool.replay_operation_key(
+                remove.operation_key,
+                lambda path, body: calls.append((path, body)),
+                lambda _path: {"state": "completed"},
+                ignore_retry_delay=True,
+            )
+
+            self.assertIsNotNone(outcome)
+            self.assertEqual(outcome.error_class, "fifo_blocked")
+            self.assertEqual(outcome.operation.operation_key, remove.operation_key)
+            self.assertEqual(calls, [])
+            self.assertEqual(
+                spool.next_replayable_operation().operation_key,
+                replace.operation_key,
+            )
+
+    def test_direct_replay_does_not_race_running_spool_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as hermes_home:
+            spool = WriteSpool(hermes_home)
+            operation = spool.admit(
+                "ingest",
+                {"content": "one", "wing": "wing", "room": "facts"},
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            calls = []
+            errors = []
+            results = []
+
+            def post(_path, _body):
+                calls.append("post")
+                entered.set()
+                release.wait(timeout=2.0)
+                return {"operation_id": "operation-one", "state": "queued"}
+
+            def get(_path):
+                return {"operation_id": "operation-one", "state": "completed", "drawer_id": "drawer-one"}
+
+            def replay_worker():
+                try:
+                    results.append(spool.replay_one(post, get))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            worker = threading.Thread(target=replay_worker)
+            worker.start()
+            self.assertTrue(entered.wait(timeout=1.0))
+
+            direct = threading.Thread(
+                target=lambda: results.append(
+                    spool.replay_operation_key(
+                        operation.operation_key,
+                        post,
+                        get,
+                        ignore_retry_delay=True,
+                    )
+                )
+            )
+            direct.start()
+            self.assertFalse(direct.join(timeout=0.05))
+            release.set()
+            worker.join(timeout=1.0)
+            direct.join(timeout=1.0)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(calls, ["post"])
+            self.assertEqual(spool.count(), 0)
+
     def test_queue_full_retains_recoverable_work(self) -> None:
         provider = RecordingProvider()
         provider.initialize("session-a")

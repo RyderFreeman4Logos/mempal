@@ -294,6 +294,10 @@ class MempalMemoryProvider:
             self._process_write(item)
             self._write_queue.task_done()
 
+    def _track_key(self, target: str) -> str:
+        scope = f"project:{self._project_id}" if self._project_id else "global"
+        return f"{target}:{self._wing}:{scope}"
+
     def _spool_write(
         self,
         kind: str,
@@ -301,12 +305,17 @@ class MempalMemoryProvider:
         *,
         action: str,
         track_key: Optional[str] = None,
+        operation_key: Optional[str] = None,
         wake: bool = True,
     ) -> SpoolOperation:
         if self._write_spool is None:
             raise RuntimeError("mempal durable write spool is not initialized")
         operation = self._write_spool.admit(
-            kind, body, track_key=track_key, action=action
+            kind,
+            body,
+            track_key=track_key,
+            action=action,
+            operation_key=operation_key,
         )
         if wake:
             self._wake_spool_worker()
@@ -339,7 +348,7 @@ class MempalMemoryProvider:
         if outcome.completed:
             self._record_success()
             self._update_health(True)
-        elif outcome.error_class:
+        elif outcome.error_class and not outcome.error_class.startswith("status_"):
             self._record_failure()
             self._update_health(False)
             logger.warning(
@@ -1028,7 +1037,10 @@ class MempalMemoryProvider:
                         result.payload.get("state") == "local_admitted"
                         or result.payload.get("durability", {}).get("kind")
                         == "durable_replay_deferred"
-                        or details.get("kind") == "durable_replay_deferred"
+                        or details.get("kind") in {
+                            "durable_replay_deferred",
+                            "durable_operation_pending",
+                        }
                     )
                     if not local_admission:
                         try:
@@ -1073,7 +1085,7 @@ class MempalMemoryProvider:
             self._wake_spool_worker()
 
     def on_memory_write(self, action, target, content, metadata=None):
-        track_key = f"{target}:{self._wing}"
+        track_key = self._track_key(target)
         room = self._memory_room_for_target(target)
         if action == "remove":
             self._spool_write(

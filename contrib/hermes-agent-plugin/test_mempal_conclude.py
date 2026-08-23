@@ -148,6 +148,17 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertTrue(details["retry_safe"])
         self.assertNotIn("result", result)
 
+    def test_pending_receipt_does_not_record_breaker_failure(self) -> None:
+        provider = ControlledConcludeProvider("queued")
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._conclude_wait_timeout = 0.0
+        before = provider._backoff._read_state()
+
+        self._conclude(provider, "pending fact")
+
+        after = provider._backoff._read_state()
+        self.assertEqual(after.failure_count, before.failure_count)
+
     def test_admission_503_never_claims_storage_and_redacts_payload(self) -> None:
         provider = AdmissionFailureProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
