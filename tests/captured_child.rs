@@ -1,14 +1,23 @@
-mod common;
+#[path = "common/harness/captured_child.rs"]
+mod captured_child_harness;
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::harness::CapturedChild;
+use captured_child_harness::CapturedChild;
 use tempfile::TempDir;
 
 #[cfg(unix)]
 #[test]
 fn captured_child_waits_for_delayed_stderr_event() {
+    let _ = (
+        CapturedChild::id,
+        CapturedChild::kill,
+        CapturedChild::signal,
+        CapturedChild::signal_or_panic,
+        captured_child_harness::hold_sqlite_lock_for,
+        captured_child_harness::write_daemon_home_diagnostics,
+    );
     let diagnostics = TempDir::new_in("/tmp").expect("short diagnostics dir");
     let mut command = Command::new("sh");
     command
