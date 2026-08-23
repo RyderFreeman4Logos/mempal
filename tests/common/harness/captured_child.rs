@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const DIAGNOSTIC_TAIL_BYTES: u64 = 16 * 1024;
 
@@ -63,6 +63,43 @@ impl CapturedChild {
     /// Polls and reaps the child if it has exited.
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
+    }
+
+    /// Waits until captured stderr contains `event` or panics with diagnostics.
+    pub fn wait_for_stderr_event(&mut self, event: &str, timeout: Duration) {
+        assert!(!event.is_empty(), "stderr event must not be empty");
+        let deadline = Instant::now() + timeout;
+        loop {
+            let stderr = fs::read(&self.stderr_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read stderr while waiting for `{event}`: {error}\n{}",
+                    self.diagnostics()
+                )
+            });
+            if stderr
+                .windows(event.len())
+                .any(|window| window == event.as_bytes())
+            {
+                return;
+            }
+            match self.try_wait() {
+                Ok(Some(status)) => panic!(
+                    "child exited before stderr event `{event}`: {status}\n{}",
+                    self.diagnostics()
+                ),
+                Ok(None) => {}
+                Err(error) => panic!(
+                    "failed to poll child while waiting for stderr event `{event}`: {error}\n{}",
+                    self.diagnostics()
+                ),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child did not emit stderr event `{event}` within {timeout:?}\n{}",
+                self.diagnostics()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Waits until the child exits and reaps it.
@@ -145,6 +182,18 @@ impl Drop for CapturedChild {
             let _ = writeln!(stderr, "{cleanup}\n{}", self.diagnostics());
         }
     }
+}
+
+/// Holds an exclusive SQLite lock for a deterministic startup delay.
+pub fn hold_sqlite_lock_for(db_path: &Path, duration: Duration) -> std::thread::JoinHandle<()> {
+    let connection = rusqlite::Connection::open(db_path).expect("open startup delay lock");
+    connection
+        .execute_batch("BEGIN EXCLUSIVE;")
+        .expect("acquire startup delay lock");
+    std::thread::spawn(move || {
+        std::thread::sleep(duration);
+        drop(connection);
+    })
 }
 
 /// Reads at most the trailing 16 KiB from `path` for failure reporting.

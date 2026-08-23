@@ -6,7 +6,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::harness::{
-    CapturedChild, embed_mock::start as start_embed_mock, write_daemon_home_diagnostics,
+    CapturedChild, embed_mock::start as start_embed_mock, hold_sqlite_lock_for,
+    write_daemon_home_diagnostics,
 };
 use mempal::bootstrap_events::BootstrapEvent;
 use mempal::core::db::Database;
@@ -821,7 +822,7 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
     // Full-suite / local-gates load can delay bootstrap past 10s; product drain
     // budget stays 30s. Widen only this readiness probe before SIGTERM.
     let deadline = Instant::now() + Duration::from_secs(30);
-    let running = loop {
+    loop {
         if let Ok(Some(_)) = child.try_wait() {
             panic!(
                 "daemon exited before paused embed request\n{}",
@@ -833,7 +834,7 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
             .expect("load operation status")
             .expect("operation record exists");
         if record.op_state == "running" && handle.request_count() > 0 {
-            break record;
+            break;
         }
         assert!(
             Instant::now() < deadline,
@@ -845,8 +846,7 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
             child.diagnostics()
         );
         std::thread::sleep(Duration::from_millis(100));
-    };
-    assert_eq!(running.op_state, "running");
+    }
     child.signal_or_panic(libc::SIGTERM, "failed to send SIGTERM");
     assert!(
         !wait_for_child_exit(&mut child, Duration::from_millis(300)),
@@ -878,8 +878,10 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
     let db = Database::open(&db_path).expect("open db");
     assert_eq!(db.drawer_count().expect("drawer count"), 1);
 
+    let release_startup = hold_sqlite_lock_for(&db_path, Duration::from_secs(2));
     let mut restarted = spawn_foreground_daemon(tmp.path(), "restart-after-drain");
-    std::thread::sleep(Duration::from_millis(300));
+    restarted.wait_for_stderr_event("daemon hook workers started", Duration::from_secs(30));
+    release_startup.join().expect("release restart delay lock");
     restarted.signal_or_panic(libc::SIGTERM, "failed to stop restarted daemon");
     let restart_status = restarted.wait_or_panic("failed to wait for restarted daemon");
     assert!(
