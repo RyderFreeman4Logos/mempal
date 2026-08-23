@@ -1042,12 +1042,15 @@ class MempalMemoryProvider:
                             "durable_operation_pending",
                         }
                     )
-                    if not local_admission:
+                    if not local_admission and details.get("kind") != "operation_key_conflict":
                         try:
                             self._record_failure()
                         except Exception:
                             logger.warning("mempal conclude failure bookkeeping failed")
-                    if details.get("kind") != "local_durable_admission_failed":
+                    if details.get("kind") not in {
+                        "local_durable_admission_failed",
+                        "operation_key_conflict",
+                    }:
                         try:
                             self._wake_spool_worker()
                         except Exception:

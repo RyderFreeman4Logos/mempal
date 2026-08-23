@@ -68,6 +68,7 @@ def submit_conclusion(
             key,
             "operation_key_conflict",
             "operation_key_conflict",
+            retry_safe=False,
         ))
     except Exception as exc:
         return ConcludeResult(False, _retry_payload(

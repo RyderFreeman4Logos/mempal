@@ -307,6 +307,33 @@ class DurableConcludeTests(unittest.TestCase):
             1,
         )
 
+    def test_operation_key_conflict_is_terminal_without_failure_or_replay_wake(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        wake_calls = []
+        provider._wake_spool_worker = lambda: wake_calls.append("wake")
+
+        first = self._conclude(provider, "first conclusion", operation_key="conflict-key")
+        before = provider._backoff._read_state()
+        conflict = self._conclude(provider, "different conclusion", operation_key="conflict-key")
+        after = provider._backoff._read_state()
+
+        self.assertEqual(first["result"], "Fact stored.")
+        details = conflict["error_details"]
+        self.assertEqual(details["kind"], "operation_key_conflict")
+        self.assertFalse(details["retry_safe"])
+        self.assertEqual(after.failure_count, before.failure_count)
+        self.assertEqual(after.open_until_epoch, before.open_until_epoch)
+        assert provider._write_spool is not None
+        self.assertEqual(provider._write_spool.count(), 0)
+        self.assertEqual(
+            sum(path == "/api/ingest/durable" for path, _ in provider.posts),
+            1,
+        )
+        self.assertEqual(wake_calls, [])
+        self.assertNotIn("first conclusion", json.dumps(conflict))
+        self.assertNotIn("different conclusion", json.dumps(conflict))
+
     def test_lost_receipt_retry_reuses_generated_key_and_single_effect(self) -> None:
         backend = SharedConcludeBackend(lose_receipt_once=True)
         provider = SharedConcludeProvider(backend)
