@@ -17,6 +17,12 @@ use local_gate_child::{
     GateChild, OwnedGateChild, capture_recorded_process, reap_owned_child, spawn_in_own_session,
 };
 
+#[cfg(unix)]
+#[test]
+fn descendant_monitor_delayed_start_is_joined_after_release() {
+    local_gate_child::descendant_monitor_delayed_start_is_joined_after_release();
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
