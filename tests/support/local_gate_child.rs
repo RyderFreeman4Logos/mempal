@@ -766,3 +766,4 @@ fn receive_pipe_output(
 
 include!("local_gate_child_tests.rs");
 include!("local_gate_child_regression_tests.rs");
+include!("local_gate_monitor_tests.rs");

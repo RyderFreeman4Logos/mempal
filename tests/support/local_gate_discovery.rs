@@ -3,7 +3,6 @@ use std::collections::HashSet;
 
 const MONITOR_DISCOVERY_BUDGET: Duration = Duration::from_millis(10);
 const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(2);
-const MONITOR_START_TIMEOUT: Duration = Duration::from_millis(50);
 
 pub(super) struct DescendantMonitor {
     root: ProcessIdentity,
@@ -15,14 +14,30 @@ pub(super) struct DescendantMonitor {
 
 impl DescendantMonitor {
     pub(super) fn spawn(root: ProcessIdentity) -> io::Result<Self> {
+        Self::spawn_inner(root, None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn spawn_delayed_for_test(
+        root: ProcessIdentity,
+        start_gate: mpsc::Receiver<()>,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(root, Some(start_gate))
+    }
+
+    fn spawn_inner(
+        root: ProcessIdentity,
+        start_gate: Option<mpsc::Receiver<()>>,
+    ) -> io::Result<Self> {
         let (stop_sender, stop_receiver) = mpsc::channel();
         let (discovered_sender, discovered_receiver) = mpsc::channel();
         let (finished_sender, finished_receiver) = mpsc::channel();
-        let (started_sender, started_receiver) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("local-gate-descendant-monitor".to_owned())
             .spawn(move || {
-                let _ = started_sender.send(());
+                if let Some(start_gate) = start_gate {
+                    let _ = start_gate.recv();
+                }
                 let mut reported = HashSet::new();
                 'monitor: loop {
                     let deadline = Instant::now() + MONITOR_DISCOVERY_BUDGET;
@@ -47,14 +62,6 @@ impl DescendantMonitor {
                     }
                 }
                 let _ = finished_sender.send(());
-            })?;
-        started_receiver
-            .recv_timeout(MONITOR_START_TIMEOUT)
-            .map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("local gate descendant monitor did not start: {error}"),
-                )
             })?;
         Ok(Self {
             root,
