@@ -11,11 +11,22 @@ from ._write_spool import (
     SpoolOperation,
     WriteSpool,
     classify_replay_error,
+    valid_control_token,
+    valid_target,
 )
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["authoritative_memory_write"]
+
+
+def _invalid_control_receipt() -> str:
+    return json.dumps({
+        "success": False,
+        "error_class": "invalid_control_fields",
+        "retryable": False,
+        "retry_safe": False,
+    })
 
 
 class _AuthoritativeWriteProvider(Protocol):
@@ -66,6 +77,8 @@ def authoritative_memory_write(
     """Persist one Hermes core memory operation through the durable spool."""
     self = provider
     retry_operation_key = kwargs.get("operation_key")
+    if not valid_control_token(retry_operation_key):
+        return _invalid_control_receipt()
     if not isinstance(retry_operation_key, str):
         retry_operation_key = None
     if not isinstance(request, Mapping):
@@ -75,12 +88,20 @@ def authoritative_memory_write(
             "retryable": False,
         })
     request = dict(request)
+    if "target" in request and not valid_target(request["target"]):
+        return _invalid_control_receipt()
+    request_operation_key = request.get("operation_key")
+    if not valid_control_token(request_operation_key):
+        return _invalid_control_receipt()
+    if not isinstance(request_operation_key, str):
+        request_operation_key = None
     action = request.get("action")
-    target = str(request.get("target") or "memory")
+    target = request.get("target", "memory")
+    if not isinstance(target, str):
+        return _invalid_control_receipt()
     content = request.get("content")
     old_text = request.get("old_text")
     operations = request.get("operations")
-    request_operation_key = request.get("operation_key")
     if isinstance(request_operation_key, str):
         retry_operation_key = request_operation_key
     batch_operation_keys = request.get("operation_keys")
@@ -132,6 +153,10 @@ def authoritative_memory_write(
                 "error_class": "invalid_operations",
                 "retryable": False,
             })
+        if isinstance(batch_operation_keys, list) and any(
+            not valid_control_token(key) for key in batch_operation_keys
+        ):
+            return _invalid_control_receipt()
         normalized: list[Dict[str, object]] = []
         for index, item in enumerate(operations):
             if not isinstance(item, dict):
@@ -164,6 +189,8 @@ def authoritative_memory_write(
                     "retryable": False,
                 })
             item_operation_key = item.get("operation_key")
+            if not valid_control_token(item_operation_key):
+                return _invalid_control_receipt()
             if item_operation_key is None and batch_operation_keys is not None:
                 item_operation_key = batch_operation_keys[index]
             normalized.append({

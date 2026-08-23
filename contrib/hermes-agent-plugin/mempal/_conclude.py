@@ -7,7 +7,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
-from ._write_spool import OperationKeyConflictError, WriteSpool, classify_write_error
+from ._write_spool import (
+    OperationKeyConflictError,
+    WriteSpool,
+    classify_write_error,
+    valid_control_token,
+)
 
 
 @dataclass(frozen=True)
@@ -50,6 +55,8 @@ def submit_conclusion(
     replay_allowed: Optional[Callable[[], bool]] = None,
 ) -> ConcludeResult:
     """Admit once and report success only after authoritative completion."""
+    if not valid_control_token(operation_key):
+        return ConcludeResult(False, _invalid_control_payload())
     key = operation_key or secrets.token_urlsafe(32)
     if spool is None:
         return ConcludeResult(False, _retry_payload(
@@ -156,6 +163,16 @@ def submit_conclusion(
                 },
             ))
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def _invalid_control_payload() -> Dict[str, Any]:
+    return {
+        "error": "Memory request was rejected.",
+        "error_details": {
+            "kind": "invalid_control_fields",
+            "retry_safe": False,
+        },
+    }
 
 
 def _local_admission_pending_payload(

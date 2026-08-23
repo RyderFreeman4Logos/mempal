@@ -4,6 +4,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 mod v26;
 use v26::{apply_v24, apply_v25, apply_v26};
 
+#[path = "db_fork_ext_v27.rs"]
+mod v27;
+use v27::apply_v27;
+
 /// Hook injected into the migration runner between `up()` and `COMMIT`.
 /// Returning Err triggers a ROLLBACK, leaving `fork_ext_version` unchanged.
 /// // harness-point: PR0
@@ -18,7 +22,7 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 26;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 27;
 
 // Partial indexes on the most expensive GROUP BY + COUNT(*) paths used by `mempal status`.
 // idx_drawers_project_id_active is a partial replacement for the non-partial
@@ -504,6 +508,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
         Migration {
             version: 26,
             up: apply_v26,
+        },
+        Migration {
+            version: 27,
+            up: apply_v27,
         },
     ]
 }

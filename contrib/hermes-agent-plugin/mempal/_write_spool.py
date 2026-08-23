@@ -33,6 +33,23 @@ JsonObject = Dict[str, Any]
 PostCallback = Callable[[str, JsonObject], Any]
 GetCallback = Callable[[str], Any]
 
+_CONTROL_TOKEN_MAX_BYTES = 128
+
+
+def valid_control_token(value: object, *, allow_none: bool = True) -> bool:
+    if value is None:
+        return allow_none
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= _CONTROL_TOKEN_MAX_BYTES
+        and all(char.isascii() and char.isprintable() and not char.isspace() for char in value)
+    )
+
+
+def valid_target(value: object) -> bool:
+    return valid_control_token(value, allow_none=False)
+
 
 class OperationKeyConflictError(ValueError):
     """An operation key was reused for a different durable operation."""
@@ -60,6 +77,8 @@ def make_track_key(target: str, wing: str, project_id: Optional[str]) -> str:
 def classify_write_error(exc: Exception) -> str:
     """Return a content-free transport/storage failure class."""
     if isinstance(exc, urllib.error.HTTPError):
+        if exc.code == 409:
+            return "operation_key_conflict"
         return f"http_{exc.code}"
     if isinstance(exc, (TimeoutError, urllib.error.URLError)):
         return "network_timeout"
@@ -83,6 +102,8 @@ def classify_replay_error(error_class: Optional[str]) -> ReplayClassification:
         return ReplayClassification(retryable=True, count_failure=False)
     if error_class in {"status_queued", "status_running"}:
         return ReplayClassification(retryable=True, count_failure=False)
+    if error_class == "operation_key_conflict":
+        return ReplayClassification(retryable=False, count_failure=False)
     if error_class.startswith("http_"):
         try:
             status = int(error_class.removeprefix("http_"))
@@ -92,6 +113,8 @@ def classify_replay_error(error_class: Optional[str]) -> ReplayClassification:
             retryable=status in _RETRYABLE_HTTP_4XX or 500 <= status <= 599,
             count_failure=True,
         )
+    if error_class == "malformed_spool_row":
+        return ReplayClassification(retryable=False, count_failure=False)
     if error_class == "target_unresolved":
         return ReplayClassification(retryable=False, count_failure=True)
     if error_class.startswith("network_") or error_class.startswith("os_error_"):
@@ -596,6 +619,13 @@ class WriteSpool(WriteSpoolClaims):
         *,
         replay_allowed: Optional[Callable[[], bool]] = None,
     ) -> ReplayOutcome:
+        if operation.quarantined_at is not None:
+            return ReplayOutcome(
+                operation,
+                completed=False,
+                error_class=operation.quarantine_reason or "malformed_spool_row",
+                quarantined=True,
+            )
         claim_token = operation.claim_token
         if not claim_token:
             return ReplayOutcome(operation, completed=False, error_class="claim_lost")
@@ -743,57 +773,3 @@ class WriteSpool(WriteSpoolClaims):
                 quarantined=quarantined,
                 error_details=error_details,
             )
-
-    @staticmethod
-    def _settled_outcome(operation: SpoolOperation) -> ReplayOutcome:
-        return ReplayOutcome(
-            operation,
-            completed=operation.settled_at is not None,
-            drawer_id=operation.result_drawer_id,
-            operation_id=operation.receipt_operation_id,
-            quarantined=False,
-        )
-
-    def _update_operation(
-        self, operation_key: str, assignment: str, values: tuple[Any, ...]
-    ) -> None:
-        with closing(self._connect()) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            updated = connection.execute(
-                f"UPDATE write_operations SET {assignment} WHERE operation_key = ?1",
-                (operation_key, *values),
-            ).rowcount
-            if updated != 1:
-                connection.execute("ROLLBACK")
-                raise KeyError("spool operation is no longer present")
-            connection.execute("COMMIT")
-
-    @staticmethod
-    def _row_to_operation(row: sqlite3.Row) -> SpoolOperation:
-        body = json.loads(str(row["body_json"]))
-        if not isinstance(body, dict):
-            raise sqlite3.DatabaseError("spool operation body is not a JSON object")
-        return SpoolOperation(
-            sequence=int(row["sequence"]),
-            operation_key=str(row["operation_key"]),
-            kind=str(row["kind"]),
-            body=body,
-            track_key=row["track_key"],
-            action=row["action"],
-            receipt_operation_id=row["receipt_operation_id"],
-            attempt_count=int(row["attempt_count"]),
-            last_error_class=row["last_error_class"],
-            next_attempt_at=float(row["next_attempt_at"]),
-            quarantined_at=(
-                None if row["quarantined_at"] is None else float(row["quarantined_at"])
-            ),
-            quarantine_reason=row["quarantine_reason"],
-            settled_at=(None if row["settled_at"] is None else float(row["settled_at"])),
-            result_drawer_id=row["result_drawer_id"],
-            claim_token=row["claim_token"],
-            claim_expires_at=(
-                None
-                if row["claim_expires_at"] is None
-                else float(row["claim_expires_at"])
-            ),
-        )

@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 import sqlite3
 import time
 from contextlib import closing
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Optional, Protocol
 
 if TYPE_CHECKING:
-    from ._write_spool import SpoolOperation
+    from ._write_spool import ReplayOutcome, SpoolOperation
 
 _CLAIM_LEASE_SECS = 30.0
 
@@ -32,12 +33,106 @@ class _SpoolOwner(Protocol):
         ignore_retry_delay: bool,
     ) -> Optional[SpoolOperation]: ...
 
-    @staticmethod
-    def _row_to_operation(row: sqlite3.Row) -> SpoolOperation: ...
-
-
 class WriteSpoolClaims:
     """Durable schema migration and claim operations kept outside the spool core."""
+
+    @staticmethod
+    def _row_to_operation(row: sqlite3.Row) -> SpoolOperation:
+        from ._write_spool import SpoolOperation
+
+        body = json.loads(str(row["body_json"]))
+        if not isinstance(body, dict):
+            raise sqlite3.DatabaseError("spool operation body is not a JSON object")
+        return SpoolOperation(
+            sequence=int(row["sequence"]),
+            operation_key=str(row["operation_key"]),
+            kind=str(row["kind"]),
+            body=body,
+            track_key=row["track_key"],
+            action=row["action"],
+            receipt_operation_id=row["receipt_operation_id"],
+            attempt_count=int(row["attempt_count"]),
+            last_error_class=row["last_error_class"],
+            next_attempt_at=float(row["next_attempt_at"]),
+            quarantined_at=(
+                None if row["quarantined_at"] is None else float(row["quarantined_at"])
+            ),
+            quarantine_reason=row["quarantine_reason"],
+            settled_at=(None if row["settled_at"] is None else float(row["settled_at"])),
+            result_drawer_id=row["result_drawer_id"],
+            claim_token=row["claim_token"],
+            claim_expires_at=(
+                None
+                if row["claim_expires_at"] is None
+                else float(row["claim_expires_at"])
+            ),
+        )
+
+    @staticmethod
+    def _quarantined_row_to_operation(
+        row: sqlite3.Row, now: float, reason: str
+    ) -> SpoolOperation:
+        from ._write_spool import SpoolOperation
+
+        def safe_int(value: Any, default: int = 0) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError, OverflowError):
+                return default
+
+        def safe_float(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError, OverflowError):
+                return default
+
+        return SpoolOperation(
+            sequence=safe_int(row["sequence"]),
+            operation_key=str(row["operation_key"]),
+            kind=str(row["kind"]),
+            body={},
+            track_key=None,
+            action=None,
+            receipt_operation_id=None,
+            attempt_count=safe_int(row["attempt_count"]),
+            last_error_class=None,
+            next_attempt_at=safe_float(row["next_attempt_at"], now),
+            quarantined_at=now,
+            quarantine_reason=reason,
+            settled_at=None,
+            result_drawer_id=None,
+            claim_token=None,
+            claim_expires_at=None,
+        )
+
+    @staticmethod
+    def _settled_outcome(operation: SpoolOperation) -> ReplayOutcome:
+        from ._write_spool import ReplayOutcome
+
+        return ReplayOutcome(
+            operation,
+            completed=operation.settled_at is not None,
+            drawer_id=operation.result_drawer_id,
+            operation_id=operation.receipt_operation_id,
+            quarantined=False,
+        )
+
+    def _update_operation(
+        self: _SpoolOwner,
+        operation_key: str,
+        assignment: str,
+        values: tuple[Any, ...],
+    ) -> None:
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                f"UPDATE write_operations SET {assignment} WHERE operation_key = ?1",
+                (operation_key, *values),
+            ).rowcount
+            if updated != 1:
+                connection.execute("ROLLBACK")
+                raise KeyError("spool operation is no longer present")
+            connection.execute("COMMIT")
 
     def _initialize_schema(self: _SpoolOwner) -> None:
         with closing(self._connect()) as connection:
@@ -228,10 +323,29 @@ class WriteSpoolClaims:
                 "SELECT * FROM write_operations WHERE operation_key = ?1",
                 (str(row["operation_key"]),),
             ).fetchone()
+            if claimed is None:
+                raise sqlite3.DatabaseError("claimed spool operation disappeared")
+            try:
+                operation = WriteSpoolClaims._row_to_operation(claimed)
+            except (ValueError, TypeError, OverflowError, sqlite3.DatabaseError):
+                reason = "malformed_spool_row"
+                connection.execute(
+                    """
+                    UPDATE write_operations
+                    SET quarantined_at = ?2,
+                        quarantine_reason = ?3,
+                        claim_token = NULL,
+                        claim_expires_at = NULL,
+                        updated_at = ?2
+                    WHERE operation_key = ?1 AND claim_token = ?4 AND settled_at IS NULL
+                    """,
+                    (str(row["operation_key"]), now, reason, claim_token),
+                )
+                operation = WriteSpoolClaims._quarantined_row_to_operation(
+                    claimed, now, reason
+                )
             connection.execute("COMMIT")
-        if claimed is None:
-            raise sqlite3.DatabaseError("claimed spool operation disappeared")
-        return self._row_to_operation(claimed)
+        return operation
 
     def _fifo_available(self: _SpoolOwner, operation_key: str) -> bool:
         with closing(self._connect()) as connection:

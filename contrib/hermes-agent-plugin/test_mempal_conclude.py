@@ -123,6 +123,26 @@ class TransitioningBreakerProvider(RecordingProvider):
 
 
 class DurableConcludeTests(unittest.TestCase):
+    def test_malformed_operation_key_is_terminal_and_side_effect_free(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        before = provider._backoff._read_state()
+
+        result = json.loads(provider.handle_tool_call(
+            "mempal_conclude",
+            {"conclusion": "safe conclusion", "operation_key": {"token": "FIXTURE"}},
+        ))
+
+        after = provider._backoff._read_state()
+        self.assertEqual(result["error_details"]["kind"], "invalid_control_fields")
+        self.assertFalse(result["error_details"]["retry_safe"])
+        self.assertNotIn("FIXTURE", json.dumps(result))
+        self.assertIsNotNone(provider._write_spool)
+        self.assertEqual(provider._write_spool.count(), 0)
+        self.assertEqual(provider.posts, [])
+        self.assertEqual(after.failure_count, before.failure_count)
+        provider.shutdown()
+
     def test_completed_receipt_with_drawer_reports_success(self) -> None:
         provider = ControlledConcludeProvider("completed", drawer_id="drawer-terminal")
         provider.initialize("session-a", user_id="alice", profile="work")

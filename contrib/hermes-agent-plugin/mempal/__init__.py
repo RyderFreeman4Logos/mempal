@@ -1042,7 +1042,7 @@ class MempalMemoryProvider:
                             "durable_operation_pending",
                         }
                     )
-                    if not local_admission and details.get("kind") != "operation_key_conflict":
+                    if not local_admission and details.get("kind") not in {"operation_key_conflict", "invalid_control_fields"}:
                         try:
                             self._record_failure()
                         except Exception:

@@ -81,6 +81,8 @@ pub enum DurableAdmissionError {
     InvalidIdempotencyKey,
     #[error("failed to encode durable ingest envelope")]
     Encode(#[source] serde_json::Error),
+    #[error("durable operation key conflicts with existing work")]
+    OperationKeyConflict,
     #[error("durable ingest queue operation failed")]
     Queue(#[from] QueueError),
     #[error("durable operation not found")]
@@ -97,8 +99,9 @@ pub fn admit(
     let payload = serde_json::to_string(&DurableIngestEnvelope::new(request))
         .map_err(DurableAdmissionError::Encode)?;
     let store = PendingMessageStore::new_without_reclaim(db_path);
-    let operation_id =
-        store.enqueue_idempotent_with_key(INGEST_ASYNC_KIND, &payload, idempotency_key)?;
+    let operation_id = store
+        .enqueue_idempotent_with_key(INGEST_ASYNC_KIND, &payload, idempotency_key)
+        .map_err(map_queue_error)?;
     status_with_store(&store, &operation_id)
 }
 
@@ -112,8 +115,9 @@ pub fn admit_delete(
     let payload = serde_json::to_string(&DurableDeleteEnvelope::new(drawer_id))
         .map_err(DurableAdmissionError::Encode)?;
     let store = PendingMessageStore::new_without_reclaim(db_path);
-    let operation_id =
-        store.enqueue_idempotent_with_key(INGEST_ASYNC_KIND, &payload, idempotency_key)?;
+    let operation_id = store
+        .enqueue_idempotent_with_key(INGEST_ASYNC_KIND, &payload, idempotency_key)
+        .map_err(map_queue_error)?;
     status_with_store(&store, &operation_id)
 }
 
@@ -147,6 +151,13 @@ fn validate_idempotency_key(key: &str) -> Result<(), DurableAdmissionError> {
     }
 }
 
+fn map_queue_error(error: QueueError) -> DurableAdmissionError {
+    match error {
+        QueueError::IdempotencyConflict => DurableAdmissionError::OperationKeyConflict,
+        other => DurableAdmissionError::Queue(other),
+    }
+}
+
 fn receipt_from_record(record: PendingOperationRecord) -> DurableOperationReceipt {
     let accepted_at_secs = if record.completed_at.is_some() {
         record.created_at.div_euclid(1_000)
@@ -168,6 +179,118 @@ fn receipt_from_record(record: PendingOperationRecord) -> DurableOperationReceip
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_key_conflict_is_rejected_before_aliasing_pending_work() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        crate::core::db::Database::open(&db_path).expect("initialize database");
+
+        let first = admit(
+            &db_path,
+            "shared-operation-key",
+            serde_json::json!({
+                "content": "private first payload",
+                "wing": "project-a",
+                "room": "facts",
+            }),
+        )
+        .expect("first admission");
+        let identical = admit(
+            &db_path,
+            "shared-operation-key",
+            serde_json::json!({
+                "content": "private first payload",
+                "wing": "project-a",
+                "room": "facts",
+            }),
+        )
+        .expect("identical pending retry");
+        let conflict = admit(
+            &db_path,
+            "shared-operation-key",
+            serde_json::json!({
+                "content": "private conflicting payload",
+                "wing": "project-b",
+                "room": "facts",
+            }),
+        );
+
+        assert_eq!(identical.operation_id, first.operation_id);
+        assert!(matches!(
+            &conflict,
+            Err(DurableAdmissionError::OperationKeyConflict)
+        ));
+        let rendered = conflict
+            .err()
+            .expect("conflict receipt must be terminal")
+            .to_string();
+        assert!(!rendered.contains("private first payload"));
+        assert!(!rendered.contains("private conflicting payload"));
+        assert_eq!(first.state, "queued");
+    }
+
+    #[test]
+    fn completed_explicit_key_retries_require_durable_identity_after_reopen() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        crate::core::db::Database::open(&db_path).expect("initialize database");
+        let request = serde_json::json!({
+            "content": "private completed payload",
+            "wing": "project-a",
+            "room": "facts",
+        });
+        let first =
+            admit(&db_path, "completed-operation-key", request.clone()).expect("first admission");
+        let store = PendingMessageStore::new_without_reclaim(&db_path);
+        let claim = store
+            .claim_next_by_kind("test-worker", 60, INGEST_ASYNC_KIND)
+            .expect("claim completed operation")
+            .expect("pending operation");
+        store.confirm(&claim).expect("complete operation");
+        drop(store);
+
+        let identical = admit(&db_path, "completed-operation-key", request)
+            .expect("identical completed retry after reopen");
+        assert_eq!(identical.operation_id, first.operation_id);
+        assert_eq!(identical.state, "completed");
+        assert!(matches!(
+            admit(
+                &db_path,
+                "completed-operation-key",
+                serde_json::json!({
+                    "content": "private completed conflict",
+                    "wing": "project-b",
+                    "room": "facts",
+                }),
+            ),
+            Err(DurableAdmissionError::OperationKeyConflict)
+        ));
+
+        let connection = rusqlite::Connection::open(&db_path).expect("open legacy fixture");
+        connection
+            .execute(
+                "UPDATE pending_message_completions SET source_hash = NULL WHERE message_id = ?1",
+                [&first.operation_id],
+            )
+            .expect("remove legacy fingerprint");
+        drop(connection);
+        let legacy = admit(
+            &db_path,
+            "completed-operation-key",
+            serde_json::json!({"content": "fixture-private-legacy-marker"}),
+        );
+        assert!(matches!(
+            &legacy,
+            Err(DurableAdmissionError::OperationKeyConflict)
+        ));
+        assert!(
+            !legacy
+                .expect_err("legacy identity must fail closed")
+                .to_string()
+                .contains("fixture-private-legacy-marker")
+        );
+    }
 
     #[test]
     fn idempotency_key_validation_is_bounded_and_content_free() {

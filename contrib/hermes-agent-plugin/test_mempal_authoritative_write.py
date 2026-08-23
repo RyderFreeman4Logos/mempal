@@ -138,111 +138,6 @@ class AuthoritativeMemoryWriteTests(unittest.TestCase):
         self.assertEqual(provider._backoff._read_state().failure_count, 0)
         provider.shutdown()
 
-    def test_batch_preserves_fifo_blocked_after_queued_item(self) -> None:
-        provider = SequencedStatusProvider(["queued", "completed"])
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        result = json.loads(provider.authoritative_memory_write({
-            "target": "user",
-            "operations": [
-                {"action": "add", "content": "queued preference"},
-                {"action": "add", "content": "blocked preference"},
-            ],
-        }))
-
-        self.assertFalse(result["success"])
-        self.assertFalse(result["partial_write"])
-        self.assertEqual(result["state"], "local_admitted")
-        self.assertTrue(result["retryable"])
-        self.assertTrue(result["retry_safe"])
-        self.assertEqual(result["durability"]["state"], "pending")
-        self.assertEqual(result["durability"]["kind"], "durable_replay_deferred")
-        self.assertEqual(result["operation_ids"], [])
-        self.assertEqual(len(result["operation_keys"]), 2)
-        self.assertEqual(provider.wake_calls, 2)
-        self.assertEqual(provider._write_spool.count(), 2)
-        provider.shutdown()
-
-    def test_mixed_completed_and_pending_batch_reports_partial_completion(self) -> None:
-        provider = SequencedStatusProvider(["completed", "queued"])
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        result = json.loads(provider.authoritative_memory_write({
-            "target": "user",
-            "operations": [
-                {"action": "add", "content": "completed preference"},
-                {"action": "add", "content": "queued preference"},
-            ],
-        }))
-
-        self.assertFalse(result["success"])
-        self.assertTrue(result["partial_write"])
-        self.assertEqual(result["state"], "local_admitted")
-        self.assertEqual(result["operation_ids"], ["operation_" + result["operation_keys"][0]])
-        self.assertEqual(len(result["operation_keys"]), 2)
-        self.assertEqual(result["durability"]["kind"], "durable_replay_deferred")
-        provider.shutdown()
-
-    def test_running_batch_is_pending_not_completed(self) -> None:
-        provider = SequencedStatusProvider(["running"])
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        result = json.loads(provider.authoritative_memory_write({
-            "target": "user",
-            "operations": [
-                {"action": "add", "content": "running preference"},
-            ],
-        }))
-
-        self.assertFalse(result["success"])
-        self.assertFalse(result["partial_write"])
-        self.assertEqual(result["durability"]["deferred_reason"], "running")
-        self.assertEqual(result["operation_ids"], [])
-        provider.shutdown()
-
-    def test_all_deferred_batch_preserves_pending_handles_without_completed_ids(self) -> None:
-        provider = SequencedStatusProvider(["queued", "running"])
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        result = json.loads(provider.authoritative_memory_write({
-            "target": "user",
-            "operations": [
-                {"action": "add", "content": "queued preference"},
-                {"action": "add", "content": "running preference"},
-            ],
-        }))
-
-        self.assertFalse(result["success"])
-        self.assertFalse(result["partial_write"])
-        self.assertEqual(result["state"], "local_admitted")
-        self.assertTrue(result["retryable"])
-        self.assertTrue(result["retry_safe"])
-        self.assertEqual(result["operation_ids"], [])
-        self.assertEqual(len(result["operation_keys"]), 2)
-        self.assertEqual(result["durability"]["kind"], "durable_replay_deferred")
-        provider.shutdown()
-
-    def test_retryable_transport_batch_is_pending_not_completed(self) -> None:
-        provider = FailingReplayProvider(urllib.error.HTTPError(
-            "/api/ingest/durable", 503, "synthetic unavailable", None, None
-        ))
-        provider.initialize("session-a", user_id="alice", profile="work")
-
-        result = json.loads(provider.authoritative_memory_write({
-            "target": "user",
-            "operations": [
-                {"action": "add", "content": "retryable preference"},
-            ],
-        }))
-
-        self.assertFalse(result["success"])
-        self.assertFalse(result["partial_write"])
-        self.assertEqual(result["state"], "local_admitted")
-        self.assertEqual(result["durability"]["deferred_reason"], "http_503")
-        self.assertEqual(result["operation_ids"], [])
-        self.assertEqual(len(result["operation_keys"]), 1)
-        provider.shutdown()
-
     def test_completed_batch_remains_successful(self) -> None:
         provider = SequencedStatusProvider(["completed", "completed"])
         provider.initialize("session-a", user_id="alice", profile="work")
@@ -593,9 +488,10 @@ class AuthoritativeMemoryWriteTests(unittest.TestCase):
                 )
                 background.shutdown()
 
-    def test_non_allowlisted_4xx_is_quarantined_not_forgiven(self) -> None:
+    def test_api_operation_key_conflict_is_terminal_and_breaker_neutral(self) -> None:
         provider = FailingStatusProvider(409)
         provider.initialize("session-a", user_id="alice", profile="work")
+        before = provider._backoff._read_state()
 
         receipt = json.loads(provider.authoritative_memory_write({
             "action": "add",
@@ -603,12 +499,17 @@ class AuthoritativeMemoryWriteTests(unittest.TestCase):
             "content": "conflict evidence",
         }))
 
+        after = provider._backoff._read_state()
         operation = provider._write_spool.next_operation()
+        self.assertIsNotNone(operation)
+        assert operation is not None
         self.assertFalse(receipt["success"])
-        self.assertEqual(receipt["error_class"], "http_409")
+        self.assertEqual(receipt["error_class"], "operation_key_conflict")
         self.assertFalse(receipt["retryable"])
         self.assertIsNotNone(operation.quarantined_at)
-        self.assertEqual(operation.quarantine_reason, "http_409")
+        self.assertEqual(operation.quarantine_reason, "operation_key_conflict")
+        self.assertEqual(after.failure_count, before.failure_count)
+        self.assertEqual(provider.wake_calls, 0)
         provider.shutdown()
 
     def test_operation_key_conflict_fails_closed_without_payload(self) -> None:

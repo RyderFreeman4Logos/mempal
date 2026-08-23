@@ -2,6 +2,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from typing import Any, List
 
 from mempal._write_spool import WriteSpool
 
@@ -36,6 +37,116 @@ class DeleteLineageTests(unittest.TestCase):
             assert outcome is not None
             self.assertEqual(outcome.error_class, "target_unresolved")
             self.assertIsNone(spool.drawer_for_track(track_key))
+
+
+class DurableSpoolReplayMigrationTests(unittest.TestCase):
+    def test_malformed_fifo_head_is_quarantined_and_tail_replays(self) -> None:
+        corruptions = [
+            ("body_json", "{"),
+            ("body_json", "[]"),
+            ("attempt_count", "not-a-number"),
+        ]
+        for column, value in corruptions:
+            with self.subTest(column=column, value_type=type(value).__name__):
+                with tempfile.TemporaryDirectory() as hermes_home:
+                    spool = WriteSpool(hermes_home)
+                    head = spool.admit(
+                        "ingest", {"content": "head", "wing": "wing", "room": "facts"}
+                    )
+                    tail = spool.admit(
+                        "ingest", {"content": "tail", "wing": "wing", "room": "facts"}
+                    )
+                    connection = sqlite3.connect(spool.path)
+                    try:
+                        connection.execute(
+                            f"UPDATE write_operations SET {column} = ? WHERE operation_key = ?",
+                            (value, head.operation_key),
+                        )
+                        connection.commit()
+                    finally:
+                        connection.close()
+                    restarted = WriteSpool(hermes_home)
+
+                    calls: List[Any] = []
+                    post = lambda _path, body: calls.append(body) or {
+                        "operation_id": "remote-tail",
+                        "state": "completed",
+                        "drawer_id": "drawer-tail",
+                    }
+                    get = lambda _path: {
+                        "state": "completed",
+                        "drawer_id": "drawer-tail",
+                    }
+
+                    quarantined = restarted.replay_one(post, get)
+                    self.assertIsNotNone(quarantined)
+                    assert quarantined is not None
+                    self.assertTrue(quarantined.quarantined)
+                    self.assertEqual(quarantined.error_class, "malformed_spool_row")
+                    self.assertEqual(calls, [])
+
+                    delivered = restarted.replay_one(post, get)
+                    self.assertIsNotNone(delivered)
+                    assert delivered is not None
+                    self.assertTrue(delivered.completed)
+                    self.assertEqual(delivered.operation.operation_key, tail.operation_key)
+                    self.assertEqual(len(calls), 1)
+                    self.assertNotIn("head", calls[0].get("request", {}))
+                    self.assertIsNone(restarted.replay_one(post, get))
+                    connection = sqlite3.connect(restarted.path)
+                    try:
+                        quarantine = connection.execute(
+                            "SELECT quarantine_reason, COUNT(*) FROM write_operations WHERE operation_key = ?",
+                            (head.operation_key,),
+                        ).fetchone()
+                    finally:
+                        connection.close()
+                    self.assertEqual(quarantine, ("malformed_spool_row", 1))
+
+    def test_direct_replay_respects_same_track_fifo(self) -> None:
+        with tempfile.TemporaryDirectory() as hermes_home:
+            spool = WriteSpool(hermes_home)
+            seed = spool.admit(
+                "ingest",
+                {"content": "old", "wing": "wing", "room": "facts"},
+                track_key="profile:wing",
+                action="add",
+            )
+            spool.complete(seed.operation_key, track_key="profile:wing", drawer_id="drawer-old")
+            replace = spool.admit(
+                "ingest",
+                {
+                    "content": "new",
+                    "replace_text": "old",
+                    "wing": "wing",
+                    "room": "facts",
+                },
+                track_key="profile:wing",
+                action="replace",
+            )
+            remove = spool.admit(
+                "delete",
+                {},
+                track_key="profile:wing",
+                action="delete",
+            )
+            calls = []
+
+            outcome = spool.replay_operation_key(
+                remove.operation_key,
+                lambda path, body: calls.append((path, body)),
+                lambda _path: {"state": "completed"},
+                ignore_retry_delay=True,
+            )
+
+            self.assertIsNotNone(outcome)
+            self.assertEqual(outcome.error_class, "fifo_blocked")
+            self.assertEqual(outcome.operation.operation_key, remove.operation_key)
+            self.assertEqual(calls, [])
+            self.assertEqual(
+                spool.next_replayable_operation().operation_key,
+                replace.operation_key,
+            )
 
 
 class DurableSchemaMigrationTests(unittest.TestCase):
