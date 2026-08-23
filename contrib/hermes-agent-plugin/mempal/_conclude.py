@@ -119,16 +119,28 @@ def submit_conclusion(
         if error_class and error_class.startswith("terminal_"):
             state = error_class.removeprefix("terminal_")
             return ConcludeResult(False, _retry_payload(
-                f"durable_operation_{state}", operation_id, key, state
+                f"durable_operation_{state}",
+                operation_id,
+                key,
+                state,
+                retry_safe=False,
             ))
         if error_class and error_class.startswith("status_"):
             state = error_class.removeprefix("status_")
-            kind = "durable_status_invalid" if state == "unknown" else "durable_operation_pending"
+            kind = (
+                "durable_operation_pending"
+                if state in {"queued", "running"}
+                else "durable_status_invalid"
+            )
         elif operation_id:
             kind = "durable_status_unavailable"
         else:
             kind = "durable_admission_deferred"
-        if kind == "durable_admission_deferred" or time.monotonic() >= deadline:
+        if (
+            kind == "durable_admission_deferred"
+            or kind == "durable_status_invalid"
+            or time.monotonic() >= deadline
+        ):
             return ConcludeResult(False, _retry_payload(
                 kind,
                 operation_id,
@@ -136,6 +148,11 @@ def submit_conclusion(
                 state,
                 error_class,
                 outcome.error_details,
+                retry_safe=kind not in {
+                    "durable_status_invalid",
+                    "durable_operation_failed",
+                    "durable_operation_rejected",
+                },
             ))
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
@@ -169,13 +186,15 @@ def _retry_payload(
     state: str,
     error_class: Optional[str] = None,
     transport_details: Optional[Dict[str, Any]] = None,
+    *,
+    retry_safe: bool = True,
 ) -> Dict[str, Any]:
     details = {
         "kind": kind,
         "operation_key": operation_key,
         "retry_operation_id": operation_key,
         "state": state,
-        "retry_safe": True,
+        "retry_safe": retry_safe,
     }
     if operation_id:
         details["operation_id"] = operation_id

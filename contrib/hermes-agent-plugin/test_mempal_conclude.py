@@ -162,6 +162,7 @@ class DurableConcludeTests(unittest.TestCase):
         provider = AdmissionFailureProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
         provider._start_write_worker = lambda: None
+        before = provider._backoff._read_state()
 
         result = self._conclude(provider, "SECRET_CONCLUSION")
 
@@ -178,6 +179,8 @@ class DurableConcludeTests(unittest.TestCase):
             provider._write_spool.next_operation().operation_key,
             details["operation_key"],
         )
+        after = provider._backoff._read_state()
+        self.assertEqual(after.failure_count - before.failure_count, 1)
         self.assertNotIn("result", result)
         serialized = json.dumps(result)
         self.assertNotIn("SECRET_CONCLUSION", serialized)
@@ -217,6 +220,8 @@ class DurableConcludeTests(unittest.TestCase):
             status_error=RuntimeError("SECRET_STATUS_RESPONSE"),
         )
         provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
+        before = provider._backoff._read_state()
 
         result = self._conclude(provider, "SECRET_CONCLUSION", operation_key="event-status")
 
@@ -227,6 +232,8 @@ class DurableConcludeTests(unittest.TestCase):
         serialized = json.dumps(result)
         self.assertNotIn("SECRET_CONCLUSION", serialized)
         self.assertNotIn("SECRET_STATUS_RESPONSE", serialized)
+        after = provider._backoff._read_state()
+        self.assertEqual(after.failure_count - before.failure_count, 1)
 
     def test_terminal_failed_or_rejected_never_reports_success(self) -> None:
         for state in ("failed", "rejected"):
@@ -250,11 +257,40 @@ class DurableConcludeTests(unittest.TestCase):
         provider = ControlledConcludeProvider("completed")
         provider.initialize("session-a", user_id="alice", profile="work")
         provider._conclude_wait_timeout = 0.0
+        provider._start_write_worker = lambda: None
+        before = provider._backoff._read_state()
 
         result = self._conclude(provider, "missing drawer", operation_key="event-no-drawer")
 
-        self.assertEqual(result["error_details"]["kind"], "durable_operation_pending")
+        self.assertEqual(result["error_details"]["kind"], "durable_status_invalid")
+        after = provider._backoff._read_state()
+        self.assertEqual(after.failure_count - before.failure_count, 1)
         self.assertNotIn("result", result)
+
+    def test_replay_status_matrix_distinguishes_pending_and_invalid_terminal(self) -> None:
+        expected = {
+            "queued": ("durable_operation_pending", 0),
+            "running": ("durable_operation_pending", 0),
+            "unknown": ("durable_status_invalid", 1),
+            "completed": ("durable_status_invalid", 1),
+            "failed": ("durable_operation_failed", 1),
+            "rejected": ("durable_operation_rejected", 1),
+        }
+        for state, (kind, failure_delta) in expected.items():
+            with self.subTest(state=state):
+                provider = ControlledConcludeProvider(state)
+                provider.initialize("session-a", user_id="alice", profile="work")
+                provider._conclude_wait_timeout = 0.0
+                provider._start_write_worker = lambda: None
+                before = provider._backoff._read_state()
+
+                result = self._conclude(
+                    provider, "status matrix", operation_key=f"event-{state}"
+                )
+
+                self.assertEqual(result["error_details"]["kind"], kind)
+                after = provider._backoff._read_state()
+                self.assertEqual(after.failure_count - before.failure_count, failure_delta)
 
     def test_retry_with_same_operation_key_reuses_operation_and_drawer(self) -> None:
         provider = RecordingProvider()

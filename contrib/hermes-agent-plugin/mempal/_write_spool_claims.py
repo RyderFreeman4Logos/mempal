@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 _CLAIM_LEASE_SECS = 30.0
 
+__all__ = ["WriteSpoolClaims"]
+
 
 class _SpoolOwner(Protocol):
     path: str
@@ -62,14 +64,6 @@ class WriteSpoolClaims:
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS idx_write_operations_fifo
-                    ON write_operations(settled_at, quarantined_at, sequence);
-                CREATE INDEX IF NOT EXISTS idx_write_operations_replay
-                    ON write_operations(quarantined_at, next_attempt_at, sequence);
-                CREATE INDEX IF NOT EXISTS idx_write_operations_track
-                    ON write_operations(track_key, sequence);
-                CREATE INDEX IF NOT EXISTS idx_write_operations_claim
-                    ON write_operations(claim_expires_at, sequence);
                 CREATE TABLE IF NOT EXISTS track_drawers (
                     track_key TEXT PRIMARY KEY,
                     drawer_id TEXT NOT NULL,
@@ -98,15 +92,15 @@ class WriteSpoolClaims:
             "receipt_operation_id",
             "attempt_count",
             "last_error_class",
-            "next_attempt_at",
-            "quarantined_at",
-            "quarantine_reason",
             "created_at",
             "updated_at",
         }
         if required - columns:
             raise sqlite3.DatabaseError("unsupported durable spool schema")
         additions = (
+            ("next_attempt_at", "REAL NOT NULL DEFAULT 0"),
+            ("quarantined_at", "REAL"),
+            ("quarantine_reason", "TEXT"),
             ("settled_at", "REAL"),
             ("result_drawer_id", "TEXT"),
             ("claim_token", "TEXT"),
@@ -119,6 +113,13 @@ class WriteSpoolClaims:
                     connection.execute(
                         f"ALTER TABLE write_operations ADD COLUMN {name} {definition}"
                     )
+            for index_name in (
+                "idx_write_operations_fifo",
+                "idx_write_operations_replay",
+                "idx_write_operations_track",
+                "idx_write_operations_claim",
+            ):
+                connection.execute(f"DROP INDEX IF EXISTS {index_name}")
             for index_sql in (
                 """
                 CREATE INDEX IF NOT EXISTS idx_write_operations_fifo

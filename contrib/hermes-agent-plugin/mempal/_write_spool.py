@@ -443,7 +443,11 @@ class WriteSpool(WriteSpoolClaims):
             if updated != 1:
                 connection.execute("ROLLBACK")
                 raise ClaimLostError("durable spool claim lost")
-            if track_key and drawer_id:
+            if track_key and delete_track:
+                connection.execute(
+                    "DELETE FROM track_drawers WHERE track_key = ?1", (track_key,)
+                )
+            elif track_key and drawer_id:
                 connection.execute(
                     """
                     INSERT INTO track_drawers(track_key, drawer_id, updated_at)
@@ -453,10 +457,6 @@ class WriteSpool(WriteSpoolClaims):
                         updated_at = excluded.updated_at
                     """,
                     (track_key, drawer_id, now),
-                )
-            elif track_key and delete_track:
-                connection.execute(
-                    "DELETE FROM track_drawers WHERE track_key = ?1", (track_key,)
                 )
             connection.execute("COMMIT")
 

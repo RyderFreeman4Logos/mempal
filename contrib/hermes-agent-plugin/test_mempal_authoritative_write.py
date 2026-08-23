@@ -45,6 +45,20 @@ class FailingStatusProvider(RecordingProvider):
         self.wake_calls += 1
 
 
+class FailingReplayProvider(RecordingProvider):
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+        self.wake_calls = 0
+
+    def _post(self, path, body):
+        self.posts.append((path, dict(body)))
+        raise self.error
+
+    def _wake_spool_worker(self):
+        self.wake_calls += 1
+
+
 class SharedDurableBackend:
     def __init__(self) -> None:
         self.calls = []
@@ -415,6 +429,7 @@ class AuthoritativeMemoryWriteTests(unittest.TestCase):
     def test_503_with_wake_false_is_pending_and_wakes_replay(self) -> None:
         provider = FailingStatusProvider(503)
         provider.initialize("session-a", user_id="alice", profile="work")
+        before = provider._backoff._read_state()
 
         receipt = json.loads(provider.authoritative_memory_write({
             "action": "add",
@@ -430,7 +445,49 @@ class AuthoritativeMemoryWriteTests(unittest.TestCase):
         self.assertEqual(operation.last_error_class, "http_503")
         self.assertIsNone(operation.quarantined_at)
         self.assertGreater(operation.next_attempt_at, time.time())
+        after = provider._backoff._read_state()
+        self.assertEqual(after.failure_count - before.failure_count, 1)
         provider.shutdown()
+
+    def test_direct_and_background_replay_count_transport_failures_once(self) -> None:
+        errors = [
+            urllib.error.HTTPError("/api/ingest/durable", 503, "synthetic", None, None),
+            OSError(5, "synthetic"),
+        ]
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                direct = FailingReplayProvider(error)
+                direct.initialize("session-a", user_id="alice", profile="work")
+                direct_before = direct._backoff._read_state()
+                direct_receipt = json.loads(direct.authoritative_memory_write({
+                    "action": "add",
+                    "target": "user",
+                    "content": "direct transport failure",
+                }))
+                direct_after = direct._backoff._read_state()
+                self.assertTrue(direct_receipt["success"])
+                self.assertEqual(
+                    direct_after.failure_count - direct_before.failure_count,
+                    1,
+                )
+                direct.shutdown()
+
+                background = FailingReplayProvider(error)
+                background.initialize("session-a", user_id="alice", profile="work")
+                background._spool_write(
+                    "ingest",
+                    {"content": "background transport failure"},
+                    action="add",
+                    wake=False,
+                )
+                background_before = background._backoff._read_state()
+                background._replay_spooled_write()
+                background_after = background._backoff._read_state()
+                self.assertEqual(
+                    background_after.failure_count - background_before.failure_count,
+                    1,
+                )
+                background.shutdown()
 
     def test_non_allowlisted_4xx_is_quarantined_not_forgiven(self) -> None:
         provider = FailingStatusProvider(409)
@@ -502,6 +559,72 @@ class AuthoritativeMemoryWriteTests(unittest.TestCase):
         self.assertEqual(provider.posts, [])
         self.assertEqual(provider._write_spool.count(), 0)
         provider.shutdown()
+
+    def test_malformed_json_shapes_return_structured_receipts_without_admission(self) -> None:
+        cases = [
+            ({"action": []}, "invalid_action"),
+            (
+                {"action": "remove", "old_text": "x", "content": {}},
+                "ambiguous_remove_payload",
+            ),
+            (
+                {
+                    "target": "user",
+                    "operations": [
+                        {"action": "add", "content": "valid"},
+                        {"action": []},
+                    ],
+                },
+                "invalid_action",
+            ),
+            (
+                {
+                    "target": "user",
+                    "operations": [
+                        {"action": "add", "content": "valid"},
+                        {"action": "remove", "old_text": "x", "content": {}},
+                    ],
+                },
+                "ambiguous_remove_payload",
+            ),
+        ]
+        for request, error_class in cases:
+            with self.subTest(request=request):
+                provider = RecordingProvider()
+                provider.initialize("session-a", user_id="alice", profile="work")
+
+                receipt = json.loads(provider.authoritative_memory_write(request))
+
+                self.assertFalse(receipt["success"])
+                self.assertEqual(receipt["error_class"], error_class)
+                self.assertFalse(receipt["retryable"])
+                self.assertEqual(provider.posts, [])
+                self.assertEqual(provider._write_spool.count(), 0)
+                provider.shutdown()
+
+    def test_batch_item_targets_are_rejected_before_admission(self) -> None:
+        cases = [
+            {"action": "add", "content": "same", "target": "user"},
+            {"action": "add", "content": "different", "target": "profile"},
+            {"action": "remove", "old_text": "same", "target": "user"},
+            {"action": "remove", "old_text": "different", "target": "profile"},
+        ]
+        for item in cases:
+            with self.subTest(item=item):
+                provider = RecordingProvider()
+                provider.initialize("session-a", user_id="alice", profile="work")
+
+                receipt = json.loads(provider.authoritative_memory_write({
+                    "target": "user",
+                    "operations": [item],
+                }))
+
+                self.assertFalse(receipt["success"])
+                self.assertEqual(receipt["error_class"], "unsupported_batch_item_target")
+                self.assertFalse(receipt["retryable"])
+                self.assertEqual(provider.posts, [])
+                self.assertEqual(provider._write_spool.count(), 0)
+                provider.shutdown()
 
     def test_track_identity_is_injective_for_adversarial_scope_ids(self) -> None:
         provider = RecordingProvider()

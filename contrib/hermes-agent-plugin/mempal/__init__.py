@@ -21,7 +21,7 @@ import queue
 import secrets
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from ._authoritative_write import authoritative_memory_write as _authoritative_memory_write
 from ._backoff import SharedPluginBackoff
@@ -868,7 +868,9 @@ class MempalMemoryProvider:
     def get_tool_schemas(self):
         return [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]
 
-    def authoritative_memory_write(self, request, **kwargs):
+    def authoritative_memory_write(
+        self, request: Mapping[str, object], **kwargs: object
+    ) -> str:
         """Persist one Hermes core memory operation through the durable spool."""
         return _authoritative_memory_write(self, request, **kwargs)
 

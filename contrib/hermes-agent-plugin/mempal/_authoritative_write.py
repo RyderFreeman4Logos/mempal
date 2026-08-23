@@ -4,43 +4,97 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Dict, Mapping, Optional, Protocol
 
-from ._write_spool import OperationKeyConflictError, classify_replay_error
+from ._write_spool import (
+    OperationKeyConflictError,
+    SpoolOperation,
+    WriteSpool,
+    classify_replay_error,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["authoritative_memory_write"]
 
 
+class _AuthoritativeWriteProvider(Protocol):
+    _write_spool: WriteSpool
+    _wing: str
+    _facts_room: str
+    _safe_min_importance: int
+
+    def _track_key(self, target: str) -> str: ...
+
+    def _memory_room_for_target(self, target: str) -> str: ...
+
+    def _with_project_id(self, payload: Dict[str, object]) -> Dict[str, object]: ...
+
+    def _spool_write(
+        self,
+        kind: str,
+        body: Dict[str, object],
+        *,
+        track_key: Optional[str],
+        action: str,
+        operation_key: Optional[str],
+        wake: bool,
+    ) -> SpoolOperation: ...
+
+    def _is_breaker_open(self) -> bool: ...
+
+    def _wake_spool_worker(self) -> None: ...
+
+    def _post(self, path: str, body: Dict[str, object]) -> object: ...
+
+    def _get(self, path: str) -> object: ...
+
+    def _record_success(self) -> None: ...
+
+    def _record_failure(self) -> None: ...
+
+    def authoritative_memory_write(
+        self, request: Mapping[str, object], **kwargs: object
+    ) -> str: ...
+
+
 def authoritative_memory_write(
-    provider: Any, request: Any, **kwargs: Any
+    provider: _AuthoritativeWriteProvider,
+    request: Mapping[str, object],
+    **kwargs: object,
 ) -> str:
     """Persist one Hermes core memory operation through the durable spool."""
     self = provider
     retry_operation_key = kwargs.get("operation_key")
-    if not isinstance(request, dict):
+    if not isinstance(retry_operation_key, str):
+        retry_operation_key = None
+    if not isinstance(request, Mapping):
         return json.dumps({
             "success": False,
             "error_class": "invalid_request",
             "retryable": False,
         })
+    request = dict(request)
     action = request.get("action")
     target = str(request.get("target") or "memory")
     content = request.get("content")
     old_text = request.get("old_text")
     operations = request.get("operations")
     request_operation_key = request.get("operation_key")
-    if request_operation_key is not None:
+    if isinstance(request_operation_key, str):
         retry_operation_key = request_operation_key
     batch_operation_keys = request.get("operation_keys")
 
     def validation_error(
-        item_action: Any,
-        item_content: Any,
-        item_old_text: Any,
+        item_action: object,
+        item_content: object,
+        item_old_text: object,
     ) -> Optional[str]:
-        if item_action not in {"add", "replace", "remove"}:
+        if not isinstance(item_action, str) or item_action not in {
+            "add",
+            "replace",
+            "remove",
+        }:
             return "invalid_action"
         if item_action in {"add", "replace"} and (
             not isinstance(item_content, str) or not item_content
@@ -50,11 +104,11 @@ def authoritative_memory_write(
             not isinstance(item_old_text, str) or not item_old_text
         ):
             return "missing_old_text"
-        if item_action == "remove" and item_content not in {None, ""}:
+        if item_action == "remove" and item_content is not None and item_content != "":
             return "ambiguous_remove_payload"
         return None
 
-    def remove_shape_error(item: Dict[str, Any]) -> Optional[str]:
+    def remove_shape_error(item: Dict[str, object]) -> Optional[str]:
         if item.get("action") != "remove":
             return None
         allowed = {"action", "content", "old_text", "operation_key", "target"}
@@ -78,12 +132,18 @@ def authoritative_memory_write(
                 "error_class": "invalid_operations",
                 "retryable": False,
             })
-        normalized: list[Dict[str, Any]] = []
+        normalized: list[Dict[str, object]] = []
         for index, item in enumerate(operations):
             if not isinstance(item, dict):
                 return json.dumps({
                     "success": False,
                     "error_class": "invalid_request",
+                    "retryable": False,
+                })
+            if "target" in item:
+                return json.dumps({
+                    "success": False,
+                    "error_class": "unsupported_batch_item_target",
                     "retryable": False,
                 })
             shape_error = remove_shape_error(item)
@@ -234,6 +294,11 @@ def authoritative_memory_write(
         else "durable_write_pending"
     )
     classification = classify_replay_error(error_class)
+    if classification.count_failure:
+        try:
+            self._record_failure()
+        except Exception:
+            logger.warning("mempal authoritative write failure bookkeeping failed")
     if classification.retryable:
         try:
             self._wake_spool_worker()
@@ -260,11 +325,6 @@ def authoritative_memory_write(
             payload["operation_id"] = outcome.operation_id
         return json.dumps(payload)
     retryable = classification.retryable
-    if classification.count_failure:
-        try:
-            self._record_failure()
-        except Exception:
-            logger.warning("mempal authoritative write failure bookkeeping failed")
     payload = {
         "success": False,
         "error_class": error_class,
