@@ -1,9 +1,4 @@
-"""Crash-safe local write spool for the Hermes mempal provider.
-
-The spool owns evidence until mempal's durable receipt reaches a completed
-terminal state. Network delivery is deliberately outside this module so
-callbacks only wait for a bounded local SQLite transaction.
-"""
+"""Crash-safe local write spool for Hermes mempal authoritative writes."""
 
 from __future__ import annotations
 
@@ -11,7 +6,6 @@ import json
 import os
 import secrets
 import sqlite3
-import threading
 import time
 import urllib.error
 from contextlib import closing
@@ -19,45 +13,48 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
 from ._rest_errors import rest_error_payload
-
+from ._write_spool_claims import WriteSpoolClaims
 
 _DB_RELATIVE_PATH = os.path.join("state", "mempal", "write-spool.sqlite3")
 _CONNECT_TIMEOUT_SECS = 0.5
 _MAX_REPLAY_ATTEMPTS = 5
 _RETRY_BACKOFF_SECS = (0.25, 0.5, 1.0, 2.0, 5.0)
-_RETRYABLE_HTTP_4XX = {"http_408", "http_429"}
+_RETRYABLE_HTTP_4XX = {408, 425, 429}
+_RETRYABLE_STATES = {"queued", "running"}
+_TERMINAL_STATES = {"failed", "rejected"}
 _NON_RETRYABLE_REPLAY_ERRORS = {
-    "target_unresolved",
+    "status_invalid",
+    "status_completed_missing_drawer",
     "terminal_failed",
     "terminal_rejected",
 }
 
+JsonObject = Dict[str, Any]
+PostCallback = Callable[[str, JsonObject], Any]
+GetCallback = Callable[[str], Any]
 
-@dataclass(frozen=True)
-class SpoolOperation:
-    sequence: int
-    operation_key: str
-    kind: str
-    body: Dict[str, Any]
-    track_key: Optional[str]
-    action: Optional[str]
-    receipt_operation_id: Optional[str]
-    attempt_count: int
-    last_error_class: Optional[str]
-    next_attempt_at: float
-    quarantined_at: Optional[float]
-    quarantine_reason: Optional[str]
+
+class OperationKeyConflictError(ValueError):
+    """An operation key was reused for a different durable operation."""
+
+
+class ClaimLostError(RuntimeError):
+    """The SQLite lease expired or was settled by another worker."""
 
 
 @dataclass(frozen=True)
-class ReplayOutcome:
-    operation: SpoolOperation
-    completed: bool
-    error_class: Optional[str] = None
-    drawer_id: Optional[str] = None
-    operation_id: Optional[str] = None
-    quarantined: bool = False
-    error_details: Optional[Dict[str, Any]] = None
+class ReplayClassification:
+    retryable: bool
+    count_failure: bool
+
+
+def make_track_key(target: str, wing: str, project_id: Optional[str]) -> str:
+    """Encode tracking scope as a typed, injective JSON tuple."""
+    return json.dumps(
+        ["track", target, wing, project_id],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def classify_write_error(exc: Exception) -> str:
@@ -71,24 +68,86 @@ def classify_write_error(exc: Exception) -> str:
     return "network_or_protocol_error"
 
 
-def _is_retryable_replay_error(error_class: Optional[str]) -> bool:
+def classify_replay_error(error_class: Optional[str]) -> ReplayClassification:
+    """Classify replay outcomes once for direct and background callers."""
     if not error_class:
-        return True
-    if error_class in _NON_RETRYABLE_REPLAY_ERRORS:
-        return False
-    if error_class.startswith("http_4") and error_class not in _RETRYABLE_HTTP_4XX:
-        return False
-    return True
+        return ReplayClassification(retryable=True, count_failure=False)
+    if error_class in {
+        "breaker_open",
+        "claim_busy",
+        "claim_lost",
+        "durable_write_pending",
+        "fifo_blocked",
+        "retry_not_due",
+    }:
+        return ReplayClassification(retryable=True, count_failure=False)
+    if error_class in {"status_queued", "status_running"}:
+        return ReplayClassification(retryable=True, count_failure=False)
+    if error_class.startswith("http_"):
+        try:
+            status = int(error_class.removeprefix("http_"))
+        except ValueError:
+            return ReplayClassification(retryable=False, count_failure=True)
+        return ReplayClassification(
+            retryable=status in _RETRYABLE_HTTP_4XX or 500 <= status <= 599,
+            count_failure=True,
+        )
+    if error_class == "target_unresolved":
+        return ReplayClassification(retryable=False, count_failure=True)
+    if error_class.startswith("network_") or error_class.startswith("os_error_"):
+        return ReplayClassification(retryable=True, count_failure=True)
+    if error_class in _NON_RETRYABLE_REPLAY_ERRORS or error_class.startswith("status_"):
+        return ReplayClassification(retryable=False, count_failure=True)
+    if error_class.startswith("terminal_"):
+        return ReplayClassification(retryable=False, count_failure=True)
+    return ReplayClassification(retryable=False, count_failure=True)
 
 
-class WriteSpool:
-    """Durable provider writes with per-track ordering and persistent lineage."""
+def _is_retryable_replay_error(error_class: Optional[str]) -> bool:
+    return classify_replay_error(error_class).retryable
+
+
+@dataclass(frozen=True)
+class SpoolOperation:
+    sequence: int
+    operation_key: str
+    kind: str
+    body: JsonObject
+    track_key: Optional[str]
+    action: Optional[str]
+    receipt_operation_id: Optional[str]
+    attempt_count: int
+    last_error_class: Optional[str]
+    next_attempt_at: float
+    quarantined_at: Optional[float]
+    quarantine_reason: Optional[str]
+    settled_at: Optional[float] = None
+    result_drawer_id: Optional[str] = None
+    claim_token: Optional[str] = None
+    claim_expires_at: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class ReplayOutcome:
+    operation: SpoolOperation
+    completed: bool
+    error_class: Optional[str] = None
+    drawer_id: Optional[str] = None
+    operation_id: Optional[str] = None
+    quarantined: bool = False
+    error_details: Optional[JsonObject] = None
+
+
+class WriteSpool(WriteSpoolClaims):
+    """Durable global-FIFO writes with SQLite claims before network I/O.
+
+    A pending predecessor blocks every later operation in this shared spool.
+    """
 
     def __init__(self, hermes_home: str) -> None:
         if not hermes_home:
             raise ValueError("hermes_home is required for durable mempal writes")
         self.path = os.path.abspath(os.path.join(hermes_home, _DB_RELATIVE_PATH))
-        self._replay_lock = threading.RLock()
         self._prepare_parent()
         self._initialize_schema()
 
@@ -118,73 +177,6 @@ class WriteSpool:
         connection.execute("PRAGMA synchronous = FULL")
         return connection
 
-    def _initialize_schema(self) -> None:
-        with closing(self._connect()) as connection:
-            connection.executescript(
-                """
-                BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS write_operations (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    operation_key TEXT NOT NULL UNIQUE,
-                    kind TEXT NOT NULL,
-                    body_json TEXT NOT NULL,
-                    track_key TEXT,
-                    action TEXT,
-                    receipt_operation_id TEXT,
-                    attempt_count INTEGER NOT NULL DEFAULT 0,
-                    last_error_class TEXT,
-                    next_attempt_at REAL NOT NULL DEFAULT 0,
-                    quarantined_at REAL,
-                    quarantine_reason TEXT,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_write_operations_fifo
-                    ON write_operations(sequence);
-                CREATE INDEX IF NOT EXISTS idx_write_operations_replay
-                    ON write_operations(quarantined_at, next_attempt_at, sequence);
-                CREATE INDEX IF NOT EXISTS idx_write_operations_track
-                    ON write_operations(track_key, sequence);
-                CREATE TABLE IF NOT EXISTS track_drawers (
-                    track_key TEXT PRIMARY KEY,
-                    drawer_id TEXT NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                COMMIT;
-                """
-            )
-            self._migrate_schema(connection)
-        self._chmod_sqlite_files()
-
-    def _migrate_schema(self, connection: sqlite3.Connection) -> None:
-        columns = {
-            str(row["name"])
-            for row in connection.execute("PRAGMA table_info(write_operations)")
-        }
-        if "next_attempt_at" not in columns:
-            connection.execute(
-                "ALTER TABLE write_operations "
-                "ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0"
-            )
-        if "quarantined_at" not in columns:
-            connection.execute("ALTER TABLE write_operations ADD COLUMN quarantined_at REAL")
-        if "quarantine_reason" not in columns:
-            connection.execute(
-                "ALTER TABLE write_operations ADD COLUMN quarantine_reason TEXT"
-            )
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_write_operations_replay
-                ON write_operations(quarantined_at, next_attempt_at, sequence)
-            """
-        )
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_write_operations_track
-                ON write_operations(track_key, sequence)
-            """
-        )
-
     def _chmod_sqlite_files(self) -> None:
         for path in (self.path, f"{self.path}-wal", f"{self.path}-shm"):
             if os.path.exists(path):
@@ -193,14 +185,19 @@ class WriteSpool:
     def admit(
         self,
         kind: str,
-        body: Dict[str, Any],
+        body: JsonObject,
         *,
         track_key: Optional[str] = None,
         action: Optional[str] = None,
         operation_key: Optional[str] = None,
     ) -> SpoolOperation:
-        operation_key = operation_key or secrets.token_urlsafe(32)
-        encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        key = secrets.token_urlsafe(32) if operation_key is None else operation_key
+        encoded = json.dumps(
+            body,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
         now = time.time()
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -212,20 +209,33 @@ class WriteSpool:
                         created_at, updated_at
                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
                     """,
-                    (operation_key, kind, encoded, track_key, action, now),
+                    (key, kind, encoded, track_key, action, now),
                 )
                 sequence = int(cursor.lastrowid)
             except sqlite3.IntegrityError:
                 connection.execute("ROLLBACK")
-                existing = self.get(operation_key)
+                existing = self.get(key)
                 if existing is None:
                     raise
+                existing_encoded = json.dumps(
+                    existing.body,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                if (
+                    existing.kind != kind
+                    or existing_encoded != encoded
+                    or existing.track_key != track_key
+                    or existing.action != action
+                ):
+                    raise OperationKeyConflictError("operation_key_conflict")
                 return existing
             connection.execute("COMMIT")
         self._chmod_sqlite_files()
         return SpoolOperation(
             sequence=sequence,
-            operation_key=operation_key,
+            operation_key=key,
             kind=kind,
             body=dict(body),
             track_key=track_key,
@@ -241,7 +251,11 @@ class WriteSpool:
     def next_operation(self) -> Optional[SpoolOperation]:
         with closing(self._connect()) as connection:
             row = connection.execute(
-                "SELECT * FROM write_operations ORDER BY sequence LIMIT 1"
+                """
+                SELECT * FROM write_operations
+                WHERE settled_at IS NULL
+                ORDER BY sequence LIMIT 1
+                """
             ).fetchone()
         return self._row_to_operation(row) if row is not None else None
 
@@ -252,16 +266,19 @@ class WriteSpool:
                 """
                 SELECT *
                 FROM write_operations AS candidate
-                WHERE candidate.quarantined_at IS NULL
+                WHERE candidate.settled_at IS NULL
+                  AND candidate.quarantined_at IS NULL
                   AND candidate.next_attempt_at <= ?1
                   AND (
-                    candidate.track_key IS NULL
-                    OR NOT EXISTS (
-                        SELECT 1
-                        FROM write_operations AS earlier
-                        WHERE earlier.track_key = candidate.track_key
-                          AND earlier.sequence < candidate.sequence
-                    )
+                    candidate.claim_token IS NULL
+                    OR candidate.claim_expires_at <= ?1
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM write_operations AS earlier
+                    WHERE earlier.sequence < candidate.sequence
+                      AND earlier.settled_at IS NULL
+                      AND earlier.quarantined_at IS NULL
                   )
                 ORDER BY candidate.sequence
                 LIMIT 1
@@ -280,15 +297,32 @@ class WriteSpool:
 
     def count(self) -> int:
         with closing(self._connect()) as connection:
-            row = connection.execute("SELECT COUNT(*) FROM write_operations").fetchone()
+            row = connection.execute(
+                "SELECT COUNT(*) FROM write_operations WHERE settled_at IS NULL"
+            ).fetchone()
         return int(row[0]) if row is not None else 0
 
-    def record_receipt(self, operation_key: str, operation_id: str) -> None:
-        self._update_operation(
-            operation_key,
-            "receipt_operation_id = ?2, updated_at = ?3",
-            (operation_id, time.time()),
-        )
+    def record_receipt(
+        self, operation_key: str, operation_id: str, claim_token: str
+    ) -> None:
+        now = time.time()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE write_operations
+                SET receipt_operation_id = ?2, updated_at = ?3
+                WHERE operation_key = ?1
+                  AND claim_token = ?4
+                  AND claim_expires_at > ?3
+                  AND settled_at IS NULL
+                """,
+                (operation_key, operation_id, now, claim_token),
+            ).rowcount
+            if updated != 1:
+                connection.execute("ROLLBACK")
+                raise ClaimLostError("durable spool claim lost")
+            connection.execute("COMMIT")
 
     def record_attempt(
         self,
@@ -296,6 +330,7 @@ class WriteSpool:
         error_class: Optional[str],
         *,
         retryable: bool = True,
+        claim_token: str,
     ) -> bool:
         now = time.time()
         with closing(self._connect()) as connection:
@@ -305,17 +340,22 @@ class WriteSpool:
                 SELECT attempt_count
                 FROM write_operations
                 WHERE operation_key = ?1
+                  AND claim_token = ?2
+                  AND claim_expires_at > ?3
+                  AND settled_at IS NULL
                 """,
-                (operation_key,),
+                (operation_key, claim_token, now),
             ).fetchone()
             if row is None:
                 connection.execute("ROLLBACK")
-                raise KeyError("spool operation is no longer present")
+                raise ClaimLostError("durable spool claim lost")
             next_count = int(row["attempt_count"]) + 1
             delay = _RETRY_BACKOFF_SECS[
                 min(next_count - 1, len(_RETRY_BACKOFF_SECS) - 1)
             ]
-            quarantined = (not retryable) and next_count >= _MAX_REPLAY_ATTEMPTS
+            quarantined = (not retryable) or (
+                error_class == "target_unresolved" and next_count >= _MAX_REPLAY_ATTEMPTS
+            )
             updated = connection.execute(
                 """
                 UPDATE write_operations
@@ -330,8 +370,13 @@ class WriteSpool:
                         WHEN ?5 THEN ?3
                         ELSE quarantine_reason
                     END,
+                    claim_token = NULL,
+                    claim_expires_at = NULL,
                     updated_at = ?6
                 WHERE operation_key = ?1
+                  AND claim_token = ?7
+                  AND claim_expires_at > ?6
+                  AND settled_at IS NULL
                 """,
                 (
                     operation_key,
@@ -340,17 +385,23 @@ class WriteSpool:
                     now + delay,
                     quarantined,
                     now,
+                    claim_token,
                 ),
             ).rowcount
             if updated != 1:
                 connection.execute("ROLLBACK")
-                raise KeyError("spool operation is no longer present")
+                raise ClaimLostError("durable spool claim lost")
             connection.execute("COMMIT")
         return quarantined
 
-    def replace_body(self, operation_key: str, body: Dict[str, Any]) -> None:
+    def replace_body(self, operation_key: str, body: JsonObject) -> None:
         """Atomically refine an admitted operation before delivery begins."""
-        encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        encoded = json.dumps(
+            body,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
         self._update_operation(
             operation_key,
             "body_json = ?2, updated_at = ?3",
@@ -364,10 +415,34 @@ class WriteSpool:
         track_key: Optional[str] = None,
         drawer_id: Optional[str] = None,
         delete_track: bool = False,
+        claim_token: Optional[str] = None,
     ) -> None:
+        if claim_token is None:
+            claimed = self._claim_operation(operation_key, ignore_retry_delay=True)
+            if claimed is None or claimed.claim_token is None:
+                raise ClaimLostError("durable spool claim unavailable")
+            claim_token = claimed.claim_token
         now = time.time()
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE write_operations
+                SET settled_at = ?2,
+                    result_drawer_id = ?3,
+                    claim_token = NULL,
+                    claim_expires_at = NULL,
+                    updated_at = ?2
+                WHERE operation_key = ?1
+                  AND claim_token = ?4
+                  AND claim_expires_at > ?2
+                  AND settled_at IS NULL
+                """,
+                (operation_key, now, drawer_id, claim_token),
+            ).rowcount
+            if updated != 1:
+                connection.execute("ROLLBACK")
+                raise ClaimLostError("durable spool claim lost")
             if track_key and drawer_id:
                 connection.execute(
                     """
@@ -383,13 +458,6 @@ class WriteSpool:
                 connection.execute(
                     "DELETE FROM track_drawers WHERE track_key = ?1", (track_key,)
                 )
-            deleted = connection.execute(
-                "DELETE FROM write_operations WHERE operation_key = ?1",
-                (operation_key,),
-            ).rowcount
-            if deleted != 1:
-                connection.execute("ROLLBACK")
-                raise KeyError("spool operation is no longer present")
             connection.execute("COMMIT")
 
     def drawer_for_track(self, track_key: str) -> Optional[str]:
@@ -402,135 +470,167 @@ class WriteSpool:
 
     def replay_one(
         self,
-        post: Callable[[str, Dict[str, Any]], Any],
-        get: Callable[[str], Any],
+        post: PostCallback,
+        get: GetCallback,
         *,
         replay_allowed: Optional[Callable[[], bool]] = None,
     ) -> Optional[ReplayOutcome]:
-        """Attempt the earliest eligible operation without surrendering ambiguity."""
-        with self._replay_lock:
-            operation = self.next_replayable_operation()
-            if operation is None:
-                return None
-            return self._replay_operation_locked(
-                operation,
-                post,
-                get,
-                replay_allowed=replay_allowed,
-            )
+        """Claim the earliest global-FIFO operation before network I/O."""
+        operation = self._claim_next()
+        if operation is None:
+            return None
+        return self._replay_claimed_operation(
+            operation,
+            post,
+            get,
+            replay_allowed=replay_allowed,
+        )
 
     def replay_operation_key(
         self,
         operation_key: str,
-        post: Callable[[str, Dict[str, Any]], Any],
-        get: Callable[[str], Any],
+        post: PostCallback,
+        get: GetCallback,
         *,
         ignore_retry_delay: bool = False,
         replay_allowed: Optional[Callable[[], bool]] = None,
     ) -> Optional[ReplayOutcome]:
-        """Attempt one specific operation, preserving its producer-owned key."""
-        with self._replay_lock:
-            operation = self.get(operation_key)
-            if operation is None:
+        """Claim one producer-owned operation without holding a Python lock."""
+        operation = self.get(operation_key)
+        if operation is None:
+            return None
+        if operation.settled_at is not None:
+            return self._settled_outcome(operation)
+        if operation.quarantined_at is not None:
+            return ReplayOutcome(
+                operation,
+                completed=False,
+                error_class=operation.quarantine_reason or operation.last_error_class,
+                operation_id=operation.receipt_operation_id,
+                quarantined=True,
+            )
+        if not ignore_retry_delay and operation.next_attempt_at > time.time():
+            return ReplayOutcome(
+                operation,
+                completed=False,
+                error_class=operation.last_error_class or "retry_not_due",
+                operation_id=operation.receipt_operation_id,
+            )
+        if not self._fifo_available(operation_key):
+            return ReplayOutcome(
+                operation,
+                completed=False,
+                error_class="fifo_blocked",
+                operation_id=operation.receipt_operation_id,
+            )
+        claimed = self._claim_operation(
+            operation_key,
+            ignore_retry_delay=ignore_retry_delay,
+        )
+        if claimed is None:
+            current = self.get(operation_key)
+            if current is None:
                 return None
-            if operation.quarantined_at is not None:
+            if current.settled_at is not None:
+                return self._settled_outcome(current)
+            if current.quarantined_at is not None:
                 return ReplayOutcome(
-                    operation,
+                    current,
                     completed=False,
-                    error_class=operation.quarantine_reason or operation.last_error_class,
-                    operation_id=operation.receipt_operation_id,
+                    error_class=current.quarantine_reason or current.last_error_class,
+                    operation_id=current.receipt_operation_id,
                     quarantined=True,
                 )
-            if not ignore_retry_delay and operation.next_attempt_at > time.time():
+            if current.claim_token and (
+                current.claim_expires_at is not None
+                and current.claim_expires_at > time.time()
+            ):
                 return ReplayOutcome(
-                    operation,
+                    current,
                     completed=False,
-                    error_class=operation.last_error_class or "retry_not_due",
-                    operation_id=operation.receipt_operation_id,
+                    error_class="claim_busy",
+                    operation_id=current.receipt_operation_id,
                 )
-            if not self._is_replayable(operation_key, ignore_retry_delay):
-                return ReplayOutcome(
-                    operation,
-                    completed=False,
-                    error_class="fifo_blocked",
-                    operation_id=operation.receipt_operation_id,
-                )
-            return self._replay_operation_locked(
-                operation,
-                post,
-                get,
-                replay_allowed=replay_allowed,
+            return ReplayOutcome(
+                current,
+                completed=False,
+                error_class="fifo_blocked",
+                operation_id=current.receipt_operation_id,
             )
-
-    def _is_replayable(self, operation_key: str, ignore_retry_delay: bool) -> bool:
-        now = time.time()
-        with closing(self._connect()) as connection:
-            row = connection.execute(
-                """
-                SELECT 1
-                FROM write_operations AS candidate
-                WHERE candidate.operation_key = ?1
-                  AND candidate.quarantined_at IS NULL
-                  AND (?2 OR candidate.next_attempt_at <= ?3)
-                  AND (
-                    candidate.track_key IS NULL
-                    OR NOT EXISTS (
-                        SELECT 1
-                        FROM write_operations AS earlier
-                        WHERE earlier.track_key = candidate.track_key
-                          AND earlier.sequence < candidate.sequence
-                    )
-                  )
-                """,
-                (operation_key, ignore_retry_delay, now),
-            ).fetchone()
-        return row is not None
+        return self._replay_claimed_operation(
+            claimed,
+            post,
+            get,
+            replay_allowed=replay_allowed,
+        )
 
     def _replay_operation(
         self,
         operation: SpoolOperation,
-        post: Callable[[str, Dict[str, Any]], Any],
-        get: Callable[[str], Any],
+        post: PostCallback,
+        get: GetCallback,
         *,
         replay_allowed: Optional[Callable[[], bool]] = None,
     ) -> ReplayOutcome:
-        with self._replay_lock:
-            return self._replay_operation_locked(
-                operation,
-                post,
-                get,
-                replay_allowed=replay_allowed,
+        claimed = self._claim_operation(operation.operation_key, ignore_retry_delay=True)
+        if claimed is None:
+            current = self.get(operation.operation_key) or operation
+            return ReplayOutcome(
+                current,
+                completed=False,
+                error_class="claim_busy",
+                operation_id=current.receipt_operation_id,
             )
+        return self._replay_claimed_operation(
+            claimed,
+            post,
+            get,
+            replay_allowed=replay_allowed,
+        )
 
-    def _replay_operation_locked(
+    def _replay_claimed_operation(
         self,
         operation: SpoolOperation,
-        post: Callable[[str, Dict[str, Any]], Any],
-        get: Callable[[str], Any],
+        post: PostCallback,
+        get: GetCallback,
         *,
         replay_allowed: Optional[Callable[[], bool]] = None,
     ) -> ReplayOutcome:
+        claim_token = operation.claim_token
+        if not claim_token:
+            return ReplayOutcome(operation, completed=False, error_class="claim_lost")
         request = dict(operation.body)
         if operation.track_key and operation.action in {"replace", "delete"}:
             if not (operation.action == "replace" and request.get("replace_text")):
                 target = self.drawer_for_track(operation.track_key)
                 if not target:
-                    quarantined = self.record_attempt(
-                        operation.operation_key,
-                        "target_unresolved",
-                        retryable=False,
-                    )
+                    try:
+                        quarantined = self.record_attempt(
+                            operation.operation_key,
+                            "target_unresolved",
+                            retryable=True,
+                            claim_token=claim_token,
+                        )
+                    except ClaimLostError:
+                        return ReplayOutcome(
+                            operation,
+                            completed=False,
+                            error_class="claim_lost",
+                        )
                     return ReplayOutcome(
                         operation,
                         completed=False,
                         error_class="target_unresolved",
                         quarantined=quarantined,
                     )
-                request["supersedes" if operation.action == "replace" else "drawer_id"] = target
+                request[
+                    "supersedes" if operation.action == "replace" else "drawer_id"
+                ] = target
         operation_id = operation.receipt_operation_id
         route = "/api/ingest/durable"
         try:
             if replay_allowed is not None and not replay_allowed():
+                self.release_claim(operation.operation_key, claim_token)
                 return ReplayOutcome(
                     operation,
                     completed=False,
@@ -558,19 +658,22 @@ class WriteSpool:
                 operation_id = str(receipt.get("operation_id") or "")
                 if not operation_id:
                     raise RuntimeError("durable admission omitted operation_id")
-                self.record_receipt(operation.operation_key, operation_id)
+                self.record_receipt(operation.operation_key, operation_id, claim_token)
                 route = f"/api/operations/{operation_id}"
                 status = get(route)
             if not isinstance(status, dict):
                 raise RuntimeError("durable status returned an invalid response")
-            state = str(status.get("state") or "")
-            drawer_id = str(status.get("drawer_id") or "")
+            state = status.get("state")
+            state = state if isinstance(state, str) else ""
+            drawer_value = status.get("drawer_id")
+            drawer_id = drawer_value if isinstance(drawer_value, str) else ""
             if state == "completed" and drawer_id:
                 self.complete(
                     operation.operation_key,
                     track_key=operation.track_key,
-                    drawer_id=None if operation.action == "delete" else drawer_id,
+                    drawer_id=drawer_id,
                     delete_track=operation.action == "delete",
+                    claim_token=claim_token,
                 )
                 return ReplayOutcome(
                     operation,
@@ -578,32 +681,37 @@ class WriteSpool:
                     drawer_id=drawer_id,
                     operation_id=operation_id,
                 )
-            error_class = f"terminal_{state}" if state in {"failed", "rejected"} else None
-            if error_class:
-                quarantined = self.record_attempt(
-                    operation.operation_key,
-                    error_class,
-                    retryable=False,
-                )
-                return ReplayOutcome(
-                    operation,
-                    completed=False,
-                    error_class=error_class,
-                    operation_id=operation_id,
-                    quarantined=quarantined,
-                )
-            status_class = f"status_{state or 'unknown'}"
+            if state == "completed":
+                error_class = "status_completed_missing_drawer"
+                retryable = False
+            elif state in _TERMINAL_STATES:
+                error_class = f"terminal_{state}"
+                retryable = False
+            elif state in _RETRYABLE_STATES:
+                error_class = f"status_{state}"
+                retryable = True
+            else:
+                error_class = "status_invalid"
+                retryable = False
             quarantined = self.record_attempt(
                 operation.operation_key,
-                status_class,
-                retryable=True,
+                error_class,
+                retryable=retryable,
+                claim_token=claim_token,
             )
             return ReplayOutcome(
                 operation,
                 completed=False,
-                error_class=status_class,
+                error_class=error_class,
                 operation_id=operation_id,
                 quarantined=quarantined,
+            )
+        except ClaimLostError:
+            return ReplayOutcome(
+                operation,
+                completed=False,
+                error_class="claim_lost",
+                operation_id=operation_id,
             )
         except Exception as exc:
             error_class = classify_write_error(exc)
@@ -612,11 +720,21 @@ class WriteSpool:
                 route,
                 exc,
             )["error_details"]
-            quarantined = self.record_attempt(
-                operation.operation_key,
-                error_class,
-                retryable=_is_retryable_replay_error(error_class),
-            )
+            classification = classify_replay_error(error_class)
+            try:
+                quarantined = self.record_attempt(
+                    operation.operation_key,
+                    error_class,
+                    retryable=classification.retryable,
+                    claim_token=claim_token,
+                )
+            except ClaimLostError:
+                return ReplayOutcome(
+                    operation,
+                    completed=False,
+                    error_class="claim_lost",
+                    operation_id=operation_id,
+                )
             return ReplayOutcome(
                 operation,
                 completed=False,
@@ -625,6 +743,16 @@ class WriteSpool:
                 quarantined=quarantined,
                 error_details=error_details,
             )
+
+    @staticmethod
+    def _settled_outcome(operation: SpoolOperation) -> ReplayOutcome:
+        return ReplayOutcome(
+            operation,
+            completed=operation.settled_at is not None,
+            drawer_id=operation.result_drawer_id,
+            operation_id=operation.receipt_operation_id,
+            quarantined=False,
+        )
 
     def _update_operation(
         self, operation_key: str, assignment: str, values: tuple[Any, ...]
@@ -660,4 +788,12 @@ class WriteSpool:
                 None if row["quarantined_at"] is None else float(row["quarantined_at"])
             ),
             quarantine_reason=row["quarantine_reason"],
+            settled_at=(None if row["settled_at"] is None else float(row["settled_at"])),
+            result_drawer_id=row["result_drawer_id"],
+            claim_token=row["claim_token"],
+            claim_expires_at=(
+                None
+                if row["claim_expires_at"] is None
+                else float(row["claim_expires_at"])
+            ),
         )

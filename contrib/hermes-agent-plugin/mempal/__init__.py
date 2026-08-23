@@ -23,16 +23,12 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from ._authoritative_write import authoritative_memory_write as _authoritative_memory_write
 from ._backoff import SharedPluginBackoff
 from ._conclude import conclusion_request, submit_conclusion
 from ._intelligence import _IntelligenceEnhancer, _LLMClient
-from ._rest_errors import (
-    rest_error_payload as _rest_error_payload,
-    search_metadata_from_headers,
-    search_timeout_metadata_from_http_error,
-)
-from ._write_spool import SpoolOperation, WriteSpool, classify_write_error
-from ._authoritative_write import authoritative_memory_write as _authoritative_memory_write
+from ._rest_errors import rest_error_payload as _rest_error_payload, search_metadata_from_headers, search_timeout_metadata_from_http_error
+from ._write_spool import SpoolOperation, WriteSpool, classify_replay_error, classify_write_error, make_track_key
 
 try:
     from mempal_search_transport import SearchTransport, SearchTransportResponse
@@ -155,7 +151,7 @@ def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
 
 
 class MempalMemoryProvider:
-    def __init__(self):
+    def __init__(self) -> None:
         self._base_url = "http://127.0.0.1:3080"
         self._session_id = ""
         self._hermes_home = ""
@@ -295,8 +291,7 @@ class MempalMemoryProvider:
             self._write_queue.task_done()
 
     def _track_key(self, target: str) -> str:
-        scope = f"project:{self._project_id}" if self._project_id else "global"
-        return f"{target}:{self._wing}:{scope}"
+        return make_track_key(target, self._wing, self._project_id)
 
     def _spool_write(
         self,
@@ -348,7 +343,9 @@ class MempalMemoryProvider:
         if outcome.completed:
             self._record_success()
             self._update_health(True)
-        elif outcome.error_class and not outcome.error_class.startswith("status_"):
+        elif outcome.error_class and classify_replay_error(
+            outcome.error_class
+        ).count_failure:
             self._record_failure()
             self._update_health(False)
             logger.warning(
@@ -383,7 +380,8 @@ class MempalMemoryProvider:
                 return
             except Exception as exc:
                 error_class = classify_write_error(exc)
-                if error_class.startswith("http_4"):
+                classification = classify_replay_error(error_class)
+                if not classification.retryable:
                     logger.warning("mempal write rejected error_class=%s", error_class)
                     self._record_failure()
                     return

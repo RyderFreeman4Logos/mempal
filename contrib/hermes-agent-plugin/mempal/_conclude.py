@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
-from ._write_spool import WriteSpool, classify_write_error
+from ._write_spool import OperationKeyConflictError, WriteSpool, classify_write_error
 
 
 @dataclass(frozen=True)
@@ -61,6 +61,14 @@ def submit_conclusion(
         ))
     try:
         spool.admit("ingest", request, action="conclude", operation_key=key)
+    except OperationKeyConflictError:
+        return ConcludeResult(False, _retry_payload(
+            "operation_key_conflict",
+            None,
+            key,
+            "operation_key_conflict",
+            "operation_key_conflict",
+        ))
     except Exception as exc:
         return ConcludeResult(False, _retry_payload(
             "local_durable_admission_failed",

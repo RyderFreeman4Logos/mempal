@@ -1,5 +1,5 @@
-import os
 import logging
+import os
 import queue
 import sqlite3
 import tempfile
@@ -526,7 +526,7 @@ class DurableSchedulingTests(unittest.TestCase):
         self.assertNotIn("synthetic response body", rendered)
         provider.shutdown()
 
-    def test_blocked_oldest_does_not_starve_raw_turn_after_restart(self) -> None:
+    def test_blocked_oldest_blocks_raw_turn_after_restart(self) -> None:
         with tempfile.TemporaryDirectory() as hermes_home:
             backend = _RestartBackend(failures=0)
             self._seed_unresolved_profile_replace(hermes_home, backend)
@@ -542,11 +542,11 @@ class DurableSchedulingTests(unittest.TestCase):
                 if path == "/api/ingest/durable"
                 and "later raw user" in body["request"].get("content", "")
             ]
-            self.assertEqual(len(raw_requests), 1)
-            self.assertEqual(restarted._write_spool.count(), 1)
+            self.assertEqual(len(raw_requests), 0)
+            self.assertEqual(restarted._write_spool.count(), 2)
             restarted.shutdown()
 
-    def test_blocked_oldest_does_not_starve_session_summary_after_restart(self) -> None:
+    def test_blocked_oldest_blocks_session_summary_after_restart(self) -> None:
         with tempfile.TemporaryDirectory() as hermes_home:
             backend = _RestartBackend(failures=0)
             self._seed_unresolved_profile_replace(hermes_home, backend)
@@ -564,11 +564,11 @@ class DurableSchedulingTests(unittest.TestCase):
                 if path == "/api/ingest/durable"
                 and "later summary evidence" in body["request"].get("content", "")
             ]
-            self.assertEqual(len(summary_requests), 1)
-            self.assertEqual(restarted._write_spool.count(), 1)
+            self.assertEqual(len(summary_requests), 0)
+            self.assertEqual(restarted._write_spool.count(), 2)
             restarted.shutdown()
 
-    def test_blocked_oldest_does_not_starve_independent_mirrored_write_after_restart(self) -> None:
+    def test_blocked_oldest_blocks_independent_mirrored_write_after_restart(self) -> None:
         with tempfile.TemporaryDirectory() as hermes_home:
             backend = _RestartBackend(failures=0)
             self._seed_unresolved_profile_replace(hermes_home, backend)
@@ -584,8 +584,8 @@ class DurableSchedulingTests(unittest.TestCase):
                 if path == "/api/ingest/durable"
                 and body["request"].get("content") == "independent mirrored evidence"
             ]
-            self.assertEqual(len(mirrored_requests), 1)
-            self.assertEqual(restarted._write_spool.count(), 1)
+            self.assertEqual(len(mirrored_requests), 0)
+            self.assertEqual(restarted._write_spool.count(), 2)
             restarted.shutdown()
 
     def test_exhausted_unresolved_target_is_quarantined_without_deleting_evidence(self) -> None:
@@ -730,7 +730,7 @@ class DurableSchedulingTests(unittest.TestCase):
             self.assertEqual(completed.drawer_id, "drawer-slow-queued")
             self.assertEqual(restarted.count(), 0)
 
-    def test_not_due_retryable_row_does_not_block_independent_due_row(self) -> None:
+    def test_not_due_retryable_row_blocks_independent_due_row_global_fifo(self) -> None:
         with tempfile.TemporaryDirectory() as hermes_home:
             spool = WriteSpool(hermes_home)
             stuck = spool.admit(
@@ -777,9 +777,8 @@ class DurableSchedulingTests(unittest.TestCase):
 
             independent = spool.replay_one(post_success, get_success)
 
-            self.assertIsNotNone(independent)
-            self.assertTrue(independent.completed)
-            self.assertEqual(delivered_contents, ["independent due"])
+            self.assertIsNone(independent)
+            self.assertEqual(delivered_contents, [])
             remaining = spool.next_operation()
             self.assertIsNotNone(remaining)
             self.assertEqual(remaining.operation_key, stuck.operation_key)

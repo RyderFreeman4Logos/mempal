@@ -8,7 +8,6 @@ import unittest
 import urllib.error
 from typing import Any, Dict, Optional
 
-
 PLUGIN_DIR = os.path.dirname(__file__)
 if PLUGIN_DIR not in sys.path:
     sys.path.insert(0, PLUGIN_DIR)
@@ -269,7 +268,7 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertEqual(len(provider.durable_status), 1)
         self.assertEqual(
             sum(path == "/api/ingest/durable" for path, _ in provider.posts),
-            2,
+            1,
         )
 
     def test_lost_receipt_retry_reuses_generated_key_and_single_effect(self) -> None:
@@ -326,7 +325,9 @@ class DurableConcludeTests(unittest.TestCase):
         provider.initialize("session-a", user_id="alice", profile="work")
         generated = iter(("explicit-a", "explicit-b"))
         original = conclude_module.secrets.token_urlsafe
-        conclude_module.secrets.token_urlsafe = lambda _size: next(generated)
+        conclude_module.secrets.token_urlsafe = lambda size: (
+            next(generated) if size == 32 else original(size)
+        )
         try:
             first = self._conclude(provider, "identical explicit conclusion")
             second = self._conclude(provider, "identical explicit conclusion")
