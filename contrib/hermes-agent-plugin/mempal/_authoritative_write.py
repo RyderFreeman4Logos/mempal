@@ -176,13 +176,25 @@ def authoritative_memory_write(
 
         completed_ids: list[str] = []
         operation_keys: list[str] = []
+        pending_durability: Optional[Dict[str, object]] = None
         for item in normalized:
             receipt = json.loads(self.authoritative_memory_write(item))
-            if receipt.get("operation_key"):
-                operation_keys.append(receipt["operation_key"])
-            if receipt.get("success"):
-                if receipt.get("operation_id"):
-                    completed_ids.append(receipt["operation_id"])
+            receipt_operation_key = receipt.get("operation_key")
+            if isinstance(receipt_operation_key, str) and receipt_operation_key:
+                operation_keys.append(receipt_operation_key)
+            is_completed = bool(receipt.get("success")) and receipt.get("state") != "local_admitted"
+            if is_completed:
+                operation_id = receipt.get("operation_id")
+                if isinstance(operation_id, str) and operation_id:
+                    completed_ids.append(operation_id)
+                continue
+            durability = receipt.get("durability")
+            if (
+                receipt.get("state") == "local_admitted"
+                and isinstance(durability, dict)
+                and durability.get("kind") == "durable_replay_deferred"
+            ):
+                pending_durability = durability
                 continue
             error_class = receipt.get("error_class") or "durable_write_pending"
             return json.dumps({
@@ -193,6 +205,20 @@ def authoritative_memory_write(
                 "error_class": error_class,
                 "last_error_class": error_class,
                 "retryable": receipt.get("retryable", True),
+            })
+        if pending_durability is not None:
+            error_class = pending_durability.get("deferred_reason") or "durable_write_pending"
+            return json.dumps({
+                "success": False,
+                "partial_write": bool(completed_ids),
+                "operation_ids": completed_ids,
+                "operation_keys": operation_keys,
+                "error_class": error_class,
+                "last_error_class": error_class,
+                "retryable": True,
+                "retry_safe": True,
+                "state": "local_admitted",
+                "durability": pending_durability,
             })
         return json.dumps({
             "success": True,
