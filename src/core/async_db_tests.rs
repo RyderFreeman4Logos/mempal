@@ -1,9 +1,15 @@
 use super::*;
-use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 
 fn short_tempdir() -> tempfile::TempDir {
     tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+}
+
+fn release_readers(release: &Arc<(Mutex<bool>, Condvar)>) {
+    let (released, condvar) = release.as_ref();
+    *released.lock().expect("lock read release") = true;
+    condvar.notify_all();
 }
 
 /// T1 — runtime-liveness (the core #345 property). On a single-worker runtime
@@ -33,31 +39,41 @@ async fn t1_runtime_liveness_read_off_runtime() {
 async fn t2_read_concurrency_up_to_n() {
     let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 4).expect("open async db");
-    let barrier = Arc::new(Barrier::new(4));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
     let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut handles = Vec::new();
     for _ in 0..4 {
         let adb = adb.clone();
-        let barrier = Arc::clone(&barrier);
+        let release = Arc::clone(&release);
         let started_tx = started_tx.clone();
         handles.push(tokio::spawn(async move {
             adb.run_read(move |_db| {
                 started_tx.send(()).expect("report read start");
-                barrier.wait();
+                let (released, condvar) = &*release;
+                let released = released.lock().expect("lock read release");
+                let _released = condvar
+                    .wait_while(released, |released| !*released)
+                    .expect("wait for read release");
                 Ok(1_i64)
             })
             .await
         }));
     }
+    let mut all_started = true;
     for _ in 0..4 {
-        tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
-            .await
-            .expect("all readers must start")
-            .expect("reader start event");
+        match tokio::time::timeout(Duration::from_secs(1), started_rx.recv()).await {
+            Ok(Some(())) => {}
+            Ok(None) | Err(_) => {
+                all_started = false;
+                break;
+            }
+        }
     }
+    release_readers(&release);
     for handle in handles {
         handle.await.expect("join").expect("read");
     }
+    assert!(all_started, "all readers must start");
 }
 
 #[tokio::test]
