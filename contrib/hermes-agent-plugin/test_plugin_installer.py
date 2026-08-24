@@ -1,6 +1,7 @@
 import contextlib
 import errno
 import io
+import shutil
 import sys
 import tempfile
 import unittest
@@ -32,7 +33,25 @@ class PluginInstallerTests(unittest.TestCase):
         self.assertTrue(all(result.current for result in checked))
         self.assertEqual({result.plugin for result in checked}, set(installer.PLUGIN_NAMES))
 
-    def test_check_detects_short_missing_and_extra_provider_files(self) -> None:
+    def test_incomplete_mempal_sources_fail_closed_before_staging_or_activation(self) -> None:
+        for missing in (
+            "_authoritative_write.py",
+            "_write_spool_claims.py",
+            "_write_spool_replay.py",
+        ):
+            with self.subTest(missing=missing):
+                source_root = Path(self.temporary.name) / f"source-{missing}"
+                hermes_home = Path(self.temporary.name) / f"hermes-{missing}"
+                shutil.copytree(PLUGIN_DIR, source_root, ignore=shutil.ignore_patterns("__pycache__"))
+                hermes_home.mkdir()
+                (source_root / "mempal" / missing).unlink()
+
+                with self.assertRaisesRegex(installer.InstallerError, "source_incomplete"):
+                    installer.refresh_plugins(source_root, hermes_home)
+
+                self.assertFalse((hermes_home / "plugins" / "mempal").exists())
+                self.assertEqual(self._transaction_artifacts_at(hermes_home), [])
+
         installer.refresh_plugins(PLUGIN_DIR, self.hermes_home)
         provider = self.hermes_home / "plugins" / "mempal"
         (provider / "__init__.py").write_text("short", encoding="utf-8")
@@ -158,7 +177,11 @@ class PluginInstallerTests(unittest.TestCase):
         )
 
     def _transaction_artifacts(self):
-        plugins = self.hermes_home / "plugins"
+        return self._transaction_artifacts_at(self.hermes_home)
+
+    @staticmethod
+    def _transaction_artifacts_at(hermes_home: Path):
+        plugins = hermes_home / "plugins"
         return sorted(
             path.name
             for path in plugins.iterdir()
