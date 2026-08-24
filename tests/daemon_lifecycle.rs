@@ -332,6 +332,43 @@ fn spawn_placeholder_daemon(home: &Path, label: &str) -> std::io::Result<Capture
     CapturedChild::spawn(&mut command, &daemon_runtime_dir(home), label, None)
 }
 
+fn wait_for_ingest_operation(home: &Path, operation_id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut command = Command::new(mempal_bin());
+        command
+            .args(["operation", "wait", operation_id, "--timeout-secs", "30"])
+            .daemon_home(home)
+            .stdin(Stdio::null());
+        let mut child = CapturedChild::spawn(
+            &mut command,
+            &daemon_runtime_dir(home),
+            &format!("wait-ingest-operation-{attempt}"),
+            None,
+        )
+        .expect("spawn wait for ingest operation");
+        let status = child.wait_or_panic_with_timeout(
+            "wait for ingest operation",
+            deadline.saturating_duration_since(Instant::now()),
+        );
+        let diagnostics = child.diagnostics();
+        if status.success() {
+            return;
+        }
+        assert!(
+            diagnostics.contains("database admission state is busy"),
+            "operation wait failed: status={status:?}\n{diagnostics}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "operation wait remained busy for 30s\n{diagnostics}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn spawn_db_backed_orphan_daemon(home: &Path, db_path: &Path) -> CapturedChild {
     let pid_path = db_path.parent().expect("parent").join("daemon.pid");
     let mut child = spawn_foreground_daemon(home, "db-backed-orphan");
@@ -475,7 +512,10 @@ fn test_daemon_restart_reaps_orphan_without_pidfile() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    orphan.wait_or_panic("orphan daemon should be reaped by restart");
+    orphan.wait_or_panic_with_timeout(
+        "orphan daemon should be reaped by restart",
+        Duration::from_secs(10),
+    );
 
     let restarted_pid = read_pid_file(&pid_path);
     assert_ne!(restarted_pid, orphan_pid);
@@ -740,19 +780,7 @@ fn test_daemon_processes_ingest_async_queue_rows() {
     let mut child = spawn_foreground_daemon(tmp.path(), "process-ingest-async");
     child.wait_for_stderr_event("daemon hook workers started", Duration::from_secs(30));
 
-    let wait = Command::new(mempal_bin())
-        .args(["operation", "wait", &operation_id, "--timeout-secs", "30"])
-        .daemon_home(tmp.path())
-        .stdin(Stdio::null())
-        .output()
-        .expect("wait for ingest operation");
-    assert!(
-        wait.status.success(),
-        "operation wait failed: status={:?}, stdout={}, stderr={}",
-        wait.status,
-        String::from_utf8_lossy(&wait.stdout),
-        String::from_utf8_lossy(&wait.stderr)
-    );
+    wait_for_ingest_operation(tmp.path(), &operation_id);
 
     child.signal_or_panic(libc::SIGTERM, "failed to send SIGTERM");
     let status = child.wait_or_panic("failed to wait for daemon");
