@@ -36,7 +36,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - **Daemon readiness CLI tests**: shared Linux supervisor for bounded redacted lifecycle handling (#892).
 
-- **Hermes receipts**: scoped smoke ingest inline; live-daemon polls `created_drawer_ids`; already-soft-deleted `mempal_delete` succeeds; cleanup IDs survive CLI/MCP/REST decode; breaker-open conclude replay is structured pending success, not tool error; open REST/Hermes breakers admit `mempal_search`/`mempal_profile` probes with typed/redacted payloads despite expired persisted-breaker reset failures, not temporary-unavailable; daemon down with ≥100 pending → `doctor`/`status`/MCP doctor emit high-severity typed availability signal; unreadable config/queue stats/unverified PIDs → privacy-safe `unavailable`, never synthetic normal; recovery: restart, drain, terminal failures, no DB edits; saturated MCP holder-budget no-write receipts and owner-bound smoke cleanup prevent false receipts/cross-operation cleanup IDs (#871, #876, #888, #918, #921, #923, #924, #927).
+- **Hermes receipts**: scoped smoke ingest inline; live-daemon polls `created_drawer_ids`; already-soft-deleted `mempal_delete` succeeds; cleanup IDs survive CLI/MCP/REST decode; breaker-open conclude replay is structured pending success, not tool error; open REST/Hermes breakers admit `mempal_search`/`mempal_profile` probes with typed/redacted payloads; daemon down with ≥100 pending → `doctor`/`status`/MCP doctor emit high-severity typed availability signal; unreadable config/queue stats/unverified PIDs → privacy-safe `unavailable`; recovery: drain, terminal failures, no DB edits; saturated MCP holder-budget no-write receipts and owner-bound smoke cleanup prevent false receipts/cross-operation cleanup IDs; MCP empty/invalid/failed roots resolve to no project (#871, #876, #888, #918, #921, #923, #924, #927, #936).
 
 - **Daemon SQLite busy**: lease renew retries Busy/locked (#929); startup busy/lock exits 75; systemd avoids churn beside extra MCP holders (#931); post-merge REST install recycles daemon (#928, #940); Hermes writes authoritative; local conclusions avoid breaker retrips (#941).
 
@@ -51,7 +51,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - **Fixture readiness**: synchronize SQLite, MCP, and queue byte-admission
   fixtures at their boundary so suite load cannot race or deadlock assertions;
   the daemon lifecycle completion poll likewise retries temporary admission
-  `Busy` through its existing deadline (#882, #889, #890).
+  `Busy` through its existing deadline (#882, #889, #890, #956).
 
 - **MCP delete retry fixture**: force observed SQLite Busy before synchronized
   lock release, eliminating the 5.5s/9s race (#886).

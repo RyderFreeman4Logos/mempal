@@ -219,3 +219,41 @@ fn test_mcp_ingest_database_write_refused_error_classifies_sqlite_busy() {
         "structured data should include database system warning: {data}"
     );
 }
+
+    #[tokio::test]
+    async fn test_mcp_search_returns_diagnostic_when_database_cannot_open() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        fs::create_dir(&db_path).expect("create directory at db path");
+        let server = MempalMcpServer::new_with_factory(
+            db_path,
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+        .expect("create MCP server");
+
+        let response = server
+            .mempal_search(Parameters(SearchRequest {
+                query: "open failure marker".to_string(),
+                top_k: Some(1),
+                disable_progressive: Some(true),
+                ..SearchRequest::default()
+            }))
+            .await
+            .expect("search should return an actionable diagnostic response")
+            .0;
+
+        assert_eq!(response.search_mode, SearchMode::Bm25Only.as_str());
+        assert!(response.results.is_empty());
+        assert!(
+            response.warnings.iter().any(|warning| {
+                warning.contains("path_or_permission") && warning.contains("bounded empty response")
+            }),
+            "response warning should expose database diagnostic: {:?}",
+            response.warnings
+        );
+        assert!(response.system_warnings.iter().any(|warning| {
+            warning.source == "database" && warning.message.contains("path_or_permission")
+        }));
+    }
