@@ -101,7 +101,11 @@ class RecordingProvider(MempalMemoryProvider):
         if path in {"/api/ingest/durable", "/api/delete/durable"}:
             operation_id = f"operation_{body['idempotency_key']}"
             request = body["request"]
-            drawer_id = request.get("drawer_id") or f"drawer_{len(self.durable_status) + 1}"
+            drawer_id = (
+                request["drawer_id"]
+                if path == "/api/delete/durable"
+                else request.get("drawer_id") or f"drawer_{len(self.durable_status) + 1}"
+            )
             self.durable_status.setdefault(operation_id, {
                 "operation_id": operation_id,
                 "state": "completed",
@@ -1008,6 +1012,7 @@ class ReadinessDurableMemoryTests(unittest.TestCase):
         result = json.loads(provider.handle_tool_call("mempal_conclude", {"conclusion": "exact text"}))
         self.assertEqual(provider.posts[-1][1]["request"]["content"], "exact text")
         self.assertIn("drawer_id", result)
+
 
 
 class ReadinessReliabilityTests(unittest.TestCase):

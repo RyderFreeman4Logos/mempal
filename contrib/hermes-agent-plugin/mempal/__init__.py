@@ -21,17 +21,18 @@ import queue
 import secrets
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
+from ._authoritative_write import authoritative_memory_write as _authoritative_memory_write
 from ._backoff import SharedPluginBackoff
-from ._conclude import conclusion_request, submit_conclusion
-from ._intelligence import _IntelligenceEnhancer, _LLMClient
-from ._rest_errors import (
-    rest_error_payload as _rest_error_payload,
-    search_metadata_from_headers,
-    search_timeout_metadata_from_http_error,
+from ._conclude import (
+    conclude_side_effects,
+    conclusion_request,
+    submit_conclusion,
 )
-from ._write_spool import SpoolOperation, WriteSpool, classify_write_error
+from ._intelligence import _IntelligenceEnhancer, _LLMClient
+from ._rest_errors import rest_error_payload as _rest_error_payload, search_metadata_from_headers, search_timeout_metadata_from_http_error
+from ._write_spool import SpoolOperation, WriteSpool, classify_replay_error, classify_write_error, make_track_key
 
 try:
     from mempal_search_transport import SearchTransport, SearchTransportResponse
@@ -154,7 +155,7 @@ def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
 
 
 class MempalMemoryProvider:
-    def __init__(self):
+    def __init__(self) -> None:
         self._base_url = "http://127.0.0.1:3080"
         self._session_id = ""
         self._hermes_home = ""
@@ -293,6 +294,9 @@ class MempalMemoryProvider:
             self._process_write(item)
             self._write_queue.task_done()
 
+    def _track_key(self, target: str) -> str:
+        return make_track_key(target, self._wing, self._project_id)
+
     def _spool_write(
         self,
         kind: str,
@@ -300,12 +304,17 @@ class MempalMemoryProvider:
         *,
         action: str,
         track_key: Optional[str] = None,
+        operation_key: Optional[str] = None,
         wake: bool = True,
     ) -> SpoolOperation:
         if self._write_spool is None:
             raise RuntimeError("mempal durable write spool is not initialized")
         operation = self._write_spool.admit(
-            kind, body, track_key=track_key, action=action
+            kind,
+            body,
+            track_key=track_key,
+            action=action,
+            operation_key=operation_key,
         )
         if wake:
             self._wake_spool_worker()
@@ -338,7 +347,9 @@ class MempalMemoryProvider:
         if outcome.completed:
             self._record_success()
             self._update_health(True)
-        elif outcome.error_class:
+        elif outcome.error_class and classify_replay_error(
+            outcome.error_class
+        ).count_failure:
             self._record_failure()
             self._update_health(False)
             logger.warning(
@@ -373,7 +384,8 @@ class MempalMemoryProvider:
                 return
             except Exception as exc:
                 error_class = classify_write_error(exc)
-                if error_class.startswith("http_4"):
+                classification = classify_replay_error(error_class)
+                if not classification.retryable:
                     logger.warning("mempal write rejected error_class=%s", error_class)
                     self._record_failure()
                     return
@@ -557,11 +569,14 @@ class MempalMemoryProvider:
         return mode
 
     def _is_breaker_open(self):
+        # Honor the breaker window whenever set (mirrored from backoff state
+        # or opened by tests/diagnostics); the threshold is only used to
+        # decide when the window may be cleared on expiry.
+        if time.monotonic() < self._breaker_open_until:
+            return True
+        self._breaker_open_until = 0.0
         if self._consecutive_failures >= _BREAKER_THRESHOLD:
-            if time.monotonic() < self._breaker_open_until:
-                return True
             self._consecutive_failures = 0
-            self._breaker_open_until = 0.0
         return self._backoff.is_open()
 
     def _record_success(self):
@@ -860,6 +875,12 @@ class MempalMemoryProvider:
     def get_tool_schemas(self):
         return [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]
 
+    def authoritative_memory_write(
+        self, request: Mapping[str, object], **kwargs: object
+    ) -> str:
+        """Persist one Hermes core memory operation through the durable spool."""
+        return _authoritative_memory_write(self, request, **kwargs)
+
     def handle_tool_call(self, tool_name, args, **kwargs):
         if (
             tool_name not in {"mempal_profile", "mempal_search"}
@@ -1018,16 +1039,7 @@ class MempalMemoryProvider:
                     except Exception:
                         logger.warning("mempal conclude success bookkeeping failed")
                 else:
-                    try:
-                        self._record_failure()
-                    except Exception:
-                        logger.warning("mempal conclude failure bookkeeping failed")
-                    details = result.payload.get("error_details", {})
-                    if details.get("kind") != "local_durable_admission_failed":
-                        try:
-                            self._wake_spool_worker()
-                        except Exception:
-                            logger.warning("mempal conclude replay wake failed")
+                    conclude_side_effects(self, result.payload)
                 return json.dumps(result.payload)
             except Exception as exc:
                 self._record_failure()
@@ -1061,7 +1073,7 @@ class MempalMemoryProvider:
             self._wake_spool_worker()
 
     def on_memory_write(self, action, target, content, metadata=None):
-        track_key = f"{target}:{self._wing}"
+        track_key = self._track_key(target)
         room = self._memory_room_for_target(target)
         if action == "remove":
             self._spool_write(

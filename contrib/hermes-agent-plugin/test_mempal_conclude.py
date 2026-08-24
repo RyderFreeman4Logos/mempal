@@ -8,12 +8,12 @@ import unittest
 import urllib.error
 from typing import Any, Dict, Optional
 
-
 PLUGIN_DIR = os.path.dirname(__file__)
 if PLUGIN_DIR not in sys.path:
     sys.path.insert(0, PLUGIN_DIR)
 
 import mempal._conclude as conclude_module  # noqa: E402
+from test_mempal_authoritative_write import FailingStatusProvider  # noqa: E402
 from test_mempal_provider import RecordingProvider  # noqa: E402
 
 
@@ -124,6 +124,105 @@ class TransitioningBreakerProvider(RecordingProvider):
 
 
 class DurableConcludeTests(unittest.TestCase):
+    def test_malformed_operation_key_is_terminal_and_side_effect_free(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        before = provider._backoff._read_state()
+        wake_calls = []
+        provider._wake_spool_worker = lambda: wake_calls.append("wake")
+
+        result = json.loads(provider.handle_tool_call(
+            "mempal_conclude",
+            {"conclusion": "safe conclusion", "operation_key": {"token": "FIXTURE"}},
+        ))
+
+        after = provider._backoff._read_state()
+        self.assertEqual(result["error_details"]["kind"], "invalid_control_fields")
+        self.assertFalse(result["error_details"]["retry_safe"])
+        self.assertNotIn("FIXTURE", json.dumps(result))
+        self.assertIsNotNone(provider._write_spool)
+        self.assertEqual(provider._write_spool.count(), 0)
+        self.assertEqual(provider.posts, [])
+        self.assertEqual(after.failure_count, before.failure_count)
+        self.assertEqual(wake_calls, [])
+        provider.shutdown()
+
+    def test_transport_409_conflict_is_terminal_without_failure_or_wake(self) -> None:
+        provider = FailingStatusProvider(409)
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
+        before = provider._backoff._read_state()
+
+        result = self._conclude(provider, "SECRET_CONFLICT_CONCLUSION")
+
+        details = result["error_details"]
+        self.assertEqual(details["kind"], "operation_key_conflict")
+        self.assertFalse(details["retry_safe"])
+        after = provider._backoff._read_state()
+        self.assertEqual(after.failure_count, before.failure_count)
+        spool = provider._write_spool
+        assert spool is not None
+        operation = spool.next_operation()
+        self.assertIsNotNone(operation)
+        assert operation is not None
+        self.assertIsNotNone(operation.quarantined_at)
+        self.assertEqual(operation.quarantine_reason, "operation_key_conflict")
+        self.assertEqual(provider.wake_calls, 0)
+        self.assertNotIn("SECRET_CONFLICT_CONCLUSION", json.dumps(result))
+        provider.shutdown()
+
+    def test_keyed_conclude_after_quarantine_is_terminal_malformed_row(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
+        before = provider._backoff._read_state()
+        wake_calls = []
+        provider._wake_spool_worker = lambda: wake_calls.append("wake")
+
+        # Admit the conclude row pending (no transport) so the worker replay
+        # below can quarantine the corrupted row; a stored conclude would
+        # already be settled and no longer claimable.
+        spool = provider._write_spool
+        assert spool is not None
+        operation_key = "malformed-key"
+        spool.admit(
+            "ingest",
+            conclude_module.conclusion_request(
+                "malformed conclusion",
+                provider._wing,
+                provider._facts_room,
+                provider._safe_min_importance,
+                provider._project_id,
+            ),
+            action="conclude",
+            operation_key=operation_key,
+        )
+        with spool._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE write_operations SET body_json = ? WHERE operation_key = ?",
+                ('{"malformed":', operation_key),
+            )
+            connection.execute("COMMIT")
+        quarantined = spool.replay_one(provider._post, provider._get)
+        self.assertIsNotNone(quarantined)
+        assert quarantined is not None
+        self.assertTrue(quarantined.quarantined)
+        self.assertEqual(quarantined.error_class, "malformed_spool_row")
+
+        retry = self._conclude(
+            provider, "malformed conclusion", operation_key=operation_key
+        )
+
+        details = retry["error_details"]
+        self.assertEqual(details["kind"], "malformed_spool_row")
+        self.assertFalse(details["retry_safe"])
+        after = provider._backoff._read_state()
+        self.assertEqual(after.failure_count, before.failure_count)
+        self.assertEqual(wake_calls, [])
+        self.assertNotIn("malformed conclusion", json.dumps(retry))
+        provider.shutdown()
+
     def test_completed_receipt_with_drawer_reports_success(self) -> None:
         provider = ControlledConcludeProvider("completed", drawer_id="drawer-terminal")
         provider.initialize("session-a", user_id="alice", profile="work")
@@ -148,10 +247,22 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertTrue(details["retry_safe"])
         self.assertNotIn("result", result)
 
+    def test_pending_receipt_does_not_record_breaker_failure(self) -> None:
+        provider = ControlledConcludeProvider("queued")
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._conclude_wait_timeout = 0.0
+        before = provider._backoff._read_state()
+
+        self._conclude(provider, "pending fact")
+
+        after = provider._backoff._read_state()
+        self.assertEqual(after.failure_count, before.failure_count)
+
     def test_admission_503_never_claims_storage_and_redacts_payload(self) -> None:
         provider = AdmissionFailureProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
         provider._start_write_worker = lambda: None
+        before = provider._backoff._read_state()
 
         result = self._conclude(provider, "SECRET_CONCLUSION")
 
@@ -168,6 +279,8 @@ class DurableConcludeTests(unittest.TestCase):
             provider._write_spool.next_operation().operation_key,
             details["operation_key"],
         )
+        after = provider._backoff._read_state()
+        self.assertEqual(after.failure_count - before.failure_count, 1)
         self.assertNotIn("result", result)
         serialized = json.dumps(result)
         self.assertNotIn("SECRET_CONCLUSION", serialized)
@@ -207,6 +320,8 @@ class DurableConcludeTests(unittest.TestCase):
             status_error=RuntimeError("SECRET_STATUS_RESPONSE"),
         )
         provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
+        before = provider._backoff._read_state()
 
         result = self._conclude(provider, "SECRET_CONCLUSION", operation_key="event-status")
 
@@ -217,6 +332,8 @@ class DurableConcludeTests(unittest.TestCase):
         serialized = json.dumps(result)
         self.assertNotIn("SECRET_CONCLUSION", serialized)
         self.assertNotIn("SECRET_STATUS_RESPONSE", serialized)
+        after = provider._backoff._read_state()
+        self.assertEqual(after.failure_count - before.failure_count, 1)
 
     def test_terminal_failed_or_rejected_never_reports_success(self) -> None:
         for state in ("failed", "rejected"):
@@ -240,11 +357,40 @@ class DurableConcludeTests(unittest.TestCase):
         provider = ControlledConcludeProvider("completed")
         provider.initialize("session-a", user_id="alice", profile="work")
         provider._conclude_wait_timeout = 0.0
+        provider._start_write_worker = lambda: None
+        before = provider._backoff._read_state()
 
         result = self._conclude(provider, "missing drawer", operation_key="event-no-drawer")
 
-        self.assertEqual(result["error_details"]["kind"], "durable_operation_pending")
+        self.assertEqual(result["error_details"]["kind"], "durable_status_invalid")
+        after = provider._backoff._read_state()
+        self.assertEqual(after.failure_count - before.failure_count, 1)
         self.assertNotIn("result", result)
+
+    def test_replay_status_matrix_distinguishes_pending_and_invalid_terminal(self) -> None:
+        expected = {
+            "queued": ("durable_operation_pending", 0),
+            "running": ("durable_operation_pending", 0),
+            "unknown": ("durable_status_invalid", 1),
+            "completed": ("durable_status_invalid", 1),
+            "failed": ("durable_operation_failed", 1),
+            "rejected": ("durable_operation_rejected", 1),
+        }
+        for state, (kind, failure_delta) in expected.items():
+            with self.subTest(state=state):
+                provider = ControlledConcludeProvider(state)
+                provider.initialize("session-a", user_id="alice", profile="work")
+                provider._conclude_wait_timeout = 0.0
+                provider._start_write_worker = lambda: None
+                before = provider._backoff._read_state()
+
+                result = self._conclude(
+                    provider, "status matrix", operation_key=f"event-{state}"
+                )
+
+                self.assertEqual(result["error_details"]["kind"], kind)
+                after = provider._backoff._read_state()
+                self.assertEqual(after.failure_count - before.failure_count, failure_delta)
 
     def test_retry_with_same_operation_key_reuses_operation_and_drawer(self) -> None:
         provider = RecordingProvider()
@@ -258,8 +404,35 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertEqual(len(provider.durable_status), 1)
         self.assertEqual(
             sum(path == "/api/ingest/durable" for path, _ in provider.posts),
-            2,
+            1,
         )
+
+    def test_operation_key_conflict_is_terminal_without_failure_or_replay_wake(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        wake_calls = []
+        provider._wake_spool_worker = lambda: wake_calls.append("wake")
+
+        first = self._conclude(provider, "first conclusion", operation_key="conflict-key")
+        before = provider._backoff._read_state()
+        conflict = self._conclude(provider, "different conclusion", operation_key="conflict-key")
+        after = provider._backoff._read_state()
+
+        self.assertEqual(first["result"], "Fact stored.")
+        details = conflict["error_details"]
+        self.assertEqual(details["kind"], "operation_key_conflict")
+        self.assertFalse(details["retry_safe"])
+        self.assertEqual(after.failure_count, before.failure_count)
+        self.assertEqual(after.open_until_epoch, before.open_until_epoch)
+        assert provider._write_spool is not None
+        self.assertEqual(provider._write_spool.count(), 0)
+        self.assertEqual(
+            sum(path == "/api/ingest/durable" for path, _ in provider.posts),
+            1,
+        )
+        self.assertEqual(wake_calls, [])
+        self.assertNotIn("first conclusion", json.dumps(conflict))
+        self.assertNotIn("different conclusion", json.dumps(conflict))
 
     def test_lost_receipt_retry_reuses_generated_key_and_single_effect(self) -> None:
         backend = SharedConcludeBackend(lose_receipt_once=True)
@@ -315,7 +488,9 @@ class DurableConcludeTests(unittest.TestCase):
         provider.initialize("session-a", user_id="alice", profile="work")
         generated = iter(("explicit-a", "explicit-b"))
         original = conclude_module.secrets.token_urlsafe
-        conclude_module.secrets.token_urlsafe = lambda _size: next(generated)
+        conclude_module.secrets.token_urlsafe = lambda size: (
+            next(generated) if size == 32 else original(size)
+        )
         try:
             first = self._conclude(provider, "identical explicit conclusion")
             second = self._conclude(provider, "identical explicit conclusion")
@@ -381,8 +556,10 @@ class DurableConcludeTests(unittest.TestCase):
         provider.initialize("session-a", user_id="alice", profile="work")
         for _ in range(5):
             provider._backoff.record_failure()
+        before = provider._backoff._read_state()
 
         result = self._conclude(provider, "SECRET_BREAKER_CONCLUSION")
+        after = provider._backoff._read_state()
 
         self.assertEqual(result["result"], "Fact admitted locally; durable storage pending.")
         self.assertEqual(result["state"], "local_admitted")
@@ -400,6 +577,8 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertNotIn("error", result)
         self.assertEqual(provider.posts, [])
         self.assertEqual(provider._write_spool.count(), 1)
+        self.assertEqual(after.failure_count, before.failure_count)
+        self.assertEqual(after.open_until_epoch, before.open_until_epoch)
         self.assertNotIn("SECRET_BREAKER_CONCLUSION", json.dumps(result))
 
     @staticmethod

@@ -162,6 +162,9 @@ fn admission_error(error: crate::durable_ingest::DurableAdmissionError) -> ApiEr
         DurableAdmissionError::OperationNotFound => {
             ApiError::new(StatusCode::NOT_FOUND, error.to_string())
         }
+        DurableAdmissionError::OperationKeyConflict => {
+            ApiError::new(StatusCode::CONFLICT, "operation_key_conflict")
+        }
         DurableAdmissionError::Queue(queue_error) if queue_error.is_sqlite_lock() => {
             ApiError::database_busy()
         }
@@ -173,5 +176,40 @@ fn admission_error(error: crate::durable_ingest::DurableAdmissionError) -> ApiEr
             },
         ) => ApiError::queue_byte_budget(payload_bytes, active_bytes, limit_bytes),
         other => internal_error(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{body::to_bytes, response::IntoResponse};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn operation_key_conflict_maps_to_content_free_client_conflict() {
+        let response =
+            admission_error(crate::durable_ingest::DurableAdmissionError::OperationKeyConflict)
+                .into_response();
+        let (parts, body) = response.into_parts();
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(body, 4096).await.expect("read conflict response"))
+                .expect("decode conflict response");
+
+        assert_eq!(parts.status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["message"], "operation_key_conflict");
+        let rendered = body.to_string();
+        for marker in [
+            "fixture-operation-key",
+            "fixture-payload",
+            "fixture-source-hash",
+            "fixture-private-marker",
+        ] {
+            assert!(!rendered.contains(marker));
+        }
+
+        let unchanged =
+            admission_error(crate::durable_ingest::DurableAdmissionError::InvalidIdempotencyKey)
+                .into_response();
+        assert_eq!(unchanged.status(), StatusCode::BAD_REQUEST);
     }
 }

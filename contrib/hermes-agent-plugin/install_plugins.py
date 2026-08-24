@@ -22,11 +22,14 @@ _SHARED_TRANSPORT_SOURCE_NAME = "mempal_search_transport.py"
 _REQUIRED_FILES = {
     "mempal": {
         "__init__.py",
+        "_authoritative_write.py",
         "_backoff.py",
         "_conclude.py",
         "_intelligence.py",
         "_rest_errors.py",
         "_write_spool.py",
+        "_write_spool_claims.py",
+        "_write_spool_replay.py",
         _SHARED_TRANSPORT_INSTALL_NAME,
         "plugin.yaml",
     },

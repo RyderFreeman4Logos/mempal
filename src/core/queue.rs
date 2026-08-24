@@ -47,6 +47,8 @@ pub enum QueueError {
     DatabaseMissing(PathBuf),
     #[error("pending message not found: {0}")]
     MessageNotFound(String),
+    #[error("explicit queue idempotency key conflicts with existing operation")]
+    IdempotencyConflict,
     #[error("pending message claim lost: {0}")]
     ClaimLost(String),
     #[error("retry count does not fit in u32 for message {id}")]
@@ -895,6 +897,11 @@ impl PendingMessageStore {
         }
 
         self.with_connection_with_busy_timeout(busy_timeout, |conn| {
+            if matches!(&identity, EnqueueIdentity::ExplicitKey(_))
+                && explicit_key_conflicts(conn, &id, kind, &source_hash)?
+            {
+                return Err(QueueError::IdempotencyConflict);
+            }
             match identity {
                 EnqueueIdentity::Fresh => {
                     conn.execute(
@@ -954,6 +961,11 @@ impl PendingMessageStore {
         let payload_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
         self.with_connection_with_busy_timeout(busy_timeout, |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if matches!(&identity, EnqueueIdentity::ExplicitKey(_))
+                && explicit_key_conflicts(&tx, &id, INGEST_ASYNC_KIND, &source_hash)?
+            {
+                return Err(QueueError::IdempotencyConflict);
+            }
             if !matches!(&identity, EnqueueIdentity::Fresh)
                 && queue_message_identity_exists(&tx, &id)?
             {
@@ -1743,7 +1755,8 @@ impl PendingMessageStore {
                     op_state,
                     rejected_reason,
                     failure_detail,
-                    result_json
+                    result_json,
+                    source_hash
                 )
                 SELECT id,
                        kind,
@@ -1755,7 +1768,8 @@ impl PendingMessageStore {
                        'failed',
                        ?3,
                        last_error,
-                       result_json
+                       result_json,
+                       source_hash
                 FROM pending_messages
                 WHERE id = ?1 AND status = 'failed'
                 ON CONFLICT(message_id) DO UPDATE SET
@@ -1768,7 +1782,8 @@ impl PendingMessageStore {
                     op_state = excluded.op_state,
                     rejected_reason = excluded.rejected_reason,
                     failure_detail = excluded.failure_detail,
-                    result_json = excluded.result_json
+                    result_json = excluded.result_json,
+                    source_hash = excluded.source_hash
                 "#,
                 params![row.id.as_str(), completed_at, archive_reason.as_str()],
             )?;
@@ -2046,6 +2061,35 @@ fn requeue_failed_message(conn: &Connection, id: &str, now: i64) -> Result<u64> 
     Ok(updated as u64)
 }
 
+fn explicit_key_conflicts(
+    conn: &Connection,
+    id: &str,
+    kind: &str,
+    source_hash: &str,
+) -> Result<bool> {
+    if let Some((existing_kind, existing_hash)) = conn
+        .query_row(
+            "SELECT kind, source_hash FROM pending_messages WHERE id = ?1",
+            [id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    {
+        return Ok(existing_kind != kind || existing_hash != source_hash);
+    }
+
+    let completed = conn
+        .query_row(
+            "SELECT kind, source_hash FROM pending_message_completions WHERE message_id = ?1",
+            [id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    Ok(completed.is_some_and(|(existing_kind, existing_hash)| {
+        existing_kind != kind || existing_hash.as_deref() != Some(source_hash)
+    }))
+}
+
 fn confirm_in_tx(
     tx: &rusqlite::Transaction<'_>,
     claim: &ClaimedMessage,
@@ -2099,9 +2143,10 @@ fn confirm_in_tx(
             op_state,
             rejected_reason,
             failure_detail,
-            result_json
+            result_json,
+            source_hash
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ON CONFLICT(message_id) DO UPDATE SET
             kind = excluded.kind,
             created_at = excluded.created_at,
@@ -2125,7 +2170,8 @@ fn confirm_in_tx(
             op_state,
             row.4,
             row.5,
-            row.6
+            row.6,
+            claim.source_hash
         ],
     )?;
     let updated = tx.execute(
@@ -2927,239 +2973,5 @@ mod tests {
     use crate::core::db::Database;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    #[test]
-    fn pending_message_ids_include_process_component() {
-        let id = next_id("msg");
-        let pid_component = format!("{:08x}", std::process::id());
-
-        assert!(
-            id.contains(&pid_component),
-            "pending message id {id} should include process component {pid_component}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn async_claim_confirm_run_off_runtime() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = tmp.path().join("palace.db");
-        Database::open(&db_path).expect("open db");
-        let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
-        sync_store
-            .enqueue("hook_user_prompt", "{\"event\":\"UserPromptSubmit\"}")
-            .expect("enqueue");
-        let store = AsyncPendingMessageStore::from_store(sync_store)
-            .with_blocking_delay(Duration::from_millis(300));
-
-        let ticks = Arc::new(AtomicU64::new(0));
-        let ticks_bg = Arc::clone(&ticks);
-        let ticker = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                ticks_bg.fetch_add(1, Ordering::SeqCst);
-            }
-        });
-
-        let claimed = store
-            .claim_next("worker-a".to_string(), 60)
-            .await
-            .expect("claim")
-            .expect("claimed message");
-        store.confirm(claimed).await.expect("confirm off runtime");
-        ticker.abort();
-
-        let observed = ticks.load(Ordering::SeqCst);
-        assert!(
-            observed >= 5,
-            "ticker advanced {observed} times while delayed claim/confirm ran; \
-             queue SQLite must run off the Tokio worker"
-        );
-    }
-
-    #[test]
-    fn claim_next_skips_ingest_async_rows_for_dedicated_workers() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = tmp.path().join("palace.db");
-        Database::open(&db_path).expect("open db");
-        let store = PendingMessageStore::new(&db_path).expect("open queue");
-        let ingest_id = store
-            .enqueue("ingest_async", r#"{"request":{}}"#)
-            .expect("enqueue async ingest");
-        let hook_id = store
-            .enqueue("hook_user_prompt", r#"{"event":"UserPromptSubmit"}"#)
-            .expect("enqueue hook");
-
-        let claimed = store
-            .claim_next("hook-worker", 60)
-            .expect("claim next")
-            .expect("hook row should be claimed");
-
-        assert_eq!(claimed.id, hook_id);
-        assert_eq!(claimed.kind, "hook_user_prompt");
-        let ingest_status = store
-            .operation_status(&ingest_id)
-            .expect("load async ingest status")
-            .expect("async ingest row remains visible");
-        assert_eq!(ingest_status.op_state, "queued");
-        assert!(ingest_status.claimed_at.is_none());
-    }
-
-    #[test]
-    fn claim_next_reuses_persistent_claim_connection_across_polls() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = tmp.path().join("palace.db");
-        Database::open(&db_path).expect("open db");
-        let store = PendingMessageStore::new(&db_path).expect("open queue");
-        let cloned_store = store.clone();
-
-        assert_eq!(store.claim_connection_open_count(), 0);
-        assert!(
-            cloned_store
-                .claim_next("hook-worker", 60)
-                .expect("first idle claim")
-                .is_none()
-        );
-        assert_eq!(store.claim_connection_open_count(), 1);
-
-        let hook_id = store
-            .enqueue("hook_user_prompt", r#"{"event":"UserPromptSubmit"}"#)
-            .expect("enqueue hook");
-        let claimed = cloned_store
-            .claim_next("hook-worker", 60)
-            .expect("claim hook")
-            .expect("hook row should be claimed");
-
-        assert_eq!(claimed.id, hook_id);
-        assert_eq!(store.claim_connection_open_count(), 1);
-        assert!(
-            cloned_store
-                .claim_next("hook-worker", 60)
-                .expect("second idle claim")
-                .is_none()
-        );
-        assert_eq!(store.claim_connection_open_count(), 1);
-    }
-
-    #[test]
-    fn claim_next_by_kind_reuses_persistent_claim_connection_across_idle_polls() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = tmp.path().join("palace.db");
-        Database::open(&db_path).expect("open db");
-        let store = PendingMessageStore::new(&db_path).expect("open queue");
-        let cloned_store = store.clone();
-
-        assert_eq!(store.claim_connection_open_count(), 0);
-        for _ in 0..3 {
-            assert!(
-                cloned_store
-                    .claim_next_by_kind("ingest-worker", 60, "ingest_async")
-                    .expect("idle ingest claim")
-                    .is_none()
-            );
-            assert_eq!(store.claim_connection_open_count(), 1);
-        }
-
-        let ingest_id = store
-            .enqueue("ingest_async", r#"{"request":{}}"#)
-            .expect("enqueue async ingest");
-        let claimed = cloned_store
-            .claim_next_by_kind("ingest-worker", 60, "ingest_async")
-            .expect("claim ingest")
-            .expect("ingest row should be claimed");
-
-        assert_eq!(claimed.id, ingest_id);
-        assert_eq!(store.claim_connection_open_count(), 1);
-    }
-
-    #[test]
-    fn confirm_and_enqueue_reuse_cached_writer_connection() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = tmp.path().join("palace.db");
-        Database::open(&db_path).expect("open db");
-        let store = PendingMessageStore::new_without_reclaim(&db_path);
-
-        assert_eq!(store.writer_open_count(), 0);
-        let id = store
-            .enqueue("hook_user_prompt", r#"{"event":"UserPromptSubmit"}"#)
-            .expect("enqueue hook");
-        assert_eq!(store.writer_open_count(), 1);
-
-        let claim = store
-            .claim_next("hook-worker", 60)
-            .expect("claim hook")
-            .expect("hook row should be claimed");
-        assert_eq!(claim.id, id);
-        store.confirm(&claim).expect("confirm hook");
-        assert_eq!(store.writer_open_count(), 1);
-    }
-
-    #[test]
-    fn status_and_stats_read_through_writer_lock() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = tmp.path().join("palace.db");
-        Database::open(&db_path).expect("open db");
-        let store = PendingMessageStore::new(&db_path).expect("open queue");
-        let ingest_id = store
-            .enqueue("ingest_async", r#"{"request":{}}"#)
-            .expect("enqueue async ingest");
-
-        let lock_holder = Connection::open(&db_path).expect("open lock holder");
-        lock_holder
-            .busy_timeout(Duration::from_millis(25))
-            .expect("set lock holder busy timeout");
-        lock_holder
-            .execute_batch("BEGIN IMMEDIATE;")
-            .expect("hold write lock");
-
-        let status = store
-            .operation_status(&ingest_id)
-            .expect("operation status should not need startup writes")
-            .expect("operation remains visible");
-        let stats = store.stats().expect("stats should not need startup writes");
-
-        assert_eq!(status.op_state, "queued");
-        assert_eq!(stats.pending, 1);
-    }
-
-    #[test]
-    fn queue_busy_timeout_covers_smoke_read_write_contention() {
-        assert!(
-            DEFAULT_BUSY_TIMEOUT >= Duration::from_secs(30),
-            "async ingest queue writes must outwait transient full-smoke read/write contention"
-        );
-    }
-
-    #[test]
-    fn claim_next_uses_bounded_sqlite_lock_budget() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = tmp.path().join("palace.db");
-        Database::open(&db_path).expect("open db");
-        let store = PendingMessageStore::new(&db_path).expect("open queue");
-        store
-            .enqueue("hook", r#"{"request":{}}"#)
-            .expect("enqueue async ingest");
-
-        let lock_holder = Connection::open(&db_path).expect("open lock holder");
-        lock_holder
-            .busy_timeout(Duration::ZERO)
-            .expect("set fail-fast lock holder timeout");
-        lock_holder
-            .execute_batch("BEGIN IMMEDIATE;")
-            .expect("hold write lock");
-
-        let started = std::time::Instant::now();
-        let error = store
-            .claim_next("worker-a", 60)
-            .expect_err("claim should exhaust the bounded lock budget");
-        let elapsed = started.elapsed();
-
-        lock_holder
-            .execute_batch("ROLLBACK;")
-            .expect("release write lock");
-
-        assert!(error.is_sqlite_lock());
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "claim lock budget must not monopolize queue blocking workers for the 30s default busy timeout"
-        );
-    }
+    include!("queue_operation_key_tests.rs");
 }
