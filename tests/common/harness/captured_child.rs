@@ -115,6 +115,30 @@ impl CapturedChild {
         }
     }
 
+    /// Polls for the child until `timeout`, killing and reaping on expiry.
+    pub fn wait_or_panic_with_timeout(&mut self, action: &str, timeout: Duration) -> ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.try_wait() {
+                Ok(Some(status)) => return status,
+                Ok(None) if Instant::now() >= deadline => {
+                    let diagnostics = self.diagnostics();
+                    let kill = self.kill();
+                    let wait = self.wait();
+                    panic!(
+                        "{action}: child did not exit within {timeout:?}; kill={kill:?}, wait={wait:?}\n{diagnostics}"
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => panic!(
+                    "{action}: failed to poll child: {error}\n{}",
+                    self.diagnostics()
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Forces the child to exit with the platform's kill operation.
     pub fn kill(&mut self) -> io::Result<()> {
         self.child.kill()
