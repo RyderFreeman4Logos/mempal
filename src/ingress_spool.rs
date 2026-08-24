@@ -1,3 +1,6 @@
+#[cfg(test)]
+use std::cell::Cell;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -13,6 +16,10 @@ use crate::hook_ipc::HookIpcEnqueueRequest;
 pub(crate) const INGRESS_SPOOL_DIR: &str = "ingress-spool";
 const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+thread_local! {
+    static SYNC_DIRECTORY_CALLS: Cell<u64> = const { Cell::new(0) };
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum IngressSpoolError {
@@ -64,6 +71,7 @@ pub(crate) struct IngressSpool {
     dir: PathBuf,
     max_bytes: u64,
     append_lock: Arc<Mutex<()>>,
+    active_claims: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl IngressSpool {
@@ -76,6 +84,7 @@ impl IngressSpool {
             dir: mempal_home.as_ref().join(INGRESS_SPOOL_DIR),
             max_bytes,
             append_lock: Arc::new(Mutex::new(())),
+            active_claims: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -97,9 +106,11 @@ impl IngressSpool {
         })
         .map_err(IngressSpoolError::Encode)?;
 
-        if path.exists() {
-            let existing = read_record(&path)?;
+        let claim_path = self.claim_path(&path);
+        if path.exists() || claim_path.exists() {
+            let existing = read_record(if path.exists() { &path } else { &claim_path })?;
             return if existing == *request {
+                sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Io)?;
                 Ok(AppendOutcome::AlreadyPresent)
             } else {
                 Err(IngressSpoolError::Conflict)
@@ -119,9 +130,14 @@ impl IngressSpool {
         }
 
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let file_name = path.file_name().ok_or_else(|| {
+            IngressSpoolError::Io(io::Error::other(
+                "ingress spool record path has no file name",
+            ))
+        })?;
         let temp_path = self.dir.join(format!(
             ".{}.{}.{}.tmp",
-            path.file_name().unwrap().to_string_lossy(),
+            file_name.to_string_lossy(),
             std::process::id(),
             counter
         ));
@@ -134,7 +150,7 @@ impl IngressSpool {
             file.write_all(&bytes).map_err(IngressSpoolError::Io)?;
             file.sync_all().map_err(IngressSpoolError::Io)?;
             fs::rename(&temp_path, &path).map_err(IngressSpoolError::Io)?;
-            sync_directory(&self.dir).map_err(IngressSpoolError::Io)
+            sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Io)
         })();
         if write_result.is_err() {
             let _ = fs::remove_file(&temp_path);
@@ -149,21 +165,42 @@ impl IngressSpool {
         let records = self.records()?;
         let mut drained = 0;
         for record in records {
-            store
+            let Some(claim_path) = self.claim(&record.path)? else {
+                continue;
+            };
+            let enqueue_result = store
                 .enqueue_idempotent_with_key_fail_fast(
                     record.request.kind.clone(),
                     record.request.payload.clone(),
                     record.request.idempotency_key.clone(),
                 )
-                .await?;
-            fs::remove_file(&record.path).map_err(IngressSpoolError::Io)?;
-            sync_directory(&self.dir).map_err(IngressSpoolError::Io)?;
+                .await;
+            match enqueue_result {
+                Ok(_) => {
+                    let delete_result = fs::remove_file(&claim_path)
+                        .map_err(IngressSpoolError::Io)
+                        .and_then(|()| {
+                            sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Io)
+                        });
+                    self.forget_claim(&claim_path)?;
+                    delete_result?;
+                }
+                Err(error) => {
+                    self.release_claim(&record.path, &claim_path)?;
+                    return Err(error.into());
+                }
+            }
             drained += 1;
         }
         Ok(drained)
     }
 
     fn records(&self) -> Result<Vec<StoredRecord>, IngressSpoolError> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| IngressSpoolError::Io(io::Error::other("spool mutex poisoned")))?;
+        self.recover_stale_claims()?;
         let mut records = Vec::new();
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
@@ -182,6 +219,93 @@ impl IngressSpool {
         }
         records.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(records)
+    }
+
+    fn claim(&self, path: &Path) -> Result<Option<PathBuf>, IngressSpoolError> {
+        let claim_path = self.claim_path(path);
+        match fs::rename(path, &claim_path) {
+            Ok(()) => {
+                self.active_claims
+                    .lock()
+                    .map_err(|_| {
+                        IngressSpoolError::Io(io::Error::other("spool claim mutex poisoned"))
+                    })?
+                    .insert(claim_path.clone());
+                Ok(Some(claim_path))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(IngressSpoolError::Io(error)),
+        }
+    }
+
+    fn release_claim(&self, path: &Path, claim_path: &Path) -> Result<(), IngressSpoolError> {
+        let result = if path.exists() {
+            let claimed = read_record(claim_path)?;
+            let existing = read_record(path)?;
+            if claimed == existing {
+                fs::remove_file(claim_path)
+            } else {
+                Err(io::Error::other(
+                    "ingress spool claim conflicts with replacement",
+                ))
+            }
+        } else {
+            fs::rename(claim_path, path)
+        };
+        self.forget_claim(claim_path)?;
+        result
+            .map_err(IngressSpoolError::Io)
+            .and_then(|()| sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Io))
+    }
+
+    fn forget_claim(&self, claim_path: &Path) -> Result<(), IngressSpoolError> {
+        self.active_claims
+            .lock()
+            .map_err(|_| IngressSpoolError::Io(io::Error::other("spool claim mutex poisoned")))?
+            .remove(claim_path);
+        Ok(())
+    }
+
+    fn recover_stale_claims(&self) -> Result<(), IngressSpoolError> {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(IngressSpoolError::Io(error)),
+        };
+        let active_claims = self
+            .active_claims
+            .lock()
+            .map_err(|_| IngressSpoolError::Io(io::Error::other("spool claim mutex poisoned")))?
+            .clone();
+        let mut recovered = false;
+        for entry in entries {
+            let claim_path = entry.map_err(IngressSpoolError::Io)?.path();
+            if claim_path.extension().and_then(|value| value.to_str()) != Some("claim")
+                || active_claims.contains(&claim_path)
+            {
+                continue;
+            }
+            let record_path = claim_path.with_extension("json");
+            if record_path.exists() {
+                let claimed = read_record(&claim_path)?;
+                let existing = read_record(&record_path)?;
+                if claimed != existing {
+                    return Err(IngressSpoolError::Conflict);
+                }
+                fs::remove_file(&claim_path).map_err(IngressSpoolError::Io)?;
+            } else {
+                fs::rename(&claim_path, &record_path).map_err(IngressSpoolError::Io)?;
+            }
+            recovered = true;
+        }
+        if recovered {
+            sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Io)?;
+        }
+        Ok(())
+    }
+
+    fn claim_path(&self, path: &Path) -> PathBuf {
+        path.with_extension("claim")
     }
 
     fn record_path(&self, request: &HookIpcEnqueueRequest) -> PathBuf {
@@ -214,7 +338,10 @@ fn spool_bytes(dir: &Path) -> Result<u64, IngressSpoolError> {
     let mut total = 0_u64;
     for entry in fs::read_dir(dir).map_err(IngressSpoolError::Io)? {
         let path = entry.map_err(IngressSpoolError::Io)?.path();
-        if path.extension().and_then(|value| value.to_str()) == Some("json") {
+        if matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("json" | "tmp" | "claim")
+        ) {
             total = total.saturating_add(fs::metadata(path).map_err(IngressSpoolError::Io)?.len());
         }
     }
@@ -222,7 +349,18 @@ fn spool_bytes(dir: &Path) -> Result<u64, IngressSpoolError> {
 }
 
 fn sync_directory(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    SYNC_DIRECTORY_CALLS.with(|calls| calls.set(calls.get() + 1));
     File::open(dir)?.sync_all()
+}
+
+fn sync_spool_namespace(dir: &Path) -> io::Result<()> {
+    sync_directory(dir)?;
+    let parent = dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    sync_directory(parent)
 }
 
 #[cfg(test)]
@@ -230,6 +368,7 @@ mod tests {
     use super::*;
     use crate::core::db::Database;
     use crate::core::queue::PendingMessageStore;
+    use std::time::Duration;
 
     fn request(key: &str, payload: &str) -> HookIpcEnqueueRequest {
         HookIpcEnqueueRequest {
@@ -254,6 +393,23 @@ mod tests {
             AppendOutcome::AlreadyPresent
         );
         assert_eq!(spool.records().expect("records").len(), 1);
+    }
+
+    #[test]
+    fn first_append_syncs_spool_and_parent_directories() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let spool = IngressSpool::new(tempdir.path());
+        let before = SYNC_DIRECTORY_CALLS.with(Cell::get);
+
+        spool
+            .append(&request("namespace-key", "payload"))
+            .expect("append");
+
+        let calls = SYNC_DIRECTORY_CALLS.with(|value| value.get() - before);
+        assert!(
+            calls >= 2,
+            "first positive append must sync ingress-spool and its parent, calls={calls}"
+        );
     }
 
     #[tokio::test]
@@ -310,6 +466,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_drainers_cannot_delete_a_replacement_record() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        Database::open(&db_path).expect("database");
+        let spool = IngressSpool::new(tempdir.path());
+        let first = request("race-key", "original");
+        let replacement = request("race-key", "replacement");
+        spool.append(&first).expect("append");
+
+        let slow_store = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+            .with_blocking_delay(Duration::from_millis(400));
+        let fast_store = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+            .with_blocking_delay(Duration::from_millis(50));
+        let slow_spool = spool.clone();
+        let slow = tokio::spawn(async move { slow_spool.drain_once(&slow_store).await });
+        tokio::task::yield_now().await;
+        let fast_spool = spool.clone();
+        let fast = tokio::spawn(async move { fast_spool.drain_once(&fast_store).await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if spool.records().expect("records").is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("one drainer should claim the record");
+
+        assert!(matches!(
+            spool.append(&replacement),
+            Err(IngressSpoolError::Conflict)
+        ));
+        fast.await.expect("fast drainer task").expect("fast drain");
+        slow.await.expect("slow drainer task").expect("slow drain");
+        assert_eq!(spool.records().expect("records after drain").len(), 0);
+    }
+
+    #[tokio::test]
     async fn a_reopened_spool_replays_an_acknowledged_record() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("palace.db");
@@ -341,5 +537,18 @@ mod tests {
             spool.records().expect("records after backpressure").len(),
             1
         );
+    }
+
+    #[test]
+    fn interrupted_temp_files_count_toward_spool_limit() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let spool = IngressSpool::with_max_bytes(tempdir.path(), 128);
+        fs::create_dir_all(&spool.dir).expect("spool dir");
+        fs::write(spool.dir.join(".interrupted.tmp"), vec![b'x'; 64]).expect("leftover temp");
+
+        assert!(matches!(
+            spool.append(&request("temp-limit", "payload")),
+            Err(IngressSpoolError::Full { .. })
+        ));
     }
 }

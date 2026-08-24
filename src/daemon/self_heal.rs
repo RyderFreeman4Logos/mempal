@@ -267,9 +267,9 @@ async fn handle_hook_ipc_connection(
 
 #[cfg(unix)]
 async fn persist_hook_ipc_request(
-    store: &AsyncPendingMessageStore,
+    _store: &AsyncPendingMessageStore,
     spool: &crate::ingress_spool::IngressSpool,
-    write_observer: &crate::daemon_bootstrap::DaemonWriteObserver,
+    _write_observer: &crate::daemon_bootstrap::DaemonWriteObserver,
     request: crate::hook_ipc::HookIpcEnqueueRequest,
 ) -> crate::hook_ipc::HookIpcEnqueueResponse {
     let kind = request.kind.clone();
@@ -279,16 +279,6 @@ async fn persist_hook_ipc_request(
     };
     match append_result {
         Ok(Ok(_)) => {
-            match spool.drain_once(store).await {
-                Ok(drained) => {
-                    write_observer.record_successful_write();
-                    tracing::debug!(drained, %kind, "replayed ingress spool records");
-                }
-                Err(error) => {
-                    write_observer.record_error(format!("ingress spool replay failed: {error}"));
-                    tracing::debug!(?error, %kind, "ingress spool remains queued for replay");
-                }
-            }
             tracing::debug!(%kind, "fsynced hook IPC capture in ingress spool");
             crate::hook_ipc::HookIpcEnqueueResponse::Accepted
         }
