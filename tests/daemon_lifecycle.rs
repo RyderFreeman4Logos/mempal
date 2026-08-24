@@ -738,6 +738,7 @@ fn test_daemon_processes_ingest_async_queue_rows() {
         .expect("enqueue async ingest");
 
     let mut child = spawn_foreground_daemon(tmp.path(), "process-ingest-async");
+    child.wait_for_stderr_event("daemon hook workers started", Duration::from_secs(30));
 
     let wait = Command::new(mempal_bin())
         .args(["operation", "wait", &operation_id, "--timeout-secs", "30"])
