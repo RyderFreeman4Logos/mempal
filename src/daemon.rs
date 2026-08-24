@@ -1176,10 +1176,12 @@ async fn spawn_hook_ipc_service(
 ) -> Result<HookIpcServiceHandle> {
     let (listener, socket_guard) = crate::hook_ipc::bind_listener(mempal_home)?;
     let socket_path = socket_guard.path().to_path_buf();
+    let spool = Arc::new(crate::ingress_spool::IngressSpool::new(mempal_home));
     let listener_task = tokio::spawn(self_heal::run_hook_ipc_listener(
         listener,
         store,
         write_observer,
+        spool,
     ));
     tracing::info!("daemon hook IPC listening on {}", socket_path.display());
     Ok(HookIpcServiceHandle {
