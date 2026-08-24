@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 fn short_tempdir() -> tempfile::TempDir {
@@ -31,21 +32,32 @@ async fn t1_runtime_liveness_read_off_runtime() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t2_read_concurrency_up_to_n() {
     let tmp = short_tempdir();
-    let adb = AsyncDb::open(&tmp.path().join("palace.db"), 4)
-        .expect("open async db")
-        .with_read_delay(Duration::from_millis(200));
-    let start = Instant::now();
+    let adb = AsyncDb::open(&tmp.path().join("palace.db"), 4).expect("open async db");
+    let barrier = Arc::new(Barrier::new(4));
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut handles = Vec::new();
     for _ in 0..4 {
         let adb = adb.clone();
-        handles.push(tokio::spawn(
-            async move { adb.run_read(|_db| Ok(1_i64)).await },
-        ));
+        let barrier = Arc::clone(&barrier);
+        let started_tx = started_tx.clone();
+        handles.push(tokio::spawn(async move {
+            adb.run_read(move |_db| {
+                started_tx.send(()).expect("report read start");
+                barrier.wait();
+                Ok(1_i64)
+            })
+            .await
+        }));
+    }
+    for _ in 0..4 {
+        tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("all readers must start")
+            .expect("reader start event");
     }
     for handle in handles {
         handle.await.expect("join").expect("read");
     }
-    assert!(start.elapsed() < Duration::from_millis(400));
 }
 
 #[tokio::test]
@@ -191,6 +203,13 @@ async fn reader_only_async_pool_runs_bounded_read_without_writer() {
     let path = tmp.path().join("palace.db");
     Database::open(&path).expect("create database");
     let adb = QueryOnlyAsyncDb::open(&path, 1).expect("open query-only async db");
+    adb.run_read_anyhow(|db| {
+        db.conn()
+            .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+            .map_err(anyhow::Error::new)
+    })
+    .await
+    .expect("reader readiness");
     let deadline = Instant::now() + Duration::from_secs(1);
     let query_only = adb
         .run_read_anyhow_until(deadline, |db| {

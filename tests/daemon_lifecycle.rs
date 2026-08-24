@@ -287,17 +287,12 @@ fn process_is_running_for_test(pid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 #[cfg(unix)]
-fn wait_for_pid_file(pid_path: &std::path::Path, timeout: Duration) -> Option<i32> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Ok(content) = fs::read_to_string(pid_path)
-            && let Ok(pid) = content.trim().parse::<i32>()
-        {
-            return Some(pid);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    None
+fn read_pid_file(pid_path: &Path) -> i32 {
+    fs::read_to_string(pid_path)
+        .unwrap_or_else(|error| panic!("read daemon pidfile {}: {error}", pid_path.display()))
+        .trim()
+        .parse()
+        .unwrap_or_else(|error| panic!("parse daemon pidfile {}: {error}", pid_path.display()))
 }
 #[cfg(unix)]
 fn wait_for_child_exit(child: &mut CapturedChild, timeout: Duration) -> bool {
@@ -339,9 +334,10 @@ fn spawn_placeholder_daemon(home: &Path, label: &str) -> std::io::Result<Capture
 
 fn spawn_db_backed_orphan_daemon(home: &Path, db_path: &Path) -> CapturedChild {
     let pid_path = db_path.parent().expect("parent").join("daemon.pid");
-    let child = spawn_foreground_daemon(home, "db-backed-orphan");
+    let mut child = spawn_foreground_daemon(home, "db-backed-orphan");
     let pid = child.id() as i32;
-    let pidfile_pid = wait_for_pid_file(&pid_path, Duration::from_secs(10)).expect("pidfile");
+    child.wait_for_stderr_event("daemon hook workers started", Duration::from_secs(30));
+    let pidfile_pid = read_pid_file(&pid_path);
     assert_eq!(pidfile_pid, pid);
     assert!(
         Command::new(mempal_bin())
@@ -352,18 +348,12 @@ fn spawn_db_backed_orphan_daemon(home: &Path, db_path: &Path) -> CapturedChild {
             .success()
     );
     fs::remove_file(&pid_path).expect("remove pidfile");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let pids = mempal::daemon_singleton::enumerate_daemon_pids("mempal", db_path);
-        if pids.contains(&pid) {
-            return child;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!(
+    assert!(
+        mempal::daemon_singleton::enumerate_daemon_pids("mempal", db_path).contains(&pid),
         "db-backed orphan daemon pid {pid} was not enumerated\n{}",
         child.diagnostics()
     );
+    child
 }
 
 #[test]
@@ -485,13 +475,9 @@ fn test_daemon_restart_reaps_orphan_without_pidfile() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    assert!(
-        wait_for_child_exit(&mut orphan, Duration::from_secs(10)),
-        "orphan daemon pid {orphan_pid} should be reaped by restart"
-    );
+    orphan.wait_or_panic("orphan daemon should be reaped by restart");
 
-    let restarted_pid =
-        wait_for_pid_file(&pid_path, Duration::from_secs(10)).expect("restarted daemon pidfile");
+    let restarted_pid = read_pid_file(&pid_path);
     assert_ne!(restarted_pid, orphan_pid);
     assert!(
         process_is_running_for_test(restarted_pid),
@@ -524,8 +510,7 @@ fn test_daemon_start_repairs_orphan_pidfile_before_reporting_running() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("daemon already running"), "{stderr}");
 
-    let repaired_pid = wait_for_pid_file(&pid_path, Duration::from_secs(2))
-        .expect("daemon start should repair singleton orphan pidfile before returning");
+    let repaired_pid = read_pid_file(&pid_path);
     assert_eq!(repaired_pid, orphan_pid);
     assert!(process_is_running_for_test(repaired_pid));
 
@@ -619,8 +604,7 @@ fn test_daemon_restart_does_not_terminate_pidfile_only_process_and_restarts() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let restarted_pid = wait_for_pid_file(&pid_path, Duration::from_secs(10))
-        .expect("daemon restart should write pidfile");
+    let restarted_pid = read_pid_file(&pid_path);
     assert_ne!(restarted_pid, old_pid);
     assert!(
         process_is_running_for_test(restarted_pid),
@@ -660,8 +644,7 @@ fn test_daemon_reap_repairs_single_orphan_pidfile() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let repaired_pid = wait_for_pid_file(&pid_path, Duration::from_secs(2))
-        .expect("daemon reap should repair singleton orphan pidfile");
+    let repaired_pid = read_pid_file(&pid_path);
     assert_eq!(repaired_pid, orphan_pid);
     assert!(process_is_running_for_test(repaired_pid));
     orphan.kill().expect("kill orphan daemon");
@@ -756,28 +739,19 @@ fn test_daemon_processes_ingest_async_queue_rows() {
 
     let mut child = spawn_foreground_daemon(tmp.path(), "process-ingest-async");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut completed = false;
-    while Instant::now() < deadline {
-        let record = match PendingMessageStore::new_without_reclaim(&db_path)
-            .operation_status(&operation_id)
-        {
-            Ok(Some(record)) => record,
-            Err(mempal::core::queue::QueueError::Admission(
-                mempal::core::db_admission::DbAdmissionError::Busy { .. },
-            )) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-            Ok(None) => panic!("operation record exists"),
-            Err(error) => panic!("load operation status: {error}"),
-        };
-        if record.op_state == "completed" {
-            completed = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let wait = Command::new(mempal_bin())
+        .args(["operation", "wait", &operation_id, "--timeout-secs", "30"])
+        .daemon_home(tmp.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("wait for ingest operation");
+    assert!(
+        wait.status.success(),
+        "operation wait failed: status={:?}, stdout={}, stderr={}",
+        wait.status,
+        String::from_utf8_lossy(&wait.stdout),
+        String::from_utf8_lossy(&wait.stderr)
+    );
 
     child.signal_or_panic(libc::SIGTERM, "failed to send SIGTERM");
     let status = child.wait_or_panic("failed to wait for daemon");
@@ -788,7 +762,10 @@ fn test_daemon_processes_ingest_async_queue_rows() {
     );
 
     assert!(
-        completed,
+        store
+            .operation_status(&operation_id)
+            .expect("load completed operation")
+            .is_some_and(|record| record.op_state == "completed"),
         "daemon must claim and complete ingest_async operations"
     );
     let db = Database::open(&db_path).expect("open db");
