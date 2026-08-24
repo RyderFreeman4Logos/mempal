@@ -324,6 +324,8 @@ fn status_remains_available_when_holder_budget_is_exhausted() {
                 .expect("fill holder budget")
         })
         .collect::<Vec<_>>();
+    let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("snapshot at holder cap");
+    assert_eq!(snapshot.active_holders, 16);
 
     let mut command =
         SpawnSpec::new(env!("CARGO_BIN_EXE_mempal")).expect("absolute mempal executable");
