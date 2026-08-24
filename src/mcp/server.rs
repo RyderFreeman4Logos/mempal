@@ -2750,24 +2750,30 @@ impl MempalMcpServer {
             .and_then(|info| info.capabilities.roots.clone())
             .is_some();
         if client_supports_roots && let Some(peer) = peer {
-            let result = peer
+            // A failed roots request is a recoverable client state: fall back
+            // to no project rather than failing the whole tool call.
+            let Ok(result) = peer
                 .send_request(ServerRequest::ListRootsRequest(Default::default()))
                 .await
-                .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+            else {
+                return Ok(None);
+            };
             let ClientResult::ListRootsResult(result) = result else {
                 return Err(ErrorData::internal_error("invalid roots response", None));
             };
             let project_id = result
                 .roots
                 .into_iter()
-                .find_map(|root| infer_project_id_from_root_uri(&root.uri).ok().flatten())
-                .ok_or_else(|| {
-                    ErrorData::internal_error("MCP roots did not contain a valid project", None)
-                })?;
-            if let Ok(mut guard) = self.client_project_id.lock() {
-                *guard = Some(project_id.clone());
+                .find_map(|root| infer_project_id_from_root_uri(&root.uri).ok().flatten());
+            if let Some(project_id) = project_id {
+                if let Ok(mut guard) = self.client_project_id.lock() {
+                    *guard = Some(project_id.clone());
+                }
+                return Ok(Some(project_id));
             }
-            return Ok(Some(project_id));
+            // Declared roots with no valid project URI are a recoverable
+            // client state too: the client simply has no project to scope to.
+            return Ok(None);
         }
 
         Ok(None)
@@ -13513,6 +13519,7 @@ mod tests {
     mod delete_busy_retry_836_tests;
     mod delete_receipt_921_tests;
     mod ingest_receipt_tests;
+    mod mcp_roots_936_tests;
     mod read_tests;
     #[derive(Clone)]
     struct StubEmbedderFactory {
@@ -17898,44 +17905,6 @@ prototypes = ["keep"]
     }
 
     include!("server_diagnostic_tests.rs");
-    #[tokio::test]
-    async fn test_mcp_search_returns_diagnostic_when_database_cannot_open() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let db_path = tempdir.path().join("palace.db");
-        fs::create_dir(&db_path).expect("create directory at db path");
-        let server = MempalMcpServer::new_with_factory(
-            db_path,
-            Arc::new(StubEmbedderFactory {
-                vector: vec![0.1, 0.2, 0.3],
-            }),
-        )
-        .expect("create MCP server");
-
-        let response = server
-            .mempal_search(Parameters(SearchRequest {
-                query: "open failure marker".to_string(),
-                top_k: Some(1),
-                disable_progressive: Some(true),
-                ..SearchRequest::default()
-            }))
-            .await
-            .expect("search should return an actionable diagnostic response")
-            .0;
-
-        assert_eq!(response.search_mode, SearchMode::Bm25Only.as_str());
-        assert!(response.results.is_empty());
-        assert!(
-            response.warnings.iter().any(|warning| {
-                warning.contains("path_or_permission") && warning.contains("bounded empty response")
-            }),
-            "response warning should expose database diagnostic: {:?}",
-            response.warnings
-        );
-        assert!(response.system_warnings.iter().any(|warning| {
-            warning.source == "database" && warning.message.contains("path_or_permission")
-        }));
-    }
-
     #[tokio::test]
     async fn test_mempal_status_returns_diagnostic_when_database_cannot_open() {
         let tempdir = tempfile::tempdir().expect("tempdir");
