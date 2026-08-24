@@ -222,8 +222,7 @@ mod tests {
             Err(DurableAdmissionError::OperationKeyConflict)
         ));
         let rendered = conflict
-            .err()
-            .expect("conflict receipt must be terminal")
+            .expect_err("conflict receipt must be terminal")
             .to_string();
         assert!(!rendered.contains("private first payload"));
         assert!(!rendered.contains("private conflicting payload"));
