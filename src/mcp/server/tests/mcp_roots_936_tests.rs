@@ -1,7 +1,5 @@
-use std::future::Future;
-
 use rmcp::model::{ClientInfo, ListRootsResult, Root, RootsCapabilities};
-use rmcp::service::{MaybeSendFuture, RequestContext, RunningService};
+use rmcp::service::{RequestContext, RunningService};
 use rmcp::{ClientHandler, RoleClient};
 
 use super::{Config, MempalMcpServer, setup_server};
@@ -19,19 +17,17 @@ impl ClientHandler for RootsFixtureClient {
         self.info.clone()
     }
 
-    fn list_roots(
+    async fn list_roots(
         &self,
         _context: RequestContext<RoleClient>,
-    ) -> impl Future<Output = Result<ListRootsResult, rmcp::ErrorData>> + MaybeSendFuture + '_ {
-        async move {
-            if self.fail_roots {
-                Err(rmcp::ErrorData::internal_error(
-                    "fixture roots request failure",
-                    None,
-                ))
-            } else {
-                Ok(ListRootsResult::new(self.roots.clone()))
-            }
+    ) -> Result<ListRootsResult, rmcp::ErrorData> {
+        if self.fail_roots {
+            Err(rmcp::ErrorData::internal_error(
+                "fixture roots request failure",
+                None,
+            ))
+        } else {
+            Ok(ListRootsResult::new(self.roots.clone()))
         }
     }
 }
