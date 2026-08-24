@@ -29,6 +29,36 @@ def _invalid_control_receipt() -> str:
     })
 
 
+def _deferred_receipt(
+    key: str,
+    operation_id: Optional[str],
+    deferred_reason: str,
+) -> str:
+    """Project a durably admitted operation as local-admitted pending.
+
+    Shared by the breaker-open branch and the replay-deferred branch so both
+    deferrals produce exactly one receipt shape.  The item was already
+    committed to the durable spool before this projection, so the caller sees
+    a stable operation key with deferred durability instead of a bare failure.
+    """
+    payload: Dict[str, object] = {
+        "success": True,
+        "state": "local_admitted",
+        "retryable": True,
+        "retry_safe": True,
+        "operation_key": key,
+        "retry_operation_id": key,
+        "durability": {
+            "state": "pending",
+            "kind": "durable_replay_deferred",
+            "deferred_reason": deferred_reason,
+        },
+    }
+    if operation_id:
+        payload["operation_id"] = operation_id
+    return json.dumps(payload)
+
+
 class _AuthoritativeWriteProvider(Protocol):
     _write_spool: WriteSpool
     _wing: str
@@ -315,12 +345,7 @@ def authoritative_memory_write(
             self._wake_spool_worker()
         except Exception:
             logger.warning("mempal authoritative write replay wake failed")
-        return json.dumps({
-            "success": False,
-            "error_class": "breaker_open",
-            "retryable": True,
-            "operation_key": key,
-        })
+        return _deferred_receipt(key, None, "breaker_open")
     try:
         outcome = self._write_spool.replay_operation_key(
             key,
@@ -357,26 +382,16 @@ def authoritative_memory_write(
             self._wake_spool_worker()
         except Exception:
             logger.warning("mempal authoritative write replay wake failed")
-        payload = {
-            "success": True,
-            "state": "local_admitted",
-            "retryable": True,
-            "retry_safe": True,
-            "operation_key": key,
-            "retry_operation_id": key,
-            "durability": {
-                "state": "pending",
-                "kind": "durable_replay_deferred",
-                "deferred_reason": (
-                    error_class.removeprefix("status_")
-                    if error_class.startswith("status_")
-                    else error_class
-                ) or "pending",
-            },
-        }
-        if outcome is not None and outcome.operation_id:
-            payload["operation_id"] = outcome.operation_id
-        return json.dumps(payload)
+        deferred_reason = (
+            error_class.removeprefix("status_")
+            if error_class.startswith("status_")
+            else error_class
+        ) or "pending"
+        return _deferred_receipt(
+            key,
+            outcome.operation_id if outcome is not None else None,
+            deferred_reason,
+        )
     retryable = classification.retryable
     payload = {
         "success": False,

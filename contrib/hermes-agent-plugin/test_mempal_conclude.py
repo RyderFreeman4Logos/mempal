@@ -13,6 +13,7 @@ if PLUGIN_DIR not in sys.path:
     sys.path.insert(0, PLUGIN_DIR)
 
 import mempal._conclude as conclude_module  # noqa: E402
+from test_mempal_authoritative_write import FailingStatusProvider  # noqa: E402
 from test_mempal_provider import RecordingProvider  # noqa: E402
 
 
@@ -127,6 +128,8 @@ class DurableConcludeTests(unittest.TestCase):
         provider = RecordingProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
         before = provider._backoff._read_state()
+        wake_calls = []
+        provider._wake_spool_worker = lambda: wake_calls.append("wake")
 
         result = json.loads(provider.handle_tool_call(
             "mempal_conclude",
@@ -141,6 +144,83 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertEqual(provider._write_spool.count(), 0)
         self.assertEqual(provider.posts, [])
         self.assertEqual(after.failure_count, before.failure_count)
+        self.assertEqual(wake_calls, [])
+        provider.shutdown()
+
+    def test_transport_409_conflict_is_terminal_without_failure_or_wake(self) -> None:
+        provider = FailingStatusProvider(409)
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
+        before = provider._backoff._read_state()
+
+        result = self._conclude(provider, "SECRET_CONFLICT_CONCLUSION")
+
+        details = result["error_details"]
+        self.assertEqual(details["kind"], "operation_key_conflict")
+        self.assertFalse(details["retry_safe"])
+        after = provider._backoff._read_state()
+        self.assertEqual(after.failure_count, before.failure_count)
+        spool = provider._write_spool
+        assert spool is not None
+        operation = spool.next_operation()
+        self.assertIsNotNone(operation)
+        assert operation is not None
+        self.assertIsNotNone(operation.quarantined_at)
+        self.assertEqual(operation.quarantine_reason, "operation_key_conflict")
+        self.assertEqual(provider.wake_calls, 0)
+        self.assertNotIn("SECRET_CONFLICT_CONCLUSION", json.dumps(result))
+        provider.shutdown()
+
+    def test_keyed_conclude_after_quarantine_is_terminal_malformed_row(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
+        before = provider._backoff._read_state()
+        wake_calls = []
+        provider._wake_spool_worker = lambda: wake_calls.append("wake")
+
+        # Admit the conclude row pending (no transport) so the worker replay
+        # below can quarantine the corrupted row; a stored conclude would
+        # already be settled and no longer claimable.
+        spool = provider._write_spool
+        assert spool is not None
+        operation_key = "malformed-key"
+        spool.admit(
+            "ingest",
+            conclude_module.conclusion_request(
+                "malformed conclusion",
+                provider._wing,
+                provider._facts_room,
+                provider._safe_min_importance,
+                provider._project_id,
+            ),
+            action="conclude",
+            operation_key=operation_key,
+        )
+        with spool._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE write_operations SET body_json = ? WHERE operation_key = ?",
+                ('{"malformed":', operation_key),
+            )
+            connection.execute("COMMIT")
+        quarantined = spool.replay_one(provider._post, provider._get)
+        self.assertIsNotNone(quarantined)
+        assert quarantined is not None
+        self.assertTrue(quarantined.quarantined)
+        self.assertEqual(quarantined.error_class, "malformed_spool_row")
+
+        retry = self._conclude(
+            provider, "malformed conclusion", operation_key=operation_key
+        )
+
+        details = retry["error_details"]
+        self.assertEqual(details["kind"], "malformed_spool_row")
+        self.assertFalse(details["retry_safe"])
+        after = provider._backoff._read_state()
+        self.assertEqual(after.failure_count, before.failure_count)
+        self.assertEqual(wake_calls, [])
+        self.assertNotIn("malformed conclusion", json.dumps(retry))
         provider.shutdown()
 
     def test_completed_receipt_with_drawer_reports_success(self) -> None:

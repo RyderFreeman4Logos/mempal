@@ -25,7 +25,11 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from ._authoritative_write import authoritative_memory_write as _authoritative_memory_write
 from ._backoff import SharedPluginBackoff
-from ._conclude import conclusion_request, submit_conclusion
+from ._conclude import (
+    conclude_side_effects,
+    conclusion_request,
+    submit_conclusion,
+)
 from ._intelligence import _IntelligenceEnhancer, _LLMClient
 from ._rest_errors import rest_error_payload as _rest_error_payload, search_metadata_from_headers, search_timeout_metadata_from_http_error
 from ._write_spool import SpoolOperation, WriteSpool, classify_replay_error, classify_write_error, make_track_key
@@ -565,11 +569,14 @@ class MempalMemoryProvider:
         return mode
 
     def _is_breaker_open(self):
+        # Honor the breaker window whenever set (mirrored from backoff state
+        # or opened by tests/diagnostics); the threshold is only used to
+        # decide when the window may be cleared on expiry.
+        if time.monotonic() < self._breaker_open_until:
+            return True
+        self._breaker_open_until = 0.0
         if self._consecutive_failures >= _BREAKER_THRESHOLD:
-            if time.monotonic() < self._breaker_open_until:
-                return True
             self._consecutive_failures = 0
-            self._breaker_open_until = 0.0
         return self._backoff.is_open()
 
     def _record_success(self):
@@ -1032,29 +1039,7 @@ class MempalMemoryProvider:
                     except Exception:
                         logger.warning("mempal conclude success bookkeeping failed")
                 else:
-                    details = result.payload.get("error_details", {})
-                    local_admission = (
-                        result.payload.get("state") == "local_admitted"
-                        or result.payload.get("durability", {}).get("kind")
-                        == "durable_replay_deferred"
-                        or details.get("kind") in {
-                            "durable_replay_deferred",
-                            "durable_operation_pending",
-                        }
-                    )
-                    if not local_admission and details.get("kind") not in {"operation_key_conflict", "invalid_control_fields"}:
-                        try:
-                            self._record_failure()
-                        except Exception:
-                            logger.warning("mempal conclude failure bookkeeping failed")
-                    if details.get("kind") not in {
-                        "local_durable_admission_failed",
-                        "operation_key_conflict",
-                    }:
-                        try:
-                            self._wake_spool_worker()
-                        except Exception:
-                            logger.warning("mempal conclude replay wake failed")
+                    conclude_side_effects(self, result.payload)
                 return json.dumps(result.payload)
             except Exception as exc:
                 self._record_failure()

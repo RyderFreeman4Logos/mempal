@@ -5,27 +5,21 @@ import threading
 import time
 import unittest
 import urllib.error
-
 from mempal._write_spool import WriteSpool
 from test_mempal_provider import RecordingProvider
-
-
 class SequencedStatusProvider(RecordingProvider):
     def __init__(self, states):
         super().__init__()
         self.states = list(states)
         self.wake_calls = 0
-
     def _get(self, path, params=None):
         status = super()._get(path, params)
         if path.startswith("/api/operations/") and self.states:
             status = dict(status)
             status["state"] = self.states.pop(0)
         return status
-
     def _wake_spool_worker(self):
         self.wake_calls += 1
-
 
 class FailingStatusProvider(RecordingProvider):
     def __init__(self, status: int) -> None:
@@ -44,7 +38,6 @@ class FailingStatusProvider(RecordingProvider):
     def _wake_spool_worker(self):
         self.wake_calls += 1
 
-
 class FailingReplayProvider(RecordingProvider):
     def __init__(self, error: Exception) -> None:
         super().__init__()
@@ -57,7 +50,6 @@ class FailingReplayProvider(RecordingProvider):
 
     def _wake_spool_worker(self):
         self.wake_calls += 1
-
 
 class SharedDurableBackend:
     def __init__(self) -> None:
@@ -84,7 +76,6 @@ class SharedDurableBackend:
             self.release.wait(timeout=2.0)
         return {"operation_id": operation_id, "state": "completed"}
 
-
 class SharedProvider(RecordingProvider):
     def __init__(self, backend: SharedDurableBackend) -> None:
         super().__init__()
@@ -101,8 +92,59 @@ class SharedProvider(RecordingProvider):
             return self.backend.operations.get(path.rsplit("/", 1)[-1], {})
         return {}
 
-
 class AuthoritativeMemoryWriteTests(unittest.TestCase):
+    def test_open_breaker_single_item_is_local_admitted_not_bare_failure(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._breaker_open_until = time.monotonic() + 999
+
+        receipt = json.loads(provider.authoritative_memory_write({
+            "action": "add",
+            "target": "user",
+            "content": "breaker pending preference",
+        }))
+
+        self.assertTrue(receipt["success"])
+        self.assertEqual(receipt["state"], "local_admitted")
+        self.assertTrue(receipt["retryable"])
+        self.assertTrue(receipt["retry_safe"])
+        self.assertTrue(receipt["operation_key"])
+        self.assertEqual(receipt["retry_operation_id"], receipt["operation_key"])
+        self.assertEqual(receipt["durability"], {
+            "state": "pending",
+            "kind": "durable_replay_deferred",
+            "deferred_reason": "breaker_open",
+        })
+        assert provider._write_spool is not None
+        self.assertEqual(provider._write_spool.count(), 1)
+        self.assertEqual(provider.posts, [])
+        provider.shutdown()
+
+    def test_open_breaker_batch_admits_all_items_and_keeps_pending_handles(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._breaker_open_until = time.monotonic() + 999
+
+        result = json.loads(provider.authoritative_memory_write({
+            "target": "user",
+            "operations": [
+                {"action": "add", "content": "first breaker preference"},
+                {"action": "add", "content": "second breaker preference"},
+            ],
+        }))
+
+        self.assertFalse(result["success"])
+        self.assertFalse(result["partial_write"])
+        self.assertEqual(result["state"], "local_admitted")
+        self.assertEqual(result["operation_ids"], [])
+        self.assertEqual(len(result["operation_keys"]), 2)
+        self.assertEqual(result["durability"]["deferred_reason"], "breaker_open")
+        self.assertEqual(result["error_class"], "breaker_open")
+        assert provider._write_spool is not None
+        self.assertEqual(provider._write_spool.count(), 2)
+        self.assertEqual(provider.posts, [])
+        provider.shutdown()
+
     def test_queued_admission_is_successful_and_wakes_spool(self) -> None:
         provider = SequencedStatusProvider(["queued"])
         provider.initialize("session-a", user_id="alice", profile="work")
@@ -753,7 +795,6 @@ class AuthoritativeMemoryWriteTests(unittest.TestCase):
                 self.assertIsNotNone(outcome)
                 self.assertTrue(outcome.completed)
             self.assertEqual(delivered, ["one", "one", "two", "three"])
-
 
 if __name__ == "__main__":
     unittest.main()

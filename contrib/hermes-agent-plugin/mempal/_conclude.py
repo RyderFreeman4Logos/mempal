@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
 import time
 from dataclasses import dataclass
@@ -10,15 +11,57 @@ from typing import Any, Callable, Dict, Optional
 from ._write_spool import (
     OperationKeyConflictError,
     WriteSpool,
+    classify_replay_error,
     classify_write_error,
     valid_control_token,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class ConcludeResult:
     stored: bool
     payload: Dict[str, Any]
+
+
+_TERMINAL_KINDS = {
+    "operation_key_conflict",
+    "invalid_control_fields",
+    "malformed_spool_row",
+}
+
+
+def conclude_side_effects(
+    provider: Any,
+    payload: Dict[str, Any],
+) -> None:
+    """Apply failure/wake bookkeeping for a non-stored conclusion.
+
+    One terminal-kind classification owns both the breaker-failure decision
+    and the worker-wake decision for conclusion outcomes, so no ad hoc set
+    can drift out of sync with the classifications in this module.
+    """
+    details = payload.get("error_details", {})
+    local_admission = (
+        payload.get("state") == "local_admitted"
+        or payload.get("durability", {}).get("kind") == "durable_replay_deferred"
+        or details.get("kind")
+        in {"durable_replay_deferred", "durable_operation_pending"}
+    )
+    if not local_admission and details.get("kind") not in _TERMINAL_KINDS:
+        try:
+            provider._record_failure()
+        except Exception:
+            logger.warning("mempal conclude failure bookkeeping failed")
+    if (
+        details.get("kind") not in _TERMINAL_KINDS
+        and details.get("kind") != "local_durable_admission_failed"
+    ):
+        try:
+            provider._wake_spool_worker()
+        except Exception:
+            logger.warning("mempal conclude replay wake failed")
 
 
 def conclusion_request(
@@ -131,6 +174,18 @@ def submit_conclusion(
                 operation_id,
                 key,
                 state,
+                error_class,
+                outcome.error_details,
+                retry_safe=False,
+            ))
+        if error_class in {"operation_key_conflict", "malformed_spool_row"}:
+            return ConcludeResult(False, _retry_payload(
+                error_class,
+                operation_id,
+                key,
+                error_class,
+                error_class,
+                outcome.error_details,
                 retry_safe=False,
             ))
         if error_class and error_class.startswith("status_"):
@@ -144,6 +199,10 @@ def submit_conclusion(
             kind = "durable_status_unavailable"
         else:
             kind = "durable_admission_deferred"
+        classification = classify_replay_error(error_class) if error_class else None
+        retry_safe = bool(
+            classification.retryable if classification is not None else True
+        ) or kind == "durable_status_unavailable"
         if (
             kind == "durable_admission_deferred"
             or kind == "durable_status_invalid"
@@ -156,11 +215,7 @@ def submit_conclusion(
                 state,
                 error_class,
                 outcome.error_details,
-                retry_safe=kind not in {
-                    "durable_status_invalid",
-                    "durable_operation_failed",
-                    "durable_operation_rejected",
-                },
+                retry_safe=retry_safe,
             ))
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 

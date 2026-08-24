@@ -7,32 +7,29 @@ import os
 import secrets
 import sqlite3
 import time
-import urllib.error
 from contextlib import closing
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Callable, Optional
 
-from ._rest_errors import rest_error_payload
 from ._write_spool_claims import WriteSpoolClaims
+from ._write_spool_replay import (
+    ClaimLostError,
+    GetCallback,
+    JsonObject,
+    OperationKeyConflictError,
+    PostCallback,
+    ReplayOutcome,
+    SpoolOperation,
+    WriteSpoolReplay,
+    _MAX_REPLAY_ATTEMPTS,
+    _RETRY_BACKOFF_SECS,
+    classify_replay_error,
+    classify_write_error,
+    legacy_track_key,
+)
 
 _DB_RELATIVE_PATH = os.path.join("state", "mempal", "write-spool.sqlite3")
 _CONNECT_TIMEOUT_SECS = 0.5
-_MAX_REPLAY_ATTEMPTS = 5
-_RETRY_BACKOFF_SECS = (0.25, 0.5, 1.0, 2.0, 5.0)
-_RETRYABLE_HTTP_4XX = {408, 425, 429}
-_RETRYABLE_STATES = {"queued", "running"}
-_TERMINAL_STATES = {"failed", "rejected"}
-_NON_RETRYABLE_REPLAY_ERRORS = {
-    "status_invalid",
-    "status_completed_missing_drawer",
-    "terminal_failed",
-    "terminal_rejected",
-}
-
-JsonObject = Dict[str, Any]
-PostCallback = Callable[[str, JsonObject], Any]
-GetCallback = Callable[[str], Any]
-
+_MAX_FINITE_BOUND = 1e300
 _CONTROL_TOKEN_MAX_BYTES = 128
 
 
@@ -51,20 +48,6 @@ def valid_target(value: object) -> bool:
     return valid_control_token(value, allow_none=False)
 
 
-class OperationKeyConflictError(ValueError):
-    """An operation key was reused for a different durable operation."""
-
-
-class ClaimLostError(RuntimeError):
-    """The SQLite lease expired or was settled by another worker."""
-
-
-@dataclass(frozen=True)
-class ReplayClassification:
-    retryable: bool
-    count_failure: bool
-
-
 def make_track_key(target: str, wing: str, project_id: Optional[str]) -> str:
     """Encode tracking scope as a typed, injective JSON tuple."""
     return json.dumps(
@@ -74,94 +57,7 @@ def make_track_key(target: str, wing: str, project_id: Optional[str]) -> str:
     )
 
 
-def classify_write_error(exc: Exception) -> str:
-    """Return a content-free transport/storage failure class."""
-    if isinstance(exc, urllib.error.HTTPError):
-        if exc.code == 409:
-            return "operation_key_conflict"
-        return f"http_{exc.code}"
-    if isinstance(exc, (TimeoutError, urllib.error.URLError)):
-        return "network_timeout"
-    if isinstance(exc, OSError):
-        return f"os_error_{exc.errno or 'unknown'}"
-    return "network_or_protocol_error"
-
-
-def classify_replay_error(error_class: Optional[str]) -> ReplayClassification:
-    """Classify replay outcomes once for direct and background callers."""
-    if not error_class:
-        return ReplayClassification(retryable=True, count_failure=False)
-    if error_class in {
-        "breaker_open",
-        "claim_busy",
-        "claim_lost",
-        "durable_write_pending",
-        "fifo_blocked",
-        "retry_not_due",
-    }:
-        return ReplayClassification(retryable=True, count_failure=False)
-    if error_class in {"status_queued", "status_running"}:
-        return ReplayClassification(retryable=True, count_failure=False)
-    if error_class == "operation_key_conflict":
-        return ReplayClassification(retryable=False, count_failure=False)
-    if error_class.startswith("http_"):
-        try:
-            status = int(error_class.removeprefix("http_"))
-        except ValueError:
-            return ReplayClassification(retryable=False, count_failure=True)
-        return ReplayClassification(
-            retryable=status in _RETRYABLE_HTTP_4XX or 500 <= status <= 599,
-            count_failure=True,
-        )
-    if error_class == "malformed_spool_row":
-        return ReplayClassification(retryable=False, count_failure=False)
-    if error_class == "target_unresolved":
-        return ReplayClassification(retryable=False, count_failure=True)
-    if error_class.startswith("network_") or error_class.startswith("os_error_"):
-        return ReplayClassification(retryable=True, count_failure=True)
-    if error_class in _NON_RETRYABLE_REPLAY_ERRORS or error_class.startswith("status_"):
-        return ReplayClassification(retryable=False, count_failure=True)
-    if error_class.startswith("terminal_"):
-        return ReplayClassification(retryable=False, count_failure=True)
-    return ReplayClassification(retryable=False, count_failure=True)
-
-
-def _is_retryable_replay_error(error_class: Optional[str]) -> bool:
-    return classify_replay_error(error_class).retryable
-
-
-@dataclass(frozen=True)
-class SpoolOperation:
-    sequence: int
-    operation_key: str
-    kind: str
-    body: JsonObject
-    track_key: Optional[str]
-    action: Optional[str]
-    receipt_operation_id: Optional[str]
-    attempt_count: int
-    last_error_class: Optional[str]
-    next_attempt_at: float
-    quarantined_at: Optional[float]
-    quarantine_reason: Optional[str]
-    settled_at: Optional[float] = None
-    result_drawer_id: Optional[str] = None
-    claim_token: Optional[str] = None
-    claim_expires_at: Optional[float] = None
-
-
-@dataclass(frozen=True)
-class ReplayOutcome:
-    operation: SpoolOperation
-    completed: bool
-    error_class: Optional[str] = None
-    drawer_id: Optional[str] = None
-    operation_id: Optional[str] = None
-    quarantined: bool = False
-    error_details: Optional[JsonObject] = None
-
-
-class WriteSpool(WriteSpoolClaims):
+class WriteSpool(WriteSpoolClaims, WriteSpoolReplay):
     """Durable global-FIFO writes with SQLite claims before network I/O.
 
     A pending predecessor blocks every later operation in this shared spool.
@@ -237,7 +133,24 @@ class WriteSpool(WriteSpoolClaims):
                 sequence = int(cursor.lastrowid)
             except sqlite3.IntegrityError:
                 connection.execute("ROLLBACK")
-                existing = self.get(key)
+                try:
+                    existing = self.get(key)
+                except (ValueError, TypeError, OverflowError, sqlite3.DatabaseError):
+                    # Existing row body is not decodable (malformed).  Read
+                    # terminal metadata without decoding it; a metadata match
+                    # keeps the retry on the same operation so the keyed
+                    # replay can project the terminal malformed row, instead
+                    # of masking it as an operation-key conflict.
+                    row = self._select_row(key)
+                    if row is None:
+                        raise
+                    if (
+                        str(row["kind"]) != kind
+                        or row["action"] != action
+                        or row["track_key"] != track_key
+                    ):
+                        raise OperationKeyConflictError("operation_key_conflict")
+                    return self._metadata_operation(row)
                 if existing is None:
                     raise
                 existing_encoded = json.dumps(
@@ -291,10 +204,18 @@ class WriteSpool(WriteSpoolClaims):
                 FROM write_operations AS candidate
                 WHERE candidate.settled_at IS NULL
                   AND candidate.quarantined_at IS NULL
-                  AND candidate.next_attempt_at <= ?1
+                  AND (
+                    candidate.next_attempt_at <= ?1
+                    OR candidate.next_attempt_at IS NULL
+                    OR typeof(candidate.next_attempt_at) NOT IN ('real', 'integer')
+                    OR abs(candidate.next_attempt_at) > ?2
+                  )
                   AND (
                     candidate.claim_token IS NULL
                     OR candidate.claim_expires_at <= ?1
+                    OR candidate.claim_expires_at IS NULL
+                    OR typeof(candidate.claim_expires_at) NOT IN ('real', 'integer')
+                    OR abs(candidate.claim_expires_at) > ?2
                   )
                   AND NOT EXISTS (
                     SELECT 1
@@ -306,7 +227,7 @@ class WriteSpool(WriteSpoolClaims):
                 ORDER BY candidate.sequence
                 LIMIT 1
                 """,
-                (now,),
+                (now, _MAX_FINITE_BOUND),
             ).fetchone()
         return self._row_to_operation(row) if row is not None else None
 
@@ -317,6 +238,13 @@ class WriteSpool(WriteSpoolClaims):
                 (operation_key,),
             ).fetchone()
         return self._row_to_operation(row) if row is not None else None
+
+    def _select_row(self, operation_key: str) -> Optional[sqlite3.Row]:
+        with closing(self._connect()) as connection:
+            return connection.execute(
+                "SELECT * FROM write_operations WHERE operation_key = ?1",
+                (operation_key,),
+            ).fetchone()
 
     def count(self) -> int:
         with closing(self._connect()) as connection:
@@ -470,6 +398,11 @@ class WriteSpool(WriteSpoolClaims):
                 connection.execute(
                     "DELETE FROM track_drawers WHERE track_key = ?1", (track_key,)
                 )
+                legacy = legacy_track_key(track_key)
+                if legacy is not None:
+                    connection.execute(
+                        "DELETE FROM track_drawers WHERE track_key = ?1", (legacy,)
+                    )
             elif track_key and drawer_id:
                 connection.execute(
                     """
@@ -484,10 +417,19 @@ class WriteSpool(WriteSpoolClaims):
             connection.execute("COMMIT")
 
     def drawer_for_track(self, track_key: str) -> Optional[str]:
+        drawer = self._drawer_id_for_key(track_key)
+        if drawer is not None:
+            return drawer
+        legacy = legacy_track_key(track_key)
+        if legacy is not None:
+            return self._drawer_id_for_key(legacy)
+        return None
+
+    def _drawer_id_for_key(self, key: str) -> Optional[str]:
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT drawer_id FROM track_drawers WHERE track_key = ?1",
-                (track_key,),
+                (key,),
             ).fetchone()
         return str(row[0]) if row is not None else None
 
@@ -508,268 +450,3 @@ class WriteSpool(WriteSpoolClaims):
             get,
             replay_allowed=replay_allowed,
         )
-
-    def replay_operation_key(
-        self,
-        operation_key: str,
-        post: PostCallback,
-        get: GetCallback,
-        *,
-        ignore_retry_delay: bool = False,
-        replay_allowed: Optional[Callable[[], bool]] = None,
-    ) -> Optional[ReplayOutcome]:
-        """Claim one producer-owned operation without holding a Python lock."""
-        operation = self.get(operation_key)
-        if operation is None:
-            return None
-        if operation.settled_at is not None:
-            return self._settled_outcome(operation)
-        if operation.quarantined_at is not None:
-            return ReplayOutcome(
-                operation,
-                completed=False,
-                error_class=operation.quarantine_reason or operation.last_error_class,
-                operation_id=operation.receipt_operation_id,
-                quarantined=True,
-            )
-        if not ignore_retry_delay and operation.next_attempt_at > time.time():
-            return ReplayOutcome(
-                operation,
-                completed=False,
-                error_class=operation.last_error_class or "retry_not_due",
-                operation_id=operation.receipt_operation_id,
-            )
-        if not self._fifo_available(operation_key):
-            return ReplayOutcome(
-                operation,
-                completed=False,
-                error_class="fifo_blocked",
-                operation_id=operation.receipt_operation_id,
-            )
-        claimed = self._claim_operation(
-            operation_key,
-            ignore_retry_delay=ignore_retry_delay,
-        )
-        if claimed is None:
-            current = self.get(operation_key)
-            if current is None:
-                return None
-            if current.settled_at is not None:
-                return self._settled_outcome(current)
-            if current.quarantined_at is not None:
-                return ReplayOutcome(
-                    current,
-                    completed=False,
-                    error_class=current.quarantine_reason or current.last_error_class,
-                    operation_id=current.receipt_operation_id,
-                    quarantined=True,
-                )
-            if current.claim_token and (
-                current.claim_expires_at is not None
-                and current.claim_expires_at > time.time()
-            ):
-                return ReplayOutcome(
-                    current,
-                    completed=False,
-                    error_class="claim_busy",
-                    operation_id=current.receipt_operation_id,
-                )
-            return ReplayOutcome(
-                current,
-                completed=False,
-                error_class="fifo_blocked",
-                operation_id=current.receipt_operation_id,
-            )
-        return self._replay_claimed_operation(
-            claimed,
-            post,
-            get,
-            replay_allowed=replay_allowed,
-        )
-
-    def _replay_operation(
-        self,
-        operation: SpoolOperation,
-        post: PostCallback,
-        get: GetCallback,
-        *,
-        replay_allowed: Optional[Callable[[], bool]] = None,
-    ) -> ReplayOutcome:
-        claimed = self._claim_operation(operation.operation_key, ignore_retry_delay=True)
-        if claimed is None:
-            current = self.get(operation.operation_key) or operation
-            return ReplayOutcome(
-                current,
-                completed=False,
-                error_class="claim_busy",
-                operation_id=current.receipt_operation_id,
-            )
-        return self._replay_claimed_operation(
-            claimed,
-            post,
-            get,
-            replay_allowed=replay_allowed,
-        )
-
-    def _replay_claimed_operation(
-        self,
-        operation: SpoolOperation,
-        post: PostCallback,
-        get: GetCallback,
-        *,
-        replay_allowed: Optional[Callable[[], bool]] = None,
-    ) -> ReplayOutcome:
-        if operation.quarantined_at is not None:
-            return ReplayOutcome(
-                operation,
-                completed=False,
-                error_class=operation.quarantine_reason or "malformed_spool_row",
-                quarantined=True,
-            )
-        claim_token = operation.claim_token
-        if not claim_token:
-            return ReplayOutcome(operation, completed=False, error_class="claim_lost")
-        request = dict(operation.body)
-        if operation.track_key and operation.action in {"replace", "delete"}:
-            if not (operation.action == "replace" and request.get("replace_text")):
-                target = self.drawer_for_track(operation.track_key)
-                if not target:
-                    try:
-                        quarantined = self.record_attempt(
-                            operation.operation_key,
-                            "target_unresolved",
-                            retryable=True,
-                            claim_token=claim_token,
-                        )
-                    except ClaimLostError:
-                        return ReplayOutcome(
-                            operation,
-                            completed=False,
-                            error_class="claim_lost",
-                        )
-                    return ReplayOutcome(
-                        operation,
-                        completed=False,
-                        error_class="target_unresolved",
-                        quarantined=quarantined,
-                    )
-                request[
-                    "supersedes" if operation.action == "replace" else "drawer_id"
-                ] = target
-        operation_id = operation.receipt_operation_id
-        route = "/api/ingest/durable"
-        try:
-            if replay_allowed is not None and not replay_allowed():
-                self.release_claim(operation.operation_key, claim_token)
-                return ReplayOutcome(
-                    operation,
-                    completed=False,
-                    error_class="breaker_open",
-                    operation_id=operation_id,
-                )
-            if operation_id:
-                route = f"/api/operations/{operation_id}"
-                status = get(route)
-            else:
-                route = (
-                    "/api/delete/durable"
-                    if operation.kind == "delete"
-                    else "/api/ingest/durable"
-                )
-                receipt = post(
-                    route,
-                    {
-                        "idempotency_key": operation.operation_key,
-                        "request": request,
-                    },
-                )
-                if not isinstance(receipt, dict):
-                    raise RuntimeError("durable admission returned an invalid receipt")
-                operation_id = str(receipt.get("operation_id") or "")
-                if not operation_id:
-                    raise RuntimeError("durable admission omitted operation_id")
-                self.record_receipt(operation.operation_key, operation_id, claim_token)
-                route = f"/api/operations/{operation_id}"
-                status = get(route)
-            if not isinstance(status, dict):
-                raise RuntimeError("durable status returned an invalid response")
-            state = status.get("state")
-            state = state if isinstance(state, str) else ""
-            drawer_value = status.get("drawer_id")
-            drawer_id = drawer_value if isinstance(drawer_value, str) else ""
-            if state == "completed" and drawer_id:
-                self.complete(
-                    operation.operation_key,
-                    track_key=operation.track_key,
-                    drawer_id=drawer_id,
-                    delete_track=operation.action == "delete",
-                    claim_token=claim_token,
-                )
-                return ReplayOutcome(
-                    operation,
-                    completed=True,
-                    drawer_id=drawer_id,
-                    operation_id=operation_id,
-                )
-            if state == "completed":
-                error_class = "status_completed_missing_drawer"
-                retryable = False
-            elif state in _TERMINAL_STATES:
-                error_class = f"terminal_{state}"
-                retryable = False
-            elif state in _RETRYABLE_STATES:
-                error_class = f"status_{state}"
-                retryable = True
-            else:
-                error_class = "status_invalid"
-                retryable = False
-            quarantined = self.record_attempt(
-                operation.operation_key,
-                error_class,
-                retryable=retryable,
-                claim_token=claim_token,
-            )
-            return ReplayOutcome(
-                operation,
-                completed=False,
-                error_class=error_class,
-                operation_id=operation_id,
-                quarantined=quarantined,
-            )
-        except ClaimLostError:
-            return ReplayOutcome(
-                operation,
-                completed=False,
-                error_class="claim_lost",
-                operation_id=operation_id,
-            )
-        except Exception as exc:
-            error_class = classify_write_error(exc)
-            error_details = rest_error_payload(
-                "Durable write replay failed.",
-                route,
-                exc,
-            )["error_details"]
-            classification = classify_replay_error(error_class)
-            try:
-                quarantined = self.record_attempt(
-                    operation.operation_key,
-                    error_class,
-                    retryable=classification.retryable,
-                    claim_token=claim_token,
-                )
-            except ClaimLostError:
-                return ReplayOutcome(
-                    operation,
-                    completed=False,
-                    error_class="claim_lost",
-                    operation_id=operation_id,
-                )
-            return ReplayOutcome(
-                operation,
-                completed=False,
-                error_class=error_class,
-                operation_id=operation_id,
-                quarantined=quarantined,
-                error_details=error_details,
-            )

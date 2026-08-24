@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import secrets
 import sqlite3
 import time
@@ -13,6 +14,7 @@ if TYPE_CHECKING:
     from ._write_spool import ReplayOutcome, SpoolOperation
 
 _CLAIM_LEASE_SECS = 30.0
+_MAX_FINITE_BOUND = 1e300
 
 __all__ = ["WriteSpoolClaims"]
 
@@ -43,6 +45,13 @@ class WriteSpoolClaims:
         body = json.loads(str(row["body_json"]))
         if not isinstance(body, dict):
             raise sqlite3.DatabaseError("spool operation body is not a JSON object")
+
+        def finite(value: Any, column: str) -> float:
+            parsed = float(value)
+            if not math.isfinite(parsed):
+                raise ValueError(f"spool {column} is not finite")
+            return parsed
+
         return SpoolOperation(
             sequence=int(row["sequence"]),
             operation_key=str(row["operation_key"]),
@@ -53,18 +62,24 @@ class WriteSpoolClaims:
             receipt_operation_id=row["receipt_operation_id"],
             attempt_count=int(row["attempt_count"]),
             last_error_class=row["last_error_class"],
-            next_attempt_at=float(row["next_attempt_at"]),
+            next_attempt_at=finite(row["next_attempt_at"], "next_attempt_at"),
             quarantined_at=(
-                None if row["quarantined_at"] is None else float(row["quarantined_at"])
+                None
+                if row["quarantined_at"] is None
+                else finite(row["quarantined_at"], "quarantined_at")
             ),
             quarantine_reason=row["quarantine_reason"],
-            settled_at=(None if row["settled_at"] is None else float(row["settled_at"])),
+            settled_at=(
+                None
+                if row["settled_at"] is None
+                else finite(row["settled_at"], "settled_at")
+            ),
             result_drawer_id=row["result_drawer_id"],
             claim_token=row["claim_token"],
             claim_expires_at=(
                 None
                 if row["claim_expires_at"] is None
-                else float(row["claim_expires_at"])
+                else finite(row["claim_expires_at"], "claim_expires_at")
             ),
         )
 
@@ -280,15 +295,29 @@ class WriteSpoolClaims:
         where = [
             "candidate.settled_at IS NULL",
             "candidate.quarantined_at IS NULL",
-            "(candidate.claim_token IS NULL OR candidate.claim_expires_at <= ?)",
+            "("
+            "candidate.claim_token IS NULL "
+            "OR candidate.claim_expires_at <= ? "
+            "OR candidate.claim_expires_at IS NULL "
+            "OR typeof(candidate.claim_expires_at) NOT IN ('real', 'integer') "
+            "OR abs(candidate.claim_expires_at) > ?"
+            ")",
             "NOT EXISTS (SELECT 1 FROM write_operations AS earlier "
             "WHERE earlier.sequence < candidate.sequence "
             "AND earlier.settled_at IS NULL AND earlier.quarantined_at IS NULL)",
         ]
-        params: list[object] = [now]
+        params: list[object] = [now, _MAX_FINITE_BOUND]
         if not ignore_retry_delay:
-            where.append("candidate.next_attempt_at <= ?")
+            where.append(
+                "("
+                "candidate.next_attempt_at <= ? "
+                "OR candidate.next_attempt_at IS NULL "
+                "OR typeof(candidate.next_attempt_at) NOT IN ('real', 'integer') "
+                "OR abs(candidate.next_attempt_at) > ?"
+                ")"
+            )
             params.append(now)
+            params.append(_MAX_FINITE_BOUND)
         if operation_key is not None:
             where.append("candidate.operation_key = ?")
             params.append(operation_key)
@@ -303,6 +332,30 @@ class WriteSpoolClaims:
             if row is None:
                 connection.execute("COMMIT")
                 return None
+            try:
+                operation = WriteSpoolClaims._row_to_operation(row)
+            except (ValueError, TypeError, OverflowError, sqlite3.DatabaseError):
+                # Decode before the claim UPDATE: claiming overwrites
+                # claim_expires_at with a fresh finite lease, which would
+                # otherwise mask a corrupt persisted value. Validate the
+                # untouched candidate row first and quarantine in place.
+                reason = "malformed_spool_row"
+                connection.execute(
+                    """
+                    UPDATE write_operations
+                    SET quarantined_at = ?2,
+                        quarantine_reason = ?3,
+                        claim_token = NULL,
+                        claim_expires_at = NULL,
+                        updated_at = ?2
+                    WHERE operation_key = ?1 AND settled_at IS NULL
+                    """,
+                    (str(row["operation_key"]), now, reason),
+                )
+                connection.execute("COMMIT")
+                return WriteSpoolClaims._quarantined_row_to_operation(
+                    row, now, reason
+                )
             updated = connection.execute(
                 """
                 UPDATE write_operations
@@ -312,9 +365,21 @@ class WriteSpoolClaims:
                 WHERE operation_key = ?1
                   AND settled_at IS NULL
                   AND quarantined_at IS NULL
-                  AND (claim_token IS NULL OR claim_expires_at <= ?3)
+                  AND (
+                    claim_token IS NULL
+                    OR claim_expires_at <= ?3
+                    OR claim_expires_at IS NULL
+                    OR typeof(claim_expires_at) NOT IN ('real', 'integer')
+                    OR abs(claim_expires_at) > ?5
+                  )
                 """,
-                (str(row["operation_key"]), claim_token, claim_expires_at),
+                (
+                    str(row["operation_key"]),
+                    claim_token,
+                    claim_expires_at,
+                    _MAX_FINITE_BOUND,
+                    _MAX_FINITE_BOUND,
+                ),
             ).rowcount
             if updated != 1:
                 connection.execute("ROLLBACK")
