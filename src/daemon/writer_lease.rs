@@ -221,6 +221,8 @@ fn spawn_runtime_writer_lease_heartbeat(
         recovery_faults,
         #[cfg(test)]
         None,
+        #[cfg(test)]
+        None,
     )
 }
 
@@ -228,6 +230,7 @@ fn spawn_runtime_writer_lease_heartbeat_with_renewal_finished_signal(
     db_path: PathBuf,
     lease: RuntimeWriterLease,
     recovery_faults: crate::daemon_recovery::DaemonRecoveryFaultReporter,
+    #[cfg(test)] renewal_started: Option<std::sync::mpsc::SyncSender<()>>,
     #[cfg(test)] renewal_finished: Option<std::sync::mpsc::SyncSender<()>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -236,7 +239,13 @@ fn spawn_runtime_writer_lease_heartbeat_with_renewal_finished_signal(
             interval.tick().await;
             let db_path = db_path.clone();
             let lease_for_renew = lease.clone();
+            #[cfg(test)]
+            let renewal_started = renewal_started.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<bool> {
+                #[cfg(test)]
+                if let Some(renewal_started) = renewal_started {
+                    let _ = renewal_started.try_send(());
+                }
                 renew_daemon_writer_lease_with_retry(&db_path, &lease_for_renew)
             })
             .await;
@@ -335,6 +344,45 @@ fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wait_for_checkpoint<T>(
+        rx: &std::sync::mpsc::Receiver<T>,
+        timeout: Duration,
+        label: &str,
+    ) -> Result<T, String> {
+        rx.recv_timeout(timeout).map_err(|err| match err {
+            std::sync::mpsc::RecvTimeoutError::Timeout => {
+                format!("{label} timed out after {}ms", timeout.as_millis())
+            }
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                format!("{label} disconnected before the checkpoint arrived")
+            }
+        })
+    }
+
+    #[test]
+    fn bounded_checkpoint_wait_returns_value_before_deadline() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send("ready").expect("send checkpoint");
+        let got = wait_for_checkpoint(&rx, Duration::from_millis(50), "ready")
+            .expect("checkpoint should arrive");
+        assert_eq!(got, "ready");
+    }
+
+    #[test]
+    fn bounded_checkpoint_wait_returns_contextual_timeout() {
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let err = wait_for_checkpoint(&rx, Duration::from_millis(10), "renewal finished")
+            .expect_err("empty channel must time out");
+        assert!(
+            err.contains("renewal finished"),
+            "timeout must name the checkpoint: {err}"
+        );
+        assert!(
+            err.contains("timed out"),
+            "timeout must be a contextual failure, not a bare Timeout panic: {err}"
+        );
+    }
 
     #[test]
     fn writer_lease_retry_classifier_treats_admission_busy_as_lock() {
@@ -579,23 +627,42 @@ mod tests {
         db.conn()
             .execute_batch("BEGIN IMMEDIATE;")
             .expect("hold CRUD writer lock");
+        let (renewal_started_tx, renewal_started_rx) = std::sync::mpsc::sync_channel(1);
         let (renewal_finished_tx, renewal_finished_rx) = std::sync::mpsc::sync_channel(1);
         let heartbeat = spawn_runtime_writer_lease_heartbeat_with_renewal_finished_signal(
             db_path.clone(),
             lease.clone(),
             recovery_faults,
+            Some(renewal_started_tx),
             Some(renewal_finished_tx),
         );
         tokio::task::spawn_blocking(move || {
-            renewal_finished_rx.recv_timeout(
-                DAEMON_WRITER_LEASE_RENEW_RETRY_DEADLINE
-                    + DAEMON_WRITER_LEASE_RENEW_BUSY_TIMEOUT
-                    + Duration::from_secs(1),
+            wait_for_checkpoint(
+                &renewal_started_rx,
+                Duration::from_secs(5),
+                "writer lease renewal start under CRUD lock",
             )
         })
         .await
-        .expect("join renewal completion checkpoint")
-        .expect("writer lease renewal must finish its bounded retry while CRUD is locked");
+        .expect("join renewal start")
+        .expect("writer lease renewal start under CRUD lock");
+
+        db.conn()
+            .execute_batch("ROLLBACK;")
+            .expect("release CRUD writer lock");
+
+        tokio::task::spawn_blocking(move || {
+            wait_for_checkpoint(
+                &renewal_finished_rx,
+                DAEMON_WRITER_LEASE_RENEW_RETRY_DEADLINE
+                    + DAEMON_WRITER_LEASE_RENEW_BUSY_TIMEOUT
+                    + Duration::from_secs(1),
+                "writer lease renewal must finish its bounded retry after CRUD lock releases",
+            )
+        })
+        .await
+        .expect("join renewal finished")
+        .expect("writer lease renewal must finish its bounded retry after CRUD lock releases");
 
         assert!(
             !super::super::shutdown_requested(),
@@ -608,10 +675,6 @@ mod tests {
         let snapshot = recovery.snapshot().expect("read isolated recovery state");
         assert_eq!(snapshot.recent_fault_count, 0);
         assert_eq!(snapshot.last_fault, None);
-
-        db.conn()
-            .execute_batch("ROLLBACK;")
-            .expect("release CRUD writer lock");
         let renewed = tokio::task::spawn_blocking(move || {
             renew_daemon_writer_lease_with_retry(&db_path, &lease)
         })
