@@ -165,6 +165,7 @@ pub struct IncompleteCleanup {
     owner: Box<DeadlineChild>,
     pub report: CleanupReport,
     pub resources: ResourceSnapshot,
+    timed_out: bool,
 }
 
 impl IncompleteCleanup {
@@ -381,6 +382,7 @@ impl DeadlineChild {
                             owner: Box::new(child),
                             report,
                             resources,
+                            timed_out: false,
                         }))
                     }
                 }
@@ -396,6 +398,7 @@ impl DeadlineChild {
                             owner: Box::new(child),
                             report,
                             resources,
+                            timed_out: true,
                         }))
                     }
                 }
@@ -420,6 +423,7 @@ impl DeadlineChild {
                         owner: Box::new(child),
                         report,
                         resources,
+                        timed_out: false,
                     }))
                 }
             };
@@ -449,6 +453,7 @@ impl DeadlineChild {
                     owner: Box::new(self),
                     report,
                     resources,
+                    timed_out,
                 }))
             }
         }
