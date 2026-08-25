@@ -13899,10 +13899,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_only_read_bypasses_writer_capable_async_db_open_failure() {
-        let (_tempdir, _db_path, server) = setup_server();
-        let server = server.with_async_db_open_error_for_test(
-            "failed to open MCP async database pool: database is locked",
-        );
+        let (_tempdir, db_path, server) = setup_server();
+        let query_only_async_db =
+            QueryOnlyAsyncDb::open(&db_path, 4).expect("open query-only async db fixture");
+        let server = server
+            .with_query_only_async_db_for_test(query_only_async_db)
+            .with_async_db_open_error_for_test(
+                "failed to open MCP async database pool: database is locked",
+            );
 
         let query_only = server
             .run_query_only_read_bounded("test_query_only_read", Duration::from_secs(1), |db| {

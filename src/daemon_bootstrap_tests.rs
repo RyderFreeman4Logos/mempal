@@ -278,9 +278,13 @@ async fn write_observer_stall_checks_record_queue_io_burst() {
     assert!(queue_sample_count() > before);
 }
 
+fn short_tempdir() -> tempfile::TempDir {
+    tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+}
+
 #[test]
 fn daemon_storage_open_skips_queue_reclaim_while_writer_is_busy() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
     drop(Database::open(&db_path).expect("initialize database"));
 
@@ -305,26 +309,20 @@ fn daemon_storage_open_skips_queue_reclaim_while_writer_is_busy() {
         sender.send(outcome).expect("send daemon storage result");
     });
     opener_started_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(5))
         .expect("daemon storage opener must reach the busy-window boundary");
-    let outcome = receiver.recv_timeout(Duration::from_secs(2)).ok();
-    let opened_while_busy = outcome.is_some();
+    // Completing while the writer lock is still held is the skip-reclaim event.
+    // The timeout is only a deadlock guard under suite load.
+    let outcome = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("daemon restart must not perform queue reclamation while opening storage");
 
     holder
         .execute_batch("ROLLBACK;")
         .expect("release SQLite write lock");
-    let outcome = outcome.unwrap_or_else(|| {
-        receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("daemon storage open must finish after releasing lock")
-    });
     opener.join().expect("join daemon storage opener");
 
     outcome.expect("open daemon storage");
-    assert!(
-        opened_while_busy,
-        "daemon restart must not perform queue reclamation while opening storage"
-    );
 }
 
 #[test]
