@@ -82,3 +82,59 @@ async fn spool_replay_preserves_sqlite_contention_for_watchdog() {
         Some(true),
     );
 }
+
+#[tokio::test]
+async fn post_publish_parent_sync_failure_then_fallback_replay_yields_one_queue_row() {
+    let tmp = tempfile::TempDir::new_in("/tmp").expect("short tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+    let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+    let spool = Arc::new(crate::ingress_spool::IngressSpool::new(tmp.path()));
+    let request = crate::hook_ipc::HookIpcEnqueueRequest::new(
+        HookEvent::UserPromptSubmit.queue_kind(),
+        r#"{"event":"UserPromptSubmit","payload":"post-publish sync"}"#,
+    );
+    let original_key = request.idempotency_key.clone();
+    crate::ingress_spool::fail_next_parent_namespace_sync();
+
+    let persist_response =
+        super::persist_hook_ipc_request(&store, &spool, &observer, request.clone()).await;
+    let crate::hook_ipc::HookIpcEnqueueResponse::Error { message } = persist_response else {
+        panic!("post-rename parent sync failure must surface as a persist error");
+    };
+    let fallback = crate::hook_ipc::HookIpcFallbackReason::Rejected(message);
+    let fallback_store = PendingMessageStore::new(&db_path).expect("open fallback queue");
+    if fallback.may_have_reached_daemon() {
+        fallback_store
+            .enqueue_idempotent_with_key(
+                HookEvent::UserPromptSubmit.queue_kind(),
+                &request.payload,
+                &original_key,
+            )
+            .expect("idempotent fallback");
+    } else {
+        fallback_store
+            .enqueue(HookEvent::UserPromptSubmit.queue_kind(), &request.payload)
+            .expect("fresh fallback");
+    }
+
+    assert_eq!(
+        spool
+            .drain_once(&store)
+            .await
+            .expect("replay published record"),
+        1
+    );
+
+    let count: i64 = rusqlite::Connection::open(&db_path)
+        .expect("open sqlite")
+        .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
+            row.get(0)
+        })
+        .expect("count pending");
+    assert_eq!(
+        count, 1,
+        "fallback plus spool replay must collapse to one row"
+    );
+}

@@ -118,10 +118,11 @@ impl fmt::Display for HookIpcFallbackReason {
 
 impl HookIpcFallbackReason {
     pub(crate) fn may_have_reached_daemon(&self) -> bool {
-        matches!(
-            self,
-            Self::Timeout | Self::RequestWriteFailed(_) | Self::ResponseReadFailed(_)
-        )
+        match self {
+            Self::Timeout | Self::RequestWriteFailed(_) | Self::ResponseReadFailed(_) => true,
+            Self::Rejected(message) => message.contains("ingress spool delivery is uncertain"),
+            _ => false,
+        }
     }
 }
 

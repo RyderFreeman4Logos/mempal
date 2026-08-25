@@ -4,6 +4,8 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -17,8 +19,15 @@ pub(crate) const INGRESS_SPOOL_DIR: &str = "ingress-spool";
 const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
+static FAIL_NEXT_PARENT_SYNC: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
 thread_local! {
     static SYNC_DIRECTORY_CALLS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_parent_namespace_sync() {
+    FAIL_NEXT_PARENT_SYNC.store(true, Ordering::SeqCst);
 }
 
 #[derive(Debug, Error)]
@@ -43,6 +52,8 @@ pub(crate) enum IngressSpoolError {
     },
     #[error("ingress spool operation key conflicts with an existing record")]
     Conflict,
+    #[error("ingress spool delivery is uncertain")]
+    Uncertain(#[source] io::Error),
     #[error(transparent)]
     Queue(#[from] QueueError),
 }
@@ -110,7 +121,7 @@ impl IngressSpool {
         if path.exists() || claim_path.exists() {
             let existing = read_record(if path.exists() { &path } else { &claim_path })?;
             return if existing == *request {
-                sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Io)?;
+                sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Uncertain)?;
                 Ok(AppendOutcome::AlreadyPresent)
             } else {
                 Err(IngressSpoolError::Conflict)
@@ -150,7 +161,7 @@ impl IngressSpool {
             file.write_all(&bytes).map_err(IngressSpoolError::Io)?;
             file.sync_all().map_err(IngressSpoolError::Io)?;
             fs::rename(&temp_path, &path).map_err(IngressSpoolError::Io)?;
-            sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Io)
+            sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Uncertain)
         })();
         if write_result.is_err() {
             let _ = fs::remove_file(&temp_path);
@@ -404,6 +415,10 @@ fn sync_spool_namespace(dir: &Path) -> io::Result<()> {
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    #[cfg(test)]
+    if FAIL_NEXT_PARENT_SYNC.swap(false, Ordering::SeqCst) {
+        return Err(io::Error::other("injected parent directory sync failure"));
+    }
     sync_directory(parent)
 }
 
