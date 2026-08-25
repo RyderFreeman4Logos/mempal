@@ -96,7 +96,7 @@ async fn post_publish_parent_sync_failure_then_fallback_replay_yields_one_queue_
         r#"{"event":"UserPromptSubmit","payload":"post-publish sync"}"#,
     );
     let original_key = request.idempotency_key.clone();
-    crate::ingress_spool::fail_next_parent_namespace_sync();
+    let _fault = crate::ingress_spool::fail_next_parent_namespace_sync_for(&spool);
 
     let persist_response =
         super::persist_hook_ipc_request(&store, &spool, &observer, request.clone()).await;

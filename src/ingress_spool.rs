@@ -19,15 +19,28 @@ pub(crate) const INGRESS_SPOOL_DIR: &str = "ingress-spool";
 const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
-static FAIL_NEXT_PARENT_SYNC: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
 thread_local! {
     static SYNC_DIRECTORY_CALLS: Cell<u64> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
-pub(crate) fn fail_next_parent_namespace_sync() {
-    FAIL_NEXT_PARENT_SYNC.store(true, Ordering::SeqCst);
+pub(crate) struct ParentSyncFaultGuard {
+    flag: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_parent_namespace_sync_for(spool: &IngressSpool) -> ParentSyncFaultGuard {
+    spool.fail_next_parent_sync.store(true, Ordering::SeqCst);
+    ParentSyncFaultGuard {
+        flag: Arc::clone(&spool.fail_next_parent_sync),
+    }
+}
+
+#[cfg(test)]
+impl Drop for ParentSyncFaultGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Error)]
@@ -83,6 +96,8 @@ pub(crate) struct IngressSpool {
     max_bytes: u64,
     append_lock: Arc<Mutex<()>>,
     active_claims: Arc<Mutex<HashSet<PathBuf>>>,
+    #[cfg(test)]
+    fail_next_parent_sync: Arc<AtomicBool>,
 }
 
 impl IngressSpool {
@@ -96,6 +111,8 @@ impl IngressSpool {
             max_bytes,
             append_lock: Arc::new(Mutex::new(())),
             active_claims: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            fail_next_parent_sync: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -121,7 +138,8 @@ impl IngressSpool {
         if path.exists() || claim_path.exists() {
             let existing = read_record(if path.exists() { &path } else { &claim_path })?;
             return if existing == *request {
-                sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Uncertain)?;
+                self.sync_spool_namespace()
+                    .map_err(IngressSpoolError::Uncertain)?;
                 Ok(AppendOutcome::AlreadyPresent)
             } else {
                 Err(IngressSpoolError::Conflict)
@@ -161,7 +179,8 @@ impl IngressSpool {
             file.write_all(&bytes).map_err(IngressSpoolError::Io)?;
             file.sync_all().map_err(IngressSpoolError::Io)?;
             fs::rename(&temp_path, &path).map_err(IngressSpoolError::Io)?;
-            sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Uncertain)
+            self.sync_spool_namespace()
+                .map_err(IngressSpoolError::Uncertain)
         })();
         if write_result.is_err() {
             let _ = fs::remove_file(&temp_path);
@@ -190,9 +209,7 @@ impl IngressSpool {
                 Ok(_) => {
                     let delete_result = fs::remove_file(&claim_path)
                         .map_err(IngressSpoolError::Io)
-                        .and_then(|()| {
-                            sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Io)
-                        });
+                        .and_then(|()| self.sync_spool_namespace().map_err(IngressSpoolError::Io));
                     self.forget_claim(&claim_path)?;
                     delete_result?;
                 }
@@ -275,7 +292,7 @@ impl IngressSpool {
         self.forget_claim(claim_path)?;
         result
             .map_err(IngressSpoolError::Io)
-            .and_then(|()| sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Io))
+            .and_then(|()| self.sync_spool_namespace().map_err(IngressSpoolError::Io))
     }
 
     fn forget_claim(&self, claim_path: &Path) -> Result<(), IngressSpoolError> {
@@ -335,7 +352,7 @@ impl IngressSpool {
             recovered = true;
         }
         if recovered {
-            sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Io)?;
+            self.sync_spool_namespace().map_err(IngressSpoolError::Io)?;
         }
         Ok(())
     }
@@ -356,7 +373,7 @@ impl IngressSpool {
         } else {
             fs::rename(path, dest).map_err(IngressSpoolError::Io)?;
         }
-        sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Io)
+        self.sync_spool_namespace().map_err(IngressSpoolError::Io)
     }
 
     fn claim_path(&self, path: &Path) -> PathBuf {
@@ -371,6 +388,20 @@ impl IngressSpool {
         identity.extend_from_slice(request.idempotency_key.as_bytes());
         let digest = blake3::hash(&identity).to_hex();
         self.dir.join(format!("{digest}.json"))
+    }
+
+    fn sync_spool_namespace(&self) -> io::Result<()> {
+        sync_directory(&self.dir)?;
+        let parent = self
+            .dir
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        #[cfg(test)]
+        if self.fail_next_parent_sync.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("injected parent directory sync failure"));
+        }
+        sync_directory(parent)
     }
 }
 
@@ -407,19 +438,6 @@ fn sync_directory(dir: &Path) -> io::Result<()> {
     #[cfg(test)]
     SYNC_DIRECTORY_CALLS.with(|calls| calls.set(calls.get() + 1));
     File::open(dir)?.sync_all()
-}
-
-fn sync_spool_namespace(dir: &Path) -> io::Result<()> {
-    sync_directory(dir)?;
-    let parent = dir
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    #[cfg(test)]
-    if FAIL_NEXT_PARENT_SYNC.swap(false, Ordering::SeqCst) {
-        return Err(io::Error::other("injected parent directory sync failure"));
-    }
-    sync_directory(parent)
 }
 
 #[cfg(test)]
@@ -721,3 +739,7 @@ mod tests {
 #[cfg(test)]
 #[path = "ingress_spool_quarantine_collision_tests.rs"]
 mod ingress_spool_quarantine_collision_tests;
+
+#[cfg(test)]
+#[path = "ingress_spool_parent_sync_isolation_tests.rs"]
+mod ingress_spool_parent_sync_isolation_tests;
