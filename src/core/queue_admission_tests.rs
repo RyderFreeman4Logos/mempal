@@ -1,19 +1,25 @@
 use crate::core::db::Database;
 use crate::core::db_admission::ProfileDbAdmission;
 use crate::core::queue::{PendingMessageStore, QueueError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(unix)]
 use rusqlite::{Connection, OpenFlags};
 
 use super::{
-    QUEUE_CONNECTION_CACHE_BYTES, QUEUE_CONNECTIONS_PER_CACHE, queue_stats_readonly,
+    QUEUE_CONNECTION_CACHE_BYTES, QUEUE_CONNECTIONS_PER_CACHE,
+    QUEUE_STATS_READONLY_DEFAULT_BUSY_TIMEOUT, queue_stats_readonly,
     queue_stats_readonly_with_busy_timeout, queue_write_admission_preflight,
+    take_last_applied_queue_busy_timeout,
 };
+
+fn short_tempdir() -> tempfile::TempDir {
+    tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+}
 
 #[test]
 fn readonly_stats_missing_database_has_no_filesystem_side_effects() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = short_tempdir();
     let db_dir = temp.path().join("missing-home").join(".mempal");
     let db_path = db_dir.join("palace.db");
 
@@ -26,7 +32,7 @@ fn readonly_stats_missing_database_has_no_filesystem_side_effects() {
 
 #[test]
 fn queue_cache_clones_share_admission_and_forks_register_separately() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     drop(Database::open(&db_path).expect("initialize database"));
 
@@ -77,7 +83,7 @@ fn queue_cache_clones_share_admission_and_forks_register_separately() {
 fn readonly_stats_open_the_admitted_target_after_symlink_retarget() {
     use std::os::unix::fs::symlink;
 
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = short_tempdir();
     let first_target = temp.path().join("first.db");
     let second_target = temp.path().join("second.db");
     let link_path = temp.path().join("palace.db");
@@ -105,7 +111,7 @@ fn readonly_stats_open_the_admitted_target_after_symlink_retarget() {
 
 #[test]
 fn readonly_stats_with_diagnostic_busy_timeout_returns_without_default_busy_wait() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     drop(Database::open(&db_path).expect("initialize database"));
 
@@ -115,10 +121,10 @@ fn readonly_stats_with_diagnostic_busy_timeout_returns_without_default_busy_wait
     lock.execute_batch("BEGIN EXCLUSIVE;")
         .expect("hold SQLite exclusive lock");
 
-    let started = Instant::now();
+    let _ = take_last_applied_queue_busy_timeout();
     let error = queue_stats_readonly_with_busy_timeout(&db_path, Duration::from_millis(25))
         .expect_err("diagnostic queue stats must report the held writer lock");
-    let elapsed = started.elapsed();
+    let applied = take_last_applied_queue_busy_timeout();
 
     lock.execute_batch("ROLLBACK;")
         .expect("release SQLite write lock");
@@ -126,9 +132,10 @@ fn readonly_stats_with_diagnostic_busy_timeout_returns_without_default_busy_wait
         error.is_sqlite_lock(),
         "expected SQLite lock diagnostic, got {error}"
     );
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "diagnostic stats inherited a long SQLite busy wait: {elapsed:?}"
+    assert_eq!(
+        applied,
+        Some(Duration::from_millis(25)),
+        "diagnostic stats inherited a long SQLite busy wait"
     );
 }
 
@@ -138,7 +145,7 @@ fn readonly_stats_with_diagnostic_busy_timeout_returns_without_default_busy_wait
 #[cfg(unix)]
 #[test]
 fn readonly_stats_plain_does_not_inherit_default_busy_wait() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     drop(Database::open(&db_path).expect("initialize database"));
 
@@ -148,10 +155,10 @@ fn readonly_stats_plain_does_not_inherit_default_busy_wait() {
     lock.execute_batch("BEGIN EXCLUSIVE;")
         .expect("hold SQLite exclusive lock");
 
-    let started = Instant::now();
+    let _ = take_last_applied_queue_busy_timeout();
     let error = queue_stats_readonly(&db_path)
         .expect_err("readonly queue stats must report the held writer lock");
-    let elapsed = started.elapsed();
+    let applied = take_last_applied_queue_busy_timeout();
 
     lock.execute_batch("ROLLBACK;")
         .expect("release SQLite write lock");
@@ -159,16 +166,17 @@ fn readonly_stats_plain_does_not_inherit_default_busy_wait() {
         error.is_sqlite_lock(),
         "expected SQLite lock diagnostic, got {error}"
     );
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "plain readonly stats inherited the default SQLite busy wait: {elapsed:?}"
+    assert_eq!(
+        applied,
+        Some(QUEUE_STATS_READONLY_DEFAULT_BUSY_TIMEOUT),
+        "plain readonly stats inherited the default SQLite busy wait"
     );
 }
 
 #[cfg(unix)]
 #[test]
 fn write_admission_preflight_returns_without_default_busy_wait() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     drop(Database::open(&db_path).expect("initialize database"));
 
@@ -176,10 +184,10 @@ fn write_admission_preflight_returns_without_default_busy_wait() {
     lock.execute_batch("BEGIN IMMEDIATE;")
         .expect("hold SQLite write lock");
 
-    let started = Instant::now();
+    let _ = take_last_applied_queue_busy_timeout();
     let error = queue_write_admission_preflight(&db_path)
         .expect_err("queue preflight must report the held writer lock");
-    let elapsed = started.elapsed();
+    let applied = take_last_applied_queue_busy_timeout();
 
     lock.execute_batch("ROLLBACK;")
         .expect("release SQLite write lock");
@@ -187,8 +195,9 @@ fn write_admission_preflight_returns_without_default_busy_wait() {
         error.is_sqlite_lock(),
         "expected SQLite lock preflight error, got {error}"
     );
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "queue preflight inherited a long SQLite busy wait: {elapsed:?}"
+    assert_eq!(
+        applied,
+        Some(Duration::ZERO),
+        "queue preflight inherited a long SQLite busy wait"
     );
 }

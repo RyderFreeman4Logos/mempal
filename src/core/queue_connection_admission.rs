@@ -78,7 +78,7 @@ impl QueueConnectionAdmission {
 pub fn queue_write_admission_preflight(path: &Path) -> Result<()> {
     let admission = QueueConnectionAdmission::new();
     let connection = admission.open_read_write(path)?;
-    connection.busy_timeout(Duration::ZERO)?;
+    apply_queue_busy_timeout(&connection, Duration::ZERO)?;
     connection.execute_batch("BEGIN IMMEDIATE; ROLLBACK;")?;
     Ok(())
 }
@@ -132,9 +132,30 @@ fn queue_stats_readonly_with_optional_busy_timeout(
         DbAdmissionRequest::new(DbHolderClass::current_process(), 1, 2 * 1024 * 1024),
     )?;
     let connection = open(admission.database_path())?;
-    connection.busy_timeout(busy_timeout.unwrap_or(QUEUE_STATS_READONLY_DEFAULT_BUSY_TIMEOUT))?;
+    apply_queue_busy_timeout(
+        &connection,
+        busy_timeout.unwrap_or(QUEUE_STATS_READONLY_DEFAULT_BUSY_TIMEOUT),
+    )?;
     connection.pragma_update(None, "cache_size", QUEUE_SQLITE_CACHE_SIZE_KIB)?;
     compute_queue_stats(&connection, DEFAULT_MAX_INGEST_ACTIVE_BYTES)
+}
+
+fn apply_queue_busy_timeout(connection: &Connection, timeout: Duration) -> Result<()> {
+    connection.busy_timeout(timeout)?;
+    #[cfg(test)]
+    LAST_APPLIED_QUEUE_BUSY_TIMEOUT.with(|cell| cell.set(Some(timeout)));
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_APPLIED_QUEUE_BUSY_TIMEOUT: std::cell::Cell<Option<Duration>> =
+        std::cell::Cell::new(None);
+}
+
+#[cfg(test)]
+pub(super) fn take_last_applied_queue_busy_timeout() -> Option<Duration> {
+    LAST_APPLIED_QUEUE_BUSY_TIMEOUT.with(|cell| cell.replace(None))
 }
 
 /// Compute queue diagnostics from an existing connection without opening or
