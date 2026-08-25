@@ -1,5 +1,64 @@
 use super::*;
 
+async fn spawn_gated_counting_llm_server(
+    count: Arc<AtomicUsize>,
+    notify: Arc<Notify>,
+) -> (
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::{Json, Router, routing::post};
+
+    let (response_release, response_wait) = tokio::sync::oneshot::channel();
+    let response_wait = Arc::new(std::sync::Mutex::new(Some(response_wait)));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let count = Arc::clone(&count);
+            let notify = Arc::clone(&notify);
+            let response_wait = Arc::clone(&response_wait);
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                notify.notify_one();
+                let response_wait = response_wait
+                    .lock()
+                    .expect("lock response gate")
+                    .take();
+                if let Some(response_wait) = response_wait {
+                    let _ = response_wait.await;
+                }
+                Json(serde_json::json!({
+                    "id": "test",
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "{\"verdict\":\"keep\",\"score\":0.9}"
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "model": "test-model",
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2
+                    }
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gated test LLM server");
+    let addr = listener.local_addr().expect("gated test LLM server address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve gated test LLM server");
+    });
+    (format!("http://{addr}/v1"), response_release, server)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_worker_successful_claim_clears_observed_contention() {
     let _guard = crate::core::config::global_config_test_lock()
@@ -14,7 +73,7 @@ async fn test_worker_successful_claim_clears_observed_contention() {
     let db_path = tmp.path().join("palace.db");
     let request_count = Arc::new(AtomicUsize::new(0));
     let request_notify = Arc::new(Notify::new());
-    let (base_url, server) = spawn_counting_llm_server(
+    let (base_url, response_release, server) = spawn_gated_counting_llm_server(
         Arc::clone(&request_count),
         Arc::clone(&request_notify),
     )
@@ -103,6 +162,10 @@ async fn test_worker_successful_claim_clears_observed_contention() {
     tokio::time::timeout(Duration::from_secs(5), request_notify.notified())
         .await
         .expect("worker should start the claimed LLM request");
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    response_release
+        .send(())
+        .expect("release the first LLM response");
     tokio::time::timeout(Duration::from_secs(20), completion)
         .await
         .expect("worker should complete the claimed task")
