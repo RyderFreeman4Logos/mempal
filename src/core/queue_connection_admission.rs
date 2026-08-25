@@ -150,7 +150,7 @@ fn apply_queue_busy_timeout(connection: &Connection, timeout: Duration) -> Resul
 #[cfg(test)]
 thread_local! {
     static LAST_APPLIED_QUEUE_BUSY_TIMEOUT: std::cell::Cell<Option<Duration>> =
-        std::cell::Cell::new(None);
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
