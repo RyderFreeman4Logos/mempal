@@ -185,6 +185,12 @@ impl IngressSpool {
                     self.forget_claim(&claim_path)?;
                     delete_result?;
                 }
+                Err(QueueError::IdempotencyConflict) => {
+                    let park = self.quarantine(&claim_path);
+                    self.forget_claim(&claim_path)?;
+                    park?;
+                    continue;
+                }
                 Err(error) => {
                     self.release_claim(&record.path, &claim_path)?;
                     return Err(error.into());
@@ -212,10 +218,13 @@ impl IngressSpool {
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
-            records.push(StoredRecord {
-                request: read_record(&path)?,
-                path,
-            });
+            match read_record(&path) {
+                Ok(request) => records.push(StoredRecord { request, path }),
+                Err(IngressSpoolError::Decode { .. }) => {
+                    self.quarantine(&path)?;
+                }
+                Err(error) => return Err(error),
+            }
         }
         records.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(records)
@@ -287,8 +296,24 @@ impl IngressSpool {
             }
             let record_path = claim_path.with_extension("json");
             if record_path.exists() {
-                let claimed = read_record(&claim_path)?;
-                let existing = read_record(&record_path)?;
+                let claimed = match read_record(&claim_path) {
+                    Ok(claimed) => claimed,
+                    Err(IngressSpoolError::Decode { .. }) => {
+                        self.quarantine(&claim_path)?;
+                        recovered = true;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let existing = match read_record(&record_path) {
+                    Ok(existing) => existing,
+                    Err(IngressSpoolError::Decode { .. }) => {
+                        self.quarantine(&record_path)?;
+                        recovered = true;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if claimed != existing {
                     return Err(IngressSpoolError::Conflict);
                 }
@@ -302,6 +327,19 @@ impl IngressSpool {
             sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Io)?;
         }
         Ok(())
+    }
+
+    fn quarantine(&self, path: &Path) -> Result<(), IngressSpoolError> {
+        let file_name = path.file_name().ok_or_else(|| {
+            IngressSpoolError::Io(io::Error::other(
+                "ingress spool record path has no file name",
+            ))
+        })?;
+        let dest = self
+            .dir
+            .join(format!("{}.quarantine", file_name.to_string_lossy()));
+        fs::rename(path, dest).map_err(IngressSpoolError::Io)?;
+        sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Io)
     }
 
     fn claim_path(&self, path: &Path) -> PathBuf {
@@ -340,7 +378,7 @@ fn spool_bytes(dir: &Path) -> Result<u64, IngressSpoolError> {
         let path = entry.map_err(IngressSpoolError::Io)?.path();
         if matches!(
             path.extension().and_then(|value| value.to_str()),
-            Some("json" | "tmp" | "claim")
+            Some("json" | "tmp" | "claim" | "quarantine")
         ) {
             total = total.saturating_add(fs::metadata(path).map_err(IngressSpoolError::Io)?.len());
         }
@@ -550,5 +588,111 @@ mod tests {
             spool.append(&request("temp-limit", "payload")),
             Err(IngressSpoolError::Full { .. })
         ));
+    }
+
+    fn ordered_conflict_and_later(
+        spool: &IngressSpool,
+    ) -> (HookIpcEnqueueRequest, HookIpcEnqueueRequest) {
+        for index in 0..64 {
+            let conflict = request(&format!("conflict-{index}"), "payload-b");
+            let later = request(&format!("later-{index}"), "payload-valid");
+            if spool.record_path(&conflict) < spool.record_path(&later) {
+                return (conflict, later);
+            }
+        }
+        panic!("could not find spool keys with conflict-before-later order");
+    }
+
+    fn quarantined_paths(spool: &IngressSpool) -> Vec<PathBuf> {
+        fs::read_dir(&spool.dir)
+            .expect("spool dir")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("quarantine"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn terminal_idempotency_conflict_is_quarantined_and_later_record_drains() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        Database::open(&db_path).expect("database");
+        let spool = IngressSpool::new(tempdir.path());
+        let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+        let (conflict, later) = ordered_conflict_and_later(&spool);
+
+        store
+            .enqueue_idempotent_with_key(
+                conflict.kind.clone(),
+                "seeded-original".to_string(),
+                conflict.idempotency_key.clone(),
+            )
+            .await
+            .expect("seed original key");
+        spool.append(&conflict).expect("append conflict");
+        spool.append(&later).expect("append later valid");
+
+        let before = spool.records().expect("records before drain");
+        assert_eq!(before[0].request.idempotency_key, conflict.idempotency_key);
+        assert_eq!(before[1].request.idempotency_key, later.idempotency_key);
+
+        let drained = spool
+            .drain_once(&store)
+            .await
+            .expect("drain continues past terminal conflict");
+        assert_eq!(drained, 1);
+        assert_eq!(spool.records().expect("active records").len(), 0);
+
+        let quarantined = quarantined_paths(&spool);
+        assert_eq!(quarantined.len(), 1);
+        let parked = read_record(&quarantined[0]).expect("quarantined conflict remains readable");
+        assert_eq!(parked.idempotency_key, conflict.idempotency_key);
+        assert_eq!(parked.payload, conflict.payload);
+
+        assert_eq!(
+            store
+                .operation_status(PendingMessageStore::idempotent_message_id(
+                    &later.kind,
+                    &later.idempotency_key,
+                ))
+                .await
+                .expect("later status")
+                .expect("later operation")
+                .id,
+            PendingMessageStore::idempotent_message_id(&later.kind, &later.idempotency_key)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_spool_record_is_quarantined_and_later_record_drains() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        Database::open(&db_path).expect("database");
+        let spool = IngressSpool::new(tempdir.path());
+        let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+        let later = request("later-valid", "payload-valid");
+
+        fs::create_dir_all(&spool.dir).expect("spool dir");
+        fs::write(spool.dir.join("0.json"), b"not-json").expect("malformed record");
+        spool.append(&later).expect("append later valid");
+
+        let drained = spool
+            .drain_once(&store)
+            .await
+            .expect("drain continues past malformed record");
+        assert_eq!(drained, 1);
+        assert_eq!(spool.records().expect("active records").len(), 0);
+        assert_eq!(quarantined_paths(&spool).len(), 1);
+        assert_eq!(
+            store
+                .operation_status(PendingMessageStore::idempotent_message_id(
+                    &later.kind,
+                    &later.idempotency_key,
+                ))
+                .await
+                .expect("later status")
+                .expect("later operation")
+                .id,
+            PendingMessageStore::idempotent_message_id(&later.kind, &later.idempotency_key)
+        );
     }
 }
