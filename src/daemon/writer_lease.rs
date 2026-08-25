@@ -215,7 +215,7 @@ fn spawn_runtime_writer_lease_heartbeat(
     lease: RuntimeWriterLease,
     recovery_faults: crate::daemon_recovery::DaemonRecoveryFaultReporter,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_runtime_writer_lease_heartbeat_with_renewal_finished_signal(
+    spawn_runtime_writer_lease_heartbeat_with_renewal_checkpoints(
         db_path,
         lease,
         recovery_faults,
@@ -226,12 +226,14 @@ fn spawn_runtime_writer_lease_heartbeat(
     )
 }
 
-fn spawn_runtime_writer_lease_heartbeat_with_renewal_finished_signal(
+fn spawn_runtime_writer_lease_heartbeat_with_renewal_checkpoints(
     db_path: PathBuf,
     lease: RuntimeWriterLease,
     recovery_faults: crate::daemon_recovery::DaemonRecoveryFaultReporter,
-    #[cfg(test)] renewal_started: Option<std::sync::mpsc::SyncSender<()>>,
-    #[cfg(test)] renewal_finished: Option<std::sync::mpsc::SyncSender<()>>,
+    #[cfg(test)] renewal_contended: Option<std::sync::mpsc::SyncSender<()>>,
+    #[cfg(test)] renewal_finished: Option<
+        std::sync::mpsc::SyncSender<std::result::Result<bool, String>>,
+    >,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(DAEMON_WRITER_LEASE_RENEW_INTERVAL);
@@ -240,18 +242,24 @@ fn spawn_runtime_writer_lease_heartbeat_with_renewal_finished_signal(
             let db_path = db_path.clone();
             let lease_for_renew = lease.clone();
             #[cfg(test)]
-            let renewal_started = renewal_started.clone();
+            let renewal_contended = renewal_contended.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<bool> {
-                #[cfg(test)]
-                if let Some(renewal_started) = renewal_started {
-                    let _ = renewal_started.try_send(());
-                }
-                renew_daemon_writer_lease_with_retry(&db_path, &lease_for_renew)
+                renew_daemon_writer_lease_with_retry(
+                    &db_path,
+                    &lease_for_renew,
+                    #[cfg(test)]
+                    renewal_contended,
+                )
             })
             .await;
             #[cfg(test)]
             if let Some(renewal_finished) = &renewal_finished {
-                let _ = renewal_finished.try_send(());
+                let completion = match &result {
+                    Ok(Ok(renewed)) => Ok(*renewed),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                let _ = renewal_finished.try_send(completion);
             }
             match result {
                 Ok(Ok(true)) => {}
@@ -281,6 +289,7 @@ fn spawn_runtime_writer_lease_heartbeat_with_renewal_finished_signal(
 fn renew_daemon_writer_lease_with_retry(
     db_path: &Path,
     lease: &RuntimeWriterLease,
+    #[cfg(test)] renewal_contended: Option<std::sync::mpsc::SyncSender<()>>,
 ) -> Result<bool> {
     let started = Instant::now();
     loop {
@@ -290,6 +299,10 @@ fn renew_daemon_writer_lease_with_retry(
                 if anyhow_error_is_sqlite_lock(&error)
                     && started.elapsed() < DAEMON_WRITER_LEASE_RENEW_RETRY_DEADLINE =>
             {
+                #[cfg(test)]
+                if let Some(renewal_contended) = &renewal_contended {
+                    let _ = renewal_contended.try_send(());
+                }
                 std::thread::sleep(DAEMON_WRITER_LEASE_RENEW_RETRY_DELAY);
             }
             Err(error) => return Err(error),
@@ -625,33 +638,41 @@ mod tests {
             crate::daemon_recovery::DaemonRecoveryFaultReporter::new(recovery.clone());
 
         db.conn()
-            .execute_batch("BEGIN IMMEDIATE;")
+            .pragma_update(None, "journal_mode", "DELETE")
+            .expect("switch isolated database to rollback journal");
+        let crud_lock = rusqlite::Connection::open(&db_path).expect("open CRUD lock connection");
+        crud_lock
+            .busy_timeout(Duration::ZERO)
+            .expect("make CRUD lock holder fail fast");
+        crud_lock
+            .execute_batch("BEGIN EXCLUSIVE;")
             .expect("hold CRUD writer lock");
-        let (renewal_started_tx, renewal_started_rx) = std::sync::mpsc::sync_channel(1);
+        drop(db);
+        let (renewal_contended_tx, renewal_contended_rx) = std::sync::mpsc::sync_channel(1);
         let (renewal_finished_tx, renewal_finished_rx) = std::sync::mpsc::sync_channel(1);
-        let heartbeat = spawn_runtime_writer_lease_heartbeat_with_renewal_finished_signal(
+        let heartbeat = spawn_runtime_writer_lease_heartbeat_with_renewal_checkpoints(
             db_path.clone(),
             lease.clone(),
             recovery_faults,
-            Some(renewal_started_tx),
+            Some(renewal_contended_tx),
             Some(renewal_finished_tx),
         );
         tokio::task::spawn_blocking(move || {
             wait_for_checkpoint(
-                &renewal_started_rx,
+                &renewal_contended_rx,
                 Duration::from_secs(5),
-                "writer lease renewal start under CRUD lock",
+                "writer lease renewal contention under CRUD lock",
             )
         })
         .await
-        .expect("join renewal start")
-        .expect("writer lease renewal start under CRUD lock");
+        .expect("join renewal contention")
+        .expect("writer lease renewal contention under CRUD lock");
 
-        db.conn()
+        crud_lock
             .execute_batch("ROLLBACK;")
             .expect("release CRUD writer lock");
 
-        tokio::task::spawn_blocking(move || {
+        let renewal_result = tokio::task::spawn_blocking(move || {
             wait_for_checkpoint(
                 &renewal_finished_rx,
                 DAEMON_WRITER_LEASE_RENEW_RETRY_DEADLINE
@@ -663,6 +684,11 @@ mod tests {
         .await
         .expect("join renewal finished")
         .expect("writer lease renewal must finish its bounded retry after CRUD lock releases");
+        assert_eq!(
+            renewal_result,
+            Ok(true),
+            "writer lease renewal must succeed after retrying the CRUD lock"
+        );
 
         assert!(
             !super::super::shutdown_requested(),
@@ -676,7 +702,12 @@ mod tests {
         assert_eq!(snapshot.recent_fault_count, 0);
         assert_eq!(snapshot.last_fault, None);
         let renewed = tokio::task::spawn_blocking(move || {
-            renew_daemon_writer_lease_with_retry(&db_path, &lease)
+            renew_daemon_writer_lease_with_retry(
+                &db_path,
+                &lease,
+                #[cfg(test)]
+                None,
+            )
         })
         .await
         .expect("join recovery renewal")
