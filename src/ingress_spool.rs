@@ -335,10 +335,16 @@ impl IngressSpool {
                 "ingress spool record path has no file name",
             ))
         })?;
-        let dest = self
-            .dir
-            .join(format!("{}.quarantine", file_name.to_string_lossy()));
-        fs::rename(path, dest).map_err(IngressSpoolError::Io)?;
+        let digest = blake3::hash(&fs::read(path).map_err(IngressSpoolError::Io)?).to_hex();
+        let dest = self.dir.join(format!(
+            "{}.{digest}.quarantine",
+            file_name.to_string_lossy()
+        ));
+        if dest.exists() {
+            fs::remove_file(path).map_err(IngressSpoolError::Io)?;
+        } else {
+            fs::rename(path, dest).map_err(IngressSpoolError::Io)?;
+        }
         sync_spool_namespace(&self.dir).map_err(IngressSpoolError::Io)
     }
 
@@ -696,3 +702,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ingress_spool_quarantine_collision_tests.rs"]
+mod ingress_spool_quarantine_collision_tests;
