@@ -6,7 +6,10 @@ use std::fs;
 use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use admission_supervisor::{DeadlineChild, LeaderResourceState, SpawnSpec, StdioMode};
+use admission_supervisor::{
+    DeadlineChild, DeadlineOutput, IncompleteCleanup, LeaderResourceState, SpawnSpec, StdioMode,
+    SupervisionError,
+};
 
 use mempal::core::AsyncDb;
 use mempal::core::db::Database;
@@ -15,8 +18,170 @@ use mempal::core::db_admission::{
 };
 
 const MIB: u64 = 1024 * 1024;
+/// Event-driven collection cap for admission fixtures under suite load.
+/// Matches `cli_deadline::CLI_HELPER_DEADLINE`; wait returns on child exit.
+const ADMISSION_FIXTURE_OUTPUT_BOUND: Duration = Duration::from_secs(30);
+const CLEANUP_RETRY: Duration = Duration::from_secs(5);
+
 fn request(class: DbHolderClass, cache_mib: u64) -> DbAdmissionRequest {
     DbAdmissionRequest::new(class, 1, cache_mib * MIB)
+}
+
+/// Wait for a supervised child to complete, then reap it.
+///
+/// Success returns the captured output. Timeout or incomplete cleanup
+/// returns a contextual error instead of a bare empty-stdout / Timeout panic.
+fn wait_for_deadline_output(
+    spec: SpawnSpec,
+    timeout: Duration,
+    label: &str,
+) -> Result<DeadlineOutput, String> {
+    let started = Instant::now();
+    let output = match DeadlineChild::output(spec, timeout) {
+        Ok(output) => output,
+        Err(SupervisionError::CleanupIncomplete(incomplete)) => {
+            match incomplete.finish_output(CLEANUP_RETRY) {
+                Ok(output) => output,
+                Err(still) => return Err(format_incomplete(label, started.elapsed(), &still)),
+            }
+        }
+        Err(error) => {
+            return Err(format!(
+                "{label} failed after {:?}: {error}",
+                started.elapsed()
+            ));
+        }
+    };
+    if output.success() && !output.timed_out {
+        return Ok(output);
+    }
+    Err(format_output_failure(label, started.elapsed(), &output))
+}
+
+fn format_output_failure(label: &str, elapsed: Duration, output: &DeadlineOutput) -> String {
+    let kind = if output.timed_out {
+        "timed out"
+    } else {
+        "failed"
+    };
+    format!(
+        "{label} {kind} after {elapsed:?}: success={} timed_out={} status={:?} stdout={} stderr={} kill_fence={} term_grace_expired={} cleanup_errors={}",
+        output.success(),
+        output.timed_out,
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        output.cleanup.kill_fence_sent,
+        output.cleanup.term_grace_expired,
+        output.cleanup.errors.len(),
+    )
+}
+
+fn format_incomplete(label: &str, elapsed: Duration, incomplete: &IncompleteCleanup) -> String {
+    format!(
+        "{label} timed out after {elapsed:?}: cleanup incomplete resources={:?} kill_fence={} term_grace_expired={} cleanup_errors={}",
+        incomplete.resources,
+        incomplete.report.kill_fence_sent,
+        incomplete.report.term_grace_expired,
+        incomplete.report.errors.len(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_output_wait_returns_completed_child_output() {
+    let mut command = SpawnSpec::new("/bin/sh").expect("absolute shell");
+    command.args(["-c", "printf ready"]);
+    let output = wait_for_deadline_output(command, Duration::from_secs(2), "ready fixture")
+        .expect("ready fixture should complete");
+    assert_eq!(output.stdout, b"ready");
+    assert!(output.success());
+    assert!(!output.timed_out);
+    assert!(output.cleanup.errors.is_empty());
+    assert!(output.cleanup.kill_fence_sent);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_output_wait_returns_contextual_timeout_and_reaps() {
+    let mut command = SpawnSpec::new("/bin/sh").expect("absolute shell");
+    command.args([
+        "-c",
+        "trap '' TERM; printf started; while :; do sleep 60; done",
+    ]);
+    let err = wait_for_deadline_output(command, Duration::from_millis(150), "hanging fixture")
+        .expect_err("hanging fixture must time out");
+    assert!(
+        err.contains("hanging fixture"),
+        "timeout must name the wait: {err}"
+    );
+    assert!(
+        err.contains("timed out"),
+        "timeout must be a contextual failure, not a bare Timeout panic: {err}"
+    );
+    assert!(
+        err.contains("kill_fence") || err.contains("cleanup"),
+        "timeout must report cleanup/reap context: {err}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_output_wait_rejects_term_trap_exit_zero_after_deadline() {
+    let mut command = SpawnSpec::new("/bin/sh").expect("absolute shell");
+    command.args(["-c", "trap 'exit 0' TERM; while :; do sleep 60; done"]);
+    let err = wait_for_deadline_output(command, Duration::from_millis(150), "term-trap fixture")
+        .expect_err("term-trap exit 0 after deadline must be Err");
+    assert!(
+        err.contains("term-trap fixture"),
+        "timeout must name the wait: {err}"
+    );
+    assert!(
+        err.contains("timed out"),
+        "timeout provenance must be preserved: {err}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_output_wait_reports_immediate_nonzero_as_failed() {
+    let command = SpawnSpec::new("/bin/false").expect("absolute false");
+    let err = wait_for_deadline_output(command, Duration::from_secs(2), "false fixture")
+        .expect_err("immediate /bin/false must fail");
+    assert!(
+        err.contains("false fixture"),
+        "failure must name the wait: {err}"
+    );
+    assert!(
+        err.contains("failed"),
+        "non-timeout failure must say failed: {err}"
+    );
+    assert!(
+        !err.contains("timed out"),
+        "non-timeout failure must not say timed out: {err}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_output_wait_reports_missing_executable_as_failed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let command = SpawnSpec::new(tmp.path().join("missing-bin"))
+        .expect("missing absolute path is accepted by SpawnSpec");
+    let err = wait_for_deadline_output(command, Duration::from_secs(2), "missing fixture")
+        .expect_err("missing executable must fail");
+    assert!(
+        err.contains("missing fixture"),
+        "failure must name the wait: {err}"
+    );
+    assert!(
+        err.contains("failed"),
+        "non-timeout spawn/setup failure must say failed: {err}"
+    );
+    assert!(
+        !err.contains("timed out"),
+        "non-timeout spawn/setup failure must not say timed out: {err}"
+    );
 }
 
 #[test]
@@ -284,8 +449,12 @@ fn deadline_child_retains_tail_diagnostics_after_capture_limit() {
         "-c",
         "head -c 1100000 /dev/zero | tr '\\0' x; printf '\\nTAIL_MARKER\\n'",
     ]);
-    let output = DeadlineChild::output(command, Duration::from_secs(5))
-        .expect("capture bounded diagnostic output");
+    let output = wait_for_deadline_output(
+        command,
+        ADMISSION_FIXTURE_OUTPUT_BOUND,
+        "capture bounded diagnostic output",
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
 
     assert!(output.success(), "fixture must complete successfully");
     assert!(
@@ -331,8 +500,12 @@ fn status_remains_available_when_holder_budget_is_exhausted() {
         SpawnSpec::new(env!("CARGO_BIN_EXE_mempal")).expect("absolute mempal executable");
     command.arg("status").env("HOME", &home);
     command.current_dir(&home).expect("absolute home directory");
-    let output =
-        DeadlineChild::output(command, Duration::from_secs(5)).expect("run status at holder cap");
+    let output = wait_for_deadline_output(
+        command,
+        ADMISSION_FIXTURE_OUTPUT_BOUND,
+        "status at holder cap",
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
 
     assert!(
         output.success(),

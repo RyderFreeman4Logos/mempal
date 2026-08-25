@@ -37,6 +37,7 @@ pub fn reference_shared_test_api() {
     let _ = ProcessIdentity::still_refers_to_original_process;
     let _ = CleanupProgress::expect_complete;
     let _ = IncompleteCleanup::finish;
+    let _ = IncompleteCleanup::finish_output;
     let _ = DeadlineChild::spawn;
     let _ = DeadlineChild::output;
     let _ = DeadlineChild::identity;

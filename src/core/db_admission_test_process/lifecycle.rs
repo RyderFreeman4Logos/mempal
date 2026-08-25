@@ -317,10 +317,30 @@ impl DeadlineChild {
                 owner: Box::new(self),
                 report,
                 resources,
+                timed_out: false,
             }),
         }
     }
+}
 
+impl IncompleteCleanup {
+    /// Finish an incomplete reap and retain captured stdout/stderr.
+    pub fn finish_output(mut self, timeout: Duration) -> Result<DeadlineOutput, Self> {
+        match self
+            .owner
+            .cleanup_until(deadline_after(timeout), CleanupMode::Kill)
+        {
+            CleanupProgress::Complete(report) => Ok(self.owner.into_output(self.timed_out, report)),
+            CleanupProgress::Incomplete { report, resources } => {
+                self.report = report;
+                self.resources = resources;
+                Err(self)
+            }
+        }
+    }
+}
+
+impl DeadlineChild {
     pub(super) fn active(&self) -> Option<&ActiveChild> {
         match &self.state {
             Lifecycle::Active(active) => Some(active),
