@@ -325,7 +325,7 @@ impl DaemonWriteObserver {
     }
 
     #[cfg(test)]
-    fn force_last_successful_write_for_test(&self, timestamp_secs: u64) {
+    pub(crate) fn force_last_successful_write_for_test(&self, timestamp_secs: u64) {
         self.inner
             .last_successful_write_secs
             .store(timestamp_secs, Ordering::Relaxed);

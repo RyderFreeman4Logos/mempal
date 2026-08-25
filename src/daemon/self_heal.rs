@@ -76,7 +76,14 @@ pub(super) async fn run_hook_ipc_listener(
                     tracing::debug!(drained, "replayed ingress spool records");
                 }
                 Err(error) => {
-                    drain_observer.record_error(format!("ingress spool drain failed: {error}"));
+                    match &error {
+                        crate::ingress_spool::IngressSpoolError::Queue(queue_error) => {
+                            drain_observer
+                                .record_queue_error("ingress spool drain failed", queue_error);
+                        }
+                        _ => drain_observer
+                            .record_error(format!("ingress spool drain failed: {error}")),
+                    }
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
@@ -312,3 +319,7 @@ fn is_hook_ipc_peer_disconnect(error: &anyhow::Error) -> bool {
 #[cfg(all(test, unix))]
 #[path = "self_heal_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "self_heal_replay_tests.rs"]
+mod replay_tests;
