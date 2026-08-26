@@ -854,7 +854,17 @@ async fn test_file_ingest_uses_bootstrap_identity_for_evidence_drawer() {
 
 #[tokio::test]
 async fn test_bootstrap_identity_separates_same_content_with_different_anchors() {
-    let (_tmp, db, server) = setup_mcp_server();
+    let tmp = short_tempdir();
+    let db_path = tmp.path().join("palace.db");
+    drop(Database::open(&db_path).expect("initialize db"));
+    let server = MempalMcpServer::new_with_factory_and_config(
+        db_path.clone(),
+        isolated_mcp_test_config(&db_path),
+        Arc::new(StubEmbedderFactory {
+            vector: vec![0.1, 0.2, 0.3],
+        }),
+    )
+    .expect("create MCP server");
     let content = "Same content must remain anchor-local.";
     let first = server
         .ingest_json_for_test(json!({
@@ -880,6 +890,7 @@ async fn test_bootstrap_identity_separates_same_content_with_different_anchors()
         .expect("second anchored evidence should succeed");
 
     assert_ne!(first.drawer_id, second.drawer_id);
+    let db = Database::open(&db_path).expect("open db after anchored ingests");
     assert_eq!(db.drawer_count().expect("drawer count"), 2);
     let first_drawer = db
         .get_drawer(&first.drawer_id)
