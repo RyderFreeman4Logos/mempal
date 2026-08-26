@@ -103,6 +103,7 @@ async fn test_worker_successful_claim_clears_observed_contention() {
     tokio::time::timeout(Duration::from_secs(5), request_notify.notified())
         .await
         .expect("worker should start the claimed LLM request");
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
     tokio::time::timeout(Duration::from_secs(20), completion)
         .await
         .expect("worker should complete the claimed task")
