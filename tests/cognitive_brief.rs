@@ -282,14 +282,13 @@ fn start_openai_embedding_stub_with_vector(
     (format!("http://{address}/v1/embeddings"), handle)
 }
 
-fn start_slow_openai_embedding_stub(
+fn start_stalled_openai_embedding_stub(
     expected_query: &str,
-    delay: Duration,
 ) -> (String, mpsc::Receiver<()>, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow embedding stub");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled embedding stub");
     listener
         .set_nonblocking(true)
-        .expect("set slow embedding stub nonblocking");
+        .expect("set stalled embedding stub nonblocking");
     let address = listener.local_addr().expect("local addr");
     let expected_query = expected_query.to_string();
     let (request_started_tx, request_started_rx) = mpsc::channel();
@@ -301,9 +300,9 @@ fn start_slow_openai_embedding_stub(
                     thread::sleep(std::time::Duration::from_millis(100));
                     None
                 }
-                Err(error) => panic!("accept slow request: {error}"),
+                Err(error) => panic!("accept stalled request: {error}"),
             })
-            .expect("slow embedding stub timed out waiting for request");
+            .expect("stalled embedding stub timed out waiting for request");
         let mut request = [0_u8; 4096];
         let bytes_read = stream.read(&mut request).expect("read embedding request");
         let request = String::from_utf8_lossy(&request[..bytes_read]);
@@ -315,17 +314,16 @@ fn start_slow_openai_embedding_stub(
         request_started_tx
             .send(())
             .expect("signal embedding request started");
-        thread::sleep(delay);
-        let body = serde_json::to_string(&json!({
-            "data": [{ "embedding": vector() }]
-        }))
-        .expect("serialize embedding response");
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let _ = stream.write_all(response.as_bytes());
+        match stream.read(&mut [0_u8; 1]) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset
+                ) => {}
+            Ok(_) => panic!("embedding client wrote unexpected data after the request"),
+            Err(error) => panic!("wait for embedding client cancellation: {error}"),
+        }
     });
     (
         format!("http://{address}/v1/embeddings"),
@@ -501,8 +499,7 @@ fn test_cli_brief_embedding_deadline_falls_back_to_bm25_json() {
     );
     db.insert_drawer(&drawer).expect("insert drawer");
     let query = "Synthetic deadline query";
-    let (endpoint, request_started, handle) =
-        start_slow_openai_embedding_stub(query, Duration::from_millis(1500));
+    let (endpoint, request_started, handle) = start_stalled_openai_embedding_stub(query);
     let base_url = endpoint.trim_end_matches("/embeddings").to_string();
 
     let output = run_mempal_with_env_timeout(
@@ -539,7 +536,7 @@ fn test_cli_brief_embedding_deadline_falls_back_to_bm25_json() {
         brief["evidence"][0]["citation"]["drawer_id"],
         "brief_evidence_deadline"
     );
-    handle.join().expect("slow embedding stub");
+    handle.join().expect("stalled embedding stub");
 }
 
 #[test]
