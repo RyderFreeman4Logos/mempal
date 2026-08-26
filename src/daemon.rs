@@ -223,6 +223,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         &context.mempal_home,
         context.store.clone(),
         context.write_observer.clone(),
+        writer_lease.lease().clone(),
     )
     .await
     .context("failed to start daemon hook IPC service")?;
@@ -1173,15 +1174,17 @@ async fn spawn_hook_ipc_service(
     mempal_home: &Path,
     store: AsyncPendingMessageStore,
     write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
+    lease: RuntimeWriterLease,
 ) -> Result<HookIpcServiceHandle> {
     let (listener, socket_guard) = crate::hook_ipc::bind_listener(mempal_home)?;
     let socket_path = socket_guard.path().to_path_buf();
     let spool = Arc::new(crate::ingress_spool::IngressSpool::new(mempal_home));
-    let listener_task = tokio::spawn(self_heal::run_hook_ipc_listener(
+    let listener_task = tokio::spawn(self_heal::run_hook_ipc_listener_with_lease(
         listener,
         store,
         write_observer,
         spool,
+        Some(lease),
     ));
     tracing::info!("daemon hook IPC listening on {}", socket_path.display());
     Ok(HookIpcServiceHandle {

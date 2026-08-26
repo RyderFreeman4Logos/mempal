@@ -1,11 +1,13 @@
 //! Generation-fenced queue mutations for long-lived runtime writers.
 
+use std::time::Duration;
+
 use rusqlite::{Connection, TransactionBehavior, params};
 
 use super::{
     AsyncPendingMessageStore, INGEST_ASYNC_KIND, OVERSIZE_REJECTION_TOTAL_KEY, PendingMessageStore,
-    QueueError, Result, active_payload_bytes_for_kind, hash_source, increment_meta_counter,
-    next_id, now_secs,
+    QueueError, Result, active_payload_bytes_for_kind, explicit_key_conflicts, hash_source,
+    idempotent_key_message_id, increment_meta_counter, next_id, now_secs,
 };
 use crate::core::types::RuntimeWriterLease;
 
@@ -19,6 +21,26 @@ impl AsyncPendingMessageStore {
     ) -> Result<String> {
         self.run(move |store| store.enqueue_fenced(lease.as_ref(), &kind, &payload, operation))
             .await
+    }
+
+    pub async fn enqueue_idempotent_with_key_fail_fast_fenced(
+        &self,
+        lease: Option<RuntimeWriterLease>,
+        kind: String,
+        payload: String,
+        idempotency_key: String,
+        operation: &'static str,
+    ) -> Result<String> {
+        self.run(move |store| {
+            store.enqueue_idempotent_with_key_fail_fast_fenced(
+                lease.as_ref(),
+                &kind,
+                &payload,
+                &idempotency_key,
+                operation,
+            )
+        })
+        .await
     }
 }
 
@@ -74,6 +96,53 @@ impl PendingMessageStore {
                     next_attempt_at
                 )
                 VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?5)
+                "#,
+                params![id, kind, source_hash, payload, created_at],
+            )?;
+            tx.commit()?;
+            Ok(id)
+        })
+    }
+
+    /// Fail-fast explicit-key enqueue under the same Immediate lease fence.
+    pub fn enqueue_idempotent_with_key_fail_fast_fenced(
+        &self,
+        lease: Option<&RuntimeWriterLease>,
+        kind: &str,
+        payload: &str,
+        idempotency_key: &str,
+        operation: &'static str,
+    ) -> Result<String> {
+        let Some(lease) = lease else {
+            return self.enqueue_idempotent_with_key_fail_fast(kind, payload, idempotency_key);
+        };
+        let created_at = now_secs();
+        let source_hash = hash_source(kind, payload);
+        let id = idempotent_key_message_id(kind, idempotency_key);
+        self.with_connection_with_busy_timeout(Some(Duration::ZERO), |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_runtime_writer_lease(&tx, lease, operation)?;
+            if explicit_key_conflicts(&tx, &id, kind, &source_hash)? {
+                return Err(QueueError::IdempotencyConflict);
+            }
+            tx.execute(
+                r#"
+                INSERT INTO pending_messages (
+                    id,
+                    kind,
+                    source_hash,
+                    status,
+                    payload,
+                    created_at,
+                    next_attempt_at
+                )
+                SELECT ?1, ?2, ?3, 'pending', ?4, ?5, ?5
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM pending_message_completions
+                    WHERE message_id = ?1
+                )
+                ON CONFLICT(id) DO NOTHING
                 "#,
                 params![id, kind, source_hash, payload, created_at],
             )?;

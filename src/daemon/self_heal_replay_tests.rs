@@ -2,8 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::core::db::Database;
-use crate::core::queue::{AsyncPendingMessageStore, PendingMessageStore};
+use crate::core::queue::{AsyncPendingMessageStore, PendingMessageStore, QueueError};
 use crate::hook::HookEvent;
+use crate::ingress_spool::IngressSpoolError;
 
 struct ShutdownResetGuard;
 
@@ -256,5 +257,106 @@ async fn leftover_claim_after_mid_drain_abort_replays_once_after_duplicate_retry
     assert_eq!(
         count, 1,
         "recovered claim replay and retry must remain exactly once"
+    );
+}
+
+fn spool_json_and_claim_counts(mempal_home: &std::path::Path) -> (usize, usize) {
+    let dir = mempal_home.join(crate::ingress_spool::INGRESS_SPOOL_DIR);
+    let mut json = 0;
+    let mut claims = 0;
+    for entry in std::fs::read_dir(&dir).expect("spool dir") {
+        match entry
+            .expect("entry")
+            .path()
+            .extension()
+            .and_then(|value| value.to_str())
+        {
+            Some("json") => json += 1,
+            Some("claim") => claims += 1,
+            _ => {}
+        }
+    }
+    (json, claims)
+}
+
+fn pending_row_count(db_path: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(db_path)
+        .expect("open sqlite")
+        .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
+            row.get(0)
+        })
+        .expect("count pending")
+}
+
+#[tokio::test]
+async fn stale_writer_lease_releases_claimed_spool_record_for_takeover_replay() {
+    let tmp = tempfile::TempDir::new_in("/tmp").expect("short tempdir");
+    let db_path = tmp.path().join("palace.db");
+    let db = Database::open(&db_path).expect("open db");
+    let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+    let request = crate::hook_ipc::HookIpcEnqueueRequest::new(
+        HookEvent::UserPromptSubmit.queue_kind(),
+        r#"{"event":"UserPromptSubmit","payload":"stale-lease-replay"}"#,
+    );
+    let spool = crate::ingress_spool::IngressSpool::new(tmp.path());
+    spool.append(&request).expect("plant durable spool record");
+
+    let stale = db
+        .runtime_writer_lease_acquire("sqlite-writer", "old", "daemon", 300, None)
+        .expect("acquire old lease")
+        .expect("old lease available");
+    assert!(
+        db.runtime_writer_lease_release(&stale)
+            .expect("release old generation")
+    );
+    let current = db
+        .runtime_writer_lease_acquire("sqlite-writer", "new", "daemon", 300, None)
+        .expect("acquire current lease")
+        .expect("current lease available");
+
+    let error = spool
+        .drain_once_fenced(&store, &stale)
+        .await
+        .expect_err("replaced generation must not commit spool replay");
+    assert!(matches!(
+        error,
+        IngressSpoolError::Queue(QueueError::RuntimeWriterLeaseLost { generation, .. })
+            if generation == stale.generation
+    ));
+    assert_eq!(
+        pending_row_count(&db_path),
+        0,
+        "stale drain must not insert"
+    );
+    assert_eq!(
+        spool_json_and_claim_counts(tmp.path()),
+        (1, 0),
+        "lease loss must release the claim back to replayable json"
+    );
+
+    assert_eq!(
+        spool
+            .drain_once_fenced(&store, &current)
+            .await
+            .expect("current generation may replay"),
+        1
+    );
+    assert_eq!(pending_row_count(&db_path), 1);
+    assert_eq!(spool_json_and_claim_counts(tmp.path()), (0, 0));
+
+    spool
+        .append(&request)
+        .expect("duplicate producer retry after takeover");
+    assert_eq!(
+        spool
+            .drain_once_fenced(&store, &current)
+            .await
+            .expect("duplicate retry drain"),
+        1
+    );
+    assert_eq!(
+        pending_row_count(&db_path),
+        1,
+        "duplicate producer retry must remain exactly once"
     );
 }
