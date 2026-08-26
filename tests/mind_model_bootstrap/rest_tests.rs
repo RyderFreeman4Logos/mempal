@@ -19,7 +19,7 @@ fn setup_rest_mcp_server() -> (
     )
     .expect("create MCP server");
     let state = mempal::api::ApiState::with_write_queue_config(
-        db_path,
+        db_path.clone(),
         factory,
         10,
         Duration::from_secs(2),
