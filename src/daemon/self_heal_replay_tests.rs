@@ -189,3 +189,72 @@ async fn sigkill_equivalent_after_durable_ack_replays_once_after_duplicate_retry
         .expect("count visible queue events");
     assert_eq!(count, 1, "abort replay and retry must remain exactly once");
 }
+
+fn plant_orphan_claim(mempal_home: &std::path::Path) {
+    let dir = mempal_home.join(crate::ingress_spool::INGRESS_SPOOL_DIR);
+    let mut planted = false;
+    for entry in std::fs::read_dir(&dir).expect("spool dir") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        std::fs::rename(&path, path.with_extension("claim")).expect("plant leftover claim");
+        planted = true;
+    }
+    assert!(planted, "durable ACK must leave a json record to claim");
+}
+
+#[tokio::test]
+async fn leftover_claim_after_mid_drain_abort_replays_once_after_duplicate_retry() {
+    let tmp = tempfile::TempDir::new_in("/tmp").expect("short tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+    let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+    let request = crate::hook_ipc::HookIpcEnqueueRequest::new(
+        HookEvent::UserPromptSubmit.queue_kind(),
+        r#"{"event":"UserPromptSubmit","payload":"leftover-claim-after-ack"}"#,
+    );
+
+    let acknowledged = Arc::new(crate::ingress_spool::IngressSpool::new(tmp.path()));
+    assert_eq!(
+        super::persist_hook_ipc_request(&store, &acknowledged, &observer, request.clone()).await,
+        crate::hook_ipc::HookIpcEnqueueResponse::Accepted,
+        "the daemon must ACK only after the ingress record is durable"
+    );
+    plant_orphan_claim(tmp.path());
+    drop(acknowledged);
+
+    let restarted = Arc::new(crate::ingress_spool::IngressSpool::new(tmp.path()));
+    assert_eq!(
+        restarted
+            .drain_once(&store)
+            .await
+            .expect("replay leftover claim"),
+        1,
+        "a fresh process must recover and replay the leftover claim"
+    );
+    assert_eq!(
+        super::persist_hook_ipc_request(&store, &restarted, &observer, request.clone()).await,
+        crate::hook_ipc::HookIpcEnqueueResponse::Accepted,
+        "the duplicate client retry must retain its idempotency key"
+    );
+    assert_eq!(
+        restarted
+            .drain_once(&store)
+            .await
+            .expect("replay duplicate retry"),
+        1
+    );
+
+    let count: i64 = rusqlite::Connection::open(&db_path)
+        .expect("open sqlite")
+        .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
+            row.get(0)
+        })
+        .expect("count visible queue events");
+    assert_eq!(
+        count, 1,
+        "recovered claim replay and retry must remain exactly once"
+    );
+}
