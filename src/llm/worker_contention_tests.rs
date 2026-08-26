@@ -14,11 +14,9 @@ async fn test_worker_successful_claim_clears_observed_contention() {
     let db_path = tmp.path().join("palace.db");
     let request_count = Arc::new(AtomicUsize::new(0));
     let request_notify = Arc::new(Notify::new());
-    let response_release = Arc::new(Notify::new());
-    let (base_url, server) = spawn_counting_llm_server_with_response_gate(
+    let (base_url, server) = spawn_counting_llm_server(
         Arc::clone(&request_count),
         Arc::clone(&request_notify),
-        Some(Arc::clone(&response_release)),
     )
     .await;
     std::fs::write(&config_path, worker_test_config(&base_url)).expect("write worker config");
@@ -105,12 +103,7 @@ async fn test_worker_successful_claim_clears_observed_contention() {
     tokio::time::timeout(Duration::from_secs(5), request_notify.notified())
         .await
         .expect("worker should start the claimed LLM request");
-    assert_eq!(
-        request_count.load(Ordering::SeqCst),
-        1,
-        "the first request must be observed before its response is released"
-    );
-    response_release.notify_one();
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
     tokio::time::timeout(Duration::from_secs(20), completion)
         .await
         .expect("worker should complete the claimed task")

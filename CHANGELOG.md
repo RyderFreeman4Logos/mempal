@@ -48,8 +48,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   contention in oversubscribe test so suite-load flock waits aren't
   miscounted as budget rejections.
 
-- **Fixture readiness**: #965 gates response on request observation; SQLite/MCP/
-  queue/ingest/async_db leases; Busy retry
+- **Fixture readiness**: sync SQLite, MCP, queue-admission fixtures; isolate
+  ingest/async_db leases; bound child waits; retry Busy through deadline
   (#882, #889, #890, #944, #956, #958, #961, #962, #965).
 
 - **MCP delete retry fixture**: force observed SQLite Busy before synchronized
