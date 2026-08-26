@@ -1,12 +1,3 @@
-use std::env;
-use std::fs::{self, OpenOptions};
-use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
-};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
 use crate::bootstrap_events::BootstrapEvent;
 use crate::core::{
     AsyncDb,
@@ -19,23 +10,27 @@ use crate::daemon_recovery::{
     DaemonRecovery, DaemonRecoveryFaultReporter, RESTART_COOLDOWN_SECS, RecoveryFault,
     RestartDecision,
 };
-use anyhow::{Context, Result};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
-
 #[cfg(target_os = "linux")]
 use crate::process_diagnostics::{
     DbHolderRemediationTarget, DbHolderReport, inspect_db_holders_for_startup_remediation,
 };
-
+use anyhow::{Context, Result};
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 const DAEMON_STALL_SECONDS: u64 = 5 * 60;
 const DAEMON_STALL_LOG_THROTTLE_SECONDS: u64 = 60;
 const DAEMON_SQLITE_CONTENTION_FRESHNESS_SECONDS: u64 = 60;
 const DAEMON_COOLDOWN_WAIT_MAX: Duration = Duration::from_secs(RESTART_COOLDOWN_SECS);
-
 /// Stable process exit status for a temporary daemon admission refusal. This
 /// is sysexits `EX_TEMPFAIL` and prevents supervisor restart thrash.
 pub const DAEMON_TEMPORARY_ADMISSION_REFUSAL_EXIT_STATUS: i32 = 75;
-
 /// A daemon start was refused solely because its restart budget is cooling down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DaemonCooldownRequired {
@@ -49,7 +44,6 @@ impl DaemonCooldownRequired {
         }
     }
 }
-
 impl std::fmt::Display for DaemonCooldownRequired {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -59,19 +53,15 @@ impl std::fmt::Display for DaemonCooldownRequired {
         )
     }
 }
-
 impl std::error::Error for DaemonCooldownRequired {}
-
 /// A daemon start could not acquire the live SQLite writer lease after its bounded admission wait.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonWriterLeaseHeld(String);
-
 impl DaemonWriterLeaseHeld {
     pub(crate) fn new(holders: impl Into<String>) -> Self {
         Self(holders.into())
     }
 }
-
 impl std::fmt::Display for DaemonWriterLeaseHeld {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -81,9 +71,7 @@ impl std::fmt::Display for DaemonWriterLeaseHeld {
         )
     }
 }
-
 impl std::error::Error for DaemonWriterLeaseHeld {}
-
 /// Returns the stable temporary-refusal process exit status when `error` was
 /// caused by a temporary daemon admission refusal or startup SQLite contention.
 pub fn temporary_refusal_exit_status(error: &anyhow::Error) -> Option<i32> {
@@ -139,6 +127,8 @@ pub struct DaemonContext {
     pub log_path: PathBuf,
     pub(crate) recovery: DaemonRecovery,
     pub(crate) recovery_faults: DaemonRecoveryFaultReporter,
+    #[cfg(feature = "rest")]
+    pub(crate) bootstrap_events: Option<mpsc::Sender<BootstrapEvent>>,
     // Drop order matters: remove the pidfile (pid_guard) BEFORE releasing the
     // singleton lock (lock_guard), so a successor that wins the lock never
     // observes a stale pidfile pointing at the just-stopped daemon.
@@ -378,6 +368,14 @@ impl DaemonContext {
             Some(runtime_root),
         )
     }
+
+    #[cfg(feature = "rest")]
+    pub(crate) fn emit_ready(&self) {
+        let _ = self
+            .bootstrap_events
+            .as_ref()
+            .map(|tx| tx.try_send(BootstrapEvent::Ready));
+    }
 }
 
 fn bootstrap_inner(
@@ -466,7 +464,7 @@ fn bootstrap_inner(
     init_tracing_subscriber();
 
     let pid_guard = PidFileGuard::create(mempal_home.join("daemon.pid"))?;
-    // harness-point: PR0
+    #[cfg(not(feature = "rest"))]
     emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::Ready);
 
     Ok(DaemonContext {
@@ -480,6 +478,8 @@ fn bootstrap_inner(
         log_path,
         recovery,
         recovery_faults,
+        #[cfg(feature = "rest")]
+        bootstrap_events,
         _pid_guard: pid_guard,
         _lock_guard: lock_guard,
     })
