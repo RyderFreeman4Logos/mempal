@@ -161,6 +161,14 @@ async fn spawn_counting_llm_server(
     count: Arc<AtomicUsize>,
     notify: Arc<Notify>,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    spawn_counting_llm_server_with_response_gate(count, notify, None).await
+}
+
+async fn spawn_counting_llm_server_with_response_gate(
+    count: Arc<AtomicUsize>,
+    notify: Arc<Notify>,
+    response_release: Option<Arc<Notify>>,
+) -> (String, tokio::task::JoinHandle<()>) {
     use axum::{Json, Router, routing::post};
 
     let app = Router::new().route(
@@ -168,9 +176,13 @@ async fn spawn_counting_llm_server(
         post(move || {
             let count = Arc::clone(&count);
             let notify = Arc::clone(&notify);
+            let response_release = response_release.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
                 notify.notify_one();
+                if let Some(response_release) = response_release {
+                    response_release.notified().await;
+                }
                 Json(serde_json::json!({
                     "id": "test",
                     "choices": [{
