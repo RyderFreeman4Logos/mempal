@@ -54,22 +54,38 @@ fn claim_sqlite_lock_backoff_delay(retry_count: u64) -> Duration {
         .min(DAEMON_CLAIM_LOCK_BACKOFF_MAX)
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(super) async fn run_hook_ipc_listener(
     listener: tokio::net::UnixListener,
     store: AsyncPendingMessageStore,
     write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
     spool: Arc<crate::ingress_spool::IngressSpool>,
 ) {
+    run_hook_ipc_listener_with_lease(listener, store, write_observer, spool, None).await
+}
+
+#[cfg(unix)]
+pub(super) async fn run_hook_ipc_listener_with_lease(
+    listener: tokio::net::UnixListener,
+    store: AsyncPendingMessageStore,
+    write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
+    spool: Arc<crate::ingress_spool::IngressSpool>,
+    lease: Option<crate::core::types::RuntimeWriterLease>,
+) {
     let drain_spool = Arc::clone(&spool);
     let drain_store = store.clone();
     let drain_observer = write_observer.clone();
+    let drain_lease = lease;
     let drain_task = tokio::spawn(async move {
         loop {
             if super::shutdown_requested() {
                 break;
             }
-            match drain_spool.drain_once(&drain_store).await {
+            let drain_result = match drain_lease.as_ref() {
+                Some(lease) => drain_spool.drain_once_fenced(&drain_store, lease).await,
+                None => drain_spool.drain_once(&drain_store).await,
+            };
+            match drain_result {
                 Ok(0) => tokio::time::sleep(Duration::from_millis(200)).await,
                 Ok(drained) => {
                     drain_observer.record_successful_write();

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::core::queue::{AsyncPendingMessageStore, QueueError};
+use crate::core::types::RuntimeWriterLease;
 use crate::hook_ipc::HookIpcEnqueueRequest;
 
 pub(crate) const INGRESS_SPOOL_DIR: &str = "ingress-spool";
@@ -192,19 +193,49 @@ impl IngressSpool {
         &self,
         store: &AsyncPendingMessageStore,
     ) -> Result<usize, IngressSpoolError> {
+        self.drain_claimed(store, None).await
+    }
+
+    pub(crate) async fn drain_once_fenced(
+        &self,
+        store: &AsyncPendingMessageStore,
+        lease: &RuntimeWriterLease,
+    ) -> Result<usize, IngressSpoolError> {
+        self.drain_claimed(store, Some(lease)).await
+    }
+
+    async fn drain_claimed(
+        &self,
+        store: &AsyncPendingMessageStore,
+        lease: Option<&RuntimeWriterLease>,
+    ) -> Result<usize, IngressSpoolError> {
         let records = self.records()?;
         let mut drained = 0;
         for record in records {
             let Some(claim_path) = self.claim(&record.path)? else {
                 continue;
             };
-            let enqueue_result = store
-                .enqueue_idempotent_with_key_fail_fast(
-                    record.request.kind.clone(),
-                    record.request.payload.clone(),
-                    record.request.idempotency_key.clone(),
-                )
-                .await;
+            let kind = record.request.kind.clone();
+            let payload = record.request.payload.clone();
+            let idempotency_key = record.request.idempotency_key.clone();
+            let enqueue_result = match lease {
+                Some(lease) => {
+                    store
+                        .enqueue_idempotent_with_key_fail_fast_fenced(
+                            Some(lease.clone()),
+                            kind,
+                            payload,
+                            idempotency_key,
+                            "drain ingress spool",
+                        )
+                        .await
+                }
+                None => {
+                    store
+                        .enqueue_idempotent_with_key_fail_fast(kind, payload, idempotency_key)
+                        .await
+                }
+            };
             match enqueue_result {
                 Ok(_) => {
                     let delete_result = fs::remove_file(&claim_path)
