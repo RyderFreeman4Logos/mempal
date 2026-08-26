@@ -41,6 +41,8 @@ pub mod hook_payload;
 pub mod hotpatch;
 pub mod importance;
 pub mod ingest;
+#[cfg(unix)]
+pub(crate) mod ingress_spool;
 pub mod integrations;
 pub mod intelligence;
 pub mod knowledge_anchor;

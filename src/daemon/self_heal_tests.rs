@@ -171,7 +171,7 @@ async fn send_contention_wave(
 }
 
 #[cfg(target_os = "linux")]
-fn assert_all_fallbacks(
+fn assert_all_accepted(
     outcomes: &[(
         crate::hook_ipc::HookIpcEnqueueRequest,
         crate::hook_ipc::HookIpcClientOutcome,
@@ -179,8 +179,8 @@ fn assert_all_fallbacks(
 ) {
     for (_, outcome) in outcomes {
         assert!(
-            matches!(outcome, crate::hook_ipc::HookIpcClientOutcome::Fallback(_)),
-            "locked contention wave must use client fallback"
+            matches!(outcome, crate::hook_ipc::HookIpcClientOutcome::Accepted),
+            "locked contention wave must ACK from the durable spool"
         );
     }
 }
@@ -188,10 +188,13 @@ fn assert_all_fallbacks(
 async fn send_hook_ipc_request(
     store: AsyncPendingMessageStore,
     observer: crate::daemon_bootstrap::DaemonWriteObserver,
+    spool: Arc<crate::ingress_spool::IngressSpool>,
     request: crate::hook_ipc::HookIpcEnqueueRequest,
 ) -> crate::hook_ipc::HookIpcEnqueueResponse {
     let (mut client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let handler = tokio::spawn(super::handle_hook_ipc_connection(server, store, observer));
+    let handler = tokio::spawn(super::handle_hook_ipc_connection(
+        server, store, observer, spool,
+    ));
     let mut frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
     frame.push(b'\n');
     tokio::io::AsyncWriteExt::write_all(&mut client, &frame)
@@ -222,7 +225,12 @@ async fn test_hook_ipc_readiness_does_not_persist_queue_row() {
     let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
     let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
     let (mut client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let handler = tokio::spawn(super::handle_hook_ipc_connection(server, store, observer));
+    let handler = tokio::spawn(super::handle_hook_ipc_connection(
+        server,
+        store,
+        observer,
+        Arc::new(crate::ingress_spool::IngressSpool::new(tmp.path())),
+    ));
     tokio::io::AsyncWriteExt::write_all(&mut client, b"{\"probe\":\"readiness\"}\n")
         .await
         .expect("write readiness request");
@@ -249,7 +257,7 @@ async fn test_hook_ipc_readiness_does_not_persist_queue_row() {
 }
 
 #[tokio::test]
-async fn test_hook_ipc_ack_requires_sqlite_persistence() {
+async fn test_hook_ipc_ack_replays_from_durable_spool() {
     let _test_guard = lock_hook_ipc_tests().await;
     super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
     let tmp = short_tempdir();
@@ -263,8 +271,16 @@ async fn test_hook_ipc_ack_requires_sqlite_persistence() {
         r#"{"event":"UserPromptSubmit","payload":"durable before ack"}"#,
     );
 
-    let response = send_hook_ipc_request(store, observer, request).await;
+    let spool = Arc::new(crate::ingress_spool::IngressSpool::new(tmp.path()));
+    let response = send_hook_ipc_request(store, observer, spool.clone(), request).await;
     assert_eq!(response, crate::hook_ipc::HookIpcEnqueueResponse::Accepted);
+    assert_eq!(
+        spool
+            .drain_once(&AsyncPendingMessageStore::new_without_reclaim(&db_path))
+            .await
+            .expect("replay durable spool"),
+        1
+    );
     let (kind, payload): (String, String) = rusqlite::Connection::open(&db_path)
         .expect("open sqlite")
         .query_row(
@@ -281,7 +297,7 @@ async fn test_hook_ipc_ack_requires_sqlite_persistence() {
 }
 
 #[tokio::test]
-async fn test_hook_ipc_rejects_sqlite_lock_without_waiting_for_persistence() {
+async fn test_hook_ipc_spools_before_ack_when_sqlite_locked() {
     let _test_guard = lock_hook_ipc_tests().await;
     super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
     let tmp = short_tempdir();
@@ -298,12 +314,15 @@ async fn test_hook_ipc_rejects_sqlite_lock_without_waiting_for_persistence() {
         HookEvent::UserPromptSubmit.queue_kind(),
         r#"{"event":"UserPromptSubmit","payload":"durable after lock"}"#,
     );
-    let kind = request.kind.clone();
-    let payload = request.payload.clone();
-    let idempotency_key = request.idempotency_key.clone();
+    let spool = Arc::new(crate::ingress_spool::IngressSpool::new(tmp.path()));
 
     let (mut client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let handler = tokio::spawn(super::handle_hook_ipc_connection(server, store, observer));
+    let handler = tokio::spawn(super::handle_hook_ipc_connection(
+        server,
+        store,
+        observer,
+        spool.clone(),
+    ));
     wait_for_active_handler_count(1, "starting locked SQLite enqueue").await;
     let mut frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
     frame.push(b'\n');
@@ -324,16 +343,11 @@ async fn test_hook_ipc_rejects_sqlite_lock_without_waiting_for_persistence() {
         serde_json::from_str(line.trim()).expect("hook IPC response")
     })
     .await
-    .expect("locked SQLite enqueue must fail fast enough for client fallback");
+    .expect("locked SQLite enqueue must ACK from the fsynced spool");
     match response {
-        crate::hook_ipc::HookIpcEnqueueResponse::Accepted => {
-            panic!("locked SQLite persistence must not ACK before durability")
-        }
+        crate::hook_ipc::HookIpcEnqueueResponse::Accepted => {}
         crate::hook_ipc::HookIpcEnqueueResponse::Error { message } => {
-            assert!(
-                message.to_ascii_lowercase().contains("database"),
-                "unexpected sanitized error: {message}"
-            );
+            panic!("durable spool should ACK before SQLite replay: {message}")
         }
     }
     let count_while_locked: i64 = rusqlite::Connection::open(&db_path)
@@ -345,10 +359,14 @@ async fn test_hook_ipc_rejects_sqlite_lock_without_waiting_for_persistence() {
     assert_eq!(count_while_locked, 0);
 
     lock_conn.execute_batch("ROLLBACK;").expect("release lock");
-    let fallback_id = PendingMessageStore::new_without_reclaim(&db_path)
-        .enqueue_idempotent_with_key(&kind, &payload, &idempotency_key)
-        .expect("fallback enqueue after lock release");
-    let (count_after_unlock, stored_id): (i64, String) = rusqlite::Connection::open(&db_path)
+    let replay_store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+    assert_eq!(
+        spool.drain_once(&replay_store).await.expect("replay spool"),
+        1
+    );
+    let stored_id =
+        PendingMessageStore::idempotent_message_id(&request.kind, &request.idempotency_key);
+    let (count_after_unlock, actual_id): (i64, String) = rusqlite::Connection::open(&db_path)
         .expect("open read connection")
         .query_row(
             "SELECT COUNT(*), COALESCE(MAX(id), '') FROM pending_messages",
@@ -357,7 +375,7 @@ async fn test_hook_ipc_rejects_sqlite_lock_without_waiting_for_persistence() {
         )
         .expect("query pending after unlock");
     assert_eq!(count_after_unlock, 1);
-    assert_eq!(stored_id, fallback_id);
+    assert_eq!(stored_id, actual_id);
 }
 
 #[tokio::test]
@@ -371,7 +389,12 @@ async fn test_hook_ipc_stalled_request_times_out_without_persisting() {
     let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
     let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
     let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let handler = tokio::spawn(super::handle_hook_ipc_connection(server, store, observer));
+    let handler = tokio::spawn(super::handle_hook_ipc_connection(
+        server,
+        store,
+        observer,
+        Arc::new(crate::ingress_spool::IngressSpool::new(tmp.path())),
+    ));
 
     let mut reader = tokio::io::BufReader::new(client);
     let mut line = String::new();
@@ -406,7 +429,7 @@ async fn test_hook_ipc_stalled_request_times_out_without_persisting() {
 }
 
 #[tokio::test]
-async fn test_hook_ipc_timeout_fallback_is_idempotent_with_slow_daemon_persist() {
+async fn test_hook_ipc_ack_does_not_wait_for_slow_sqlite_replay() {
     let _test_guard = lock_hook_ipc_tests().await;
     super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
     let tmp = short_tempdir();
@@ -422,8 +445,14 @@ async fn test_hook_ipc_timeout_fallback_is_idempotent_with_slow_daemon_persist()
     let store = AsyncPendingMessageStore::new_without_reclaim(&db_path)
         .with_blocking_delay(crate::hook_ipc::HOOK_IPC_TIMEOUT + Duration::from_millis(200));
     let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+    let spool = Arc::new(crate::ingress_spool::IngressSpool::new(tmp.path()));
     let (mut client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let handler = tokio::spawn(super::handle_hook_ipc_connection(server, store, observer));
+    let handler = tokio::spawn(super::handle_hook_ipc_connection(
+        server,
+        store,
+        observer,
+        spool.clone(),
+    ));
 
     let mut frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
     frame.push(b'\n');
@@ -434,23 +463,34 @@ async fn test_hook_ipc_timeout_fallback_is_idempotent_with_slow_daemon_persist()
         .await
         .expect("flush request");
 
-    let timed_out = tokio::time::timeout(crate::hook_ipc::HOOK_IPC_TIMEOUT, async move {
+    let response = tokio::time::timeout(crate::hook_ipc::HOOK_IPC_TIMEOUT, async move {
         let mut reader = tokio::io::BufReader::new(client);
         let mut line = String::new();
-        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        serde_json::from_str::<crate::hook_ipc::HookIpcEnqueueResponse>(line.trim())
+            .expect("hook IPC response")
     })
     .await;
-    assert!(
-        timed_out.is_err(),
-        "client should time out before daemon persist"
+    assert_eq!(
+        response.expect("spool ACK must not wait for SQLite"),
+        crate::hook_ipc::HookIpcEnqueueResponse::Accepted
+    );
+    assert_eq!(
+        std::fs::read_dir(tmp.path().join(crate::ingress_spool::INGRESS_SPOOL_DIR))
+            .expect("read ingress spool")
+            .filter_map(Result::ok)
+            .filter(
+                |entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            )
+            .count(),
+        1
     );
 
-    let fallback_store = PendingMessageStore::new_without_reclaim(&db_path);
-    let fallback_id = fallback_store
-        .enqueue_idempotent_with_key(&kind, &payload, &idempotency_key)
-        .expect("fallback enqueue");
-
     handler.await.expect("handler task");
+    let replay_store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+    assert_eq!(spool.drain_once(&replay_store).await.expect("replay"), 1);
 
     let conn = rusqlite::Connection::open(&db_path).expect("open sqlite");
     let count: i64 = conn
@@ -469,7 +509,10 @@ async fn test_hook_ipc_timeout_fallback_is_idempotent_with_slow_daemon_persist()
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read pending row");
-    assert_eq!(stored_id, fallback_id);
+    assert_eq!(
+        stored_id,
+        PendingMessageStore::idempotent_message_id(&kind, &idempotency_key)
+    );
     assert_eq!(stored_kind, kind);
     assert!(
         stored_payload == payload,
@@ -487,6 +530,7 @@ async fn test_hook_ipc_closed_peer_write_is_debug_only() {
 
     let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
     let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+    let spool = Arc::new(crate::ingress_spool::IngressSpool::new(tmp.path()));
     let request = crate::hook_ipc::HookIpcEnqueueRequest::new(
         HookEvent::UserPromptSubmit.queue_kind(),
         r#"{"event":"UserPromptSubmit","payload":"closed peer synthetic"}"#,
@@ -503,13 +547,20 @@ async fn test_hook_ipc_closed_peer_write_is_debug_only() {
     drop(client);
 
     let (logs, _log_guard) = install_log_capture();
-    super::handle_hook_ipc_connection(server, store, observer).await;
+    super::handle_hook_ipc_connection(server, store, observer, spool.clone()).await;
     let logs = captured_logs(&logs);
     assert!(
         logs.contains("hook IPC client disconnected before response"),
         "{logs}"
     );
     assert!(!logs.contains("WARN"), "{logs}");
+    assert_eq!(
+        spool
+            .drain_once(&AsyncPendingMessageStore::new_without_reclaim(&db_path))
+            .await
+            .expect("replay closed-peer capture"),
+        1
+    );
     let count: i64 = rusqlite::Connection::open(&db_path)
         .expect("open sqlite")
         .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
@@ -535,7 +586,10 @@ async fn test_hook_ipc_listener_bounds_active_handlers() {
     let store = AsyncPendingMessageStore::new_without_reclaim(&db_path)
         .with_blocking_delay(Duration::from_millis(250));
     let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
-    let listener_task = tokio::spawn(super::run_hook_ipc_listener(listener, store, observer));
+    let spool = Arc::new(crate::ingress_spool::IngressSpool::new(&mempal_home));
+    let listener_task = tokio::spawn(super::run_hook_ipc_listener(
+        listener, store, observer, spool,
+    ));
     let mut clients = Vec::new();
 
     for attempt in 0..(super::HOOK_IPC_HANDLER_LIMIT + 8) {
@@ -607,10 +661,12 @@ async fn test_hook_ipc_listener_recovers_after_real_sqlite_contention() {
     let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
     assert_eq!(sqlite_db_fd_count(&db_path), 0);
     let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+    let spool = Arc::new(crate::ingress_spool::IngressSpool::new(&mempal_home));
     let listener_task = tokio::spawn(super::run_hook_ipc_listener(
         listener,
         store.clone(),
         observer,
+        spool,
     ));
 
     let lock_conn = rusqlite::Connection::open(&db_path).expect("open lock connection");
@@ -618,11 +674,11 @@ async fn test_hook_ipc_listener_recovers_after_real_sqlite_contention() {
         .execute_batch("BEGIN IMMEDIATE;")
         .expect("hold SQLite write lock");
 
-    let mut fallback_requests = Vec::new();
+    let mut spooled_count = 0_usize;
     for wave in 0..2 {
         let wave_outcomes = send_contention_wave(&mempal_home, wave, 4).await;
-        assert_all_fallbacks(&wave_outcomes);
-        fallback_requests.extend(wave_outcomes.into_iter().map(|(request, _)| request));
+        assert_all_accepted(&wave_outcomes);
+        spooled_count += wave_outcomes.len();
         wait_for_active_handler_count(0, "contention wave").await;
         assert_eq!(pending_message_total(&db_path), 0);
         let fd_count = sqlite_db_fd_count(&db_path);
@@ -634,22 +690,18 @@ async fn test_hook_ipc_listener_recovers_after_real_sqlite_contention() {
 
     lock_conn.execute_batch("ROLLBACK;").expect("release lock");
     drop(lock_conn);
-    {
-        let fallback_store = PendingMessageStore::new_without_reclaim(&db_path);
-        for request in &fallback_requests {
-            fallback_store
-                .enqueue_idempotent_with_key(
-                    &request.kind,
-                    &request.payload,
-                    &request.idempotency_key,
-                )
-                .expect("fallback enqueue after lock release");
+    let expected_spooled = i64::try_from(spooled_count).expect("spooled request count fits i64");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if pending_message_total(&db_path) == expected_spooled {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }
-    assert_eq!(
-        pending_message_total(&db_path),
-        i64::try_from(fallback_requests.len()).expect("fallback request count fits i64")
-    );
+    })
+    .await
+    .expect("spool records should replay after SQLite contention");
+    assert_eq!(pending_message_total(&db_path), expected_spooled);
 
     let sentinel_request = crate::hook_ipc::HookIpcEnqueueRequest::new(
         HookEvent::UserPromptSubmit.queue_kind(),
@@ -662,10 +714,18 @@ async fn test_hook_ipc_listener_recovers_after_real_sqlite_contention() {
         crate::hook_ipc::HookIpcClientOutcome::Accepted
     );
     wait_for_active_handler_count(0, "sentinel recovery request").await;
-    assert_eq!(
-        pending_message_total(&db_path),
-        i64::try_from(fallback_requests.len() + 1).expect("request count fits i64")
-    );
+    let expected_total = i64::try_from(spooled_count + 1).expect("request count fits i64");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if pending_message_total(&db_path) == expected_total {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background spool drainer should replay accepted captures");
+    assert_eq!(pending_message_total(&db_path), expected_total);
 
     let claimed = store
         .claim_next("daemon-linux-contention-test".to_string(), 60)

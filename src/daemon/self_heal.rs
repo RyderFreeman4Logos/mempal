@@ -1,5 +1,7 @@
 #[cfg(unix)]
 use std::io::ErrorKind;
+#[cfg(unix)]
+use std::sync::Arc;
 #[cfg(all(test, unix))]
 use std::sync::atomic::AtomicUsize;
 #[cfg(all(test, unix))]
@@ -57,7 +59,36 @@ pub(super) async fn run_hook_ipc_listener(
     listener: tokio::net::UnixListener,
     store: AsyncPendingMessageStore,
     write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
+    spool: Arc<crate::ingress_spool::IngressSpool>,
 ) {
+    let drain_spool = Arc::clone(&spool);
+    let drain_store = store.clone();
+    let drain_observer = write_observer.clone();
+    let drain_task = tokio::spawn(async move {
+        loop {
+            if super::shutdown_requested() {
+                break;
+            }
+            match drain_spool.drain_once(&drain_store).await {
+                Ok(0) => tokio::time::sleep(Duration::from_millis(200)).await,
+                Ok(drained) => {
+                    drain_observer.record_successful_write();
+                    tracing::debug!(drained, "replayed ingress spool records");
+                }
+                Err(error) => {
+                    match &error {
+                        crate::ingress_spool::IngressSpoolError::Queue(queue_error) => {
+                            drain_observer
+                                .record_queue_error("ingress spool drain failed", queue_error);
+                        }
+                        _ => drain_observer
+                            .record_error(format!("ingress spool drain failed: {error}")),
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+    });
     let mut handlers = tokio::task::JoinSet::new();
     loop {
         if super::shutdown_requested() {
@@ -75,8 +106,15 @@ pub(super) async fn run_hook_ipc_listener(
                     Ok((stream, _addr)) => {
                         let store = store.clone();
                         let write_observer = write_observer.clone();
+                        let spool = Arc::clone(&spool);
                         handlers.spawn(async move {
-                            handle_hook_ipc_connection(stream, store, write_observer).await;
+                            handle_hook_ipc_connection(
+                                stream,
+                                store,
+                                write_observer,
+                                spool,
+                            )
+                            .await;
                         });
                     }
                     Err(error) => {
@@ -92,6 +130,8 @@ pub(super) async fn run_hook_ipc_listener(
         }
     }
     drain_hook_ipc_handlers(&mut handlers, HOOK_IPC_HANDLER_DRAIN_BUDGET).await;
+    drain_task.abort();
+    let _ = drain_task.await;
 }
 
 #[cfg(unix)]
@@ -186,6 +226,7 @@ async fn handle_hook_ipc_connection(
     mut stream: tokio::net::UnixStream,
     store: AsyncPendingMessageStore,
     write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
+    spool: Arc<crate::ingress_spool::IngressSpool>,
 ) {
     #[cfg(all(test, unix))]
     let _active_handler = HookIpcHandlerCounterGuard::new();
@@ -198,7 +239,7 @@ async fn handle_hook_ipc_connection(
     let response = match request_result {
         Ok(Ok(crate::hook_ipc::HookIpcRequest::Enqueue(request))) => {
             crate::hook_ipc::HookIpcResponse::Enqueue(
-                persist_hook_ipc_request(&store, &write_observer, request).await,
+                persist_hook_ipc_request(&store, &spool, &write_observer, request).await,
             )
         }
         Ok(Ok(crate::hook_ipc::HookIpcRequest::Readiness(_))) => {
@@ -233,26 +274,29 @@ async fn handle_hook_ipc_connection(
 
 #[cfg(unix)]
 async fn persist_hook_ipc_request(
-    store: &AsyncPendingMessageStore,
-    write_observer: &crate::daemon_bootstrap::DaemonWriteObserver,
+    _store: &AsyncPendingMessageStore,
+    spool: &crate::ingress_spool::IngressSpool,
+    _write_observer: &crate::daemon_bootstrap::DaemonWriteObserver,
     request: crate::hook_ipc::HookIpcEnqueueRequest,
 ) -> crate::hook_ipc::HookIpcEnqueueResponse {
-    let result = store
-        .enqueue_idempotent_with_key_fail_fast(
-            request.kind.clone(),
-            request.payload.clone(),
-            request.idempotency_key.clone(),
-        )
-        .await;
-    write_observer.observe_semantic_queue_result("failed to persist hook IPC capture", &result);
-    match result {
-        Ok(message_id) => {
-            tracing::debug!(message_id, kind = %request.kind, "persisted hook IPC capture");
+    let kind = request.kind.clone();
+    let append_result = {
+        let spool = spool.clone();
+        tokio::task::spawn_blocking(move || spool.append(&request)).await
+    };
+    match append_result {
+        Ok(Ok(_)) => {
+            tracing::debug!(%kind, "fsynced hook IPC capture in ingress spool");
             crate::hook_ipc::HookIpcEnqueueResponse::Accepted
         }
+        Ok(Err(error)) => {
+            let message = format!("failed to fsync ingress spool capture: {error}");
+            tracing::warn!(?error, %kind, "failed to fsync ingress spool capture");
+            crate::hook_ipc::HookIpcEnqueueResponse::Error { message }
+        }
         Err(error) => {
-            let message = format!("failed to persist hook IPC capture: {error}");
-            tracing::warn!(?error, kind = %request.kind, "failed to persist hook IPC capture");
+            let message = format!("failed to fsync ingress spool capture: {error}");
+            tracing::warn!(?error, %kind, "ingress spool task failed");
             crate::hook_ipc::HookIpcEnqueueResponse::Error { message }
         }
     }
@@ -275,3 +319,7 @@ fn is_hook_ipc_peer_disconnect(error: &anyhow::Error) -> bool {
 #[cfg(all(test, unix))]
 #[path = "self_heal_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "self_heal_replay_tests.rs"]
+mod replay_tests;
