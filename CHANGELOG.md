@@ -26,7 +26,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ### Fixed
 
 - Daemon SQLite writer-lease admission waits out a live maintenance holder past observed `remaining_secs` (capped) instead of exiting 75 under `RestartPreventExitStatus=75`; a live incompatible `mcp-ingest-worker` holder is still refused immediately without takeover (#916, #849).
-- Durable ingest spool: fsync before ack; exactly-once replay after acknowledged abort and retry; leftover `.claim` recovery after mid-drain abort (#945).
+- Durable ingest spool: fsync before ack; exactly-once leftover `.claim`/abort replay (#945).
 - Cited-recall latest-decision walks the full successor chain, filters context the same way, and requires a live correction/continuation citation (#898).
 - Codex snapshots atomically remove superseded turns/vectors and fail closed on ambiguity (#896).
 - MCP search shares a deadline and releases reads before responding (#881).
