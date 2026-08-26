@@ -50,7 +50,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - **Fixture readiness**: sync SQLite, MCP, queue-admission fixtures; isolate
   ingest/async_db leases; bound child waits; retry Busy through deadline
-  (#882, #889, #890, #944, #956, #958, #961, #962, #965).
+  (#882, #889, #890, #944, #956, #958, #961, #962).
 
 - **MCP delete retry fixture**: force observed SQLite Busy before synchronized
   lock release, eliminating the 5.5s/9s race (#886).
