@@ -161,16 +161,31 @@ async fn spawn_counting_llm_server(
     count: Arc<AtomicUsize>,
     notify: Arc<Notify>,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    spawn_counting_llm_server_with_expected_content(count, notify, None).await
+}
+
+async fn spawn_counting_llm_server_with_expected_content(
+    count: Arc<AtomicUsize>,
+    notify: Arc<Notify>,
+    expected_content: Option<String>,
+) -> (String, tokio::task::JoinHandle<()>) {
     use axum::{Json, Router, routing::post};
 
     let app = Router::new().route(
         "/v1/chat/completions",
-        post(move || {
+        post(move |Json(request): Json<LlmRequest>| {
             let count = Arc::clone(&count);
             let notify = Arc::clone(&notify);
+            let expected_content = expected_content.clone();
             async move {
-                count.fetch_add(1, Ordering::SeqCst);
-                notify.notify_one();
+                if expected_content.as_deref().is_none_or(|expected| {
+                    request.messages.iter().any(|message| {
+                        message.role == "user" && message.content.contains(expected)
+                    })
+                }) {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    notify.notify_one();
+                }
                 Json(serde_json::json!({
                     "id": "test",
                     "choices": [{

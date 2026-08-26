@@ -14,9 +14,10 @@ async fn test_worker_successful_claim_clears_observed_contention() {
     let db_path = tmp.path().join("palace.db");
     let request_count = Arc::new(AtomicUsize::new(0));
     let request_notify = Arc::new(Notify::new());
-    let (base_url, server) = spawn_counting_llm_server(
+    let (base_url, server) = spawn_counting_llm_server_with_expected_content(
         Arc::clone(&request_count),
         Arc::clone(&request_notify),
+        Some("claim-contention-cleared".to_string()),
     )
     .await;
     std::fs::write(&config_path, worker_test_config(&base_url)).expect("write worker config");
@@ -29,8 +30,11 @@ async fn test_worker_successful_claim_clears_observed_contention() {
     store
         .enqueue(
             LLM_TASK_KIND,
-            &serde_json::to_string(&gating_task("claim-contention-cleared"))
-                .expect("serialize task"),
+            &serde_json::to_string(&LlmTaskPayload {
+                content: "claim-contention-cleared".to_string(),
+                ..gating_task("claim-contention-cleared")
+            })
+            .expect("serialize task"),
         )
         .expect("enqueue LLM task");
     let async_store = AsyncPendingMessageStore::from_store(store.clone())
