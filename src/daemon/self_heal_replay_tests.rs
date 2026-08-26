@@ -138,3 +138,54 @@ async fn post_publish_parent_sync_failure_then_fallback_replay_yields_one_queue_
         "fallback plus spool replay must collapse to one row"
     );
 }
+
+#[tokio::test]
+async fn sigkill_equivalent_after_durable_ack_replays_once_after_duplicate_retry() {
+    let tmp = tempfile::TempDir::new_in("/tmp").expect("short tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+    let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+    let request = crate::hook_ipc::HookIpcEnqueueRequest::new(
+        HookEvent::UserPromptSubmit.queue_kind(),
+        r#"{"event":"UserPromptSubmit","payload":"sigkill-after-ack"}"#,
+    );
+
+    let acknowledged = Arc::new(crate::ingress_spool::IngressSpool::new(tmp.path()));
+    assert_eq!(
+        super::persist_hook_ipc_request(&store, &acknowledged, &observer, request.clone()).await,
+        crate::hook_ipc::HookIpcEnqueueResponse::Accepted,
+        "the daemon must ACK only after the ingress record is durable"
+    );
+    drop(acknowledged);
+
+    let restarted = Arc::new(crate::ingress_spool::IngressSpool::new(tmp.path()));
+    assert_eq!(
+        restarted
+            .drain_once(&store)
+            .await
+            .expect("replay after abort"),
+        1,
+        "a fresh process must replay the acknowledged record"
+    );
+    assert_eq!(
+        super::persist_hook_ipc_request(&store, &restarted, &observer, request.clone()).await,
+        crate::hook_ipc::HookIpcEnqueueResponse::Accepted,
+        "the duplicate client retry must retain its idempotency key"
+    );
+    assert_eq!(
+        restarted
+            .drain_once(&store)
+            .await
+            .expect("replay duplicate retry"),
+        1
+    );
+
+    let count: i64 = rusqlite::Connection::open(&db_path)
+        .expect("open sqlite")
+        .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
+            row.get(0)
+        })
+        .expect("count visible queue events");
+    assert_eq!(count, 1, "abort replay and retry must remain exactly once");
+}
