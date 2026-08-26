@@ -268,6 +268,10 @@ impl IngressSpool {
                         IngressSpoolError::Io(io::Error::other("spool claim mutex poisoned"))
                     })?
                     .insert(claim_path.clone());
+                if let Err(error) = self.sync_spool_namespace() {
+                    self.forget_claim(&claim_path)?;
+                    return Err(IngressSpoolError::Uncertain(error));
+                }
                 Ok(Some(claim_path))
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
