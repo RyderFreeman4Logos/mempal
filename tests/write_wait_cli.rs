@@ -68,7 +68,7 @@ fn write_config(home: &Path, base_url: &str) -> PathBuf {
         format!(
             r#"
 db_path = "{}"
-
+api.addr="127.0.0.1:0"
 [embed]
 backend = "openai_compat"
 api_model = "test-embed"
@@ -133,8 +133,7 @@ fn run_cli_with_stdin(home: &Path, args: &[&str], payload: &[u8]) -> Output {
     child.wait_with_output().expect("wait mempal")
 }
 
-/// Bounded variant for tests that exercise admission-blocked CLI paths
-/// where the child could hang indefinitely under regression.
+/// Bounded admission-blocked CLI path variant.
 fn run_cli_with_stdin_bounded(
     home: &Path,
     args: &[&str],

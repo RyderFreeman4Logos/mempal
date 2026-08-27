@@ -2,9 +2,10 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::{
     api::{ApiState, serve_with_optional_mcp},
@@ -27,7 +28,7 @@ pub(super) async fn spawn_rest(
         Err(error) => {
             tracing::warn!("daemon REST server failed to bind {addr}: {error}");
             eprintln!("warning: daemon REST server failed to bind {addr}: {error}");
-            return Ok(None);
+            return Err(error).context(format!("daemon REST server failed to bind {addr}"));
         }
     };
     let local_addr = listener
@@ -49,7 +50,7 @@ pub(super) async fn spawn_rest(
         writer_lease,
         context.write_observer.clone(),
     )?;
-    Ok(Some(tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         if let Err(error) = serve_with_optional_mcp(listener, state, mcp_server, async {
             while !super::shutdown_requested() {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -59,7 +60,31 @@ pub(super) async fn spawn_rest(
         {
             tracing::error!("daemon REST server error: {error}");
         }
-    })))
+    });
+    if let Err(error) = wait_for_rest_server(local_addr).await {
+        task.abort();
+        return Err(error);
+    }
+    Ok(Some(task))
+}
+
+async fn wait_for_rest_server(addr: SocketAddr) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(100))
+        .timeout(Duration::from_millis(250))
+        .build()
+        .context("failed to build REST readiness client")?;
+    let url = format!("http://{addr}/api/status");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if client.get(&url).send().await.is_ok() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("daemon REST server did not become ready at {addr}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 pub(super) fn server_for_rest(

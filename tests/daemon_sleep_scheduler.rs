@@ -122,6 +122,9 @@ fn daemon_runs_configured_sleep_cycle_when_hooks_are_disabled() {
         format!(
             r#"db_path = "{}"
 
+[api]
+addr = "127.0.0.1:0"
+
 [embed]
 backend = "stub"
 
@@ -163,6 +166,9 @@ fn daemon_sigterm_is_bounded_during_blocked_sleep_cycle() {
         mempal_home.join("config.toml"),
         format!(
             r#"db_path = "{}"
+
+[api]
+addr = "127.0.0.1:0"
 
 [embed]
 backend = "stub"
@@ -210,6 +216,9 @@ fn daemon_runs_configured_sleep_cycle_under_its_writer_lease() {
         mempal_home.join("config.toml"),
         format!(
             r#"db_path = "{}"
+
+[api]
+addr = "127.0.0.1:0"
 
 [embed]
 backend = "stub"

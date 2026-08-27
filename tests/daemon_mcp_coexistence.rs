@@ -67,6 +67,9 @@ impl TestHome {
                 r#"
 db_path = "{}"
 
+[api]
+addr = "127.0.0.1:0"
+
 [embed]
 backend = "stub"
 

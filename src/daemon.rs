@@ -169,8 +169,11 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     // even when hooks are disabled.
     #[cfg(feature = "rest")]
     let _rest_task = if context.config.api.enabled {
-        mcp::spawn_rest(context, &db_path, &writer_lease).await?
+        let task = mcp::spawn_rest(context, &db_path, &writer_lease).await?;
+        context.emit_ready();
+        task
     } else {
+        context.emit_ready();
         None
     };
     let sleep_scheduler_handle = sleep_scheduler::spawn(
@@ -3718,6 +3721,9 @@ fn write_daemon_embedder_status_path(
 
 #[cfg(test)]
 mod mcp_ingest_tests;
+
+#[cfg(all(test, feature = "rest"))]
+mod rest_readiness_tests;
 
 #[cfg(test)]
 mod tests {
