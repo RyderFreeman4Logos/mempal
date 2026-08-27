@@ -509,6 +509,9 @@ async fn harness_integration_smoke() -> Result<()> {
         r#"
 db_path = "{}"
 
+[api]
+addr = "127.0.0.1:0"
+
 [embed]
 backend = "openai_compat"
 base_url = "{}"

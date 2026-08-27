@@ -45,6 +45,9 @@ fn setup_daemon_home() -> (TempDir, PathBuf) {
             r#"
 db_path = "{}"
 
+[api]
+addr = "127.0.0.1:0"
+
 [embedder]
 backend = "stub"
 

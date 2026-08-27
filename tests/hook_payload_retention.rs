@@ -370,7 +370,7 @@ fn daemon_startup_runs_hook_payload_retention_with_configured_age_budget() {
     std::fs::write(
         mempal_home.join("config.toml"),
         format!(
-            "db_path = \"{}\"\n\n[hooks]\nenabled = false\npayload_retention_days = 30\n\n[daemon]\nlog_path = \"{}\"\n\n[sleep]\nenabled = true\nauto_interval_secs = 3600\nphases = [\"salience\"]\n",
+            "db_path = \"{}\"\n\n[api]\naddr = \"127.0.0.1:0\"\n\n[hooks]\nenabled = false\npayload_retention_days = 30\n\n[daemon]\nlog_path = \"{}\"\n\n[sleep]\nenabled = true\nauto_interval_secs = 3600\nphases = [\"salience\"]\n",
             db_path.display(),
             log_path.display()
         ),

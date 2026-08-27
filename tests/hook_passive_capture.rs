@@ -43,7 +43,6 @@ fn setup_home() -> (TempDir, PathBuf, PathBuf, PathBuf) {
     let config_path = mempal_home.join("config.toml");
     (tmp, mempal_home, db_path, config_path)
 }
-
 fn write_config(
     config_path: &Path,
     db_path: &Path,
@@ -76,6 +75,7 @@ backend = "stub"
         format!(
             r#"
 db_path = "{}"
+api.addr="127.0.0.1:0"
 {embed}
 [hooks]
 enabled = {enabled}
@@ -530,7 +530,7 @@ async fn test_daemon_promotes_spooled_hook_payload_to_raw_mirror_and_cleans_spoo
     let output = run_hook(tmp.path(), "hook_post_tool", raw_payload.as_bytes());
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(output.stderr.is_empty(), "spooled hook should stay quiet");
+    assert!(output.stderr.is_empty(), "quiet");
     let queued_payload: String = Connection::open(&db_path)
         .expect("open sqlite")
         .query_row(
@@ -601,7 +601,7 @@ async fn test_daemon_gating_drops_low_value_hook_and_keeps_high_signal_prompt() 
         format!(
             r#"
 db_path = "{}"
-
+api.addr="127.0.0.1:0"
 [embed]
 backend = "openai_compat"
 
@@ -910,7 +910,7 @@ async fn test_daemon_sigterm_graceful_shutdown() {
             |row| row.get(0),
         )
         .expect("claimed count");
-    assert_eq!(claimed, 0, "no message may remain claimed after SIGTERM");
+    assert_eq!(claimed, 0, "claimed");
     assert!(
         !tmp.path().join(".mempal/daemon.pid").exists(),
         "daemon pid file must be removed"
