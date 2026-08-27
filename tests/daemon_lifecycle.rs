@@ -35,6 +35,9 @@ fn setup_daemon_home() -> (TempDir, PathBuf, PathBuf) {
             r#"
 db_path = "{}"
 
+[api]
+addr = "127.0.0.1:0"
+
 [embedder]
 backend = "stub"
 
@@ -51,6 +54,13 @@ log_path = "{}"
     )
     .expect("write config");
     (tmp, db_path, config_path)
+}
+
+#[test]
+fn daemon_lifecycle_uses_ephemeral_rest_addr() {
+    let (_home, _db_path, config_path) = setup_daemon_home();
+    let config = mempal::core::config::Config::load_from(&config_path).expect("load config");
+    assert_eq!(config.api.addr, "127.0.0.1:0");
 }
 
 fn daemon_runtime_dir(home: &Path) -> PathBuf {
@@ -221,6 +231,9 @@ fn write_openai_daemon_config(
         format!(
             r#"
 db_path = "{}"
+
+[api]
+addr = "127.0.0.1:0"
 
 [embed]
 backend = "openai_compat"
@@ -418,18 +431,31 @@ fn test_daemon_context_bootstrap_ordering() {
     });
     let pid_path = context.mempal_home.join("daemon.pid");
 
-    assert_eq!(
-        stages,
-        vec![
-            BootstrapEvent::RecoveryAdmitted,
-            BootstrapEvent::Daemonize,
-            BootstrapEvent::RuntimeInit,
-            BootstrapEvent::ConfigHandleBootstrap,
-            BootstrapEvent::DbOpen,
-            BootstrapEvent::TracingInit,
-            BootstrapEvent::Ready,
-        ]
-    );
+    assert_eq!(stages, {
+        #[cfg(feature = "rest")]
+        {
+            vec![
+                BootstrapEvent::RecoveryAdmitted,
+                BootstrapEvent::Daemonize,
+                BootstrapEvent::RuntimeInit,
+                BootstrapEvent::ConfigHandleBootstrap,
+                BootstrapEvent::DbOpen,
+                BootstrapEvent::TracingInit,
+            ]
+        }
+        #[cfg(not(feature = "rest"))]
+        {
+            vec![
+                BootstrapEvent::RecoveryAdmitted,
+                BootstrapEvent::Daemonize,
+                BootstrapEvent::RuntimeInit,
+                BootstrapEvent::ConfigHandleBootstrap,
+                BootstrapEvent::DbOpen,
+                BootstrapEvent::TracingInit,
+                BootstrapEvent::Ready,
+            ]
+        }
+    });
     assert!(
         pid_path.exists(),
         "pid file must exist during daemon lifetime"
