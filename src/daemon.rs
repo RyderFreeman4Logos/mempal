@@ -456,16 +456,6 @@ fn ensure_daemon_runtime_writer_lease_active(
     }
 }
 
-fn with_daemon_runtime_writer_lease_write<T>(
-    db: &Database,
-    lease: Option<&RuntimeWriterLease>,
-    operation: &'static str,
-    write: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    db.with_runtime_writer_lease_write(lease, operation, write)
-        .with_context(|| format!("daemon writer mutation failed during {operation}"))
-}
-
 fn spawn_daemon_ingest_drain_worker(
     context: &DaemonContext,
     db_path: &Path,
@@ -3840,6 +3830,11 @@ fn write_daemon_embedder_status_path(
     };
     write_daemon_embedder_status(mempal_home, status);
 }
+
+#[path = "daemon_write_retry.rs"]
+mod daemon_write_retry;
+
+use daemon_write_retry::with_daemon_runtime_writer_lease_write;
 
 #[cfg(test)]
 mod mcp_ingest_tests;
