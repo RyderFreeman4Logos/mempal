@@ -1322,7 +1322,7 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
     };
     let mut last_drawer_id = None;
     for record in records {
-        let drawer_id = ingest_drawer_record(&drawer_context, record).await?;
+        let drawer_id = ingest_drawer_record(&drawer_context, record, message.retry_count).await?;
         let suggest_result = {
             let config = (*context.config).clone();
             let mempal_home = context.mempal_home.to_path_buf();
@@ -2358,6 +2358,7 @@ fn envelope_agent_fallback(raw_payload: &str) -> String {
 async fn ingest_drawer_record<E: Embedder + ?Sized>(
     context: &DrawerIngestContext<'_, E>,
     record: DrawerRecord,
+    retry_count: u32,
 ) -> Result<String> {
     let (drawer_id, exists) = {
         let record = record.clone();
@@ -2379,7 +2380,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
             })
             .await?
     };
-    if exists {
+    if exists && retry_count == 0 {
         return Ok(drawer_id);
     }
 
@@ -2422,6 +2423,8 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         Ok(())
     };
 
+    let admission_raw_payload_created =
+        persist_before_model_work(context, &drawer_id, &record).await?;
     let mut vector = None;
     let mut gating_audit_recorded = false;
     if gating_decision.is_none()
@@ -2452,6 +2455,14 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 &decision,
                 record.project_id.clone(),
                 None,
+            )
+            .await?;
+            discard_model_rejected_admission(
+                context.db,
+                context.daemon.runtime_writer_lease,
+                &drawer_id,
+                &record,
+                admission_raw_payload_created,
             )
             .await?;
             return Ok(drawer_id);
@@ -2490,6 +2501,14 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         .await?;
         gating_audit_recorded = true;
         if llm_decision.is_rejected() {
+            discard_model_rejected_admission(
+                context.db,
+                context.daemon.runtime_writer_lease,
+                &drawer_id,
+                &record,
+                admission_raw_payload_created,
+            )
+            .await?;
             return Ok(drawer_id);
         }
         gating_decision = Some(llm_decision);
@@ -2605,6 +2624,14 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 )
                 .await?;
             }
+            discard_model_rejected_admission(
+                context.db,
+                context.daemon.runtime_writer_lease,
+                &drawer_id,
+                &record,
+                admission_raw_payload_created,
+            )
+            .await?;
             Ok(novelty.near_drawer_id.unwrap_or(drawer_id))
         }
         NoveltyAction::Merge => {
@@ -3041,6 +3068,96 @@ async fn record_novelty_audit_async(
     .await
 }
 
+async fn persist_before_model_work<E: Embedder + ?Sized>(
+    context: &DrawerIngestContext<'_, E>,
+    drawer_id: &str,
+    record: &DrawerRecord,
+) -> Result<bool> {
+    let payload_path = Path::new(&record.source_file);
+    let raw_payload_created = !payload_path.exists()
+        && (record.deferred_raw_payload.is_some() || record.deferred_raw_payload_path.is_some());
+    persist_deferred_raw_payload(record)?;
+    insert_drawer_async(
+        context.db,
+        context.daemon.runtime_writer_lease,
+        drawer_id,
+        record.clone(),
+    )
+    .await?;
+    Ok(raw_payload_created)
+}
+
+async fn discard_model_rejected_admission(
+    db: &AsyncDb,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
+    drawer_id: &str,
+    record: &DrawerRecord,
+    raw_payload_created: bool,
+) -> Result<()> {
+    let drawer_id = drawer_id.to_string();
+    let runtime_writer_lease = runtime_writer_lease.cloned();
+    db.run_write_anyhow(move |db| {
+        with_daemon_runtime_writer_lease_write(
+            db,
+            runtime_writer_lease.as_ref(),
+            "discard model-rejected hook drawer",
+            || {
+                db.conn()
+                    .execute("DELETE FROM drawers WHERE id = ?1", [&drawer_id])
+                    .with_context(|| format!("failed to discard hook drawer {}", drawer_id))?;
+                Ok(())
+            },
+        )
+    })
+    .await?;
+    if raw_payload_created {
+        match fs::remove_file(&record.source_file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to discard hook payload {}", record.source_file)
+                });
+            }
+        }
+        if let Some(parent) = Path::new(&record.source_file).parent() {
+            match fs::remove_dir(parent) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to discard hook payload directory {}",
+                            parent.display()
+                        )
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn insert_drawer_async(
+    db: &AsyncDb,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
+    drawer_id: &str,
+    record: DrawerRecord,
+) -> Result<()> {
+    let drawer_id = drawer_id.to_string();
+    let runtime_writer_lease = runtime_writer_lease.cloned();
+    db.run_write_anyhow(move |db| {
+        with_daemon_runtime_writer_lease_write(
+            db,
+            runtime_writer_lease.as_ref(),
+            "insert daemon hook drawer before model work",
+            || insert_drawer(db, &drawer_id, &record),
+        )
+    })
+    .await
+}
+
 async fn insert_drawer_with_vector_async(
     db: &AsyncDb,
     runtime_writer_lease: Option<&RuntimeWriterLease>,
@@ -3061,12 +3178,7 @@ async fn insert_drawer_with_vector_async(
     .await
 }
 
-fn insert_drawer_with_vector(
-    db: &Database,
-    drawer_id: &str,
-    record: &DrawerRecord,
-    vector: &[f32],
-) -> Result<()> {
+fn insert_drawer(db: &Database, drawer_id: &str, record: &DrawerRecord) -> Result<()> {
     if db
         .drawer_exists(drawer_id)
         .with_context(|| format!("failed to re-check existing drawer {}", drawer_id))?
@@ -3087,8 +3199,18 @@ fn insert_drawer_with_vector(
     });
     db.insert_drawer_with_project(&drawer, record.project_id.as_deref())
         .with_context(|| format!("failed to insert hook drawer {}", drawer.id))?;
-    db.insert_vector_with_project(&drawer.id, vector, record.project_id.as_deref())
-        .with_context(|| format!("failed to insert hook vector {}", drawer.id))?;
+    Ok(())
+}
+
+fn insert_drawer_with_vector(
+    db: &Database,
+    drawer_id: &str,
+    record: &DrawerRecord,
+    vector: &[f32],
+) -> Result<()> {
+    insert_drawer(db, drawer_id, record)?;
+    db.insert_vector_with_project(drawer_id, vector, record.project_id.as_deref())
+        .with_context(|| format!("failed to insert hook vector {}", drawer_id))?;
     Ok(())
 }
 
@@ -5815,7 +5937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_automatic_hook_without_llm_gate_does_not_write_drawer() {
+    async fn test_automatic_hook_without_llm_gate_persists_before_gate() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -5888,15 +6010,87 @@ mod tests {
             )
             .expect("count drawers");
         assert_eq!(
-            drawer_count, 0,
-            "automatic hook must not durably insert without an LLM keep verdict"
+            drawer_count, 1,
+            "automatic hook must durably insert before the LLM gate"
+        );
+        let vector_table_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'drawer_vectors'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check vector table");
+        assert_eq!(
+            vector_table_count, 0,
+            "failed LLM gate must not require an embedding"
+        );
+        assert!(
+            super::raw_payload_storage_path(&hook_payload, tmp.path()).exists(),
+            "raw hook payload must be durable before the LLM gate"
         );
         assert!(
             store
                 .claim_next_by_kind("llm-required-final", 60, "llm_task")
                 .expect("claim llm task")
                 .is_none(),
-            "automatic hook must not queue a post-insert LLM task when no drawer was written"
+            "automatic hook must not queue a post-insert LLM task when the gate fails"
+        );
+
+        let mut llm_server = mockito::Server::new_async().await;
+        let llm_mock = llm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "model": "test-llm",
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": serde_json::json!({
+                                "score": 0.95,
+                                "reason": "retry keep",
+                            })
+                            .to_string(),
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        config.llm.enabled = true;
+        config.llm.base_url = Some(format!("{}/v1", llm_server.url()));
+        config.llm.model = Some("test-llm".to_string());
+        config.llm.enabled_for = vec!["gating".to_string()];
+        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+        let mut retry_message = message.clone();
+        retry_message.retry_count = 1;
+        process_claimed_message_with_embedder(
+            &async_db,
+            &async_store,
+            "llm-required-worker",
+            &retry_message,
+            &StaticEmbedder,
+            DaemonIngestContext {
+                prototype_classifier: None,
+                llm_gate: Some(&llm_gate),
+                config: &config,
+                mempal_home: tmp.path(),
+                runtime_writer_lease: None,
+                heartbeat_trigger: None,
+            },
+        )
+        .await
+        .expect("retry should resume model work for the admitted drawer");
+        llm_mock.assert_async().await;
+        let vector_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM drawer_vectors", [], |row| row.get(0))
+            .expect("count retry vector");
+        assert_eq!(
+            vector_count, 1,
+            "retry must complete embedding after admission"
         );
     }
 
@@ -6163,7 +6357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_automatic_hook_soft_prototype_reject_retries_when_llm_inactive() {
+    async fn test_automatic_hook_soft_prototype_reject_persists_before_llm_retry() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -6256,14 +6450,17 @@ mod tests {
         assert_eq!(queue_row.0, "pending");
         assert_eq!(queue_row.1, 1);
         assert!(
-            !tmp.path().join("hook-payloads").exists(),
-            "soft prototype reject must not persist raw payload before LLM keep"
+            tmp.path().join("hook-payloads").exists(),
+            "soft prototype reject must persist raw payload before LLM retry"
         );
         let drawer_count: i64 = db
             .conn()
             .query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))
             .expect("query drawer count");
-        assert_eq!(drawer_count, 0);
+        assert_eq!(
+            drawer_count, 1,
+            "soft prototype reject must persist before the LLM retry"
+        );
         let audit_count: i64 = db
             .conn()
             .query_row("SELECT COUNT(*) FROM gating_audit", [], |row| row.get(0))
@@ -6404,7 +6601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_automatic_hook_malformed_llm_gate_does_not_write_drawer() {
+    async fn test_automatic_hook_malformed_llm_gate_persists_before_retry() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut llm_server = mockito::Server::new_async().await;
         let llm_mock = llm_server
@@ -6507,10 +6704,13 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count drawers");
-        assert_eq!(drawer_count, 0);
+        assert_eq!(
+            drawer_count, 1,
+            "malformed automatic hook gate must persist before retry"
+        );
         assert!(
-            !tmp.path().join("hook-payloads").exists(),
-            "malformed automatic hook gate must not persist raw payload before retry"
+            tmp.path().join("hook-payloads").exists(),
+            "malformed automatic hook gate must persist raw payload before retry"
         );
     }
 

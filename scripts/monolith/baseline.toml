@@ -284,10 +284,10 @@ rationale = "Writer-lease fenced crystallization writes; #680 correctness fix"
 [[files]]
 path = "src/daemon.rs"
 kind = "source"
-baseline_tokens = 54102
-baseline_lines = 6792
-issue = "858"
-rationale = "#858 hooks typed queue-write SQLite contention into confirm/mark_failed/heartbeat observation paths; exact no-growth ratchet."
+baseline_tokens = 55457
+baseline_lines = 6985
+issue = "986"
+rationale = "#986 persists automatic-hook drawer and raw payload before unavailable LLM/hook gates; exact no-growth ratchet."
 
 [[files]]
 path = "src/daemon_bootstrap.rs"
