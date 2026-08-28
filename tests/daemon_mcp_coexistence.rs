@@ -293,6 +293,8 @@ async fn assert_daemon_coexists_with_mcp_count(
     for _ in 0..mcp_count {
         let mut client = McpStdio::start(&test_home.db_path, HashMap::new()).await?;
         client.initialize().await?;
+        let config = Config::load_from(&test_home.mempal_home.join("config.toml"))?;
+        assert_eq!(config.api.addr, "127.0.0.1:0");
         let status = call_status(&mut client).await?;
         assert!(status["structuredContent"].is_object());
         if open_writer_pool {

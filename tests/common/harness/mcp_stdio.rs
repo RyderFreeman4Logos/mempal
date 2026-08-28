@@ -86,6 +86,10 @@ model = "test-llm"
         let config = format!(
             r#"
 db_path = "{}"
+
+[api]
+addr = "127.0.0.1:0"
+
 {}{}
 [hooks]
 enabled = true

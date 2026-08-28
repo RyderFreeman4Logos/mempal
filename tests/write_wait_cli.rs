@@ -68,7 +68,6 @@ fn write_config(home: &Path, base_url: &str) -> PathBuf {
         format!(
             r#"
 db_path = "{}"
-api.addr="127.0.0.1:0"
 [embed]
 backend = "openai_compat"
 api_model = "test-embed"
@@ -102,7 +101,7 @@ fn enable_daemon_in_config(config_path: &Path, home: &Path) {
         .expect("open config for daemon append");
     writeln!(
         config,
-        "\n[hooks]\nenabled = true\ndaemon_poll_interval_ms = 100\n\n[daemon]\nlog_path = \"{}\"",
+        "\n[hooks]\nenabled = true\ndaemon_poll_interval_ms = 100\n\n[daemon]\nlog_path = \"{}\"\n\n[api]\naddr=\"localhost:0\"",
         home.join(".mempal/daemon.log").display()
     )
     .expect("append daemon config");

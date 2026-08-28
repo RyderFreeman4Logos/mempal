@@ -133,8 +133,12 @@ async fn test_worker_survives_mark_failed_lock_contention() {
     let db_path = tmp.path().join("palace.db");
     let request_count = Arc::new(AtomicUsize::new(0));
     let request_notify = Arc::new(Notify::new());
-    let (base_url, server) =
-        spawn_counting_llm_server(Arc::clone(&request_count), request_notify).await;
+    let (base_url, server) = spawn_counting_llm_server_with_expected_content(
+        Arc::clone(&request_count),
+        request_notify,
+        Some("mark-failed-lock-second".to_string()),
+    )
+    .await;
     std::fs::write(&config_path, worker_test_config(&base_url)).expect("write worker config");
     ConfigHandle::bootstrap_quiet(&config_path).expect("bootstrap worker config");
 
@@ -148,8 +152,11 @@ async fn test_worker_survives_mark_failed_lock_contention() {
     store
         .enqueue(
             LLM_TASK_KIND,
-            &serde_json::to_string(&gating_task("mark-failed-lock-second"))
-                .expect("serialize task"),
+            &serde_json::to_string(&LlmTaskPayload {
+                content: "mark-failed-lock-second".to_string(),
+                ..gating_task("mark-failed-lock-second")
+            })
+            .expect("serialize task"),
         )
         .expect("enqueue second LLM task");
     let async_store = AsyncPendingMessageStore::from_store(store.clone())

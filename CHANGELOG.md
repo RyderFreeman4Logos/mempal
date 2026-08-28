@@ -49,6 +49,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   contention in oversubscribe test so suite-load flock waits aren't
   miscounted as budget rejections.
 
+- **Hermetic live-daemon tests**: isolate REST ports, MCP coexistence,
+  ingest-wait, mark-failed contention, and dashboard admission fixtures
+  so exact-gates do not bind live `:3080` or reconstruct admission locks
+  per poll (#988, #989, #973, #991, #993).
 - **Fixture readiness**: isolate ingest/async_db leases; bound waits;
   retry Busy through deadline (#882, #889, #890, #944, #956, #958, #961,
   #962, #965, #971, #975, #976).
