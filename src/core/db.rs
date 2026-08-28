@@ -538,6 +538,9 @@ fn validate_vector_metric(metric: &str) -> Result<&str, DbError> {
 
 #[path = "db_open.rs"]
 mod db_open;
+#[path = "db_write_reserve.rs"]
+mod db_write_reserve;
+pub(crate) use db_write_reserve::ensure_write_reserve_logged;
 #[path = "db_writer_lease_fence.rs"]
 mod db_writer_lease_fence;
 pub use db_writer_lease_fence::{DrawerMergeWithNovelty, IngestBoostBatch};
@@ -558,6 +561,25 @@ impl Database {
     }
 
     pub fn insert_drawer_with_project_validity(
+        &self,
+        drawer: &Drawer,
+        project_id: Option<&str>,
+        source_root: Option<&str>,
+        valid_from: Option<&str>,
+        valid_until: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.with_write_reserve_retry("insert drawer", || {
+            self.insert_drawer_with_project_validity_once(
+                drawer,
+                project_id,
+                source_root,
+                valid_from,
+                valid_until,
+            )
+        })
+    }
+
+    fn insert_drawer_with_project_validity_once(
         &self,
         drawer: &Drawer,
         project_id: Option<&str>,

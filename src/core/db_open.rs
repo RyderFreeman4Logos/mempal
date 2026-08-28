@@ -232,8 +232,10 @@ impl Database {
                     source,
                 })?;
             }
+            if admitted {
+                ensure_write_reserve_logged(&sqlite_path);
+            }
         }
-
         register_sqlite_vec()?;
         let conn = match mode {
             OpenMode::ReadOnly => Connection::open_with_flags(

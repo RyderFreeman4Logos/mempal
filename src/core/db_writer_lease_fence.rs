@@ -193,6 +193,36 @@ impl Database {
         self.with_runtime_writer_lease_transaction(Some(lease), operation, write)
     }
 
+    pub(crate) fn with_runtime_writer_lease_write_retry<T, E>(
+        &self,
+        lease: Option<&RuntimeWriterLease>,
+        operation: &'static str,
+        mut write: impl FnMut() -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<DbError> + std::error::Error + 'static,
+    {
+        if !self.conn.is_autocommit() {
+            if let Some(lease) = lease {
+                self.runtime_writer_lease_cleanup_expired_tx(true)
+                    .map_err(E::from)?;
+                self.require_runtime_writer_lease_tx(lease, operation)
+                    .map_err(E::from)?;
+            }
+            return write();
+        }
+
+        self.with_write_reserve_retry(operation, || {
+            if let Some(lease) = lease {
+                self.runtime_writer_lease_cleanup_expired_tx(true)
+                    .map_err(E::from)?;
+                self.require_runtime_writer_lease_tx(lease, operation)
+                    .map_err(E::from)?;
+            }
+            write()
+        })
+    }
+
     pub(super) fn with_runtime_writer_lease_transaction<T, E>(
         &self,
         lease: Option<&RuntimeWriterLease>,
