@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 9257
-baseline_lines = 655
-issue = "885"
-rationale = "#885 records daemon pidfile signal-identity hardening; exact no-growth ratchet."
+baseline_tokens = 9326
+baseline_lines = 626
+issue = "993"
+rationale = "#993/#988/#989/#973/#991 changelog-check requires Unreleased isolation notes; CHANGELOG.md growth is unavoidable, exact no-growth ratchet."
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
 kind = "source"
