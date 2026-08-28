@@ -91,6 +91,10 @@ fn insert_drawer(db_path: &Path, seed: &DrawerSeed) {
 
 fn insert_drawer_with_project(db_path: &Path, seed: &DrawerSeed, project_id: Option<&str>) {
     let db = Database::open(db_path).expect("open db");
+    insert_drawer_with_db(&db, seed, project_id);
+}
+
+fn insert_drawer_with_db(db: &Database, seed: &DrawerSeed, project_id: Option<&str>) {
     db.insert_drawer_with_project(
         &Drawer {
             id: seed.id.clone(),
@@ -161,6 +165,15 @@ fn record_gating_audit(db_path: &Path, drawer_id: &str, accepted: bool) {
 
 fn record_novelty_audit(db_path: &Path, drawer_id: &str, action: NoveltyAction, created_at: i64) {
     let db = Database::open(db_path).expect("open db");
+    record_novelty_audit_with_db(&db, drawer_id, action, created_at);
+}
+
+fn record_novelty_audit_with_db(
+    db: &Database,
+    drawer_id: &str,
+    action: NoveltyAction,
+    created_at: i64,
+) {
     db.record_novelty_audit(drawer_id, action, Some(drawer_id), Some(0.91), None, None)
         .expect("record novelty audit");
     db.conn()
@@ -380,6 +393,7 @@ fn now_unix_secs() -> i64 {
 #[test]
 fn test_audit_novelty_lists_decisions() {
     let env = DashboardEnv::new();
+    let db = Database::open(&env.db_path).expect("open db");
     let decisions = [
         ("novelty-09", NoveltyAction::Insert),
         ("novelty-08", NoveltyAction::Insert),
@@ -397,8 +411,8 @@ fn test_audit_novelty_lists_decisions() {
     // now_unix_secs() in the same second and produce identical timestamps).
     let base_ts = now_unix_secs();
     for (index, (drawer_id, action)) in decisions.iter().enumerate() {
-        insert_drawer(
-            &env.db_path,
+        insert_drawer_with_db(
+            &db,
             &drawer_seed(
                 *drawer_id,
                 format!("novelty drawer {index}"),
@@ -407,9 +421,10 @@ fn test_audit_novelty_lists_decisions() {
                 format!("{}", 1_713_000_000 + index),
                 2,
             ),
+            None,
         );
-        record_novelty_audit(
-            &env.db_path,
+        record_novelty_audit_with_db(
+            &db,
             drawer_id,
             *action,
             base_ts - 60 + (decisions.len() - index) as i64,
@@ -1304,8 +1319,9 @@ fn test_stats_per_project_breakdown() {
 fn test_audit_filters_by_project_when_isolation_strict() {
     let env = DashboardEnv::new();
     env.set_project_scope(Some("proj-A"), true);
-    insert_drawer_with_project(
-        &env.db_path,
+    let db = Database::open(&env.db_path).expect("open db");
+    insert_drawer_with_db(
+        &db,
         &drawer_seed(
             "audit-proj-a",
             "audit project a",
@@ -1316,8 +1332,8 @@ fn test_audit_filters_by_project_when_isolation_strict() {
         ),
         Some("proj-A"),
     );
-    insert_drawer_with_project(
-        &env.db_path,
+    insert_drawer_with_db(
+        &db,
         &drawer_seed(
             "audit-proj-b",
             "audit project b",
@@ -1328,18 +1344,8 @@ fn test_audit_filters_by_project_when_isolation_strict() {
         ),
         Some("proj-B"),
     );
-    record_novelty_audit(
-        &env.db_path,
-        "audit-proj-a",
-        NoveltyAction::Insert,
-        now_unix_secs(),
-    );
-    record_novelty_audit(
-        &env.db_path,
-        "audit-proj-b",
-        NoveltyAction::Drop,
-        now_unix_secs(),
-    );
+    record_novelty_audit_with_db(&db, "audit-proj-a", NoveltyAction::Insert, now_unix_secs());
+    record_novelty_audit_with_db(&db, "audit-proj-b", NoveltyAction::Drop, now_unix_secs());
 
     let output = run_mempal(&env.home, env.cwd(), &["audit", "novelty", "--since", "7d"]);
     assert!(
@@ -1375,9 +1381,7 @@ fn insert_drawer_at_offset(db_path: &std::path::Path, id: &str, offset_secs: u64
 #[test]
 fn test_tail_since_10m_returns_recent_drawer() {
     let env = DashboardEnv::new();
-    // drawer added 30 seconds ago — within the 10-minute window
     insert_drawer_at_offset(&env.db_path, "recent-drawer", 30);
-    // old drawer outside the window (25 hours ago)
     insert_drawer_at_offset(&env.db_path, "old-drawer", 25 * 3600);
 
     let output = run_mempal(&env.home, env.cwd(), &["tail", "--since", "10m"]);
@@ -1400,9 +1404,7 @@ fn test_tail_since_10m_returns_recent_drawer() {
 #[test]
 fn test_tail_since_1h_returns_recent_drawer() {
     let env = DashboardEnv::new();
-    // drawer added 5 minutes ago — within the 1-hour window
     insert_drawer_at_offset(&env.db_path, "five-min-drawer", 300);
-    // old drawer outside the window (2 hours ago)
     insert_drawer_at_offset(&env.db_path, "two-hour-drawer", 2 * 3600);
 
     let output = run_mempal(&env.home, env.cwd(), &["tail", "--since", "1h"]);
@@ -1425,9 +1427,7 @@ fn test_tail_since_1h_returns_recent_drawer() {
 #[test]
 fn test_tail_and_timeline_share_parser() {
     let env = DashboardEnv::new();
-    // drawer added 30 seconds ago
     insert_drawer_at_offset(&env.db_path, "shared-parser-drawer", 30);
-    // old drawer (2 hours ago, outside 1h window)
     insert_drawer_at_offset(&env.db_path, "shared-parser-old", 2 * 3600);
 
     let tail_out = run_mempal(&env.home, env.cwd(), &["tail", "--since", "1h"]);
@@ -1438,7 +1438,6 @@ fn test_tail_and_timeline_share_parser() {
     let tail_stdout = String::from_utf8_lossy(&tail_out.stdout);
     let timeline_stdout = String::from_utf8_lossy(&timeline_out.stdout);
 
-    // Both commands must include the recent drawer
     assert!(
         tail_stdout.contains("shared-parser-drawer"),
         "tail --since 1h should include recent drawer\n{tail_stdout}"
@@ -1447,7 +1446,6 @@ fn test_tail_and_timeline_share_parser() {
         timeline_stdout.contains("shared-parser-drawer"),
         "timeline --since 1h should include recent drawer\n{timeline_stdout}"
     );
-    // Both commands must exclude the old drawer
     assert!(
         !tail_stdout.contains("shared-parser-old"),
         "tail --since 1h should exclude old drawer\n{tail_stdout}"
@@ -1461,7 +1459,6 @@ fn test_tail_and_timeline_share_parser() {
 #[test]
 fn test_tail_since_iso_8601_accepted() {
     let env = DashboardEnv::new();
-    // Use an ISO timestamp 1 hour in the past — anything newer should appear
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock")
@@ -1469,7 +1466,6 @@ fn test_tail_since_iso_8601_accepted() {
     insert_drawer_at_offset(&env.db_path, "iso-recent", 30);
     insert_drawer_at_offset(&env.db_path, "iso-old", 2 * 3600);
 
-    // Build an ISO timestamp for 1h ago
     let cutoff_secs = now - 3600;
     let cutoff_ts = mempal::cowork::peek::format_rfc3339(
         UNIX_EPOCH + std::time::Duration::from_secs(cutoff_secs),
