@@ -3,7 +3,7 @@ use super::*;
 #[cfg(unix)]
 #[test]
 fn test_daemon_sigterm_graceful() {
-    let (tmp, db_path, _config_path) = setup_daemon_home();
+    let (tmp, db_path, config_path) = setup_daemon_home();
     let mut server = Server::new();
     let _mock = server
         .mock("POST", "/embeddings")
@@ -16,6 +16,9 @@ fn test_daemon_sigterm_graceful() {
         format!(
             r#"
 db_path = "{}"
+
+[api]
+addr = "127.0.0.1:0"
 
 [embed]
 backend = "openai_compat"
@@ -39,6 +42,8 @@ log_path = "{}"
         ),
     )
     .expect("rewrite config");
+    let config = mempal::core::config::Config::load_from(&config_path).expect("load config");
+    assert_eq!(config.api.addr, "127.0.0.1:0");
     let store = PendingMessageStore::new(&db_path).expect("store");
     let envelope = CapturedHookEnvelope {
         event: HookEvent::SessionStart.display_name().to_string(),
