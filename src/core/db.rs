@@ -1117,7 +1117,9 @@ impl Database {
         lease: Option<&RuntimeWriterLease>,
         merge: DrawerMergeWithNovelty<'_>,
     ) -> Result<(), DbError> {
-        self.with_runtime_writer_lease_transaction(lease, "merge drawer", || {
+        self.with_runtime_writer_lease_write_retry(lease, "merge drawer", || {
+            #[cfg(test)]
+            self.take_lease_fenced_write_sqlite_full()?;
             self.ensure_vectors_table(merge.vector.len())?;
             let vector_json = serde_json::to_string(merge.vector)?;
             let content_hash = content_hash_hex(merge.merged_content);

@@ -1,6 +1,11 @@
 //! Atomic generation fencing for runtime writer mutations.
 
 use rusqlite::{OptionalExtension, params};
+#[cfg(test)]
+use std::{
+    collections::HashSet,
+    sync::{Mutex, OnceLock},
+};
 
 use super::{
     Database, DbError, NoveltyAuditInsert, anchor, anchor_kind_as_str, content_hash_hex,
@@ -8,6 +13,10 @@ use super::{
     memory_domain_as_str, memory_kind_as_str, provenance_as_str, source_type_as_str,
 };
 use crate::core::types::{Drawer, RuntimeWriterLease};
+
+#[cfg(test)]
+static LEASE_FENCED_WRITES_TO_FAIL_WITH_SQLITE_FULL: OnceLock<Mutex<HashSet<std::path::PathBuf>>> =
+    OnceLock::new();
 
 /// One atomic drawer merge plus its novelty audit record.
 pub struct DrawerMergeWithNovelty<'a> {
@@ -30,6 +39,34 @@ pub struct IngestBoostBatch<'a> {
 }
 
 impl Database {
+    #[cfg(test)]
+    pub(crate) fn fail_next_lease_fenced_write_with_sqlite_full(&self) {
+        LEASE_FENCED_WRITES_TO_FAIL_WITH_SQLITE_FULL
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .expect("lock leased-write SQLITE_FULL test failures")
+            .insert(self.path.clone());
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_lease_fenced_write_sqlite_full(&self) -> Result<(), DbError> {
+        let should_fail = LEASE_FENCED_WRITES_TO_FAIL_WITH_SQLITE_FULL
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .expect("lock leased-write SQLITE_FULL test failures")
+            .remove(&self.path);
+        if should_fail {
+            return Err(DbError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::DiskFull,
+                    extended_code: rusqlite::ffi::SQLITE_FULL,
+                },
+                Some("database or disk is full".to_string()),
+            )));
+        }
+        Ok(())
+    }
+
     /// Record a gating audit under the same write lock that validates `lease`.
     pub fn record_gating_audit_fenced(
         &self,
@@ -43,7 +80,9 @@ impl Database {
         let Some(lease) = lease else {
             return self.record_gating_audit(candidate_hash, decision, project_id, content);
         };
-        self.with_runtime_writer_lease_write(Some(lease), operation, || {
+        self.with_runtime_writer_lease_write_retry(Some(lease), operation, || {
+            #[cfg(test)]
+            self.take_lease_fenced_write_sqlite_full()?;
             self.record_gating_audit_in_current_transaction(
                 candidate_hash,
                 decision,
