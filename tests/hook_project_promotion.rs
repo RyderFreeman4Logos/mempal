@@ -196,6 +196,46 @@ async fn test_codex_user_prompt_promotes_to_project_wing() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_spooled_user_prompt_promotes_audit_and_project_records() {
+    let _guard = config_guard().await;
+    let env = TestEnv::new();
+    let payload = serde_json::json!({
+        "agent": "codex",
+        "session_id": "codex-session-spooled-promotion",
+        "prompt": "Decision: preserve the spool until queue settlement.",
+        "padding": "x".repeat(64 * 1024),
+    })
+    .to_string();
+    let spool = env.mempal_home.join("hook-spool/spooled-prompt.json");
+    fs::create_dir_all(spool.parent().expect("spool parent")).expect("create spool parent");
+    fs::write(&spool, &payload).expect("write spooled payload");
+    let envelope = CapturedHookEnvelope {
+        event: HookEvent::UserPromptSubmit.display_name().to_string(),
+        kind: HookEvent::UserPromptSubmit.queue_kind().to_string(),
+        agent: "codex".to_string(),
+        captured_at: "2026-05-05T12:00:00Z".to_string(),
+        claude_cwd: env.project_dir.display().to_string(),
+        payload: None,
+        payload_path: Some(spool.display().to_string()),
+        payload_preview: None,
+        original_size_bytes: payload.len(),
+        truncated: false,
+    };
+    env.store
+        .enqueue(
+            HookEvent::UserPromptSubmit.queue_kind(),
+            &serde_json::to_string(&envelope).expect("serialize envelope"),
+        )
+        .expect("enqueue spooled prompt");
+
+    env.process_once().await;
+
+    assert_eq!(count_drawers(&env.db_path, "hooks-raw", "user-prompt"), 1);
+    assert_eq!(count_drawers(&env.db_path, "warifu-ce", "decision"), 1);
+    assert!(spool.exists(), "unconfirmed queue work retains its spool");
+}
+
 struct PromotedDrawer {
     content: String,
     source_file: String,

@@ -1347,7 +1347,6 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
         );
     }
 
-    cleanup_hook_spool_payload(&hook_payload)?;
     Ok(last_drawer_id.unwrap_or_else(|| message.id.clone()))
 }
 
@@ -1434,18 +1433,6 @@ fn read_bounded_hook_payload_handle_from(reader: impl Read) -> Result<String> {
         }));
     }
     Ok(raw_payload)
-}
-
-fn cleanup_hook_spool_payload(payload: &HookPayloadBody) -> Result<()> {
-    let Some(spool_path) = payload.spool_path.as_deref() else {
-        return Ok(());
-    };
-    match fs::remove_file(spool_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to remove hook spool {}", spool_path.display())),
-    }
 }
 
 fn bounded_hook_gate_content(content: &str, original_size_bytes: usize) -> String {

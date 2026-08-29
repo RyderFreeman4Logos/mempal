@@ -58,9 +58,9 @@ where
 }
 
 pub(super) fn persist_raw_payload_from_path(source: &Path, target: &Path) -> Result<()> {
-    let mut spool = fs::File::open(source)
-        .with_context(|| format!("failed to open hook spool {}", source.display()))?;
     persist(target, |file| {
+        let mut spool = fs::File::open(source)
+            .with_context(|| format!("failed to open hook spool {}", source.display()))?;
         std::io::copy(&mut spool, file)
             .with_context(|| {
                 format!(
@@ -70,14 +70,7 @@ pub(super) fn persist_raw_payload_from_path(source: &Path, target: &Path) -> Res
                 )
             })
             .map(|_| ())
-    })?;
-    match fs::remove_file(source) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to remove hook spool {}", source.display()))
-        }
-    }
+    })
 }
 
 pub(super) fn persist_raw_payload_at(raw_payload: &str, path: &Path) -> Result<()> {
@@ -125,10 +118,13 @@ mod tests {
             fs::read_to_string(&promoted_target).expect("read promoted"),
             "spooled payload"
         );
-        assert!(!spool.exists(), "promoted spool must be removed");
+        assert!(spool.exists(), "promoted spool must outlive publication");
+        fs::remove_file(&spool).expect("remove spool after settlement");
+        persist_raw_payload_from_path(&spool, &promoted_target)
+            .expect("reuse durable payload without reopening deleted spool");
         assert_eq!(
             sync_calls(),
-            (2, 2),
+            (3, 3),
             "every payload must sync its private file and parent namespace"
         );
     }
