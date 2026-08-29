@@ -46,7 +46,7 @@ use db_writer_lease_liveness::{
     runtime_writer_lease_holder_should_retain, runtime_writer_metadata_with_process_identity,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 20;
+pub const CURRENT_SCHEMA_VERSION: u32 = 21;
 pub const CURRENT_VECTOR_INDEX_VERSION: &str = "v2";
 pub const VECTOR_DISTANCE_METRIC: &str = "cosine";
 /// Default SQLite page cache budget for normal CLI/daemon/MCP connections.
@@ -7080,6 +7080,10 @@ CREATE INDEX IF NOT EXISTS idx_runtime_writer_leases_mode
     ON runtime_writer_leases(mode);
 "#;
 
+const V21_MIGRATION_SQL: &str = r#"
+ALTER TABLE drawers ADD COLUMN admission_owner TEXT;
+"#;
+
 const V12_COMPACTION_SCHEMA_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_drawers_compacted_into
     ON drawers(compacted_into)
@@ -7242,6 +7246,10 @@ fn migrations() -> &'static [Migration] {
         Migration {
             version: 20,
             sql: V20_MIGRATION_SQL,
+        },
+        Migration {
+            version: 21,
+            sql: V21_MIGRATION_SQL,
         },
     ];
     MIGRATIONS

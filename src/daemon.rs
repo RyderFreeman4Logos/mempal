@@ -50,6 +50,7 @@ use crate::session_review::{
     split_session_metadata, validate_linked_drawer_ids,
 };
 
+mod admission;
 mod durable_payload;
 #[cfg(feature = "rest")]
 mod mcp;
@@ -1329,7 +1330,8 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
     };
     let mut last_drawer_id = None;
     for record in records {
-        let drawer_id = ingest_drawer_record(&drawer_context, record, message.retry_count).await?;
+        let drawer_id =
+            ingest_drawer_record(&drawer_context, record, message.retry_count, &message.id).await?;
         let suggest_result = {
             let config = (*context.config).clone();
             let mempal_home = context.mempal_home.to_path_buf();
@@ -2336,6 +2338,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     context: &DrawerIngestContext<'_, E>,
     record: DrawerRecord,
     retry_count: u32,
+    admission_owner: &str,
 ) -> Result<String> {
     let (drawer_id, exists) = {
         let record = record.clone();
@@ -2400,7 +2403,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         Ok(())
     };
 
-    persist_before_model_work(context, &drawer_id, &record).await?;
+    persist_before_model_work(context, &drawer_id, &record, admission_owner).await?;
     let mut vector = None;
     let mut gating_audit_recorded = false;
     if gating_decision.is_none()
@@ -2433,11 +2436,12 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 None,
             )
             .await?;
-            discard_model_rejected_admission(
+            admission::discard_model_rejected_admission(
                 context.db,
                 context.daemon.runtime_writer_lease,
                 &drawer_id,
                 &record.source_file,
+                admission_owner,
             )
             .await?;
             return Ok(drawer_id);
@@ -2476,11 +2480,12 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         .await?;
         gating_audit_recorded = true;
         if llm_decision.is_rejected() {
-            discard_model_rejected_admission(
+            admission::discard_model_rejected_admission(
                 context.db,
                 context.daemon.runtime_writer_lease,
                 &drawer_id,
                 &record.source_file,
+                admission_owner,
             )
             .await?;
             return Ok(drawer_id);
@@ -2598,11 +2603,12 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 )
                 .await?;
             }
-            discard_model_rejected_admission(
+            admission::discard_model_rejected_admission(
                 context.db,
                 context.daemon.runtime_writer_lease,
                 &drawer_id,
                 &record.source_file,
+                admission_owner,
             )
             .await?;
             Ok(novelty.near_drawer_id.unwrap_or(drawer_id))
@@ -3046,6 +3052,7 @@ async fn persist_before_model_work<E: Embedder + ?Sized>(
     context: &DrawerIngestContext<'_, E>,
     drawer_id: &str,
     record: &DrawerRecord,
+    admission_owner: &str,
 ) -> Result<()> {
     persist_deferred_raw_payload(record)?;
     insert_drawer_async(
@@ -3053,68 +3060,9 @@ async fn persist_before_model_work<E: Embedder + ?Sized>(
         context.daemon.runtime_writer_lease,
         drawer_id,
         record.clone(),
+        admission_owner.to_string(),
     )
     .await?;
-    Ok(())
-}
-
-async fn discard_model_rejected_admission(
-    db: &AsyncDb,
-    runtime_writer_lease: Option<&RuntimeWriterLease>,
-    drawer_id: &str,
-    source_file: &str,
-) -> Result<()> {
-    let drawer_id = drawer_id.to_string();
-    let source_file = source_file.to_string();
-    let source_file_for_db = source_file.clone();
-    let runtime_writer_lease = runtime_writer_lease.cloned();
-    let payload_unreferenced = db
-        .run_write_anyhow(move |db| {
-            with_daemon_runtime_writer_lease_write(
-                db,
-                runtime_writer_lease.as_ref(),
-                "discard model-rejected hook drawer",
-                || {
-                    db.conn()
-                        .execute("DELETE FROM drawers WHERE id = ?1", [&drawer_id])
-                        .with_context(|| {
-                            format!("failed to discard hook drawer {}", drawer_id)
-                        })?;
-                    let referenced = db.conn().query_row(
-                        "SELECT EXISTS(SELECT 1 FROM drawers WHERE source_file = ?1 AND deleted_at IS NULL)",
-                        [source_file_for_db.as_str()],
-                        |row| row.get::<_, i64>(0),
-                    )?;
-                    Ok(referenced == 0)
-                },
-            )
-        })
-        .await?;
-    if payload_unreferenced {
-        match fs::remove_file(&source_file) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to discard hook payload {source_file}"));
-            }
-        }
-        if let Some(parent) = Path::new(&source_file).parent() {
-            match fs::remove_dir(parent) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "failed to discard hook payload directory {}",
-                            parent.display()
-                        )
-                    });
-                }
-            }
-        }
-    }
     Ok(())
 }
 
@@ -3123,6 +3071,7 @@ async fn insert_drawer_async(
     runtime_writer_lease: Option<&RuntimeWriterLease>,
     drawer_id: &str,
     record: DrawerRecord,
+    admission_owner: String,
 ) -> Result<()> {
     let drawer_id = drawer_id.to_string();
     let runtime_writer_lease = runtime_writer_lease.cloned();
@@ -3131,7 +3080,7 @@ async fn insert_drawer_async(
             db,
             runtime_writer_lease.as_ref(),
             "insert daemon hook drawer before model work",
-            || insert_drawer(db, &drawer_id, &record),
+            || insert_drawer_with_admission_owner(db, &drawer_id, &record, Some(&admission_owner)),
         )
     })
     .await
@@ -3158,26 +3107,43 @@ async fn insert_drawer_with_vector_async(
 }
 
 fn insert_drawer(db: &Database, drawer_id: &str, record: &DrawerRecord) -> Result<()> {
-    if db
-        .drawer_exists(drawer_id)
-        .with_context(|| format!("failed to re-check existing drawer {}", drawer_id))?
-    {
-        return Ok(());
-    }
+    insert_drawer_with_admission_owner(db, drawer_id, record, None)
+}
 
-    let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
-        id: drawer_id.to_string(),
-        content: record.content.clone(),
-        wing: record.wing.clone(),
-        room: Some(record.room.clone()),
-        source_file: Some(record.source_file.clone()),
-        source_type: SourceType::SystemGenerated,
-        added_at: record.added_at.clone(),
-        chunk_index: Some(0),
-        importance: record.importance,
-    });
-    db.insert_drawer_with_project(&drawer, record.project_id.as_deref())
-        .with_context(|| format!("failed to insert hook drawer {}", drawer.id))?;
+fn insert_drawer_with_admission_owner(
+    db: &Database,
+    drawer_id: &str,
+    record: &DrawerRecord,
+    admission_owner: Option<&str>,
+) -> Result<()> {
+    db.with_write_reserve_retry(
+        "insert daemon hook drawer admission",
+        || -> std::result::Result<(), DbError> {
+            if db.drawer_exists(drawer_id)? {
+                return Ok(());
+            }
+
+            let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+                id: drawer_id.to_string(),
+                content: record.content.clone(),
+                wing: record.wing.clone(),
+                room: Some(record.room.clone()),
+                source_file: Some(record.source_file.clone()),
+                source_type: SourceType::SystemGenerated,
+                added_at: record.added_at.clone(),
+                chunk_index: Some(0),
+                importance: record.importance,
+            });
+            db.insert_drawer_with_project(&drawer, record.project_id.as_deref())?;
+            if let Some(admission_owner) = admission_owner {
+                db.conn().execute(
+                    "UPDATE drawers SET admission_owner = ?1 WHERE id = ?2",
+                    [admission_owner, drawer_id],
+                )?;
+            }
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 
@@ -6042,17 +6008,24 @@ mod tests {
             deferred_raw_payload: None,
             deferred_raw_payload_path: None,
         };
-        super::insert_drawer(&db, "rejected-candidate", &record).expect("insert rejected drawer");
+        super::insert_drawer_with_admission_owner(
+            &db,
+            "rejected-candidate",
+            &record,
+            Some("rejected-message"),
+        )
+        .expect("insert rejected drawer");
         let mut retained_record = record.clone();
         retained_record.content = "retained equivalent capture".to_string();
         super::insert_drawer(&db, "retained-candidate", &retained_record)
             .expect("insert retained drawer");
 
-        super::discard_model_rejected_admission(
+        super::admission::discard_model_rejected_admission(
             &async_db,
             None,
             "rejected-candidate",
             &record.source_file,
+            "rejected-message",
         )
         .await
         .expect("discard rejected drawer");
