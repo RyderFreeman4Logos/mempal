@@ -5979,6 +5979,10 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
             ensure_v15_crystallize_schema(conn, read_user_version(conn)?)?;
             continue;
         }
+        if migration.version == 21 && drawers_column_exists(conn, "admission_owner")? {
+            apply_migration_atomic(conn, &V21_ALREADY_APPLIED_MIGRATION)?;
+            continue;
+        }
         apply_migration_atomic(conn, migration)?;
         if migration.version == 17 {
             repopulate_fts_contentless(conn)?;
@@ -7263,6 +7267,11 @@ struct Migration {
 const V7_ALREADY_APPLIED_MIGRATION: Migration = Migration {
     version: 7,
     sql: V7_ALREADY_APPLIED_MIGRATION_SQL,
+};
+
+const V21_ALREADY_APPLIED_MIGRATION: Migration = Migration {
+    version: 21,
+    sql: "",
 };
 
 fn register_sqlite_vec() -> Result<(), DbError> {
