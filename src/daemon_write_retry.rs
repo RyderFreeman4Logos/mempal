@@ -34,9 +34,24 @@ pub(super) fn with_daemon_runtime_writer_lease_write<T>(
     operation: &'static str,
     mut write: impl FnMut() -> Result<T>,
 ) -> Result<T> {
-    db.with_runtime_writer_lease_write_retry(lease, operation, || write().map_err(DaemonWriteError))
-        .map_err(|error| error.0)
-        .with_context(|| format!("daemon writer mutation failed during {operation}"))
+    let result = db
+        .with_runtime_writer_lease_write_retry(lease, operation, || {
+            write().map_err(DaemonWriteError)
+        })
+        .map_err(|error| error.0);
+    match result {
+        Err(error)
+            if matches!(
+                error.downcast_ref::<DbError>(),
+                Some(DbError::RuntimeWriterLeaseLost { .. })
+            ) =>
+        {
+            Err(error)
+        }
+        result => {
+            result.with_context(|| format!("daemon writer mutation failed during {operation}"))
+        }
+    }
 }
 
 pub(super) fn record_session_review_rejection(
