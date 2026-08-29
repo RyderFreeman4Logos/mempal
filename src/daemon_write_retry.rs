@@ -120,10 +120,23 @@ mod tests {
         db.insert_drawer(&drawer).expect("insert merge target");
         db.insert_vector(&drawer.id, &[0.1])
             .expect("insert merge target vector");
+        let candidate = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+            id: "daemon-merge-candidate".to_string(),
+            content: "admitted candidate".to_string(),
+            wing: "test-wing".to_string(),
+            room: Some("test-room".to_string()),
+            source_file: Some("hook-payload.json".to_string()),
+            source_type: SourceType::SystemGenerated,
+            added_at: "2026-08-28T00:00:00Z".to_string(),
+            chunk_index: Some(0),
+            importance: 0,
+        });
+        db.insert_drawer(&candidate)
+            .expect("persist admitted merge candidate");
         let reserve_path = db_path.with_file_name(".palace.db.write-reserve");
         db.fail_next_lease_fenced_write_with_sqlite_full();
 
-        db.update_drawer_after_merge_and_record_novelty_audit_fenced(
+        db.update_drawer_after_merge_consume_candidate_and_record_novelty_audit_fenced(
             Some(&lease),
             DrawerMergeWithNovelty {
                 drawer_id: &drawer.id,
@@ -140,6 +153,7 @@ mod tests {
                     project_id: None,
                 },
             },
+            &candidate.id,
         )
         .expect("leased merge must retry after SQLITE_FULL");
 
@@ -156,6 +170,11 @@ mod tests {
                 )
                 .expect("read committed merge"),
             "after merge"
+        );
+        assert!(
+            !db.drawer_exists(&candidate.id)
+                .expect("read consumed admitted merge candidate"),
+            "successful merge must consume the pre-admitted candidate"
         );
     }
 

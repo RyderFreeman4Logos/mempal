@@ -1112,31 +1112,6 @@ impl Database {
         )
     }
 
-    pub fn update_drawer_after_merge_and_record_novelty_audit_fenced(
-        &self,
-        lease: Option<&RuntimeWriterLease>,
-        merge: DrawerMergeWithNovelty<'_>,
-    ) -> Result<(), DbError> {
-        self.with_runtime_writer_lease_write_retry(lease, "merge drawer", || {
-            #[cfg(test)]
-            self.take_lease_fenced_write_sqlite_full()?;
-            self.ensure_vectors_table(merge.vector.len())?;
-            let vector_json = serde_json::to_string(merge.vector)?;
-            let content_hash = content_hash_hex(merge.merged_content);
-            self.apply_drawer_merge_update(DrawerMergeUpdate {
-                drawer_id: merge.drawer_id,
-                merged_content: merge.merged_content,
-                updated_at: merge.updated_at,
-                content_hash: &content_hash,
-                vector_json: &vector_json,
-                vector_len: merge.vector.len(),
-                expected_merge_count: merge.expected_merge_count,
-            })?;
-            self.insert_novelty_audit_row(merge.audit)?;
-            Ok(())
-        })
-    }
-
     fn apply_drawer_merge_update(&self, update: DrawerMergeUpdate<'_>) -> Result<(), DbError> {
         let updated = self.conn.execute(
             r#"

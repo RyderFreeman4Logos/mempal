@@ -2765,7 +2765,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 context
                     .db
                     .run_write_anyhow(move |db| {
-                        db.update_drawer_after_merge_and_record_novelty_audit_fenced(
+                        db.update_drawer_after_merge_consume_candidate_and_record_novelty_audit_fenced(
                             runtime_writer_lease.as_ref(),
                             DrawerMergeWithNovelty {
                                 drawer_id: &target_id_for_merge,
@@ -2782,6 +2782,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                                     project_id: project_id.as_deref(),
                                 },
                             },
+                            &drawer_id_for_merge,
                         )
                         .map_err(|error| match error {
                             DbError::DrawerMergeConflict { .. } => anyhow::Error::new(error),
