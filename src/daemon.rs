@@ -2414,8 +2414,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         Ok(())
     };
 
-    let admission_raw_payload_created =
-        persist_before_model_work(context, &drawer_id, &record).await?;
+    persist_before_model_work(context, &drawer_id, &record).await?;
     let mut vector = None;
     let mut gating_audit_recorded = false;
     if gating_decision.is_none()
@@ -2452,8 +2451,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 context.db,
                 context.daemon.runtime_writer_lease,
                 &drawer_id,
-                &record,
-                admission_raw_payload_created,
+                &record.source_file,
             )
             .await?;
             return Ok(drawer_id);
@@ -2496,8 +2494,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 context.db,
                 context.daemon.runtime_writer_lease,
                 &drawer_id,
-                &record,
-                admission_raw_payload_created,
+                &record.source_file,
             )
             .await?;
             return Ok(drawer_id);
@@ -2619,8 +2616,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 context.db,
                 context.daemon.runtime_writer_lease,
                 &drawer_id,
-                &record,
-                admission_raw_payload_created,
+                &record.source_file,
             )
             .await?;
             Ok(novelty.near_drawer_id.unwrap_or(drawer_id))
@@ -3064,10 +3060,7 @@ async fn persist_before_model_work<E: Embedder + ?Sized>(
     context: &DrawerIngestContext<'_, E>,
     drawer_id: &str,
     record: &DrawerRecord,
-) -> Result<bool> {
-    let payload_path = Path::new(&record.source_file);
-    let raw_payload_created = !payload_path.exists()
-        && (record.deferred_raw_payload.is_some() || record.deferred_raw_payload_path.is_some());
+) -> Result<()> {
     persist_deferred_raw_payload(record)?;
     insert_drawer_async(
         context.db,
@@ -3076,43 +3069,51 @@ async fn persist_before_model_work<E: Embedder + ?Sized>(
         record.clone(),
     )
     .await?;
-    Ok(raw_payload_created)
+    Ok(())
 }
 
 async fn discard_model_rejected_admission(
     db: &AsyncDb,
     runtime_writer_lease: Option<&RuntimeWriterLease>,
     drawer_id: &str,
-    record: &DrawerRecord,
-    raw_payload_created: bool,
+    source_file: &str,
 ) -> Result<()> {
     let drawer_id = drawer_id.to_string();
+    let source_file = source_file.to_string();
+    let source_file_for_db = source_file.clone();
     let runtime_writer_lease = runtime_writer_lease.cloned();
-    db.run_write_anyhow(move |db| {
-        with_daemon_runtime_writer_lease_write(
-            db,
-            runtime_writer_lease.as_ref(),
-            "discard model-rejected hook drawer",
-            || {
-                db.conn()
-                    .execute("DELETE FROM drawers WHERE id = ?1", [&drawer_id])
-                    .with_context(|| format!("failed to discard hook drawer {}", drawer_id))?;
-                Ok(())
-            },
-        )
-    })
-    .await?;
-    if raw_payload_created {
-        match fs::remove_file(&record.source_file) {
+    let payload_unreferenced = db
+        .run_write_anyhow(move |db| {
+            with_daemon_runtime_writer_lease_write(
+                db,
+                runtime_writer_lease.as_ref(),
+                "discard model-rejected hook drawer",
+                || {
+                    db.conn()
+                        .execute("DELETE FROM drawers WHERE id = ?1", [&drawer_id])
+                        .with_context(|| {
+                            format!("failed to discard hook drawer {}", drawer_id)
+                        })?;
+                    let referenced = db.conn().query_row(
+                        "SELECT EXISTS(SELECT 1 FROM drawers WHERE source_file = ?1 AND deleted_at IS NULL)",
+                        [source_file_for_db.as_str()],
+                        |row| row.get::<_, i64>(0),
+                    )?;
+                    Ok(referenced == 0)
+                },
+            )
+        })
+        .await?;
+    if payload_unreferenced {
+        match fs::remove_file(&source_file) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to discard hook payload {}", record.source_file)
-                });
+                return Err(error)
+                    .with_context(|| format!("failed to discard hook payload {source_file}"));
             }
         }
-        if let Some(parent) = Path::new(&record.source_file).parent() {
+        if let Some(parent) = Path::new(&source_file).parent() {
             match fs::remove_dir(parent) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -5876,7 +5877,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_automatic_hook_without_llm_gate_persists_before_gate() {
+    async fn test_automatic_hook_reject_after_unavailable_model_removes_raw_payload() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -5987,8 +5988,8 @@ mod tests {
                         "message": {
                             "role": "assistant",
                             "content": serde_json::json!({
-                                "score": 0.95,
-                                "reason": "retry keep",
+                                "verdict": "reject",
+                                "score": 0.05,
                             })
                             .to_string(),
                         }
@@ -6021,15 +6022,68 @@ mod tests {
             },
         )
         .await
-        .expect("retry should resume model work for the admitted drawer");
+        .expect("retry should reject the admitted drawer");
         llm_mock.assert_async().await;
-        let vector_count: i64 = db
-            .conn()
-            .query_row("SELECT COUNT(*) FROM drawer_vectors", [], |row| row.get(0))
-            .expect("count retry vector");
-        assert_eq!(
-            vector_count, 1,
-            "retry must complete embedding after admission"
+        assert!(
+            !db.drawer_exists(&queued_id).expect("drawer exists query"),
+            "retry rejection must discard the admitted drawer"
+        );
+        assert!(
+            !super::raw_payload_storage_path(&hook_payload, tmp.path()).exists(),
+            "retry rejection must discard the raw payload created before the unavailable model"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_model_rejection_keeps_raw_payload_referenced_by_another_drawer() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let payload_path = tmp.path().join("hook-payloads/shared.json");
+        std::fs::create_dir_all(payload_path.parent().expect("payload parent"))
+            .expect("create payload parent");
+        std::fs::write(&payload_path, "shared raw payload").expect("write payload");
+        let record = super::DrawerRecord {
+            wing: "hooks-raw".to_string(),
+            room: "shared".to_string(),
+            source_file: payload_path.to_string_lossy().to_string(),
+            content: "rejected candidate".to_string(),
+            added_at: "2026-05-01T12:34:56Z".to_string(),
+            importance: 0,
+            bypass_novelty: false,
+            project_id: None,
+            deferred_raw_payload: None,
+            deferred_raw_payload_path: None,
+        };
+        super::insert_drawer(&db, "rejected-candidate", &record).expect("insert rejected drawer");
+        let mut retained_record = record.clone();
+        retained_record.content = "retained equivalent capture".to_string();
+        super::insert_drawer(&db, "retained-candidate", &retained_record)
+            .expect("insert retained drawer");
+
+        super::discard_model_rejected_admission(
+            &async_db,
+            None,
+            "rejected-candidate",
+            &record.source_file,
+        )
+        .await
+        .expect("discard rejected drawer");
+
+        assert!(
+            !db.drawer_exists("rejected-candidate")
+                .expect("rejected drawer exists query"),
+            "rejected drawer must be removed"
+        );
+        assert!(
+            db.drawer_exists("retained-candidate")
+                .expect("retained drawer exists query"),
+            "other drawer must remain"
+        );
+        assert!(
+            payload_path.exists(),
+            "a payload referenced by another retained drawer must not be removed"
         );
     }
 
