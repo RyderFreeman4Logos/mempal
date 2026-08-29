@@ -1,5 +1,5 @@
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fs;
+use std::io::Read;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -50,6 +50,7 @@ use crate::session_review::{
     split_session_metadata, validate_linked_drawer_ids,
 };
 
+mod durable_payload;
 #[cfg(feature = "rest")]
 mod mcp;
 #[path = "daemon/self_heal.rs"]
@@ -3280,73 +3281,15 @@ fn raw_payload_storage_path(raw_payload: &str, mempal_home: &Path) -> PathBuf {
 
 fn persist_deferred_raw_payload(record: &DrawerRecord) -> Result<()> {
     if let Some(spool_path) = record.deferred_raw_payload_path.as_deref() {
-        return persist_raw_payload_from_path(spool_path, Path::new(&record.source_file));
+        return durable_payload::persist_raw_payload_from_path(
+            spool_path,
+            Path::new(&record.source_file),
+        );
     }
     let Some(raw_payload) = record.deferred_raw_payload.as_deref() else {
         return Ok(());
     };
-    persist_raw_payload_at(raw_payload, Path::new(&record.source_file))
-}
-
-fn persist_raw_payload_from_path(source: &Path, target: &Path) -> Result<()> {
-    let payload_dir = target.parent().ok_or_else(|| {
-        anyhow::anyhow!("raw hook payload path has no parent: {}", target.display())
-    })?;
-    fs::create_dir_all(payload_dir)
-        .with_context(|| format!("failed to create {}", payload_dir.display()))?;
-    if target.exists() {
-        return Ok(());
-    }
-    match fs::rename(source, target) {
-        Ok(()) => return Ok(()),
-        Err(_error) if target.exists() => return Ok(()),
-        Err(error) => {
-            if !source.exists() {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to promote hook spool {} to {}",
-                        source.display(),
-                        target.display()
-                    )
-                });
-            }
-        }
-    }
-    fs::copy(source, target).with_context(|| {
-        format!(
-            "failed to copy hook spool {} to {}",
-            source.display(),
-            target.display()
-        )
-    })?;
-    match fs::remove_file(source) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to remove hook spool {}", source.display()))
-        }
-    }
-}
-
-fn persist_raw_payload_at(raw_payload: &str, path: &Path) -> Result<()> {
-    let payload_dir = path.parent().ok_or_else(|| {
-        anyhow::anyhow!("raw hook payload path has no parent: {}", path.display())
-    })?;
-    fs::create_dir_all(payload_dir)
-        .with_context(|| format!("failed to create {}", payload_dir.display()))?;
-    if !path.exists() {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
-        file.write_all(raw_payload.as_bytes())
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        file.flush()
-            .with_context(|| format!("failed to flush {}", path.display()))?;
-    }
-    Ok(())
+    durable_payload::persist_raw_payload_at(raw_payload, Path::new(&record.source_file))
 }
 
 fn should_enqueue_llm_gating(
