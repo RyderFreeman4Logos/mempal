@@ -736,6 +736,10 @@ async fn process_hook_worker_message_inner(
                 tracing::error!(?error, "failed to confirm {message_id}");
                 span.finish_error(error);
             } else {
+                if let Err(error) = remove_confirmed_hook_spool(&message, &state.mempal_home) {
+                    tracing::error!(?error, "failed to remove confirmed hook spool {message_id}");
+                    state.write_observer.record_error(error.to_string());
+                }
                 span.finish_success();
             }
         }
@@ -1397,6 +1401,16 @@ fn load_hook_payload_body(
         raw_payload: Some(raw_payload),
         spool_path,
     })
+}
+
+fn remove_confirmed_hook_spool(message: &ClaimedMessage, mempal_home: &Path) -> Result<()> {
+    let envelope: CapturedHookEnvelope = serde_json::from_str(&message.payload)
+        .context("failed to decode confirmed hook envelope")?;
+    let Some(payload_path) = envelope.payload_path.as_deref() else {
+        return Ok(());
+    };
+    let payload_path = validated_hook_payload_path(payload_path, mempal_home)?;
+    durable_payload::remove_after_settlement(&payload_path)
 }
 
 fn validated_hook_payload_path(payload_path: &str, mempal_home: &Path) -> Result<PathBuf> {
@@ -4902,6 +4916,9 @@ mod tests {
             "static-test"
         }
     }
+
+    #[path = "spool_settlement_tests.rs"]
+    mod spool_settlement_tests;
 
     #[test]
     fn test_daemon_fenced_write_rejects_takeover_after_preflight() {

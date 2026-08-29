@@ -35,6 +35,15 @@ fn sync_existing(path: &Path, parent: &Path) -> Result<()> {
     sync_parent(parent)
 }
 
+pub(super) fn remove_after_settlement(path: &Path) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        anyhow::anyhow!("settled hook spool path has no parent: {}", path.display())
+    })?;
+    fs::remove_file(path)
+        .with_context(|| format!("failed to remove settled hook spool {}", path.display()))?;
+    sync_parent(parent)
+}
+
 fn persist<F>(path: &Path, write: F) -> Result<()>
 where
     F: FnOnce(&mut fs::File) -> Result<()>,
