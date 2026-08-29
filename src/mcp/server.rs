@@ -22762,6 +22762,7 @@ enabled = true
 
     #[tokio::test]
     async fn test_mcp_operation_status_returns_queue_result_with_slow_warning_snapshot() {
+        let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (_tempdir, db_path, server) = setup_server();
         let operation_id = PendingMessageStore::new_without_reclaim(&db_path)
             .enqueue(INGEST_ASYNC_KIND, "{}")
