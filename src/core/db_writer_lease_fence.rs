@@ -50,7 +50,7 @@ impl Database {
     }
 
     #[cfg(test)]
-    pub(super) fn take_lease_fenced_write_sqlite_full(&self) -> Result<(), DbError> {
+    pub(crate) fn take_lease_fenced_write_sqlite_full(&self) -> Result<(), DbError> {
         let should_fail = LEASE_FENCED_WRITES_TO_FAIL_WITH_SQLITE_FULL
             .get_or_init(|| Mutex::new(HashSet::new()))
             .lock()

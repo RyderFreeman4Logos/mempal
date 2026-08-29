@@ -1288,14 +1288,15 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
     let envelope: CapturedHookEnvelope =
         serde_json::from_str(&message.payload).context("failed to decode queued hook envelope")?;
     let hook_payload = load_hook_payload_body(&envelope, context.mempal_home)?;
-    let records = {
+    let (records, session_review_rejected) = {
         let envelope = envelope.clone();
         let hook_payload = hook_payload.clone();
         let config = (*context.config).clone();
         let mempal_home = context.mempal_home.to_path_buf();
         let runtime_writer_lease = context.runtime_writer_lease.cloned();
         db.run_write_anyhow(move |db| {
-            db.with_runtime_writer_lease_write(
+            with_daemon_runtime_writer_lease_write(
+                db,
                 runtime_writer_lease.as_ref(),
                 "build daemon hook drawer records",
                 || build_drawer_records(db, &envelope, &hook_payload, &config, &mempal_home),
@@ -1303,6 +1304,21 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
         })
         .await?
     };
+    if session_review_rejected {
+        let runtime_writer_lease = context.runtime_writer_lease.cloned();
+        let counter_result = db
+            .run_write_anyhow(move |db| {
+                record_session_review_rejection(db, runtime_writer_lease.as_ref())
+            })
+            .await;
+        if let Err(error) = counter_result {
+            tracing::warn!(
+                ?error,
+                key = SESSION_REVIEW_REJECTED_TOTAL_KEY,
+                "failed to record session-review rejection counter"
+            );
+        }
+    }
     let drawer_context = DrawerIngestContext {
         db,
         store,
@@ -1986,10 +2002,11 @@ fn build_drawer_records(
     hook_payload: &HookPayloadBody,
     config: &crate::core::config::Config,
     mempal_home: &Path,
-) -> Result<Vec<DrawerRecord>> {
+) -> Result<(Vec<DrawerRecord>, bool)> {
     let mut audit_record = build_audit_drawer_record(envelope, hook_payload, config, mempal_home)?;
     apply_turn_strata(&mut audit_record, config);
     let mut records = Vec::new();
+    let mut session_review_rejected = false;
     if should_keep_drawer_record(&audit_record, config) {
         records.push(audit_record.clone());
     }
@@ -2060,7 +2077,7 @@ fn build_drawer_records(
             }
             Ok(None) => {}
             Err(error) => {
-                record_session_review_rejection(db);
+                session_review_rejected = true;
                 tracing::warn!(
                     ?error,
                     event = %envelope.event,
@@ -2072,7 +2089,7 @@ fn build_drawer_records(
         }
     }
 
-    Ok(records)
+    Ok((records, session_review_rejected))
 }
 
 fn apply_turn_strata(record: &mut DrawerRecord, config: &crate::core::config::Config) {
@@ -2147,24 +2164,6 @@ fn build_user_prompt_project_record(
         deferred_raw_payload: audit_record.deferred_raw_payload.clone(),
         deferred_raw_payload_path: audit_record.deferred_raw_payload_path.clone(),
     }))
-}
-
-fn record_session_review_rejection(db: &Database) {
-    if let Err(error) = db.conn().execute(
-        r#"
-        INSERT INTO fork_ext_meta (key, value)
-        VALUES (?1, '1')
-        ON CONFLICT(key) DO UPDATE
-        SET value = CAST(CAST(COALESCE(fork_ext_meta.value, '0') AS INTEGER) + 1 AS TEXT)
-        "#,
-        [SESSION_REVIEW_REJECTED_TOTAL_KEY],
-    ) {
-        tracing::warn!(
-            ?error,
-            key = SESSION_REVIEW_REJECTED_TOTAL_KEY,
-            "failed to record session-review rejection counter"
-        );
-    }
 }
 
 fn load_session_review_payload(
@@ -3766,7 +3765,7 @@ fn write_daemon_embedder_status_path(
 #[path = "daemon_write_retry.rs"]
 mod daemon_write_retry;
 
-use daemon_write_retry::with_daemon_runtime_writer_lease_write;
+use daemon_write_retry::{record_session_review_rejection, with_daemon_runtime_writer_lease_write};
 
 #[cfg(test)]
 mod mcp_ingest_tests;
@@ -6932,7 +6931,8 @@ mod tests {
             spool_path: None,
         };
         let records = build_drawer_records(&db, &envelope, &hook_payload, &config, &mempal_home)
-            .expect("drawer records");
+            .expect("drawer records")
+            .0;
 
         assert!(records.is_empty());
         assert!(

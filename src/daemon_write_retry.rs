@@ -39,6 +39,32 @@ pub(super) fn with_daemon_runtime_writer_lease_write<T>(
         .with_context(|| format!("daemon writer mutation failed during {operation}"))
 }
 
+pub(super) fn record_session_review_rejection(
+    db: &Database,
+    lease: Option<&RuntimeWriterLease>,
+) -> Result<()> {
+    with_daemon_runtime_writer_lease_write(
+        db,
+        lease,
+        "record session-review rejection counter",
+        || {
+            #[cfg(test)]
+            db.take_lease_fenced_write_sqlite_full()
+                .map_err(anyhow::Error::from)?;
+            db.conn().execute(
+                r#"
+                INSERT INTO fork_ext_meta (key, value)
+                VALUES (?1, '1')
+                ON CONFLICT(key) DO UPDATE
+                SET value = CAST(CAST(COALESCE(fork_ext_meta.value, '0') AS INTEGER) + 1 AS TEXT)
+                "#,
+                [super::SESSION_REVIEW_REJECTED_TOTAL_KEY],
+            )?;
+            Ok(())
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -88,6 +114,32 @@ mod tests {
                 })
                 .expect("read committed gating audit"),
             1
+        );
+    }
+
+    #[test]
+    fn session_end_rejection_counter_consumes_reserve_after_sqlite_full() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open database");
+        let reserve_path = db_path.with_file_name(".palace.db.write-reserve");
+        db.fail_next_lease_fenced_write_with_sqlite_full();
+
+        super::record_session_review_rejection(&db, None).expect("rejection counter must retry");
+
+        assert!(
+            !reserve_path.exists(),
+            "SessionEnd rejection counter must consume the write reserve and retry"
+        );
+        assert_eq!(
+            db.conn()
+                .query_row(
+                    "SELECT value FROM fork_ext_meta WHERE key = ?1",
+                    [super::super::SESSION_REVIEW_REJECTED_TOTAL_KEY],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("query rejection counter"),
+            "1"
         );
     }
 
