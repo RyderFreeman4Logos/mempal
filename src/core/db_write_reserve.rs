@@ -124,7 +124,7 @@ pub(crate) fn ensure_write_reserve(database_path: &Path) -> std::io::Result<()> 
         .write(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .mode(0o600)
-        .open(path)?;
+        .open(&path)?;
     let current_len = file.metadata()?.len();
     if current_len < WRITE_RESERVE_BYTES {
         // SAFETY: `file` keeps this valid descriptor open for the call, and the
@@ -140,6 +140,7 @@ pub(crate) fn ensure_write_reserve(database_path: &Path) -> std::io::Result<()> 
             return Err(std::io::Error::from_raw_os_error(result));
         }
         file.sync_all()?;
+        sync_reserve_parent_directory(&path)?;
     }
     Ok(())
 }
@@ -173,6 +174,9 @@ fn consume_write_reserve(database_path: &Path, operation: &'static str) -> bool 
     if fs::remove_file(&path).is_err() {
         return false;
     }
+    if sync_reserve_parent_directory(&path).is_err() {
+        return false;
+    }
     let warned = WRITE_RESERVE_WARNED
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
@@ -187,6 +191,14 @@ fn consume_write_reserve(database_path: &Path, operation: &'static str) -> bool 
     #[cfg(test)]
     pause_after_reserve_consumed_for_test(&path);
     true
+}
+
+fn sync_reserve_parent_directory(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    crate::ingress_spool::sync_directory(parent)
 }
 
 #[cfg(test)]
@@ -443,5 +455,32 @@ mod tests {
                 .expect("read retried write"),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reserve_namespace_transitions_sync_parent_after_publication() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let reserve_path = write_reserve_path(&db_path);
+        let take_sync_count =
+            || crate::ingress_spool::SYNC_DIRECTORY_CALLS.with(|calls| calls.get());
+        let reset_sync_count =
+            || crate::ingress_spool::SYNC_DIRECTORY_CALLS.with(|calls| calls.set(0));
+
+        reset_sync_count();
+        ensure_write_reserve(&db_path).expect("create reserve");
+        let created = take_sync_count();
+        reset_sync_count();
+        assert!(consume_write_reserve(&db_path, "test namespace sync"));
+        let removed = take_sync_count();
+        reset_sync_count();
+        ensure_write_reserve(&db_path).expect("refill reserve");
+        let refilled = take_sync_count();
+
+        assert_eq!(created, 1);
+        assert_eq!(removed, 1);
+        assert_eq!(refilled, 1);
+        assert!(reserve_path.exists());
     }
 }
