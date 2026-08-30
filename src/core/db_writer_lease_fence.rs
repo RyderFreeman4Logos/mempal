@@ -106,11 +106,12 @@ impl Database {
         lease: Option<&RuntimeWriterLease>,
         merge: DrawerMergeWithNovelty<'_>,
         candidate_drawer_id: &str,
+        candidate_admission_owner: &str,
     ) -> Result<(), DbError> {
         self.update_drawer_after_merge_and_record_novelty_audit_fenced_inner(
             lease,
             merge,
-            Some(candidate_drawer_id),
+            Some((candidate_drawer_id, candidate_admission_owner)),
         )
     }
 
@@ -118,7 +119,7 @@ impl Database {
         &self,
         lease: Option<&RuntimeWriterLease>,
         merge: DrawerMergeWithNovelty<'_>,
-        candidate_drawer_id: Option<&str>,
+        candidate: Option<(&str, &str)>,
     ) -> Result<(), DbError> {
         self.with_runtime_writer_lease_write_retry(lease, "merge drawer", || {
             #[cfg(test)]
@@ -136,10 +137,12 @@ impl Database {
                 expected_merge_count: merge.expected_merge_count,
             })?;
             self.insert_novelty_audit_row(merge.audit)?;
-            if let Some(candidate_drawer_id) = candidate_drawer_id {
+            if let Some((candidate_drawer_id, candidate_admission_owner)) = candidate {
                 if candidate_drawer_id != merge.drawer_id {
-                    self.conn
-                        .execute("DELETE FROM drawers WHERE id = ?1", [candidate_drawer_id])?;
+                    self.conn.execute(
+                        "DELETE FROM drawers WHERE id = ?1 AND admission_owner = ?2",
+                        [candidate_drawer_id, candidate_admission_owner],
+                    )?;
                 }
             }
             Ok(())

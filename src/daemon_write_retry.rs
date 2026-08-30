@@ -200,6 +200,12 @@ mod tests {
         });
         db.insert_drawer(&candidate)
             .expect("persist admitted merge candidate");
+        db.conn()
+            .execute(
+                "UPDATE drawers SET admission_owner = ?1 WHERE id = ?2",
+                ["daemon-enospc-merge-test", candidate.id.as_str()],
+            )
+            .expect("mark merge candidate admission owner");
         let reserve_path = db_path.with_file_name(".palace.db.write-reserve");
         db.fail_next_lease_fenced_write_with_sqlite_full();
 
@@ -221,6 +227,7 @@ mod tests {
                 },
             },
             &candidate.id,
+            "daemon-enospc-merge-test",
         )
         .expect("leased merge must retry after SQLITE_FULL");
 
@@ -242,6 +249,107 @@ mod tests {
             !db.drawer_exists(&candidate.id)
                 .expect("read consumed admitted merge candidate"),
             "successful merge must consume the pre-admitted candidate"
+        );
+    }
+
+    #[test]
+    fn leased_merge_does_not_consume_candidate_owned_by_another_message() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open database");
+        let lease = db
+            .runtime_writer_lease_acquire(
+                super::super::SQLITE_WRITER_LEASE_NAME,
+                "daemon-foreign-candidate-test",
+                "daemon",
+                300,
+                None,
+            )
+            .expect("acquire daemon writer lease")
+            .expect("daemon writer lease available");
+        let target = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+            id: "foreign-candidate-target".to_string(),
+            content: "before merge".to_string(),
+            wing: "test-wing".to_string(),
+            room: Some("test-room".to_string()),
+            source_file: Some("target.json".to_string()),
+            source_type: SourceType::SystemGenerated,
+            added_at: "2026-08-28T00:00:00Z".to_string(),
+            chunk_index: Some(0),
+            importance: 0,
+        });
+        let candidate = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+            id: "foreign-candidate".to_string(),
+            content: "completed by another message".to_string(),
+            wing: "test-wing".to_string(),
+            room: Some("test-room".to_string()),
+            source_file: Some("candidate.json".to_string()),
+            source_type: SourceType::SystemGenerated,
+            added_at: "2026-08-28T00:00:00Z".to_string(),
+            chunk_index: Some(0),
+            importance: 0,
+        });
+        db.insert_drawer(&target).expect("insert merge target");
+        db.insert_vector(&target.id, &[0.1])
+            .expect("insert target vector");
+        db.insert_drawer(&candidate)
+            .expect("insert completed candidate");
+        db.insert_vector(&candidate.id, &[0.2])
+            .expect("insert candidate vector");
+        db.conn()
+            .execute(
+                "UPDATE drawers SET admission_owner = ?1 WHERE id = ?2",
+                ["another-message", candidate.id.as_str()],
+            )
+            .expect("mark candidate owned by another message");
+
+        db.update_drawer_after_merge_consume_candidate_and_record_novelty_audit_fenced(
+            Some(&lease),
+            DrawerMergeWithNovelty {
+                drawer_id: &target.id,
+                merged_content: "after merge",
+                updated_at: "2026-08-28T00:01:00Z",
+                vector: &[0.3],
+                expected_merge_count: 0,
+                audit: NoveltyAuditInsert {
+                    candidate_hash: &candidate.id,
+                    action: NoveltyAction::Merge,
+                    near_drawer_id: Some(&target.id),
+                    cosine: Some(0.9),
+                    audit_decision: None,
+                    project_id: None,
+                },
+            },
+            &candidate.id,
+            "current-message",
+        )
+        .expect("merge must succeed without consuming another message's candidate");
+
+        assert_eq!(
+            db.conn()
+                .query_row(
+                    "SELECT content FROM drawers WHERE id = ?1",
+                    [&target.id],
+                    |row| { row.get::<_, String>(0) }
+                )
+                .expect("read merged target"),
+            "after merge"
+        );
+        assert!(
+            db.drawer_exists(&candidate.id)
+                .expect("read foreign candidate"),
+            "merge must not consume another message's completed candidate"
+        );
+        assert_eq!(
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM drawer_vectors WHERE id = ?1",
+                    [&candidate.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read foreign candidate vector"),
+            1,
+            "foreign candidate vector must remain"
         );
     }
 

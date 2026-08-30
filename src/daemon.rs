@@ -2760,6 +2760,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 let target_id_for_merge = target_id.clone();
                 let audit_decision = novelty.audit_decision.map(ToOwned::to_owned);
                 let project_id = record.project_id.clone();
+                let admission_owner_for_merge = admission_owner.to_owned();
                 let runtime_writer_lease = context.daemon.runtime_writer_lease.cloned();
                 context
                     .db
@@ -2782,6 +2783,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                                 },
                             },
                             &drawer_id_for_merge,
+                            &admission_owner_for_merge,
                         )
                         .map_err(|error| match error {
                             DbError::DrawerMergeConflict { .. } => anyhow::Error::new(error),
