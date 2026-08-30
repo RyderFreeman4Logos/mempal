@@ -279,6 +279,12 @@ pub enum DbError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to lock write reserve {path}")]
+    WriteReserveLock {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     /// Unadmitted opens (lease-control / helpers) must not follow database symlinks.
     /// Callers should pass the canonical path from an admitted [`Database::path`].
     #[error(
