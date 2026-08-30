@@ -556,6 +556,8 @@ fn capture_stdin_payload(bytes: Vec<u8>, mempal_home: &Path) -> Result<CapturedP
 
 fn spool_hook_payload(raw_payload: &str, mempal_home: &Path) -> Result<PathBuf> {
     let digest = blake3::hash(raw_payload.as_bytes()).to_hex().to_string();
+    fs::create_dir_all(mempal_home)
+        .with_context(|| format!("failed to create mempal home {}", mempal_home.display()))?;
     let _retention_lock = crate::hook_payload::lock_for_home(mempal_home)?;
     let spool_dir = mempal_home.join(HOOK_SPOOL_DIR);
     fs::create_dir_all(&spool_dir)
@@ -577,14 +579,36 @@ fn spool_hook_payload(raw_payload: &str, mempal_home: &Path) -> Result<PathBuf> 
             .with_context(|| format!("failed to write {}", tmp_path.display()))?;
         file.flush()
             .with_context(|| format!("failed to flush {}", tmp_path.display()))?;
+        sync_hook_spool_payload(&file, &tmp_path)?;
     }
 
     match fs::rename(&tmp_path, &path) {
-        Ok(()) => Ok(path),
+        Ok(()) => {
+            sync_hook_spool_directory(&spool_dir)?;
+            Ok(path)
+        }
         Err(error) => {
             Err(error).with_context(|| format!("failed to publish hook spool {}", path.display()))
         }
     }
+}
+
+fn sync_hook_spool_payload(file: &fs::File, path: &Path) -> Result<()> {
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", path.display()))?;
+    #[cfg(test)]
+    crate::hook_payload::HOOK_SPOOL_SYNC_EVENTS.with(|events| events.borrow_mut().push("payload"));
+    Ok(())
+}
+fn sync_hook_spool_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .with_context(|| format!("failed to open hook spool directory {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to sync hook spool directory {}", path.display()))?;
+    #[cfg(test)]
+    crate::hook_payload::HOOK_SPOOL_SYNC_EVENTS
+        .with(|events| events.borrow_mut().push("directory"));
+    Ok(())
 }
 
 fn decode_stdin_bytes(bytes: &[u8]) -> String {
@@ -734,7 +758,7 @@ mod tests {
             "automatic hook capture must not persist oversized raw payload before LLM gate"
         );
     }
-
+    include!("hook_durable_tests.rs");
     #[test]
     fn test_small_capture_preserves_raw_payload() {
         let tmp = tempfile::TempDir::new().expect("tempdir");

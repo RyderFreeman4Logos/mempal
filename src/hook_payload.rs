@@ -16,6 +16,12 @@ use rusqlite::Connection;
 
 use crate::hook::HOOK_SPOOL_DIR;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static HOOK_SPOOL_SYNC_EVENTS: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 const PAYLOAD_RETENTION_LOCK: &str = ".hook-payload-retention.lock";
 
 /// Cross-process owner for payload publication and pruning.
@@ -35,11 +41,16 @@ pub(crate) fn lock_for_home(mempal_home: &Path) -> Result<PayloadRetentionLock> 
                 lock_path.display()
             )
         })?;
-    // SAFETY: `file` owns a valid descriptor for the duration of the call.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if result != 0 {
-        return Err(io::Error::last_os_error())
-            .with_context(|| format!("failed to lock {}", lock_path.display()));
+    loop {
+        // SAFETY: `file` owns a valid descriptor for the duration of the call.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result == 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error).with_context(|| format!("failed to lock {}", lock_path.display()));
+        }
     }
     Ok(PayloadRetentionLock(file))
 }
