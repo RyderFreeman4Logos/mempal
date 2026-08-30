@@ -1,5 +1,3 @@
-use std::{fs, path::Path};
-
 use anyhow::{Context, Result};
 
 use crate::core::{AsyncDb, types::RuntimeWriterLease};
@@ -8,69 +6,30 @@ pub(super) async fn discard_model_rejected_admission(
     db: &AsyncDb,
     runtime_writer_lease: Option<&RuntimeWriterLease>,
     drawer_id: &str,
-    source_file: &str,
     admission_owner: &str,
 ) -> Result<()> {
     let drawer_id = drawer_id.to_string();
-    let source_file = source_file.to_string();
-    let source_file_for_db = source_file.clone();
     let admission_owner = admission_owner.to_string();
     let runtime_writer_lease = runtime_writer_lease.cloned();
-    let payload_unreferenced = db
-        .run_write_anyhow(move |db| {
-            super::with_daemon_runtime_writer_lease_write(
-                db,
-                runtime_writer_lease.as_ref(),
-                "discard model-rejected hook drawer",
-                || {
-                    let deleted = db
-                        .conn()
-                        .execute(
-                            "DELETE FROM drawers WHERE id = ?1 AND admission_owner = ?2",
-                            [&drawer_id, &admission_owner],
-                        )
-                        .with_context(|| format!("failed to discard hook drawer {drawer_id}"))?;
-                    if deleted == 0 {
-                        return Ok(false);
-                    }
-                    let referenced = db.conn().query_row(
-                        "SELECT EXISTS(SELECT 1 FROM drawers WHERE source_file = ?1 AND deleted_at IS NULL)",
-                        [source_file_for_db.as_str()],
-                        |row| row.get::<_, i64>(0),
-                    )?;
-                    Ok(referenced == 0)
-                },
-            )
-        })
-        .await?;
-    if payload_unreferenced {
-        match fs::remove_file(&source_file) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to discard hook payload {source_file}"));
-            }
-        }
-        if let Some(parent) = Path::new(&source_file).parent() {
-            match fs::remove_dir(parent) {
-                Ok(()) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-                    ) => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "failed to discard hook payload directory {}",
-                            parent.display()
-                        )
-                    });
-                }
-            }
-        }
-    }
+    db.run_write_anyhow(move |db| {
+        super::with_daemon_runtime_writer_lease_write(
+            db,
+            runtime_writer_lease.as_ref(),
+            "discard model-rejected hook drawer",
+            || {
+                db.conn()
+                    .execute(
+                        "DELETE FROM drawers WHERE id = ?1 AND admission_owner = ?2",
+                        [&drawer_id, &admission_owner],
+                    )
+                    .with_context(|| format!("failed to discard hook drawer {drawer_id}"))?;
+                Ok(())
+            },
+        )
+    })
+    .await?;
+    // Payload retention owns filesystem deletion: `source_file` is citation data,
+    // and unlinking here would race concurrent admissions that share a payload.
     Ok(())
 }
 
@@ -78,16 +37,17 @@ pub(super) async fn discard_model_rejected_admission(
 mod tests {
     use crate::core::{
         AsyncDb,
-        config::{Config, LlmJudgeConfig},
+        config::{Config, HooksSessionEndConfig, LlmJudgeConfig},
         db::Database,
         queue::{AsyncPendingMessageStore, PendingMessageStore},
     };
     use crate::embed::Embedder;
     use crate::hook::{CapturedHookEnvelope, HookEvent};
+    use crate::session_review::{SessionReviewOutcome, extract_session_review};
 
     use super::super::{
-        DaemonIngestContext, HookLlmGateRuntime, process_claimed_message_with_embedder,
-        raw_payload_storage_path,
+        DaemonIngestContext, DrawerRecord, HookLlmGateRuntime, insert_drawer_with_admission_owner,
+        process_claimed_message_with_embedder, raw_payload_storage_path,
     };
 
     struct StaticEmbedder;
@@ -105,6 +65,60 @@ mod tests {
         fn name(&self) -> &str {
             "static-test"
         }
+    }
+
+    #[tokio::test]
+    async fn session_review_rejection_does_not_unlink_session_id_path() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let victim = tmp.path().join("session-id-victim.txt");
+        std::fs::write(&victim, "must survive model rejection").expect("write victim");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let payload = serde_json::json!({
+            "session_id": victim,
+            "messages": [{"role": "assistant", "content": "retain this review"}],
+            "tool_calls": []
+        })
+        .to_string();
+        let review = match extract_session_review(
+            Some(&payload),
+            "codex",
+            &HooksSessionEndConfig {
+                extract_self_review: true,
+                min_length: 1,
+                ..HooksSessionEndConfig::default()
+            },
+        )
+        .expect("extract session review")
+        {
+            SessionReviewOutcome::Review(review) => review,
+            outcome => panic!("expected session review, got {outcome:?}"),
+        };
+        let record = DrawerRecord {
+            wing: review.wing,
+            room: review.room,
+            source_file: review.source_file,
+            content: review.content,
+            added_at: "2026-05-01T12:34:56Z".to_string(),
+            importance: review.importance,
+            bypass_novelty: true,
+            project_id: None,
+            deferred_raw_payload: None,
+            deferred_raw_payload_path: None,
+        };
+        insert_drawer_with_admission_owner(&db, "rejected-review", &record, Some("owner"))
+            .expect("insert admission");
+
+        super::discard_model_rejected_admission(&async_db, None, "rejected-review", "owner")
+            .await
+            .expect("discard admission");
+
+        assert!(!db.drawer_exists("rejected-review").expect("drawer query"));
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim must remain"),
+            "must survive model rejection"
+        );
     }
 
     #[tokio::test]

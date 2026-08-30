@@ -2454,7 +2454,6 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 context.db,
                 context.daemon.runtime_writer_lease,
                 &drawer_id,
-                &record.source_file,
                 admission_owner,
             )
             .await?;
@@ -2498,7 +2497,6 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 context.db,
                 context.daemon.runtime_writer_lease,
                 &drawer_id,
-                &record.source_file,
                 admission_owner,
             )
             .await?;
@@ -2621,7 +2619,6 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 context.db,
                 context.daemon.runtime_writer_lease,
                 &drawer_id,
-                &record.source_file,
                 admission_owner,
             )
             .await?;
@@ -3793,8 +3790,8 @@ mod tests {
         HookWorkerState, PayloadHandleMissing, automatic_hook_llm_gate_deadline,
         build_drawer_records, compile_classifier_from_embedder, llm_worker_claim_enabled,
         poll_claim_next, process_claimed_message_with_embedder, queue_failure_disposition,
-        request_shutdown, reset_shutdown_request, run_hook_worker, wait_for_hook_worker_or_tick,
-        wing_from_cwd,
+        raw_payload_storage_path, request_shutdown, reset_shutdown_request, run_hook_worker,
+        wait_for_hook_worker_or_tick, wing_from_cwd,
     };
 
     #[test]
@@ -5846,7 +5843,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_automatic_hook_reject_after_unavailable_model_removes_raw_payload() {
+    async fn test_automatic_hook_reject_after_unavailable_model_retains_raw_payload() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -5998,8 +5995,8 @@ mod tests {
             "retry rejection must discard the admitted drawer"
         );
         assert!(
-            !super::raw_payload_storage_path(&hook_payload, tmp.path()).exists(),
-            "retry rejection must discard the raw payload created before the unavailable model"
+            super::raw_payload_storage_path(&hook_payload, tmp.path()).exists(),
+            "retention pruning must own raw payload deletion after retry rejection"
         );
     }
 
@@ -6041,7 +6038,6 @@ mod tests {
             &async_db,
             None,
             "rejected-candidate",
-            &record.source_file,
             "rejected-message",
         )
         .await
@@ -6684,7 +6680,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_automatic_hook_llm_reject_records_verdict_without_drawer() {
+    async fn test_automatic_hook_llm_reject_retains_payload_for_pruner() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut llm_server = mockito::Server::new_async().await;
         let llm_mock = llm_server
@@ -6764,8 +6760,8 @@ mod tests {
             "LLM-rejected automatic hook candidate must not become durable"
         );
         assert!(
-            !tmp.path().join("hook-payloads").exists(),
-            "LLM-rejected automatic hook candidate must not persist raw payload"
+            raw_payload_storage_path(&hook_payload, tmp.path()).exists(),
+            "retention pruning, not model rejection, owns raw payload deletion"
         );
         let (audit_decision, audit_drawer_id, llm_verdict, llm_score, content_preview): (
             String,
@@ -6803,7 +6799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_automatic_hook_truncated_reject_does_not_persist_oversize_payload() {
+    async fn test_automatic_hook_truncated_reject_preserves_untrusted_payload_path() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut llm_server = mockito::Server::new_async().await;
         let llm_mock = llm_server
@@ -6819,6 +6815,8 @@ mod tests {
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
         let store = PendingMessageStore::new(db.path()).expect("open queue");
         let async_store = AsyncPendingMessageStore::from_store(store.clone());
+        let victim = tmp.path().join("truncated-path-victim.txt");
+        std::fs::write(&victim, "must survive model rejection").expect("write victim");
         let envelope = CapturedHookEnvelope {
             event: HookEvent::PostToolUse.display_name().to_string(),
             kind: HookEvent::PostToolUse.queue_kind().to_string(),
@@ -6826,7 +6824,7 @@ mod tests {
             captured_at: "2026-05-01T12:34:56Z".to_string(),
             claude_cwd: tmp.path().to_string_lossy().to_string(),
             payload: None,
-            payload_path: None,
+            payload_path: Some(victim.to_string_lossy().to_string()),
             payload_preview: Some("oversize synthetic preview".to_string()),
             original_size_bytes: 10 * 1024 * 1024 + 1,
             truncated: true,
@@ -6882,6 +6880,10 @@ mod tests {
         assert!(
             !tmp.path().join("hook-payloads").exists(),
             "truncated automatic hook reject must not persist raw payload"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim must remain"),
+            "must survive model rejection"
         );
     }
 

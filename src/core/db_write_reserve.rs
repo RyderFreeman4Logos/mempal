@@ -33,6 +33,8 @@ pub(crate) fn ensure_write_reserve(database_path: &Path) -> std::io::Result<()> 
         .open(path)?;
     let current_len = file.metadata()?.len();
     if current_len < WRITE_RESERVE_BYTES {
+        // SAFETY: `file` keeps this valid descriptor open for the call, and the
+        // nonnegative offset and length are each bounded by WRITE_RESERVE_BYTES.
         let result = unsafe {
             libc::posix_fallocate(
                 file.as_raw_fd(),
