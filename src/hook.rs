@@ -556,6 +556,7 @@ fn capture_stdin_payload(bytes: Vec<u8>, mempal_home: &Path) -> Result<CapturedP
 
 fn spool_hook_payload(raw_payload: &str, mempal_home: &Path) -> Result<PathBuf> {
     let digest = blake3::hash(raw_payload.as_bytes()).to_hex().to_string();
+    let _retention_lock = crate::hook_payload::lock_for_home(mempal_home)?;
     let spool_dir = mempal_home.join(HOOK_SPOOL_DIR);
     fs::create_dir_all(&spool_dir)
         .with_context(|| format!("failed to create {}", spool_dir.display()))?;

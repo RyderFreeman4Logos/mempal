@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 
@@ -31,6 +32,8 @@ fn sync_parent(parent: &Path) -> Result<()> {
 fn sync_existing(path: &Path, parent: &Path) -> Result<()> {
     let file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    file.set_modified(SystemTime::now())
+        .with_context(|| format!("failed to refresh mtime for {}", path.display()))?;
     sync_file(&file, path)?;
     sync_parent(parent)
 }
@@ -51,6 +54,7 @@ where
     let parent = path.parent().ok_or_else(|| {
         anyhow::anyhow!("raw hook payload path has no parent: {}", path.display())
     })?;
+    let _retention_lock = crate::hook_payload::lock_for_payload_path(path)?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     if path.exists() {
         return sync_existing(path, parent);
