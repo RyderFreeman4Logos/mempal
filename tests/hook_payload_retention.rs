@@ -305,10 +305,14 @@ fn hook_payload_retention_prunes_only_old_unreferenced_files() {
     let spool = mempal_home.join(HOOK_SPOOL_DIR);
     std::fs::create_dir_all(&spool).expect("create spool");
 
-    let claimed = spool.join("claimed.json");
-    let pending = spool.join("pending.json");
-    let orphan = spool.join("orphan.json");
-    let young = spool.join("young.json");
+    let claimed =
+        spool.join("3e1a4bf4fa637a19bbb37ba2756d9606d09d1a28ed0489c61597240c2b28ab72.123.456.json");
+    let pending =
+        spool.join("472b8fb626185dae9ba0c62b156c89a12b945e5127994852fd0769790172183a.123.456.json");
+    let orphan =
+        spool.join("56d69ab8462fa8c12ab8f56bd1396a48ca7061e9bae2446b38b5dac7c49c5f36.123.456.json");
+    let young =
+        spool.join("65089e01c9b3d6e00c02c6fbe5dec61163f679b15640aa951c17c5d6b55a716a.123.456.json");
     for path in [&claimed, &pending, &orphan] {
         write_old_payload(path, "old raw payload");
     }
@@ -357,8 +361,10 @@ fn daemon_startup_runs_hook_payload_retention_with_configured_age_budget() {
     std::fs::create_dir_all(&spool).expect("create spool");
     Database::open(&db_path).expect("initialize database");
 
-    let expired = spool.join("expired.json");
-    let within_budget = spool.join("within-budget.json");
+    let expired =
+        spool.join("eedb4e26a4de39b8a307fc034409616eee744663fa2a33df01a5374318d64664.123.456.json");
+    let within_budget =
+        spool.join("64ec739ab9d449671c02b77a2456701a8e04032e612ad9334e8f1d3cf61bb79d.123.456.json");
     write_old_payload(&expired, "expired raw payload");
     std::fs::write(&within_budget, "retained raw payload").expect("write retained payload");
     set_file_mtime(
