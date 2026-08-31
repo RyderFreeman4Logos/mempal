@@ -61,7 +61,7 @@ mod sleep_scheduler;
 mod systemd_notify;
 mod writer_lease;
 use self_heal::ClaimBackoffState;
-use systemd_notify::notify_systemd_ready;
+use systemd_notify::{notify_systemd_ready, validate_api_enabled};
 #[cfg(test)]
 use writer_lease::SQLITE_WRITER_LEASE_NAME;
 use writer_lease::{RuntimeWriterLeaseHandle, acquire_daemon_writer_lease};
@@ -112,6 +112,7 @@ pub fn run_command_with_bootstrap_events(
 }
 
 async fn run_loop(context: &DaemonContext) -> Result<()> {
+    validate_api_enabled(context.config.api.enabled)?;
     let db_path = {
         let db = context.db.lock().await;
         db.path().to_path_buf()
@@ -196,7 +197,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         recovery
             .record_recovered()
             .context("failed to mark daemon recovery complete")?;
-        notify_systemd_ready();
+        notify_systemd_ready()?;
         eprintln!("hooks not enabled; daemon running configured background services only");
         if sleep_scheduler_enabled {
             while !shutdown_requested() {
@@ -362,7 +363,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     recovery
         .record_recovered()
         .context("failed to mark daemon recovery complete")?;
-    notify_systemd_ready();
+    notify_systemd_ready()?;
     loop {
         if shutdown_requested() {
             tracing::info!("shutdown requested; stopping daemon loop");

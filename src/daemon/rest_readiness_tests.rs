@@ -1,3 +1,9 @@
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixDatagram as StdUnixDatagram};
 use std::{
     ffi::OsString,
     net::SocketAddr,
@@ -21,11 +27,15 @@ struct NotifySocketEnv {
 
 impl NotifySocketEnv {
     fn set(path: &Path) -> Self {
+        Self::set_value(path.as_os_str().to_owned())
+    }
+
+    fn set_value(value: OsString) -> Self {
         let lock = NOTIFY_ENV_LOCK.lock().expect("NOTIFY_SOCKET env lock");
         let previous = std::env::var_os("NOTIFY_SOCKET");
         // SAFETY: the test lock serializes this process-global environment mutation.
         unsafe {
-            std::env::set_var("NOTIFY_SOCKET", path);
+            std::env::set_var("NOTIFY_SOCKET", value);
         }
         Self {
             previous,
@@ -63,13 +73,22 @@ fn write_fixture(
     tempdir: &tempfile::TempDir,
     api_addr: SocketAddr,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
+    write_fixture_with_options(tempdir, api_addr, true, false)
+}
+
+fn write_fixture_with_options(
+    tempdir: &tempfile::TempDir,
+    api_addr: SocketAddr,
+    api_enabled: bool,
+    hooks_enabled: bool,
+) -> (std::path::PathBuf, std::path::PathBuf) {
     let db_path = tempdir.path().join("palace.db");
     let config_path = tempdir.path().join("config.toml");
     std::fs::write(
         &config_path,
         format!(
-            "db_path = \"{}\"\n\n[api]\nenabled = true\naddr = \"{}\"\n\n[embed]\nbackend = \"stub\"\n\n[hooks]\nenabled = false\n\n[ingest_gating]\nenabled = false\n",
-            db_path.display(), api_addr
+            "db_path = \"{}\"\n\n[api]\nenabled = {api_enabled}\naddr = \"{api_addr}\"\n\n[embed]\nbackend = \"stub\"\n\n[hooks]\nenabled = {hooks_enabled}\n\n[ingest_gating]\nenabled = false\n",
+            db_path.display()
         ),
     )
     .expect("write REST readiness config");
@@ -100,6 +119,20 @@ async fn bootstrap_fixture(
         .expect("daemon bootstrap runtime")
         .shutdown_background();
     context
+}
+
+async fn run_loop_with_timeout(context: DaemonContext) -> anyhow::Result<()> {
+    let mut run_task = tokio::spawn(async move { run_loop(&context).await });
+    match tokio::time::timeout(Duration::from_secs(2), &mut run_task).await {
+        Ok(result) => result.expect("daemon task panicked"),
+        Err(_) => {
+            run_task.abort();
+            let _ = run_task.await;
+            Err(anyhow::anyhow!(
+                "daemon startup did not finish within the test deadline"
+            ))
+        }
+    }
 }
 
 fn has_ready_event(receiver: &mut tokio::sync::mpsc::Receiver<BootstrapEvent>) -> bool {
@@ -226,4 +259,166 @@ async fn daemon_ready_requires_a_serving_rest_listener_and_rejects_bind_failure(
         .expect("serving REST fixture task panicked")
         .expect("serving REST fixture failed");
     assert!(Database::open(&serving_db_path).is_ok());
+}
+
+#[tokio::test]
+async fn systemd_notify_send_failure_is_propagated_without_leaking_socket_path() {
+    let _shutdown_lock = global_shutdown_test_lock().lock_owned().await;
+    reset_shutdown_request();
+
+    let tempdir = tempfile::tempdir().expect("create notification failure fixture");
+    let notify_path = tempdir.path().join("notify-secret-path.sock");
+    let (_db_path, config_path) = write_fixture(&tempdir, "127.0.0.1:0".parse().unwrap());
+    let (events, _receiver) = tokio::sync::mpsc::channel(16);
+    let context = bootstrap_fixture(config_path, &tempdir, events).await;
+
+    let result = {
+        let _notify_env = NotifySocketEnv::set(&notify_path);
+        run_loop_with_timeout(context).await
+    };
+    let error = result.expect_err("missing systemd notification socket must fail startup");
+    assert!(
+        error.to_string().contains("systemd readiness notification"),
+        "startup should return the notification failure, not a test timeout: {error:#}"
+    );
+    assert!(
+        !error.to_string().contains(notify_path.to_str().unwrap()),
+        "systemd notification errors must not expose the socket path: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn systemd_notify_non_unicode_socket_value_is_an_error() {
+    let _shutdown_lock = global_shutdown_test_lock().lock_owned().await;
+    reset_shutdown_request();
+
+    let tempdir = tempfile::tempdir().expect("create non-Unicode notification fixture");
+    let (_db_path, config_path) = write_fixture(&tempdir, "127.0.0.1:0".parse().unwrap());
+    let (events, _receiver) = tokio::sync::mpsc::channel(16);
+    let context = bootstrap_fixture(config_path, &tempdir, events).await;
+
+    let result = {
+        let _notify_env = NotifySocketEnv::set_value(OsString::from_vec(vec![
+            b'/', b'n', b'o', b't', b'i', b'f', b'y', b'-', 0xff,
+        ]));
+        run_loop_with_timeout(context).await
+    };
+    let error =
+        result.expect_err("non-Unicode systemd notification socket values must fail startup");
+    assert!(
+        error.to_string().contains("systemd readiness notification"),
+        "startup should return the notification failure, not a test timeout: {error:#}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn systemd_notify_abstract_address_errors_are_propagated() {
+    let _shutdown_lock = global_shutdown_test_lock().lock_owned().await;
+    reset_shutdown_request();
+
+    let tempdir = tempfile::tempdir().expect("create abstract notification fixture");
+    let abstract_name = "x".repeat(256);
+    let (_db_path, config_path) = write_fixture(&tempdir, "127.0.0.1:0".parse().unwrap());
+    let (events, _receiver) = tokio::sync::mpsc::channel(16);
+    let context = bootstrap_fixture(config_path, &tempdir, events).await;
+
+    let result = {
+        let _notify_env = NotifySocketEnv::set_value(OsString::from(format!("@{abstract_name}")));
+        run_loop_with_timeout(context).await
+    };
+    let error = result.expect_err("an invalid Linux abstract address must fail startup");
+    assert!(
+        error.to_string().contains("systemd readiness notification"),
+        "startup should return the notification failure, not a test timeout: {error:#}"
+    );
+    assert!(
+        !error.to_string().contains(&abstract_name),
+        "systemd notification errors must not expose the abstract socket name: {error:#}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn systemd_notify_supports_linux_abstract_namespace() {
+    let _shutdown_lock = global_shutdown_test_lock().lock_owned().await;
+    reset_shutdown_request();
+
+    let tempdir = tempfile::tempdir().expect("create abstract notification fixture");
+    let abstract_name = format!("mempal-notify-{}", std::process::id());
+    let address = UnixSocketAddr::from_abstract_name(&abstract_name).expect("abstract address");
+    let socket = StdUnixDatagram::bind_addr(&address).expect("bind abstract receiver");
+    socket
+        .set_nonblocking(true)
+        .expect("set abstract receiver nonblocking");
+    let socket = tokio::net::UnixDatagram::from_std(socket).expect("adopt abstract receiver");
+    let (_db_path, config_path) =
+        write_fixture_with_options(&tempdir, "127.0.0.1:0".parse().unwrap(), true, true);
+    let (events, _receiver) = tokio::sync::mpsc::channel(16);
+    let context = bootstrap_fixture(config_path, &tempdir, events).await;
+
+    let (packet, second_packet, run_result) = {
+        let _notify_env = NotifySocketEnv::set_value(OsString::from(format!("@{abstract_name}")));
+        let run_task = tokio::spawn(async move { run_loop(&context).await });
+        let packet = receive_notify_packet(&socket, Duration::from_secs(2)).await;
+        let second_packet = receive_notify_packet(&socket, Duration::from_millis(100)).await;
+        request_shutdown();
+        let run_result = tokio::time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("abstract notification fixture did not stop")
+            .expect("abstract notification fixture task panicked");
+        (packet, second_packet, run_result)
+    };
+    assert_eq!(packet, Some(b"READY=1".to_vec()));
+    assert!(
+        second_packet.is_none(),
+        "successful startup must send only one READY=1 packet"
+    );
+    run_result.expect("abstract notification fixture failed");
+}
+
+#[tokio::test]
+async fn systemd_notify_fails_when_api_is_disabled() {
+    let _shutdown_lock = global_shutdown_test_lock().lock_owned().await;
+    reset_shutdown_request();
+
+    let tempdir = tempfile::tempdir().expect("create API-disabled notification fixture");
+    let notify_path = tempdir.path().join("notify.sock");
+    let notify_socket = tokio::net::UnixDatagram::bind(&notify_path)
+        .expect("bind API-disabled notification receiver");
+    let (_db_path, config_path) =
+        write_fixture_with_options(&tempdir, "127.0.0.1:0".parse().unwrap(), false, false);
+    let (events, _receiver) = tokio::sync::mpsc::channel(16);
+    let context = bootstrap_fixture(config_path, &tempdir, events).await;
+
+    let result = {
+        let _notify_env = NotifySocketEnv::set(&notify_path);
+        run_loop_with_timeout(context).await
+    };
+    let error = result.expect_err("configured systemd readiness requires an enabled API");
+    assert!(
+        error.to_string().contains("API"),
+        "API-disabled systemd readiness failure should be explicit: {error:#}"
+    );
+    assert!(
+        receive_notify_packet(&notify_socket, Duration::from_millis(100))
+            .await
+            .is_none(),
+        "API-disabled startup must not send false READY=1"
+    );
+}
+
+#[test]
+fn systemd_unit_uses_notify_access_main() {
+    let service = include_str!("../../contrib/systemd/mempal-daemon.service")
+        .split_once("[Service]")
+        .expect("systemd unit service section")
+        .1;
+    assert!(
+        service.lines().any(|line| line.trim() == "Type=notify")
+            && service
+                .lines()
+                .any(|line| line.trim() == "NotifyAccess=main"),
+        "systemd unit must use main-process readiness notifications"
+    );
 }
