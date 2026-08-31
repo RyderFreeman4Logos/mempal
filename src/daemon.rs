@@ -924,8 +924,6 @@ fn spawn_stall_watchdog(
             if observer.maybe_log_stall(&store).await {
                 recovery_faults
                     .record_fault_once(crate::daemon_recovery::RecoveryFault::WriteStall);
-                #[cfg(unix)]
-                request_shutdown_and_notify();
                 break;
             }
         }
@@ -3751,6 +3749,10 @@ use daemon_write_retry::{record_session_review_rejection, with_daemon_runtime_wr
 
 #[cfg(test)]
 mod mcp_ingest_tests;
+
+#[cfg(test)]
+#[path = "daemon_stall_watchdog_tests.rs"]
+mod daemon_stall_watchdog_tests;
 
 #[cfg(all(test, feature = "rest"))]
 mod rest_readiness_tests;
