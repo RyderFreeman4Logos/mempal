@@ -519,13 +519,13 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertNotIn("SECRET_LOCAL_CONCLUSION", serialized)
         self.assertNotIn("SECRET_LOCAL_SPOOL_BODY", serialized)
 
-    def test_replay_breaker_deferral_returns_pending_success(self) -> None:
+    def test_replay_breaker_deferral_returns_retryable_receipt(self) -> None:
         provider = TransitioningBreakerProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
         provider._start_write_worker = lambda: None
 
         first = self._conclude(provider, "SECRET_REPLAY_CONCLUSION")
-        retry_key = first["operation_key"]
+        retry_key = first["error_details"]["operation_key"]
         second = self._conclude(
             provider,
             "SECRET_REPLAY_CONCLUSION",
@@ -533,25 +533,19 @@ class DurableConcludeTests(unittest.TestCase):
         )
 
         for result in (first, second):
-            self.assertEqual(result["result"], "Fact admitted locally; durable storage pending.")
-            self.assertEqual(result["state"], "local_admitted")
-            self.assertEqual(result["operation_key"], retry_key)
-            self.assertEqual(result["retry_operation_id"], retry_key)
-            self.assertTrue(result["retry_safe"])
-            self.assertEqual(
-                result["durability"],
-                {
-                    "state": "pending",
-                    "kind": "durable_replay_deferred",
-                    "deferred_reason": "breaker_open",
-                },
-            )
-            self.assertNotIn("error", result)
+            details = result["error_details"]
+            self.assertEqual(details["kind"], "durable_admission_deferred")
+            self.assertEqual(details["state"], "local_admitted")
+            self.assertEqual(details["error_class"], "breaker_open")
+            self.assertEqual(details["operation_key"], retry_key)
+            self.assertEqual(details["retry_operation_id"], retry_key)
+            self.assertTrue(details["retry_safe"])
+            self.assertNotIn("result", result)
         self.assertEqual(provider._write_spool.count(), 1)
         self.assertEqual(provider.posts, [])
         self.assertNotIn("SECRET_REPLAY_CONCLUSION", json.dumps(second))
 
-    def test_open_breaker_returns_local_admission_success_without_transport(self) -> None:
+    def test_open_breaker_returns_retryable_receipt_after_durable_spool(self) -> None:
         provider = RecordingProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
         for _ in range(5):
@@ -561,22 +555,22 @@ class DurableConcludeTests(unittest.TestCase):
         result = self._conclude(provider, "SECRET_BREAKER_CONCLUSION")
         after = provider._backoff._read_state()
 
-        self.assertEqual(result["result"], "Fact admitted locally; durable storage pending.")
-        self.assertEqual(result["state"], "local_admitted")
-        self.assertTrue(result["operation_key"])
-        self.assertEqual(result["retry_operation_id"], result["operation_key"])
-        self.assertTrue(result["retry_safe"])
-        self.assertEqual(
-            result["durability"],
-            {
-                "state": "pending",
-                "kind": "durable_replay_deferred",
-                "deferred_reason": "breaker_open",
-            },
-        )
-        self.assertNotIn("error", result)
+        details = result["error_details"]
+        self.assertEqual(details["kind"], "durable_admission_deferred")
+        self.assertEqual(details["state"], "local_admitted")
+        self.assertEqual(details["error_class"], "breaker_open")
+        self.assertTrue(details["operation_key"])
+        self.assertEqual(details["retry_operation_id"], details["operation_key"])
+        self.assertTrue(details["retry_safe"])
+        self.assertNotIn("result", result)
         self.assertEqual(provider.posts, [])
-        self.assertEqual(provider._write_spool.count(), 1)
+        spool = provider._write_spool
+        assert spool is not None
+        self.assertTrue(os.path.isfile(spool.path))
+        operation = spool.get(details["operation_key"])
+        self.assertIsNotNone(operation)
+        assert operation is not None
+        self.assertEqual(operation.body["content"], "SECRET_BREAKER_CONCLUSION")
         self.assertEqual(after.failure_count, before.failure_count)
         self.assertEqual(after.open_until_epoch, before.open_until_epoch)
         self.assertNotIn("SECRET_BREAKER_CONCLUSION", json.dumps(result))
