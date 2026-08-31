@@ -268,6 +268,52 @@ fn test_hook_direct_fallback_initializes_missing_db_before_enqueue() {
     );
 }
 
+#[test]
+fn test_hook_sqlite_open_failure_spools_complete_envelope() {
+    let (home, db_path) = setup_home_without_opening_db();
+    fs::create_dir(&db_path).expect("make database path fail to open as SQLite");
+    let payload = r#"{"prompt":"sqlite-open-failure-spool-marker"}"#;
+
+    let output = run_hook(&home, "hook_user_prompt", payload.as_bytes());
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a durable ingress spool fallback must keep hook capture successful: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let spool_dir = home.path().join(".mempal").join("ingress-spool");
+    let records = fs::read_dir(&spool_dir)
+        .expect("SQLite failure must create ingress spool")
+        .map(|entry| entry.expect("spool entry").path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records.len(),
+        1,
+        "one hook capture must create one spool record"
+    );
+
+    let record: Value = serde_json::from_slice(&fs::read(&records[0]).expect("read spool record"))
+        .expect("structured spool record");
+    assert_eq!(record["kind"], "hook_user_prompt");
+    assert!(
+        record["idempotency_key"]
+            .as_str()
+            .is_some_and(|key| !key.is_empty()),
+        "spool record must be replayable exactly once"
+    );
+    let envelope: Value = serde_json::from_str(
+        record["payload"]
+            .as_str()
+            .expect("complete hook envelope in spool"),
+    )
+    .expect("spooled envelope JSON");
+    assert_eq!(envelope["event"], "UserPromptSubmit");
+    assert_eq!(envelope["kind"], "hook_user_prompt");
+    assert_eq!(envelope["payload"], payload);
+}
+
 #[cfg(unix)]
 #[test]
 fn test_hook_direct_fallback_waits_for_transient_sqlite_busy() {

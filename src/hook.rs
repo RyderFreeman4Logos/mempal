@@ -357,32 +357,32 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
         },
     );
 
+    let spool_database_fallback = || {
+        let mut request = crate::hook_ipc::HookIpcEnqueueRequest::new(event.queue_kind(), &payload);
+        if let FallbackEnqueueIdentity::Idempotent { key } = fallback.identity() {
+            request.idempotency_key = key.to_string();
+        }
+        crate::ingress_spool::IngressSpool::new(&mempal_home)
+            .append(&request)
+            .context("failed to fsync hook fallback into ingress spool")
+            .map(|_| ())
+    };
     let database = match Database::open(&db_path) {
         Ok(database) => database,
         Err(error) => {
-            crate::hook_diagnostics::log_hook_failure(
-                &mempal_home,
-                event_name,
-                &crate::hook_diagnostics::HookOutcome::Dropped {
-                    error: format!("{error:#}"),
-                    stage: "db_init".to_string(),
-                },
-            );
-            return Err(error).context("failed to initialize pending queue database");
+            return spool_database_fallback().with_context(|| {
+                format!(
+                    "failed to spool hook payload after database initialization error: {error:#}"
+                )
+            });
         }
     };
     let store = match PendingMessageStore::new(&db_path) {
         Ok(store) => store,
         Err(error) => {
-            crate::hook_diagnostics::log_hook_failure(
-                &mempal_home,
-                event_name,
-                &crate::hook_diagnostics::HookOutcome::Dropped {
-                    error: format!("{error:#}"),
-                    stage: "queue_init".to_string(),
-                },
-            );
-            return Err(error).context("failed to open pending queue");
+            return spool_database_fallback().with_context(|| {
+                format!("failed to spool hook payload after queue initialization error: {error:#}")
+            });
         }
     };
     drop(database);
@@ -392,18 +392,11 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
             store.enqueue_idempotent_with_key(event.queue_kind(), &payload, key)
         }
     };
-    if let Err(error) = &enqueue_result {
-        crate::hook_diagnostics::log_hook_failure(
-            &mempal_home,
-            event_name,
-            &crate::hook_diagnostics::HookOutcome::Dropped {
-                error: format!("{error:#}"),
-                stage: "enqueue".to_string(),
-            },
-        );
+    if let Err(error) = enqueue_result {
+        return spool_database_fallback().with_context(|| {
+            format!("failed to spool hook payload after queue enqueue error: {error:#}")
+        });
     }
-    enqueue_result
-        .with_context(|| format!("failed to enqueue hook payload after {}", fallback.reason()))?;
     Ok(())
 }
 
