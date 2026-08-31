@@ -78,23 +78,25 @@ class Supervisor:
         pid = snapshot.identity.pid
         existing = self.owned.get(pid)
         if existing is not None:
-            if existing.identity is None:
-                previous = self.seen_identities.get(pid)
-                if previous is not None and previous != snapshot.identity:
+            if existing.identity is not None:
+                if existing.identity != snapshot.identity:
                     self.ownership_uncertain = True
-                    return
-                self.seen_identities[pid] = snapshot.identity
-                existing.identity = snapshot.identity
-                existing.pidfd = open_pidfd(pid)
-            elif existing.identity != snapshot.identity:
-                self.ownership_uncertain = True
-            return
+                return
         previous = self.seen_identities.get(pid)
         if previous is not None and previous != snapshot.identity:
             self.ownership_uncertain = True
             return
+        try:
+            pidfd = open_pidfd(snapshot.identity)
+        except (OSError, ValueError):
+            self.ownership_uncertain = True
+            return
         self.seen_identities[pid] = snapshot.identity
-        self.owned[pid] = OwnedProcess(snapshot.identity, open_pidfd(pid))
+        if existing is not None:
+            existing.identity = snapshot.identity
+            existing.pidfd = pidfd
+        else:
+            self.owned[pid] = OwnedProcess(snapshot.identity, pidfd)
 
     def discover(self) -> dict[int, Snapshot]:
         try:
@@ -381,15 +383,24 @@ def ensure_linux_subreaper() -> None:
         raise OSError(error, os.strerror(error))
 
 
-def open_pidfd(pid: int) -> int | None:
+def open_pidfd(identity: Identity) -> int | None:
     if not hasattr(os, "pidfd_open"):
         return None
     try:
-        return os.pidfd_open(pid, 0)
+        pidfd = os.pidfd_open(identity.pid, 0)
     except OSError as error:
         if error.errno in (errno.ESRCH, errno.ENOSYS, errno.EINVAL, errno.EPERM):
             return None
         return None
+    try:
+        snapshot = read_snapshot(identity.pid)
+    except (OSError, ValueError):
+        os.close(pidfd)
+        raise
+    if snapshot is None or snapshot.identity != identity:
+        os.close(pidfd)
+        raise ValueError("pid identity changed while opening pidfd")
+    return pidfd
 
 
 def install_signal_handlers() -> None:

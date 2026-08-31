@@ -373,6 +373,62 @@ while True:
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cargo_test_wrapper_rejects_an_interposed_pidfd_during_descendant_adoption() {
+    let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
+    let harness = r#"
+import importlib.util
+import subprocess
+import sys
+
+spec = importlib.util.spec_from_file_location("timeout_wrapper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+child = subprocess.Popen(["/bin/sleep", "10"], start_new_session=True)
+supervisor = module.Supervisor(child, 1)
+expected = module.Snapshot(module.Identity(424242, 10), supervisor.supervisor_pid, 424242, 424242, "S")
+interposed = module.Snapshot(module.Identity(424242, 11), supervisor.supervisor_pid, 424242, 424242, "S")
+opened = []
+closed = []
+original_open = module.os.pidfd_open
+original_close = module.os.close
+original_read_snapshot = module.read_snapshot
+try:
+    module.os.pidfd_open = lambda pid, flags: opened.append((pid, flags)) or 91
+    module.os.close = closed.append
+    module.read_snapshot = lambda pid: interposed
+    supervisor._adopt(expected)
+    assert 424242 not in supervisor.owned
+    assert supervisor.ownership_uncertain
+    assert opened == [(424242, 0)]
+    assert closed == [91]
+finally:
+    for handle in supervisor.owned.values():
+        if handle.pidfd == 91:
+            handle.pidfd = None
+    module.os.pidfd_open = original_open
+    module.os.close = original_close
+    module.read_snapshot = original_read_snapshot
+    supervisor.close()
+    child.terminate()
+    child.wait()
+"#;
+    let output = Command::new("python3")
+        .args(["-c", harness])
+        .arg(&script)
+        .output()
+        .expect("run interposed-pidfd adoption harness");
+
+    assert!(
+        output.status.success(),
+        "interposed pidfd must be rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cargo_test_wrapper_limits_proc_discovery_for_a_successful_short_child() {
     let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
     let harness = r#"
