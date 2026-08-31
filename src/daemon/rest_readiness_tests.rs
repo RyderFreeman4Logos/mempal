@@ -1,10 +1,63 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    ffi::OsString,
+    net::SocketAddr,
+    path::Path,
+    sync::{Mutex, MutexGuard},
+    time::Duration,
+};
 
 use crate::{
     bootstrap_events::BootstrapEvent, core::db::Database, daemon_bootstrap::DaemonContext,
 };
 
 use super::{global_shutdown_test_lock, request_shutdown, reset_shutdown_request, run_loop};
+
+static NOTIFY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct NotifySocketEnv {
+    previous: Option<OsString>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl NotifySocketEnv {
+    fn set(path: &Path) -> Self {
+        let lock = NOTIFY_ENV_LOCK.lock().expect("NOTIFY_SOCKET env lock");
+        let previous = std::env::var_os("NOTIFY_SOCKET");
+        // SAFETY: the test lock serializes this process-global environment mutation.
+        unsafe {
+            std::env::set_var("NOTIFY_SOCKET", path);
+        }
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for NotifySocketEnv {
+    fn drop(&mut self) {
+        // SAFETY: the test lock serializes this process-global environment restore.
+        unsafe {
+            if let Some(previous) = &self.previous {
+                std::env::set_var("NOTIFY_SOCKET", previous);
+            } else {
+                std::env::remove_var("NOTIFY_SOCKET");
+            }
+        }
+    }
+}
+
+async fn receive_notify_packet(
+    socket: &tokio::net::UnixDatagram,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let mut packet = [0_u8; 128];
+    match tokio::time::timeout(timeout, socket.recv(&mut packet)).await {
+        Ok(Ok(length)) => Some(packet[..length].to_vec()),
+        Ok(Err(error)) => panic!("receive systemd notification: {error}"),
+        Err(_) => None,
+    }
+}
 
 fn write_fixture(
     tempdir: &tempfile::TempDir,
@@ -73,6 +126,10 @@ async fn daemon_ready_requires_a_serving_rest_listener_and_rejects_bind_failure(
         .local_addr()
         .expect("read occupied REST address");
     let (occupied_db_path, occupied_config_path) = write_fixture(&occupied_tempdir, occupied_addr);
+    let occupied_notify_path = occupied_tempdir.path().join("notify.sock");
+    let occupied_notify = tokio::net::UnixDatagram::bind(&occupied_notify_path)
+        .expect("bind occupied startup notification receiver");
+    let _occupied_notify_env = NotifySocketEnv::set(&occupied_notify_path);
     let (occupied_events, mut occupied_receiver) = tokio::sync::mpsc::channel(16);
     let occupied_context =
         bootstrap_fixture(occupied_config_path, &occupied_tempdir, occupied_events).await;
@@ -95,6 +152,13 @@ async fn daemon_ready_requires_a_serving_rest_listener_and_rejects_bind_failure(
         !has_ready_event(&mut occupied_receiver),
         "daemon-ready was advertised after REST bind failure"
     );
+    assert!(
+        receive_notify_packet(&occupied_notify, Duration::from_millis(100))
+            .await
+            .is_none(),
+        "REST bind failure must not send READY=1"
+    );
+    drop(_occupied_notify_env);
     drop(occupied_listener);
     assert!(
         Database::open(&occupied_db_path).is_ok(),
@@ -108,6 +172,10 @@ async fn daemon_ready_requires_a_serving_rest_listener_and_rejects_bind_failure(
     let serving_addr = reserved_listener.local_addr().expect("read REST address");
     drop(reserved_listener);
     let (serving_db_path, serving_config_path) = write_fixture(&serving_tempdir, serving_addr);
+    let serving_notify_path = serving_tempdir.path().join("notify.sock");
+    let serving_notify = tokio::net::UnixDatagram::bind(&serving_notify_path)
+        .expect("bind serving startup notification receiver");
+    let _serving_notify_env = NotifySocketEnv::set(&serving_notify_path);
     let (serving_events, mut serving_receiver) = tokio::sync::mpsc::channel(16);
     let serving_context =
         bootstrap_fixture(serving_config_path, &serving_tempdir, serving_events).await;
@@ -128,6 +196,17 @@ async fn daemon_ready_requires_a_serving_rest_listener_and_rejects_bind_failure(
     })
     .await
     .expect("REST readiness event did not arrive");
+    assert_eq!(
+        receive_notify_packet(&serving_notify, Duration::from_secs(5)).await,
+        Some(b"READY=1".to_vec()),
+        "successful startup must send exactly READY=1 after final readiness"
+    );
+    assert!(
+        receive_notify_packet(&serving_notify, Duration::from_millis(100))
+            .await
+            .is_none(),
+        "successful startup must send only one READY=1 packet"
+    );
 
     let response = reqwest::Client::new()
         .post(format!("http://{serving_addr}/api/ingest/durable"))

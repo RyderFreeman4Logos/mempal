@@ -57,8 +57,11 @@ mod mcp;
 #[path = "daemon/self_heal.rs"]
 mod self_heal;
 mod sleep_scheduler;
+#[path = "daemon/systemd_notify.rs"]
+mod systemd_notify;
 mod writer_lease;
 use self_heal::ClaimBackoffState;
+use systemd_notify::notify_systemd_ready;
 #[cfg(test)]
 use writer_lease::SQLITE_WRITER_LEASE_NAME;
 use writer_lease::{RuntimeWriterLeaseHandle, acquire_daemon_writer_lease};
@@ -193,6 +196,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         recovery
             .record_recovered()
             .context("failed to mark daemon recovery complete")?;
+        notify_systemd_ready();
         eprintln!("hooks not enabled; daemon running configured background services only");
         if sleep_scheduler_enabled {
             while !shutdown_requested() {
@@ -358,6 +362,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     recovery
         .record_recovered()
         .context("failed to mark daemon recovery complete")?;
+    notify_systemd_ready();
     loop {
         if shutdown_requested() {
             tracing::info!("shutdown requested; stopping daemon loop");
@@ -3755,7 +3760,7 @@ mod mcp_ingest_tests;
 #[path = "daemon_stall_watchdog_tests.rs"]
 mod daemon_stall_watchdog_tests;
 
-#[cfg(all(test, feature = "rest"))]
+#[cfg(all(test, feature = "rest", unix))]
 mod rest_readiness_tests;
 
 #[cfg(test)]
