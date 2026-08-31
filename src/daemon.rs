@@ -3746,6 +3746,9 @@ mod daemon_stall_watchdog_tests;
 #[cfg(all(test, feature = "rest", unix))]
 mod rest_readiness_tests;
 
+#[cfg(all(test, feature = "rest", unix))]
+mod rest_readiness_systemd_tests;
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
