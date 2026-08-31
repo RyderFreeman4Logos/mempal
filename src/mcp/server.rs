@@ -60,7 +60,7 @@ use crate::cowork::{
     PeekRequest as CoworkPeekRequest, Tool, peek_partner,
 };
 use crate::doctor::{COWORK_BUS_ACTIONS, PHASE3_ACTIONS, REQUIRED_MCP_TOOLS, build_doctor_report};
-use crate::embed::{EmbedderFactory, global_embed_status};
+use crate::embed::{EmbedError, EmbedderFactory, global_embed_status};
 use crate::field_taxonomy::field_taxonomy;
 use crate::ingest::{
     IngestError,
@@ -608,6 +608,30 @@ fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
         .collect::<Vec<_>>()
         .join("; ")
 }
+
+#[derive(Debug)]
+enum McpQueuedIngestError {
+    Embed(EmbedError),
+    Mcp(ErrorData),
+}
+
+impl From<ErrorData> for McpQueuedIngestError {
+    fn from(error: ErrorData) -> Self {
+        Self::Mcp(error)
+    }
+}
+
+impl McpQueuedIngestError {
+    fn into_error_data(self) -> ErrorData {
+        match self {
+            Self::Embed(error) => {
+                ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
+            }
+            Self::Mcp(error) => error,
+        }
+    }
+}
+
 impl MempalMcpServer {
     pub fn new(db_path: PathBuf, config: crate::core::config::Config) -> anyhow::Result<Self> {
         Self::new_with_factory_and_config(
@@ -1309,9 +1333,20 @@ impl MempalMcpServer {
             .await
         {
             Ok(Ok(response)) => Ok(response),
-            Ok(Err(error)) => Err(error.to_string()),
-            Err(error) => Err(error.to_string()),
+            Ok(Err(error)) => Err(error),
+            Err(error) => Err(McpQueuedIngestError::Mcp(ErrorData::internal_error(
+                error.to_string(),
+                None,
+            ))),
         };
+        let retryable_embed = matches!(
+            &outcome,
+            Err(McpQueuedIngestError::Embed(error)) if error.is_retryable()
+        );
+        let outcome = outcome.map_err(|error| match error {
+            McpQueuedIngestError::Embed(error) => error.to_string(),
+            McpQueuedIngestError::Mcp(error) => error.to_string(),
+        });
         let telemetry_error = outcome.as_ref().err().cloned();
         if let Err(detail) = &outcome
             && mcp_ingest_failure_is_retryable_writer_lease_lost(detail)
@@ -1337,7 +1372,7 @@ impl MempalMcpServer {
             return result;
         }
         if let Err(detail) = &outcome
-            && mcp_ingest_failure_is_retryable_transient_write_lock(detail)
+            && (retryable_embed || mcp_ingest_failure_is_retryable_transient_write_lock(detail))
         {
             Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
             let next_retry_count = u64::from(claim.retry_count).saturating_add(1);
@@ -1346,13 +1381,20 @@ impl MempalMcpServer {
                 crate::observability::IngestWorkerBackoffSnapshot {
                     retry_count: next_retry_count,
                     next_delay_ms: u64::try_from(next_delay.as_millis()).unwrap_or(u64::MAX),
-                    last_error_class: Some("transient_write_lock".to_string()),
+                    last_error_class: Some(
+                        if retryable_embed {
+                            "retryable_embed"
+                        } else {
+                            "transient_write_lock"
+                        }
+                        .to_string(),
+                    ),
                 },
             );
             let requeued = requeue_ingest_claim_after_transient_write_lock(
                 queue,
                 &claim,
-                detail.clone(),
+                detail.to_string(),
                 next_delay,
                 self.daemon_write_observer.as_ref(),
             )
@@ -1363,7 +1405,11 @@ impl MempalMcpServer {
             };
             let result = requeued.and(released);
             match &result {
-                Ok(()) => span.finish_error_class("transient_write_lock_requeued"),
+                Ok(()) => span.finish_error_class(if retryable_embed {
+                    "retryable_embed_requeued"
+                } else {
+                    "transient_write_lock_requeued"
+                }),
                 Err(error) => span.finish_error(error),
             }
             tokio::time::sleep(next_delay).await;
@@ -1482,9 +1528,20 @@ impl MempalMcpServer {
             .await
         {
             Ok(Ok(response)) => Ok(response),
-            Ok(Err(error)) => Err(error.to_string()),
-            Err(error) => Err(error.to_string()),
+            Ok(Err(error)) => Err(error),
+            Err(error) => Err(McpQueuedIngestError::Mcp(ErrorData::internal_error(
+                error.to_string(),
+                None,
+            ))),
         };
+        let retryable_embed = matches!(
+            &outcome,
+            Err(McpQueuedIngestError::Embed(error)) if error.is_retryable()
+        );
+        let outcome = outcome.map_err(|error| match error {
+            McpQueuedIngestError::Embed(error) => error.to_string(),
+            McpQueuedIngestError::Mcp(error) => error.to_string(),
+        });
         if let Err(detail) = &outcome
             && mcp_ingest_failure_is_retryable_writer_lease_lost(detail)
         {
@@ -1501,7 +1558,7 @@ impl MempalMcpServer {
             return Ok(());
         }
         if let Err(detail) = &outcome
-            && mcp_ingest_failure_is_retryable_transient_write_lock(detail)
+            && (retryable_embed || mcp_ingest_failure_is_retryable_transient_write_lock(detail))
         {
             Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
             let next_retry_count = u64::from(claim.retry_count).saturating_add(1);
@@ -1510,13 +1567,20 @@ impl MempalMcpServer {
                 crate::observability::IngestWorkerBackoffSnapshot {
                     retry_count: next_retry_count,
                     next_delay_ms: u64::try_from(next_delay.as_millis()).unwrap_or(u64::MAX),
-                    last_error_class: Some("transient_write_lock".to_string()),
+                    last_error_class: Some(
+                        if retryable_embed {
+                            "retryable_embed"
+                        } else {
+                            "transient_write_lock"
+                        }
+                        .to_string(),
+                    ),
                 },
             );
             requeue_ingest_claim_after_transient_write_lock(
                 queue,
                 &claim,
-                detail.clone(),
+                detail.to_string(),
                 next_delay,
                 self.daemon_write_observer.as_ref(),
             )
@@ -1737,7 +1801,7 @@ impl MempalMcpServer {
         .await
         {
             Ok(Ok(response)) => Ok(response),
-            Ok(Err(error)) => Err(error.to_string()),
+            Ok(Err(error)) => Err(error),
             Err(_) => {
                 Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
                 if let Some(writer_lease) = writer_lease {
@@ -1753,6 +1817,14 @@ impl MempalMcpServer {
                 return Ok(ScopedIngestProcessResult::TimedOut);
             }
         };
+        let retryable_embed = matches!(
+            &outcome,
+            Err(McpQueuedIngestError::Embed(error)) if error.is_retryable()
+        );
+        let outcome = outcome.map_err(|error| match error {
+            McpQueuedIngestError::Embed(error) => error.to_string(),
+            McpQueuedIngestError::Mcp(error) => error.to_string(),
+        });
         if let Err(detail) = &outcome
             && mcp_ingest_failure_is_retryable_writer_lease_lost(detail)
         {
@@ -1772,7 +1844,7 @@ impl MempalMcpServer {
             return Ok(ScopedIngestProcessResult::ReleasedForRetry);
         }
         if let Err(detail) = &outcome
-            && mcp_ingest_failure_is_retryable_transient_write_lock(detail)
+            && (retryable_embed || mcp_ingest_failure_is_retryable_transient_write_lock(detail))
         {
             Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
             if let Some(writer_lease) = writer_lease {
@@ -2193,11 +2265,13 @@ impl MempalMcpServer {
         &self,
         operation: QueuedWriteOperation,
         runtime_writer_lease: Option<RuntimeWriterLease>,
-    ) -> anyhow::Result<std::result::Result<IngestResponse, ErrorData>> {
+    ) -> anyhow::Result<std::result::Result<IngestResponse, McpQueuedIngestError>> {
         let queued = match operation {
             QueuedWriteOperation::Ingest(queued) => queued,
             QueuedWriteOperation::Delete { drawer_id } => {
-                return Ok(run_durable_delete(self.db_path.clone(), drawer_id).await);
+                return Ok(run_durable_delete(self.db_path.clone(), drawer_id)
+                    .await
+                    .map_err(McpQueuedIngestError::Mcp));
             }
         };
         let worker = self.clone();
@@ -2232,7 +2306,7 @@ impl MempalMcpServer {
         &self,
         operation: QueuedWriteOperation,
         runtime_writer_lease: Option<&RuntimeWriterLease>,
-    ) -> std::result::Result<IngestResponse, ErrorData> {
+    ) -> std::result::Result<IngestResponse, McpQueuedIngestError> {
         match operation {
             QueuedWriteOperation::Ingest(queued) => self
                 .mempal_ingest_sync_with_superseded_override(
@@ -2244,7 +2318,9 @@ impl MempalMcpServer {
                 .await
                 .map(|response| response.0),
             QueuedWriteOperation::Delete { drawer_id } => {
-                run_durable_delete(self.db_path.clone(), drawer_id).await
+                run_durable_delete(self.db_path.clone(), drawer_id)
+                    .await
+                    .map_err(McpQueuedIngestError::Mcp)
             }
         }
     }
@@ -7263,7 +7339,7 @@ impl MempalMcpServer {
             .await
             {
                 Ok(Ok(Ok(response))) => response,
-                Ok(Ok(Err(error))) => return Err(error),
+                Ok(Ok(Err(error))) => return Err(error.into_error_data()),
                 Ok(Err(error)) => {
                     return Err(ErrorData::internal_error(
                         format!("failed to run dry-run ingest off runtime: {error}"),
@@ -8007,6 +8083,12 @@ impl MempalMcpServer {
             None,
         )
         .await
+        .map_err(|error| match error {
+            McpQueuedIngestError::Embed(error) => {
+                ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
+            }
+            McpQueuedIngestError::Mcp(error) => error,
+        })
     }
 
     async fn open_sync_ingest_db_with_admission_retry(
@@ -8049,11 +8131,11 @@ impl MempalMcpServer {
         controls: IngestControls,
         runtime_writer_lease: Option<&RuntimeWriterLease>,
         pre_resolved_superseded_drawer_id: Option<String>,
-    ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
+    ) -> std::result::Result<Json<IngestResponse>, McpQueuedIngestError> {
         let dry_run = request.dry_run.unwrap_or(false);
         let controls = resolve_mcp_ingest_controls(&request, controls)?;
         if !dry_run && global_embed_status().should_block_writes() {
-            return Err(degraded_write_error());
+            return Err(degraded_write_error().into());
         }
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let project_id = self
@@ -8080,7 +8162,8 @@ impl MempalMcpServer {
                     },
                     Some("database is locked".to_string()),
                 ),
-            ));
+            )
+            .into());
         }
         let db = self.open_sync_ingest_db_with_admission_retry().await?;
         // Snapshot the request-wide warnings once so every early-return path reports a
@@ -8132,16 +8215,15 @@ impl MempalMcpServer {
         .unwrap_or_else(|| request.importance.unwrap_or(0));
         let mut timings = BTreeMap::new();
 
-        let embedder = self.embedder_factory.build().await.map_err(|error| {
-            ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
-        })?;
+        let embedder = self
+            .embedder_factory
+            .build()
+            .await
+            .map_err(McpQueuedIngestError::Embed)?;
         let chunks =
             crate::ingest::prepare_chunks(&scrubbed_content, &config.chunker, embedder.as_ref());
         if chunks.is_empty() {
-            return Err(ErrorData::invalid_params(
-                "content produced no chunks",
-                None,
-            ));
+            return Err(ErrorData::invalid_params("content produced no chunks", None).into());
         }
 
         let scrubbed_replace_text = request
@@ -8529,9 +8611,10 @@ impl MempalMcpServer {
         } else if let Some(fv) = first_vector.take() {
             if chunks.len() > 1 {
                 let rest_refs: Vec<&str> = chunk_refs[1..].to_vec();
-                let mut rest_vecs = embedder.embed(&rest_refs).await.map_err(|error| {
-                    ErrorData::internal_error(format!("embedding failed: {error}"), None)
-                })?;
+                let mut rest_vecs = embedder
+                    .embed(&rest_refs)
+                    .await
+                    .map_err(McpQueuedIngestError::Embed)?;
                 let mut all = vec![fv];
                 all.append(&mut rest_vecs);
                 all
@@ -8539,9 +8622,10 @@ impl MempalMcpServer {
                 vec![fv]
             }
         } else {
-            embedder.embed(&chunk_refs).await.map_err(|error| {
-                ErrorData::internal_error(format!("embedding failed: {error}"), None)
-            })?
+            embedder
+                .embed(&chunk_refs)
+                .await
+                .map_err(McpQueuedIngestError::Embed)?
         };
         if vectors.len() != chunks.len() {
             return Err(ErrorData::internal_error(
@@ -8551,7 +8635,8 @@ impl MempalMcpServer {
                     chunks.len()
                 ),
                 None,
-            ));
+            )
+            .into());
         }
         if let Some(v) = vectors.first() {
             ensure_vector_dim_matches(&db, v.len())?;
@@ -9010,7 +9095,7 @@ impl MempalMcpServer {
                             err,
                             crate::core::queue::QueueError::RuntimeWriterLeaseLost { .. }
                         ) {
-                            return Err(db_error(err));
+                            return Err(db_error(err).into());
                         }
                         tracing::warn!(
                             error = %err,
@@ -17136,115 +17221,7 @@ pattern_boost = 0.2
         assert_ingest_worker_backoff_snapshot(0, 0, Some("terminal"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_async_ingest_transient_write_lock_requeues_instead_of_failing() {
-        let _observability_lock =
-            crate::observability::test_support::global_observability_test_lock()
-                .lock_owned()
-                .await;
-        crate::observability::test_support::reset_ingest_worker_backoff_for_tests();
-        let (_tempdir, db_path, server) = setup_server();
-        let server = server.with_sync_db_open_lock_failures_for_test(1);
-        let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
-        let request = IngestRequest {
-            content: "transient write lock should retry async ingest".to_string(),
-            wing: "smoke".to_string(),
-            room: Some("mcp".to_string()),
-            source_type: Some("agent_inference".to_string()),
-            memory_kind: Some("evidence".to_string()),
-            domain: Some("project".to_string()),
-            field: Some("smoke".to_string()),
-            smoke: Some(true),
-            project_id: Some("project-transient-write-lock".to_string()),
-            dry_run: Some(false),
-            ..IngestRequest::default()
-        };
-        let project_id = server
-            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
-            .await
-            .expect("resolve project");
-        let prepared = server
-            .prepare_async_ingest_operation(
-                &request,
-                IngestControls::default(),
-                config.as_ref(),
-                compiled_privacy.as_ref(),
-                project_id,
-            )
-            .await
-            .expect("prepare async ingest");
-        let payload = serde_json::to_string(&prepared).expect("serialize prepared ingest");
-        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
-        let operation_id = queue
-            .enqueue(INGEST_ASYNC_KIND, &payload)
-            .expect("enqueue async ingest");
-        let claim = queue
-            .claim_next_by_kind("worker-transient-write-lock", 60, INGEST_ASYNC_KIND)
-            .expect("claim queued op")
-            .expect("claimed queued op");
-        let async_queue = AsyncPendingMessageStore::from_store(queue.clone());
-
-        server
-            .process_ingest_claim(&async_queue, "worker-transient-write-lock", claim)
-            .await
-            .expect("transient write lock should requeue the ingest");
-
-        let queued = queue
-            .operation_status(&operation_id)
-            .expect("load requeued operation")
-            .expect("operation remains durable");
-        assert_eq!(queued.op_state, IngestOperationState::Queued.as_str());
-        assert!(queued.claimed_at.is_none());
-        assert!(queued.completed_at.is_none());
-        assert!(queued.failure_detail.is_none());
-
-        let completion_count: i64 = rusqlite::Connection::open(&db_path)
-            .expect("open db")
-            .query_row(
-                "SELECT COUNT(*) FROM pending_message_completions WHERE message_id = ?1",
-                [operation_id.as_str()],
-                |row| row.get(0),
-            )
-            .expect("count completions");
-        assert_eq!(
-            completion_count, 0,
-            "transient write lock must not create a failed completion receipt"
-        );
-        // Note: we intentionally do NOT assert on the global ingest worker backoff
-        // snapshot here. That state is shared across parallel test threads, and
-        // asserting on it produces intermittent failures when another test resets
-        // the global between process_ingest_claim and the read. The backoff
-        // sequence is verified in
-        // test_mcp_async_ingest_transient_write_backoff_sequence_caps_at_30s.
-        //
-        // The behavioral assertions above (requeue + no completion receipt +
-        // successful retry) are sufficient to prove the transient lock path works.
-
-        tokio::time::sleep(ingest_worker_backoff_delay(1) + Duration::from_millis(200)).await;
-        let retry_claim = queue
-            .claim_next_by_kind("worker-transient-write-lock-retry", 60, INGEST_ASYNC_KIND)
-            .expect("claim retry op")
-            .expect("retry claim remains available");
-        server
-            .process_ingest_claim(
-                &async_queue,
-                "worker-transient-write-lock-retry",
-                retry_claim,
-            )
-            .await
-            .expect("retry should complete after lock clears");
-
-        let completed = server
-            .operation_status_json_for_test(&operation_id)
-            .await
-            .expect("completed status");
-        assert_eq!(completed.state, Some(IngestOperationState::Completed));
-        assert!(
-            !completed.created_drawer_ids.is_empty(),
-            "retry completion must expose cleanup-safe created drawer IDs"
-        );
-        assert!(completed.failure_detail.is_none());
-    }
+    include!("server/tests/ingest_embed_retry_tests.rs");
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_scoped_finite_completion_lock_respects_budget() {
