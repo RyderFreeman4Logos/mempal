@@ -124,8 +124,9 @@ class Supervisor:
             if current is not None and current.identity != identity:
                 if handle.pidfd is not None:
                     os.close(handle.pidfd)
+                # A different start time proves the owned process exited; the new
+                # process is unrelated and must not make cleanup fail closed.
                 del self.owned[pid]
-                self.ownership_uncertain = True
                 continue
             owned_identities.add(identity)
         changed = True

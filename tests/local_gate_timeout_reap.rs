@@ -482,6 +482,51 @@ finally:
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cargo_test_wrapper_proves_cleanup_when_a_reaped_owned_pid_is_reused() {
+    let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
+    let harness = r#"
+import importlib.util
+import subprocess
+import sys
+
+spec = importlib.util.spec_from_file_location("timeout_wrapper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+child = subprocess.Popen(["/bin/sleep", "10"], start_new_session=True)
+supervisor = module.Supervisor(child, 1)
+stale = module.Identity(424242, 1)
+reused = module.Snapshot(module.Identity(424242, 2), 1, 424242, 424242, "S")
+supervisor.owned[424242] = module.OwnedProcess(stale, None, True)
+supervisor.seen_identities[424242] = stale
+original_scan = module.scan_snapshots
+try:
+    module.scan_snapshots = lambda: {424242: reused}
+    supervisor.discover()
+    assert 424242 not in supervisor.owned
+    assert not supervisor.ownership_uncertain
+finally:
+    module.scan_snapshots = original_scan
+    supervisor.close()
+    child.terminate()
+    child.wait()
+"#;
+    let output = Command::new("python3")
+        .args(["-c", harness])
+        .arg(&script)
+        .output()
+        .expect("run reused-PID cleanup-proof harness");
+
+    assert!(
+        output.status.success(),
+        "a reused PID proves the owned identity exited: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cargo_test_wrapper_limits_proc_discovery_for_a_successful_short_child() {
     let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
     let harness = r#"
