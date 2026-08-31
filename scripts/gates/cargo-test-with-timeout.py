@@ -19,6 +19,7 @@ from pathlib import Path
 PR_SET_CHILD_SUBREAPER = 36
 SYS_PIDFD_SEND_SIGNAL = 424
 POLL_INTERVAL = 0.01
+DISCOVERY_INTERVAL = 0.25
 _pending_signal: int | None = None
 
 
@@ -329,6 +330,8 @@ class Supervisor:
 
     def run(self, timeout: float) -> int:
         deadline = time.monotonic() + timeout
+        next_discovery = time.monotonic()
+        snapshots: dict[int, Snapshot] = {}
         try:
             while True:
                 if _pending_signal is not None:
@@ -339,7 +342,6 @@ class Supervisor:
                         return 125
                     return 128 + signum
                 status = self.child.poll()
-                snapshots = self.discover()
                 if status is not None:
                     clean = self.cleanup()
                     if not clean:
@@ -347,6 +349,7 @@ class Supervisor:
                         return 125
                     return shell_status(status)
                 if time.monotonic() >= deadline:
+                    snapshots = self.discover()
                     timed_out = True
                     print(f"cargo test command timed out after {timeout:g}s", file=sys.stderr)
                     print(f"active command: {shlex.join(self.child.args)}", file=sys.stderr)
@@ -356,6 +359,9 @@ class Supervisor:
                         print("failed to prove owned process cleanup", file=sys.stderr)
                         return 125
                     return 124
+                if time.monotonic() >= next_discovery:
+                    snapshots = self.discover()
+                    next_discovery = time.monotonic() + DISCOVERY_INTERVAL
                 time.sleep(POLL_INTERVAL)
         finally:
             self.close()

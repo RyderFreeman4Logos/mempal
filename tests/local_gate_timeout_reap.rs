@@ -370,3 +370,53 @@ while True:
         "wrapper returned success while its non-UTF-8 owned descendant was alive"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cargo_test_wrapper_limits_proc_discovery_for_a_successful_short_child() {
+    let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
+    let harness = r#"
+import importlib.util
+import subprocess
+import sys
+
+spec = importlib.util.spec_from_file_location("timeout_wrapper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.ensure_linux_subreaper()
+
+calls = 0
+scan_snapshots = module.scan_snapshots
+def counted_scan_snapshots():
+    global calls
+    calls += 1
+    return scan_snapshots()
+module.scan_snapshots = counted_scan_snapshots
+
+child = subprocess.Popen(["/bin/sleep", "0.15"], start_new_session=True)
+supervisor = module.Supervisor(child, 1)
+assert supervisor.run(1) == 0
+print(calls)
+"#;
+    let output = Command::new("python3")
+        .args(["-c", harness])
+        .arg(&script)
+        .output()
+        .expect("run instrumented timeout wrapper");
+
+    assert!(
+        output.status.success(),
+        "instrumented timeout wrapper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let scans = String::from_utf8(output.stdout)
+        .expect("UTF-8 scan count")
+        .trim()
+        .parse::<usize>()
+        .expect("numeric scan count");
+    assert!(
+        scans <= 3,
+        "successful short child performed {scans} whole-proc discovery scans"
+    );
+}
