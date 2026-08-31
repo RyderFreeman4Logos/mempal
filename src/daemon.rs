@@ -2453,7 +2453,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 None,
             )
             .await?;
-            admission::discard_model_rejected_admission(
+            admission::soft_delete_model_rejected_admission(
                 context.db,
                 context.daemon.runtime_writer_lease,
                 &drawer_id,
@@ -2496,7 +2496,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         .await?;
         gating_audit_recorded = true;
         if llm_decision.is_rejected() {
-            admission::discard_model_rejected_admission(
+            admission::soft_delete_model_rejected_admission(
                 context.db,
                 context.daemon.runtime_writer_lease,
                 &drawer_id,
@@ -2618,7 +2618,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 )
                 .await?;
             }
-            admission::discard_model_rejected_admission(
+            admission::soft_delete_model_rejected_admission(
                 context.db,
                 context.daemon.runtime_writer_lease,
                 &drawer_id,
@@ -6039,7 +6039,7 @@ mod tests {
         super::insert_drawer(&db, "retained-candidate", &retained_record)
             .expect("insert retained drawer");
 
-        super::admission::discard_model_rejected_admission(
+        super::admission::soft_delete_model_rejected_admission(
             &async_db,
             None,
             "rejected-candidate",

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use crate::core::{AsyncDb, types::RuntimeWriterLease};
 
-pub(super) async fn discard_model_rejected_admission(
+pub(super) async fn soft_delete_model_rejected_admission(
     db: &AsyncDb,
     runtime_writer_lease: Option<&RuntimeWriterLease>,
     drawer_id: &str,
@@ -15,14 +15,16 @@ pub(super) async fn discard_model_rejected_admission(
         super::with_daemon_runtime_writer_lease_write(
             db,
             runtime_writer_lease.as_ref(),
-            "discard model-rejected hook drawer",
+            "soft-delete model-rejected hook drawer",
             || {
+                let deleted_at = super::current_timestamp();
                 db.conn()
                     .execute(
-                        "DELETE FROM drawers WHERE id = ?1 AND admission_owner = ?2",
-                        [&drawer_id, &admission_owner],
+                        "UPDATE drawers SET deleted_at = ?1 \
+                         WHERE id = ?2 AND admission_owner = ?3 AND deleted_at IS NULL",
+                        [&deleted_at, &drawer_id, &admission_owner],
                     )
-                    .with_context(|| format!("failed to discard hook drawer {drawer_id}"))?;
+                    .with_context(|| format!("failed to soft-delete hook drawer {drawer_id}"))?;
                 Ok(())
             },
         )
@@ -68,7 +70,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_review_rejection_does_not_unlink_session_id_path() {
+    async fn model_rejection_soft_deletes_admitted_drawer_without_unlinking_payload() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let victim = tmp.path().join("session-id-victim.txt");
         std::fs::write(&victim, "must survive model rejection").expect("write victim");
@@ -110,11 +112,14 @@ mod tests {
         insert_drawer_with_admission_owner(&db, "rejected-review", &record, Some("owner"))
             .expect("insert admission");
 
-        super::discard_model_rejected_admission(&async_db, None, "rejected-review", "owner")
+        super::soft_delete_model_rejected_admission(&async_db, None, "rejected-review", "owner")
             .await
             .expect("discard admission");
 
-        assert!(!db.drawer_exists("rejected-review").expect("drawer query"));
+        assert!(
+            db.drawer_is_soft_deleted("rejected-review")
+                .expect("rejected admission remains as a durable soft-deleted row")
+        );
         assert_eq!(
             std::fs::read_to_string(&victim).expect("victim must remain"),
             "must survive model rejection"
