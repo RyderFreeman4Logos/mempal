@@ -3170,6 +3170,7 @@ fn insert_drawer_with_vector(
     insert_drawer(db, drawer_id, record)?;
     db.insert_vector_with_project(drawer_id, vector, record.project_id.as_deref())
         .with_context(|| format!("failed to insert hook vector {}", drawer_id))?;
+    admission::finalize_admission_owner_after_completion(db, drawer_id)?;
     Ok(())
 }
 

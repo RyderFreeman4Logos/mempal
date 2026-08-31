@@ -1,6 +1,19 @@
 use anyhow::{Context, Result};
 
-use crate::core::{AsyncDb, types::RuntimeWriterLease};
+use crate::core::{AsyncDb, db::Database, types::RuntimeWriterLease};
+
+pub(super) fn finalize_admission_owner_after_completion(
+    db: &Database,
+    drawer_id: &str,
+) -> Result<()> {
+    db.conn()
+        .execute(
+            "UPDATE drawers SET admission_owner = NULL WHERE id = ?1",
+            [drawer_id],
+        )
+        .with_context(|| format!("failed to finalize hook drawer admission {drawer_id}"))?;
+    Ok(())
+}
 
 pub(super) async fn soft_delete_model_rejected_admission(
     db: &AsyncDb,
@@ -250,5 +263,138 @@ mod tests {
             raw_payload_storage_path(&hook_payload, tmp.path()).exists(),
             "completed drawer raw payload must remain"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_rejection_does_not_discard_completed_drawer_owned_by_stale_admission() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+        let hook_payload = serde_json::json!({
+            "tool_name": "DesignCapture",
+            "input": "record stale admission ownership",
+            "output": "A completed duplicate must survive its earlier failed admission retry.",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue failed admission");
+        let failed_admission = store
+            .claim_next("failed-admission-worker", 60)
+            .expect("claim failed admission")
+            .expect("failed admission");
+        let mut unavailable_config = Config::default();
+        unavailable_config.ingest_gating.enabled = true;
+        unavailable_config.ingest_gating.llm_judge = Some(LlmJudgeConfig {
+            enabled: true,
+            ..LlmJudgeConfig::default()
+        });
+        process_claimed_message_with_embedder(
+            &async_db,
+            &async_store,
+            "failed-admission-worker",
+            &failed_admission,
+            &StaticEmbedder,
+            DaemonIngestContext {
+                prototype_classifier: None,
+                llm_gate: None,
+                config: &unavailable_config,
+                mempal_home: tmp.path(),
+                runtime_writer_lease: None,
+                heartbeat_trigger: None,
+            },
+        )
+        .await
+        .expect_err("first admission must fail after persisting its drawer");
+
+        store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue completed duplicate");
+        let completed_duplicate = store
+            .claim_next("completed-duplicate-worker", 60)
+            .expect("claim completed duplicate")
+            .expect("completed duplicate");
+        let drawer_id = process_claimed_message_with_embedder(
+            &async_db,
+            &async_store,
+            "completed-duplicate-worker",
+            &completed_duplicate,
+            &StaticEmbedder,
+            DaemonIngestContext {
+                prototype_classifier: None,
+                llm_gate: None,
+                config: &Config::default(),
+                mempal_home: tmp.path(),
+                runtime_writer_lease: None,
+                heartbeat_trigger: None,
+            },
+        )
+        .await
+        .expect("complete duplicate");
+
+        let mut llm_server = mockito::Server::new_async().await;
+        let llm_mock = llm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(r#"{"model":"test-llm","choices":[{"message":{"role":"assistant","content":"{\"verdict\":\"reject\",\"score\":0.05}"}}]}"#)
+            .create_async()
+            .await;
+        unavailable_config.llm.enabled = true;
+        unavailable_config.llm.base_url = Some(format!("{}/v1", llm_server.url()));
+        unavailable_config.llm.model = Some("test-llm".to_string());
+        unavailable_config.llm.enabled_for = vec!["gating".to_string()];
+        let llm_gate = HookLlmGateRuntime::new(&unavailable_config.llm);
+        let mut retry = failed_admission.clone();
+        retry.retry_count = 1;
+        process_claimed_message_with_embedder(
+            &async_db,
+            &async_store,
+            "failed-admission-worker",
+            &retry,
+            &StaticEmbedder,
+            DaemonIngestContext {
+                prototype_classifier: None,
+                llm_gate: Some(&llm_gate),
+                config: &unavailable_config,
+                mempal_home: tmp.path(),
+                runtime_writer_lease: None,
+                heartbeat_trigger: None,
+            },
+        )
+        .await
+        .expect("reject retry without stealing completed duplicate");
+        llm_mock.assert_async().await;
+
+        assert!(
+            db.drawer_exists(&drawer_id)
+                .expect("completed duplicate drawer exists after stale retry rejection"),
+            "stale retry rejection must not delete another message's completed drawer"
+        );
+        let vector_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM drawer_vectors WHERE id = ?1",
+                [drawer_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("completed duplicate vector count");
+        assert_eq!(vector_count, 1, "completed duplicate vector must remain");
     }
 }
