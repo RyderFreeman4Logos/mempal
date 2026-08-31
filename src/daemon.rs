@@ -197,6 +197,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         recovery
             .record_recovered()
             .context("failed to mark daemon recovery complete")?;
+        ensure_daemon_runtime_writer_lease_active(&*context.db.lock().await, writer_lease.lease())?;
         notify_systemd_ready()?;
         eprintln!("hooks not enabled; daemon running configured background services only");
         if sleep_scheduler_enabled {
@@ -363,6 +364,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     recovery
         .record_recovered()
         .context("failed to mark daemon recovery complete")?;
+    ensure_daemon_runtime_writer_lease_active(&*context.db.lock().await, writer_lease.lease())?;
     notify_systemd_ready()?;
     loop {
         if shutdown_requested() {
@@ -438,29 +440,23 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
 fn ensure_daemon_runtime_writer_lease_active(
     db: &Database,
-    lease: Option<&RuntimeWriterLease>,
-    operation: &'static str,
+    lease: &RuntimeWriterLease,
 ) -> Result<()> {
-    let Some(lease) = lease else {
-        return Ok(());
-    };
-    let active = db.runtime_writer_lease_is_active(lease).with_context(|| {
-        format!(
-            "failed to verify daemon writer lease `{}` before {operation}",
-            lease.name
-        )
-    })?;
+    let active = db
+        .runtime_writer_lease_is_active(lease)
+        .with_context(|| format!("writer lease `{}` stale before READY", lease.name))?;
     if active {
         Ok(())
     } else {
-        anyhow::bail!(
-            "SQLite writer lease `{}` for {} was lost before {operation}",
-            lease.name,
-            lease.owner
-        )
+        Err(DbError::RuntimeWriterLeaseLost {
+            lease_name: lease.name.clone(),
+            owner: lease.owner.clone(),
+            generation: lease.generation,
+            operation: "READY",
+        }
+        .into())
     }
 }
 
@@ -4949,12 +4945,8 @@ mod tests {
             )
             .expect("acquire stale lease")
             .expect("stale lease available");
-        super::ensure_daemon_runtime_writer_lease_active(
-            &db,
-            Some(&stale),
-            "daemon test preflight",
-        )
-        .expect("stale generation is active at preflight");
+        super::ensure_daemon_runtime_writer_lease_active(&db, &stale)
+            .expect("stale generation is active at preflight");
         assert!(
             db.runtime_writer_lease_release(&stale)
                 .expect("release stale generation")

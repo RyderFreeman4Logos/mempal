@@ -13,7 +13,9 @@ use std::{
 };
 
 use crate::{
-    bootstrap_events::BootstrapEvent, core::db::Database, daemon_bootstrap::DaemonContext,
+    bootstrap_events::BootstrapEvent,
+    core::db::{Database, DbError},
+    daemon_bootstrap::DaemonContext,
 };
 
 use super::{
@@ -25,6 +27,8 @@ static NOTIFY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct NotifySocketEnv {
     previous: Option<OsString>,
+    previous_home: Option<OsString>,
+    restore_home: bool,
     _lock: MutexGuard<'static, ()>,
 }
 
@@ -34,14 +38,28 @@ impl NotifySocketEnv {
     }
 
     fn set_value(value: OsString) -> Self {
+        Self::set_value_and_home(value, None)
+    }
+
+    fn set_with_home(path: &Path, home: &Path) -> Self {
+        Self::set_value_and_home(path.as_os_str().to_owned(), Some(home))
+    }
+
+    fn set_value_and_home(value: OsString, home: Option<&Path>) -> Self {
         let lock = NOTIFY_ENV_LOCK.lock().expect("NOTIFY_SOCKET env lock");
         let previous = std::env::var_os("NOTIFY_SOCKET");
+        let previous_home = std::env::var_os("HOME");
         // SAFETY: the test lock serializes this process-global environment mutation.
         unsafe {
             std::env::set_var("NOTIFY_SOCKET", value);
+            if let Some(home) = home {
+                std::env::set_var("HOME", home);
+            }
         }
         Self {
             previous,
+            previous_home,
+            restore_home: home.is_some(),
             _lock: lock,
         }
     }
@@ -55,6 +73,13 @@ impl Drop for NotifySocketEnv {
                 std::env::set_var("NOTIFY_SOCKET", previous);
             } else {
                 std::env::remove_var("NOTIFY_SOCKET");
+            }
+            if self.restore_home {
+                if let Some(previous_home) = &self.previous_home {
+                    std::env::set_var("HOME", previous_home);
+                } else {
+                    std::env::remove_var("HOME");
+                }
             }
         }
     }
@@ -262,6 +287,58 @@ async fn daemon_ready_requires_a_serving_rest_listener_and_rejects_bind_failure(
         .expect("serving REST fixture task panicked")
         .expect("serving REST fixture failed");
     assert!(Database::open(&serving_db_path).is_ok());
+}
+
+#[tokio::test]
+async fn systemd_ready_rejects_a_writer_lease_lost_after_admission() {
+    let _shutdown_lock = global_shutdown_test_lock().lock_owned().await;
+    reset_shutdown_request();
+
+    let tempdir = tempfile::tempdir().expect("create stale writer lease fixture");
+    let notify_path = tempdir.path().join("notify.sock");
+    let notify_socket = tokio::net::UnixDatagram::bind(&notify_path)
+        .expect("bind stale writer lease notification receiver");
+    let (_db_path, config_path) = write_fixture(
+        &tempdir,
+        "127.0.0.1:0".parse().expect("parse ephemeral REST address"),
+    );
+    let _process_env = NotifySocketEnv::set_with_home(&notify_path, tempdir.path());
+    let (events, _receiver) = tokio::sync::mpsc::channel(16);
+    let context = bootstrap_fixture(config_path, &tempdir, events).await;
+    context
+        .db
+        .lock()
+        .await
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER invalidate_daemon_writer_lease_after_admission
+             AFTER INSERT ON runtime_writer_leases
+             WHEN NEW.name = 'sqlite-writer' AND NEW.mode = 'daemon'
+             BEGIN
+               DELETE FROM runtime_writer_leases
+               WHERE name = NEW.name
+                 AND owner = NEW.owner
+                 AND session_id = NEW.session_id
+                 AND generation = NEW.generation;
+             END;",
+        )
+        .expect("install stale writer lease fixture trigger");
+
+    let result = run_loop_with_timeout(context).await;
+    assert!(
+        receive_notify_packet(&notify_socket, Duration::from_millis(100))
+            .await
+            .is_none(),
+        "stale writer lease must not send READY=1"
+    );
+    let error = result.expect_err("stale writer lease must fail final readiness");
+    assert!(
+        error.chain().any(|cause| matches!(
+            cause.downcast_ref::<DbError>(),
+            Some(DbError::RuntimeWriterLeaseLost { .. })
+        )),
+        "stale writer lease must return the typed lease-loss error: {error:#}"
+    );
 }
 
 #[cfg(target_os = "linux")]
