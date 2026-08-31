@@ -21,6 +21,9 @@ pub(crate) fn notify_systemd_ready() -> anyhow::Result<()> {
         return Ok(());
     };
     let socket = UnixDatagram::unbound().context("failed to create systemd readiness notifier")?;
+    socket
+        .set_nonblocking(true)
+        .context("failed to configure systemd readiness notifier")?;
     let socket_bytes = socket_path.as_os_str().as_bytes();
 
     #[cfg(target_os = "linux")]

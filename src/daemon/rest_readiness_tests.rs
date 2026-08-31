@@ -16,7 +16,10 @@ use crate::{
     bootstrap_events::BootstrapEvent, core::db::Database, daemon_bootstrap::DaemonContext,
 };
 
-use super::{global_shutdown_test_lock, request_shutdown, reset_shutdown_request, run_loop};
+use super::{
+    global_shutdown_test_lock, notify_systemd_ready, request_shutdown, reset_shutdown_request,
+    run_loop,
+};
 
 static NOTIFY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -259,6 +262,113 @@ async fn daemon_ready_requires_a_serving_rest_listener_and_rejects_bind_failure(
         .expect("serving REST fixture task panicked")
         .expect("serving REST fixture failed");
     assert!(Database::open(&serving_db_path).is_ok());
+}
+
+#[cfg(target_os = "linux")]
+fn fill_notify_receiver_queue(path: &Path) -> Vec<StdUnixDatagram> {
+    let mut fillers = Vec::new();
+    let payload = b"READY=1";
+    for _ in 0..4_096 {
+        let filler = StdUnixDatagram::unbound().expect("create notification queue filler");
+        filler
+            .set_nonblocking(true)
+            .expect("set notification queue filler nonblocking");
+        match filler.send_to(payload, path) {
+            Ok(_) => fillers.push(filler),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return fillers,
+            Err(error) => panic!("fill notification receiver queue: {error}"),
+        }
+    }
+    panic!("notification receiver queue did not become full");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn systemd_notify_returns_bounded_error_when_receiver_queue_is_full() {
+    let tempdir = tempfile::tempdir().expect("create full notification queue fixture");
+    let notify_path = tempdir.path().join("notify.sock");
+    let receiver = StdUnixDatagram::bind(&notify_path).expect("bind full notification receiver");
+    let fillers = fill_notify_receiver_queue(&notify_path);
+    assert!(
+        !fillers.is_empty(),
+        "notification queue filler sent no packets"
+    );
+
+    let _notify_env = NotifySocketEnv::set(&notify_path);
+    let (result_sender, result_receiver) = std::sync::mpsc::channel();
+    let notifier = std::thread::spawn(move || {
+        result_sender
+            .send(notify_systemd_ready())
+            .expect("send notification test result");
+    });
+
+    let (result, timed_out) = match result_receiver.recv_timeout(Duration::from_millis(250)) {
+        Ok(result) => (result, false),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let mut packet = [0_u8; 4096];
+            receiver
+                .recv(&mut packet)
+                .expect("drain notification receiver queue");
+            let result = result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("blocked notification did not finish after queue cleanup");
+            (result, true)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("notification test thread exited without a result")
+        }
+    };
+    notifier.join().expect("notification test thread panicked");
+
+    assert!(
+        !timed_out,
+        "systemd readiness notification blocked on a full receiver queue"
+    );
+    let error = result.expect_err("a full notification receiver queue must return an error");
+    assert_eq!(
+        error
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::WouldBlock),
+        "full-queue errors must preserve WouldBlock"
+    );
+    assert!(
+        error.to_string().contains("systemd readiness notification"),
+        "full-queue errors must retain notification context: {error:#}"
+    );
+    assert!(
+        !error.to_string().contains(notify_path.to_str().unwrap()),
+        "full-queue errors must not expose the socket path: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn systemd_notify_empty_socket_values_fail_bounded_without_leaking_value() {
+    let _shutdown_lock = global_shutdown_test_lock().lock_owned().await;
+    reset_shutdown_request();
+
+    for value in [OsString::new(), OsString::from("@")] {
+        let tempdir = tempfile::tempdir().expect("create empty notification fixture");
+        let (_db_path, config_path) = write_fixture(&tempdir, "127.0.0.1:0".parse().unwrap());
+        let (events, _receiver) = tokio::sync::mpsc::channel(16);
+        let context = bootstrap_fixture(config_path, &tempdir, events).await;
+        let result = {
+            let _notify_env = NotifySocketEnv::set_value(value.clone());
+            run_loop_with_timeout(context).await
+        };
+        let error = result.expect_err("an empty systemd notification value must fail startup");
+        assert!(
+            error.to_string().contains("systemd readiness notification"),
+            "empty notification values must fail with notification context: {error:#}"
+        );
+        if !value.is_empty() {
+            assert!(
+                !error.to_string().contains(value.to_str().unwrap()),
+                "empty notification errors must not expose the raw value: {error:#}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
