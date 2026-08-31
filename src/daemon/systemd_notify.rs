@@ -25,13 +25,17 @@ pub(crate) fn notify_systemd_ready() -> anyhow::Result<()> {
         .set_nonblocking(true)
         .context("failed to configure systemd readiness notifier")?;
     let socket_bytes = socket_path.as_os_str().as_bytes();
+    if socket_bytes.is_empty() {
+        anyhow::bail!("systemd readiness notification address is invalid");
+    }
 
     #[cfg(target_os = "linux")]
     if let Some(name) = socket_bytes.strip_prefix(b"@") {
         use std::os::linux::net::SocketAddrExt;
         use std::os::unix::net::SocketAddr;
-        let name = std::str::from_utf8(name)
-            .map_err(|_| anyhow::anyhow!("systemd readiness notification address is invalid"))?;
+        if name.is_empty() {
+            anyhow::bail!("systemd readiness notification address is invalid");
+        }
         let address = SocketAddr::from_abstract_name(name)
             .map_err(|_| anyhow::anyhow!("systemd readiness notification address is invalid"))?;
         socket

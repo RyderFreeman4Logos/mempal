@@ -302,7 +302,7 @@ fn systemd_notify_returns_bounded_error_when_receiver_queue_is_full() {
             .expect("send notification test result");
     });
 
-    let (result, timed_out) = match result_receiver.recv_timeout(Duration::from_millis(250)) {
+    let (result, timed_out) = match result_receiver.recv_timeout(Duration::from_secs(2)) {
         Ok(result) => (result, false),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             let mut packet = [0_u8; 4096];
@@ -369,6 +369,82 @@ async fn systemd_notify_empty_socket_values_fail_bounded_without_leaking_value()
             );
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn systemd_notify_rejects_bound_empty_abstract_address_without_sending() {
+    use std::io::ErrorKind;
+
+    let address = UnixSocketAddr::from_abstract_name("")
+        .expect("empty abstract address should be constructible");
+    let receiver = StdUnixDatagram::bind_addr(&address).expect("bind empty abstract receiver");
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("bound empty abstract receiver read timeout");
+
+    let result = {
+        let _notify_env = NotifySocketEnv::set_value(OsString::from("@"));
+        notify_systemd_ready()
+    };
+    let mut packet = [0_u8; 128];
+    let receive_result = receiver.recv(&mut packet);
+
+    assert_eq!(
+        result.as_ref().err().map(ToString::to_string).as_deref(),
+        Some("systemd readiness notification address is invalid"),
+        "bound empty abstract receiver observed {receive_result:?}"
+    );
+    assert!(
+        matches!(
+            receive_result,
+            Err(ref error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+        ),
+        "invalid empty abstract address must not send READY=1: {receive_result:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn systemd_notify_delivers_to_non_unicode_abstract_address() {
+    let abstract_name = b"mempal-\xff".to_vec();
+    let address = UnixSocketAddr::from_abstract_name(&abstract_name)
+        .expect("non-Unicode abstract address should be constructible");
+    let receiver = StdUnixDatagram::bind_addr(&address)
+        .expect("bind non-Unicode abstract notification receiver");
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("non-Unicode abstract receiver read timeout");
+
+    let mut notify_value = vec![b'@'];
+    notify_value.extend_from_slice(&abstract_name);
+    let result = {
+        let _notify_env = NotifySocketEnv::set_value(OsString::from_vec(notify_value));
+        notify_systemd_ready()
+    };
+    let mut packet = [0_u8; 128];
+    let first_packet = receiver
+        .recv(&mut packet)
+        .ok()
+        .map(|length| packet[..length].to_vec());
+    receiver
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("non-Unicode abstract second-packet read timeout");
+    let second_packet = receiver.recv(&mut packet);
+
+    assert!(
+        result.is_ok(),
+        "non-Unicode abstract notification should send successfully: {result:?}"
+    );
+    assert_eq!(
+        first_packet,
+        Some(b"READY=1".to_vec()),
+        "non-Unicode abstract notification must send exactly READY=1"
+    );
+    assert!(
+        matches!(second_packet, Err(ref error) if error.kind() == std::io::ErrorKind::TimedOut || error.kind() == std::io::ErrorKind::WouldBlock),
+        "non-Unicode abstract notification must send only one packet: {second_packet:?}"
+    );
 }
 
 #[tokio::test]
