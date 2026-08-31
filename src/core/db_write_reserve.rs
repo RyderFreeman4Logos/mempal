@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{
     Database, DbError, RUNTIME_WRITER_LEASE_TRANSACTION_RETRY_DEADLINE, db_error_is_sqlite_lock,
@@ -69,17 +69,30 @@ impl WriteReserveLock {
                 .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
                 .mode(0o600)
                 .open(write_reserve_lock_path(database_path))?;
+            let deadline = Instant::now() + RUNTIME_WRITER_LEASE_TRANSACTION_RETRY_DEADLINE;
             loop {
                 // SAFETY: `file` keeps this valid descriptor open for the call,
                 // and `flock` does not retain the descriptor or access Rust memory.
-                let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+                let result =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                 if result == 0 {
                     return Ok(Self { file });
                 }
                 let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::EINTR) {
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
                     return Err(error);
                 }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "write reserve lock wait timed out",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(25).min(remaining));
             }
         }
         #[cfg(not(unix))]
@@ -153,6 +166,10 @@ pub(crate) fn ensure_write_reserve(_database_path: &Path) -> std::io::Result<()>
 pub(crate) fn ensure_write_reserve_logged(database_path: &Path) {
     #[cfg(test)]
     notify_reserve_ensure_attempted_for_test(database_path);
+    tracing::info!(
+        path = %database_path.display(),
+        "waiting for write reserve lock"
+    );
     let Ok(_lock) = WriteReserveLock::acquire(database_path) else {
         tracing::debug!(
             path = %database_path.display(),
@@ -455,6 +472,54 @@ mod tests {
                 .expect("read retried write"),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_reserve_lock_contention_is_bounded() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::time::Duration;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("uncontended open must refill write reserve");
+        let lock_path = write_reserve_lock_path(&db_path);
+        let holder = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .mode(0o600)
+            .open(lock_path)
+            .expect("open write-reserve lock");
+        // SAFETY: `holder` keeps this valid descriptor open for the call.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let (result_tx, result_rx) = sync_channel(1);
+        let started = Instant::now();
+        let contender = thread::spawn(move || {
+            let result =
+                db.with_write_reserve_retry("test lock contention", || Ok::<_, DbError>(()));
+            result_tx
+                .send((started.elapsed(), result))
+                .expect("send lock result");
+        });
+        let received = result_rx.recv_timeout(Duration::from_secs(6));
+        drop(holder);
+        contender.join().expect("contender thread");
+
+        let (elapsed, result) = received.expect("bounded write-reserve lock acquisition");
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "lock wait took {elapsed:?}"
+        );
+        let error = result.expect_err("contended write-reserve lock must time out");
+        let DbError::WriteReserveLock { source, .. } = error else {
+            panic!("expected typed write-reserve lock error");
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::TimedOut);
+        Database::open(&db_path).expect("uncontended open after release");
     }
 
     #[cfg(unix)]
