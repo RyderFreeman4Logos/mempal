@@ -65,7 +65,11 @@ class Supervisor:
 
     def _adopt_root_immediately(self) -> None:
         self.owned[self.child.pid] = OwnedProcess(None)
-        snapshot = read_snapshot(self.child.pid)
+        try:
+            snapshot = read_snapshot(self.child.pid)
+        except (OSError, ValueError):
+            self.ownership_uncertain = True
+            return
         if snapshot is not None:
             self._adopt(snapshot)
 
@@ -94,7 +98,7 @@ class Supervisor:
     def discover(self) -> dict[int, Snapshot]:
         try:
             snapshots = scan_snapshots()
-        except OSError:
+        except (OSError, ValueError):
             self.ownership_uncertain = True
             root = self.owned.get(self.child.pid)
             if root is None or root.identity is None:
@@ -188,7 +192,11 @@ class Supervisor:
                 return False
             if ready:
                 return False
-        snapshot = read_snapshot(process_group)
+        try:
+            snapshot = read_snapshot(process_group)
+        except (OSError, ValueError):
+            self.ownership_uncertain = True
+            return False
         return (
             snapshot is not None
             and snapshot.identity == identity
@@ -389,25 +397,31 @@ def install_signal_handlers() -> None:
 
 def read_snapshot(pid: int) -> Snapshot | None:
     try:
-        text = Path(f"/proc/{pid}/stat").read_text()
-    except (OSError, UnicodeError):
-        return None
-    closing_paren = text.rfind(") ")
+        data = Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ESRCH):
+            return None
+        raise
+    closing_paren = data.rfind(b") ")
     if closing_paren < 0:
-        return None
-    fields = text[closing_paren + 2 :].split()
+        raise ValueError(f"malformed /proc/{pid}/stat")
+    fields = data[closing_paren + 2 :].split()
     if len(fields) < 20:
-        return None
+        raise ValueError(f"malformed /proc/{pid}/stat")
     try:
+        snapshot_pid = int(data.split(b" (", 1)[0])
+        state = fields[0].decode("ascii")
+        if snapshot_pid != pid or len(state) != 1:
+            raise ValueError
         return Snapshot(
-            identity=Identity(pid, int(fields[19])),
+            identity=Identity(snapshot_pid, int(fields[19])),
             parent_pid=int(fields[1]),
             process_group=int(fields[2]),
             session=int(fields[3]),
-            state=fields[0],
+            state=state,
         )
-    except ValueError:
-        return None
+    except (UnicodeError, ValueError) as error:
+        raise ValueError(f"malformed /proc/{pid}/stat") from error
 
 
 def scan_snapshots() -> dict[int, Snapshot]:

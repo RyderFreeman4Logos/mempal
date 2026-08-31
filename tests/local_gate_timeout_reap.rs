@@ -320,3 +320,53 @@ fn cargo_test_wrapper_reaps_descendant_after_leader_exits_and_drains_pipes() {
     assert!(String::from_utf8_lossy(&stdout).contains("early stdout"));
     assert!(String::from_utf8_lossy(&stderr).contains("early stderr"));
 }
+
+#[cfg(unix)]
+#[test]
+fn cargo_test_wrapper_reaps_non_utf8_task_name_after_leader_exits() {
+    let script = repo_root().join("scripts/gates/cargo-test-with-timeout.sh");
+    let fixture = tempfile::tempdir().expect("create non-UTF-8 task-name fixture");
+    let identity_file = fixture.path().join("descendant-identity");
+    let command = r#"
+        setsid /usr/bin/python3 -c '
+import ctypes
+import os
+import signal
+import time
+
+ctypes.CDLL(None).prctl(15, b"\xff", 0, 0, 0)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+pid = os.getpid()
+fields = open(f"/proc/{pid}/stat", "rb").read().rpartition(b") ")[2].split()
+open(os.environ["IDENTITY_FILE"], "wb").write(str(pid).encode() + b" " + fields[19] + b"\n")
+while True:
+    time.sleep(0.01)
+        ' &
+        while [[ ! -s "${IDENTITY_FILE:?}" ]]; do /bin/sleep 0.01; done
+        exit 0
+    "#;
+    let (mut wrapper, _stdout_done, _stderr_done) =
+        spawn_piped_wrapper(&script, command, "10", &identity_file);
+    wait_for_file(
+        &identity_file,
+        Duration::from_secs(2),
+        "non-UTF-8 task-name descendant identity",
+    );
+    let identity_record = fs::read_to_string(&identity_file).expect("read non-UTF-8 identity");
+
+    let status = wait_for_wrapper(
+        &mut wrapper,
+        Duration::from_secs(4),
+        "wrapper with a non-UTF-8 task-name descendant",
+    );
+    let running_before_cleanup = recorded_process_is_running(&identity_record);
+    if running_before_cleanup {
+        kill_recorded_process(&identity_record);
+    }
+
+    assert_eq!(status.code(), Some(0));
+    assert!(
+        !running_before_cleanup,
+        "wrapper returned success while its non-UTF-8 owned descendant was alive"
+    );
+}
