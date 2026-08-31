@@ -34,16 +34,19 @@ fn wait_for_file(path: &Path, timeout: Duration, description: &str) {
 }
 
 #[cfg(unix)]
+type PipedWrapper = (
+    std::process::Child,
+    Receiver<std::io::Result<Vec<u8>>>,
+    Receiver<std::io::Result<Vec<u8>>>,
+);
+
+#[cfg(unix)]
 fn spawn_piped_wrapper(
     script: &Path,
     command: &str,
     timeout_secs: &str,
     identity_path: &Path,
-) -> (
-    std::process::Child,
-    Receiver<std::io::Result<Vec<u8>>>,
-    Receiver<std::io::Result<Vec<u8>>>,
-) {
+) -> PipedWrapper {
     let mut wrapper = Command::new("/bin/bash");
     wrapper
         .arg(script)
