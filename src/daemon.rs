@@ -2354,27 +2354,30 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     retry_count: u32,
     admission_owner: &str,
 ) -> Result<String> {
-    let (drawer_id, exists) = {
+    let (drawer_id, exists, has_vector) = {
         let record = record.clone();
         context
             .db
             .run_read_anyhow(move |db| {
-                db.resolve_ingest_drawer_id(
-                    &record.wing,
-                    Some(record.room.as_str()),
-                    &record.content,
-                    record.project_id.as_deref(),
-                )
-                .with_context(|| {
-                    format!(
-                        "failed to resolve drawer identity for {}/{}",
-                        record.wing, record.room
+                let (drawer_id, exists) = db
+                    .resolve_ingest_drawer_id(
+                        &record.wing,
+                        Some(record.room.as_str()),
+                        &record.content,
+                        record.project_id.as_deref(),
                     )
-                })
+                    .with_context(|| {
+                        format!(
+                            "failed to resolve drawer identity for {}/{}",
+                            record.wing, record.room
+                        )
+                    })?;
+                let has_vector = exists && db.drawer_vector_details(&drawer_id)?.has_vector;
+                Ok((drawer_id, exists, has_vector))
             })
             .await?
     };
-    if exists && retry_count == 0 {
+    if exists && retry_count == 0 && has_vector {
         return Ok(drawer_id);
     }
 
