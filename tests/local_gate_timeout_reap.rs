@@ -137,6 +137,112 @@ fn receive_pipe(
         .expect("read wrapper output")
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn cargo_test_wrapper_names_leftover_owned_processes_on_cleanup_proof_failure() {
+    let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
+    let harness = r#"
+import importlib.util
+import subprocess
+import sys
+
+spec = importlib.util.spec_from_file_location("timeout_wrapper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+child = subprocess.Popen(["/bin/sleep", "10"], start_new_session=True)
+supervisor = module.Supervisor(child, 1)
+original_poll = child.poll
+supervisor.cleanup = lambda: False
+child.poll = lambda: 0
+try:
+    assert supervisor.run(1) == 125
+finally:
+    child.poll = original_poll
+    child.terminate()
+    child.wait()
+    supervisor.close()
+"#;
+    let output = Command::new("python3")
+        .args(["-c", harness])
+        .arg(&script)
+        .output()
+        .expect("run cleanup-proof diagnostics harness");
+
+    assert!(
+        output.status.success(),
+        "cleanup-proof diagnostics harness failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("remaining owned processes:"),
+        "stderr={stderr}"
+    );
+    assert!(stderr.contains("pid="), "stderr={stderr}");
+    assert!(stderr.contains("start_time="), "stderr={stderr}");
+    assert!(stderr.contains("comm='sleep'"), "stderr={stderr}");
+    assert!(stderr.contains("ppid="), "stderr={stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cargo_test_wrapper_does_not_adopt_an_idle_sccache_daemon() {
+    let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
+    let harness = r#"
+import ctypes
+import importlib.util
+import subprocess
+import sys
+import time
+
+spec = importlib.util.spec_from_file_location("timeout_wrapper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+child = subprocess.Popen(["/bin/sleep", "10"], start_new_session=True)
+cache = subprocess.Popen([
+    "/usr/bin/python3", "-c",
+    "import ctypes, time; ctypes.CDLL(None).prctl(15, b'sccache', 0, 0, 0); time.sleep(10)",
+])
+supervisor = module.Supervisor(child, 1)
+original_open = module.open_pidfd
+try:
+    deadline = time.monotonic() + 1
+    while module.read_snapshot(cache.pid).comm != "sccache":
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    module.open_pidfd = lambda identity: None
+    supervisor.discover()
+    module.open_pidfd = original_open
+    assert cache.pid not in supervisor.owned
+    child.terminate()
+    child.wait()
+    assert supervisor.cleanup()
+    assert cache.poll() is None
+finally:
+    module.open_pidfd = original_open
+    cache.terminate()
+    cache.wait()
+    child.terminate()
+    child.wait()
+    supervisor.close()
+"#;
+    let output = Command::new("python3")
+        .args(["-c", harness])
+        .arg(&script)
+        .output()
+        .expect("run idle sccache cleanup harness");
+
+    assert!(
+        output.status.success(),
+        "idle sccache must not block cleanup proof: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn cargo_test_wrapper_timeout_reaps_a_term_ignoring_descendant() {

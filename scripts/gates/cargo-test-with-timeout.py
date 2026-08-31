@@ -36,6 +36,7 @@ class Snapshot:
     process_group: int
     session: int
     state: str
+    comm: str = "?"
 
 
 @dataclass
@@ -135,6 +136,10 @@ class Supervisor:
             for snapshot in snapshots.values():
                 pid = snapshot.identity.pid
                 if pid == self.supervisor_pid or pid in self.owned:
+                    continue
+                # A direct sccache child is its persistent cache server reparented to
+                # the subreaper, not work owned by this gate invocation.
+                if snapshot.parent_pid == self.supervisor_pid and snapshot.comm == "sccache":
                     continue
                 parent = snapshots.get(snapshot.parent_pid)
                 if snapshot.parent_pid == self.supervisor_pid or (
@@ -346,6 +351,30 @@ class Supervisor:
                     file=sys.stderr,
                 )
 
+    def process_cleanup_failure(self) -> None:
+        print("remaining owned processes:", file=sys.stderr)
+        try:
+            snapshots = scan_snapshots()
+        except (OSError, ValueError):
+            snapshots = {}
+        for pid, handle in sorted(self.owned.items()):
+            if handle.exited or handle.identity is None:
+                continue
+            snapshot = snapshots.get(pid)
+            if snapshot is None or snapshot.identity != handle.identity:
+                print(
+                    f" pid={pid} start_time={handle.identity.start_time} comm='?' ppid=?",
+                    file=sys.stderr,
+                )
+                continue
+            if snapshot.state in ("Z", "X"):
+                continue
+            print(
+                f" pid={pid} start_time={snapshot.identity.start_time}"
+                f" comm={snapshot.comm!r} ppid={snapshot.parent_pid}",
+                file=sys.stderr,
+            )
+
     def close(self) -> None:
         for handle in self.owned.values():
             if handle.pidfd is not None:
@@ -363,6 +392,7 @@ class Supervisor:
                     clean = self.cleanup()
                     if not clean:
                         print("failed to prove owned process cleanup", file=sys.stderr)
+                        self.process_cleanup_failure()
                         return 125
                     return 128 + signum
                 status = self.child.poll()
@@ -370,6 +400,7 @@ class Supervisor:
                     clean = self.cleanup()
                     if not clean:
                         print("failed to prove owned process cleanup", file=sys.stderr)
+                        self.process_cleanup_failure()
                         return 125
                     return shell_status(status)
                 if time.monotonic() >= deadline:
@@ -381,6 +412,7 @@ class Supervisor:
                     clean = self.cleanup()
                     if not clean:
                         print("failed to prove owned process cleanup", file=sys.stderr)
+                        self.process_cleanup_failure()
                         return 125
                     return 124
                 if time.monotonic() >= next_discovery:
@@ -441,14 +473,15 @@ def read_snapshot(pid: int) -> Snapshot | None:
         if error.errno in (errno.ENOENT, errno.ESRCH):
             return None
         raise
+    opening_paren = data.find(b" (")
     closing_paren = data.rfind(b") ")
-    if closing_paren < 0:
+    if opening_paren < 0 or closing_paren <= opening_paren:
         raise ValueError(f"malformed /proc/{pid}/stat")
     fields = data[closing_paren + 2 :].split()
     if len(fields) < 20:
         raise ValueError(f"malformed /proc/{pid}/stat")
     try:
-        snapshot_pid = int(data.split(b" (", 1)[0])
+        snapshot_pid = int(data[:opening_paren])
         state = fields[0].decode("ascii")
         if snapshot_pid != pid or len(state) != 1:
             raise ValueError
@@ -458,6 +491,7 @@ def read_snapshot(pid: int) -> Snapshot | None:
             process_group=int(fields[2]),
             session=int(fields[3]),
             state=state,
+            comm=data[opening_paren + 2 : closing_paren].decode("utf-8", "backslashreplace"),
         )
     except (UnicodeError, ValueError) as error:
         raise ValueError(f"malformed /proc/{pid}/stat") from error
