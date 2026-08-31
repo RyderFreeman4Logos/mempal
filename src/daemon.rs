@@ -54,12 +54,19 @@ mod admission;
 mod durable_payload;
 #[cfg(feature = "rest")]
 mod mcp;
+#[path = "daemon/runtime_readiness.rs"]
+mod runtime_readiness;
 #[path = "daemon/self_heal.rs"]
 mod self_heal;
 mod sleep_scheduler;
 #[path = "daemon/systemd_notify.rs"]
 mod systemd_notify;
 mod writer_lease;
+#[cfg(feature = "rest")]
+use runtime_readiness::drain_rest_server;
+use runtime_readiness::{
+    ensure_daemon_runtime_writer_lease_active, spawn_daemon_ingest_drain_worker,
+};
 use self_heal::ClaimBackoffState;
 use systemd_notify::{notify_systemd_ready, validate_api_enabled};
 #[cfg(test)]
@@ -174,7 +181,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     // Start REST API before the hooks check so the API remains available
     // even when hooks are disabled.
     #[cfg(feature = "rest")]
-    let _rest_task = if context.config.api.enabled {
+    let mut rest_task = if context.config.api.enabled {
         let task = mcp::spawn_rest(context, &db_path, &writer_lease).await?;
         context.emit_ready();
         task
@@ -198,7 +205,18 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
             .record_recovered()
             .context("failed to mark daemon recovery complete")?;
         ensure_daemon_runtime_writer_lease_active(&*context.db.lock().await, writer_lease.lease())?;
-        notify_systemd_ready()?;
+        if let Err(error) = notify_systemd_ready() {
+            #[cfg(unix)]
+            request_shutdown_and_notify();
+            #[cfg(feature = "rest")]
+            drain_rest_server(rest_task).await;
+            ingest_drain_worker
+                .shutdown_and_drain_with_budget(Some(DAEMON_DRAIN_BUDGET))
+                .await;
+            sleep_scheduler::drain(sleep_scheduler_handle).await;
+            let _ = context.store.reclaim_stale(0).await;
+            return Err(error);
+        }
         eprintln!("hooks not enabled; daemon running configured background services only");
         if sleep_scheduler_enabled {
             while !shutdown_requested() {
@@ -207,8 +225,9 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         } else {
             // Keep the process alive for the REST server when configured.
             #[cfg(feature = "rest")]
-            if let Some(task) = _rest_task {
+            if let Some(task) = rest_task.as_mut() {
                 let _ = task.await;
+                rest_task = None;
                 #[cfg(unix)]
                 request_shutdown_and_notify();
             }
@@ -226,6 +245,8 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
             .shutdown_and_drain_with_budget(Some(DAEMON_DRAIN_BUDGET))
             .await;
         sleep_scheduler::drain(sleep_scheduler_handle).await;
+        #[cfg(feature = "rest")]
+        drain_rest_server(rest_task).await;
         return Ok(());
     }
 
@@ -365,7 +386,11 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         .record_recovered()
         .context("failed to mark daemon recovery complete")?;
     ensure_daemon_runtime_writer_lease_active(&*context.db.lock().await, writer_lease.lease())?;
-    notify_systemd_ready()?;
+    let ready = notify_systemd_ready();
+    if ready.is_err() {
+        #[cfg(unix)]
+        request_shutdown_and_notify();
+    }
     loop {
         if shutdown_requested() {
             tracing::info!("shutdown requested; stopping daemon loop");
@@ -415,6 +440,8 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     sleep_scheduler::drain(sleep_scheduler_handle).await;
     endpoint_requeue_handle.abort();
     let _ = endpoint_requeue_handle.await;
+    #[cfg(feature = "rest")]
+    drain_rest_server(rest_task).await;
     // Bound the final ingest-worker join like hooks/LLM workers. A claimed
     // op can block on embed/network I/O against a dead endpoint; unbounded
     // await here previously prevented SIGTERM from completing within the
@@ -437,48 +464,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         tracing::info!("released {released} claimed messages back to pending on shutdown");
     }
 
-    Ok(())
-}
-
-fn ensure_daemon_runtime_writer_lease_active(
-    db: &Database,
-    lease: &RuntimeWriterLease,
-) -> Result<()> {
-    let active = db
-        .runtime_writer_lease_is_active(lease)
-        .with_context(|| format!("writer lease `{}` stale before READY", lease.name))?;
-    if active {
-        Ok(())
-    } else {
-        Err(DbError::RuntimeWriterLeaseLost {
-            lease_name: lease.name.clone(),
-            owner: lease.owner.clone(),
-            generation: lease.generation,
-            operation: "READY",
-        }
-        .into())
-    }
-}
-
-fn spawn_daemon_ingest_drain_worker(
-    context: &DaemonContext,
-    db_path: &Path,
-    writer_lease: &RuntimeWriterLeaseHandle,
-) -> Result<crate::mcp::IngestDrainWorkerHandle> {
-    let config = context.config.as_ref().clone();
-    let server = crate::mcp::MempalMcpServer::new_with_factory_and_config(
-        db_path.to_path_buf(),
-        config.clone(),
-        Arc::new(crate::embed::ConfiguredEmbedderFactory::new_for_daemon(
-            config,
-        )),
-    )?
-    .with_daemon_owned_async_db(context.async_db.clone())
-    .with_external_ingest_writer_lease(writer_lease.lease().clone())
-    .with_daemon_write_observer(context.write_observer.clone());
-    let handle = server.spawn_scoped_ingest_drain_worker();
-    tracing::info!("daemon async ingest worker started");
-    Ok(handle)
+    ready
 }
 
 #[derive(Clone)]

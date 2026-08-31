@@ -154,8 +154,16 @@ async fn run_loop_with_timeout(context: DaemonContext) -> anyhow::Result<()> {
     match tokio::time::timeout(Duration::from_secs(2), &mut run_task).await {
         Ok(result) => result.expect("daemon task panicked"),
         Err(_) => {
-            run_task.abort();
-            let _ = run_task.await;
+            request_shutdown();
+            match tokio::time::timeout(Duration::from_secs(5), &mut run_task).await {
+                Ok(result) => {
+                    let _ = result.expect("daemon task panicked");
+                }
+                Err(_) => {
+                    run_task.abort();
+                    let _ = run_task.await;
+                }
+            }
             Err(anyhow::anyhow!(
                 "daemon startup did not finish within the test deadline"
             ))
@@ -531,13 +539,22 @@ async fn systemd_notify_send_failure_is_propagated_without_leaking_socket_path()
 
     let tempdir = tempfile::tempdir().expect("create notification failure fixture");
     let notify_path = tempdir.path().join("notify-secret-path.sock");
-    let (_db_path, config_path) = write_fixture(&tempdir, "127.0.0.1:0".parse().unwrap());
+    let reserved_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve notification-failure REST address");
+    let api_addr = reserved_listener
+        .local_addr()
+        .expect("read notification-failure REST address");
+    drop(reserved_listener);
+    let (db_path, config_path) = write_fixture(&tempdir, api_addr);
     let (events, _receiver) = tokio::sync::mpsc::channel(16);
     let context = bootstrap_fixture(config_path, &tempdir, events).await;
 
     let result = {
         let _notify_env = NotifySocketEnv::set(&notify_path);
-        run_loop_with_timeout(context).await
+        tokio::time::timeout(Duration::from_secs(5), run_loop(&context))
+            .await
+            .expect("missing notification socket must not stall startup")
     };
     let error = result.expect_err("missing systemd notification socket must fail startup");
     assert!(
@@ -548,6 +565,57 @@ async fn systemd_notify_send_failure_is_propagated_without_leaking_socket_path()
         !error.to_string().contains(notify_path.to_str().unwrap()),
         "systemd notification errors must not expose the socket path: {error:#}"
     );
+    tokio::net::TcpListener::bind(api_addr)
+        .await
+        .expect("notification failure must release the REST listener");
+    assert_eq!(
+        crate::core::queue::queue_stats_readonly(&db_path)
+            .expect("read queue after notification failure")
+            .claimed,
+        0,
+        "notification failure must leave no claimed queue work"
+    );
+    assert!(
+        rusqlite::Connection::open(&db_path)
+            .expect("open notification-failure database")
+            .query_row("SELECT COUNT(*) FROM runtime_writer_leases", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .expect("count runtime writer leases")
+            == 0,
+        "notification failure must release the daemon writer lease"
+    );
+}
+
+#[tokio::test]
+async fn run_loop_timeout_drains_children_before_restoring_notify_environment() {
+    let _shutdown_lock = global_shutdown_test_lock().lock_owned().await;
+    reset_shutdown_request();
+
+    let tempdir = tempfile::tempdir().expect("create timeout cleanup fixture");
+    let reserved_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve timeout cleanup REST address");
+    let api_addr = reserved_listener
+        .local_addr()
+        .expect("read timeout cleanup REST address");
+    drop(reserved_listener);
+    let (_db_path, config_path) = write_fixture(&tempdir, api_addr);
+    let (events, _receiver) = tokio::sync::mpsc::channel(16);
+    let context = bootstrap_fixture(config_path, &tempdir, events).await;
+
+    let result = {
+        let _notify_env = NotifySocketEnv::set(&tempdir.path().join("notify.sock"));
+        run_loop_with_timeout(context).await
+    };
+    assert!(
+        result.is_err(),
+        "the timeout helper must report its expired deadline"
+    );
+    tokio::net::TcpListener::bind(api_addr)
+        .await
+        .expect("timeout cleanup must release the REST listener");
 }
 
 #[tokio::test]
