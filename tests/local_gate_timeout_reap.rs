@@ -429,6 +429,56 @@ finally:
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cargo_test_wrapper_rejects_reused_parent_identity_for_adoption() {
+    let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
+    let harness = r#"
+import importlib.util
+import subprocess
+import sys
+
+spec = importlib.util.spec_from_file_location("timeout_wrapper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+child = subprocess.Popen(["/bin/sleep", "10"], start_new_session=True)
+supervisor = module.Supervisor(child, 1)
+stale_parent = module.Identity(100, 1)
+current_parent = module.Snapshot(module.Identity(100, 2), supervisor.supervisor_pid, 100, 100, "S")
+unrelated_child = module.Snapshot(module.Identity(200, 3), 100, 200, 200, "S")
+supervisor.owned[100] = module.OwnedProcess(stale_parent, None, True)
+supervisor.seen_identities[100] = stale_parent
+original_scan = module.scan_snapshots
+original_open = module.open_pidfd
+try:
+    module.scan_snapshots = lambda: {100: current_parent, 200: unrelated_child}
+    module.open_pidfd = lambda identity: (_ for _ in ()).throw(AssertionError(identity))
+    supervisor.discover()
+    assert 100 not in supervisor.owned
+    assert 200 not in supervisor.owned
+    assert supervisor.ownership_uncertain
+finally:
+    module.scan_snapshots = original_scan
+    module.open_pidfd = original_open
+    supervisor.close()
+    child.terminate()
+    child.wait()
+"#;
+    let output = Command::new("python3")
+        .args(["-c", harness])
+        .arg(&script)
+        .output()
+        .expect("run reused-parent adoption harness");
+
+    assert!(
+        output.status.success(),
+        "reused parent must not authorize adoption: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cargo_test_wrapper_limits_proc_discovery_for_a_successful_short_child() {
     let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
     let harness = r#"
@@ -474,5 +524,60 @@ print(calls)
     assert!(
         scans <= 3,
         "successful short child performed {scans} whole-proc discovery scans"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cargo_test_wrapper_throttles_proc_discovery_during_cleanup_graces() {
+    let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
+    let harness = r#"
+import importlib.util
+import subprocess
+import sys
+
+spec = importlib.util.spec_from_file_location("timeout_wrapper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+child = subprocess.Popen(["/bin/sleep", "10"], start_new_session=True)
+supervisor = module.Supervisor(child, 0.03)
+calls = 0
+clock = [0.0]
+original_monotonic = module.time.monotonic
+original_sleep = module.time.sleep
+
+def discover():
+    global calls
+    calls += 1
+    return {}
+
+supervisor.discover = discover
+supervisor.signal_owned = lambda signum, snapshots: True
+supervisor.reap_owned_children = lambda: None
+supervisor.live_status = lambda snapshots: (True, False)
+module.time.monotonic = lambda: clock[0]
+module.time.sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+try:
+    assert not supervisor.cleanup()
+    assert calls <= 3, calls
+finally:
+    module.time.monotonic = original_monotonic
+    module.time.sleep = original_sleep
+    supervisor.close()
+    child.terminate()
+    child.wait()
+"#;
+    let output = Command::new("python3")
+        .args(["-c", harness])
+        .arg(&script)
+        .output()
+        .expect("run cleanup discovery harness");
+
+    assert!(
+        output.status.success(),
+        "cleanup must throttle whole-proc discovery: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

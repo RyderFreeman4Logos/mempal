@@ -115,7 +115,19 @@ class Supervisor:
                     state="R",
                 )
             }
-        owned_pids = set(self.owned)
+        owned_identities: set[Identity] = set()
+        for pid, handle in tuple(self.owned.items()):
+            identity = handle.identity
+            if identity is None:
+                continue
+            current = snapshots.get(pid)
+            if current is not None and current.identity != identity:
+                if handle.pidfd is not None:
+                    os.close(handle.pidfd)
+                del self.owned[pid]
+                self.ownership_uncertain = True
+                continue
+            owned_identities.add(identity)
         changed = True
         while changed:
             changed = False
@@ -123,11 +135,14 @@ class Supervisor:
                 pid = snapshot.identity.pid
                 if pid == self.supervisor_pid or pid in self.owned:
                     continue
-                if snapshot.parent_pid == self.supervisor_pid or snapshot.parent_pid in owned_pids:
+                parent = snapshots.get(snapshot.parent_pid)
+                if snapshot.parent_pid == self.supervisor_pid or (
+                    parent is not None and parent.identity in owned_identities
+                ):
                     before = len(self.owned)
                     self._adopt(snapshot)
                     if len(self.owned) != before:
-                        owned_pids.add(pid)
+                        owned_identities.add(snapshot.identity)
                         changed = True
         return snapshots
 
@@ -289,8 +304,11 @@ class Supervisor:
         snapshots = self.discover()
         term_proved = self.signal_owned(signal.SIGTERM, snapshots)
         term_deadline = time.monotonic() + self.grace
+        next_discovery = time.monotonic() + DISCOVERY_INTERVAL
         while time.monotonic() < term_deadline:
-            snapshots = self.discover()
+            if time.monotonic() >= next_discovery:
+                snapshots = self.discover()
+                next_discovery = time.monotonic() + DISCOVERY_INTERVAL
             self.reap_owned_children()
             live, unknown = self.live_status(snapshots)
             if not live and not unknown and term_proved:
@@ -300,8 +318,11 @@ class Supervisor:
         snapshots = self.discover()
         kill_proved = self.signal_owned(signal.SIGKILL, snapshots)
         kill_deadline = time.monotonic() + self.grace
+        next_discovery = time.monotonic() + DISCOVERY_INTERVAL
         while time.monotonic() < kill_deadline:
-            snapshots = self.discover()
+            if time.monotonic() >= next_discovery:
+                snapshots = self.discover()
+                next_discovery = time.monotonic() + DISCOVERY_INTERVAL
             self.reap_owned_children()
             live, unknown = self.live_status(snapshots)
             if not live and not unknown and kill_proved:
