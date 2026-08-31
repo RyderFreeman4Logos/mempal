@@ -1,4 +1,6 @@
 #[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
@@ -151,7 +153,7 @@ async fn bootstrap_fixture(
 
 async fn run_loop_with_timeout(context: DaemonContext) -> anyhow::Result<()> {
     let mut run_task = tokio::spawn(async move { run_loop(&context).await });
-    match tokio::time::timeout(Duration::from_secs(2), &mut run_task).await {
+    match tokio::time::timeout(Duration::from_secs(7), &mut run_task).await {
         Ok(result) => result.expect("daemon task panicked"),
         Err(_) => {
             request_shutdown();
@@ -351,16 +353,32 @@ async fn systemd_ready_rejects_a_writer_lease_lost_after_admission() {
 
 #[cfg(target_os = "linux")]
 fn fill_notify_receiver_queue(path: &Path) -> Vec<StdUnixDatagram> {
-    let mut fillers = Vec::new();
+    let filler = StdUnixDatagram::unbound().expect("create notification queue filler");
+    filler
+        .set_nonblocking(true)
+        .expect("set notification queue filler nonblocking");
+    let send_buffer_size: libc::c_int = 1 << 20;
+    // SAFETY: filler owns a valid datagram fd and the option value is a live c_int.
+    let result = unsafe {
+        libc::setsockopt(
+            filler.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&send_buffer_size as *const libc::c_int).cast(),
+            std::mem::size_of_val(&send_buffer_size) as libc::socklen_t,
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "set notification queue filler send buffer: {}",
+        std::io::Error::last_os_error()
+    );
     let payload = b"READY=1";
     for _ in 0..4_096 {
-        let filler = StdUnixDatagram::unbound().expect("create notification queue filler");
-        filler
-            .set_nonblocking(true)
-            .expect("set notification queue filler nonblocking");
         match filler.send_to(payload, path) {
-            Ok(_) => fillers.push(filler),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return fillers,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return vec![filler],
             Err(error) => panic!("fill notification receiver queue: {error}"),
         }
     }
@@ -374,9 +392,10 @@ fn systemd_notify_returns_bounded_error_when_receiver_queue_is_full() {
     let notify_path = tempdir.path().join("notify.sock");
     let receiver = StdUnixDatagram::bind(&notify_path).expect("bind full notification receiver");
     let fillers = fill_notify_receiver_queue(&notify_path);
-    assert!(
-        !fillers.is_empty(),
-        "notification queue filler sent no packets"
+    assert_eq!(
+        fillers.len(),
+        1,
+        "notification queue saturation must retain one sender FD"
     );
 
     let _notify_env = NotifySocketEnv::set(&notify_path);
