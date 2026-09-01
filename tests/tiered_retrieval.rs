@@ -249,7 +249,7 @@ fn test_tiered_context_overflow_budget_to_t2() {
 
 #[test]
 fn test_tiered_t3_respects_recency_window() {
-    let (_, db) = new_db();
+    let (_tmp, db) = new_db();
     let now = now_unix_secs();
     // drawer_old: 10 days ago — outside 3-day window
     insert(
@@ -289,7 +289,7 @@ fn test_tiered_t3_respects_recency_window() {
 
 #[test]
 fn test_tiered_t3_kg_validity_filter_precedes_candidate_limit() {
-    let (_, db) = new_db();
+    let (_tmp, db) = new_db();
     let now = now_unix_secs();
     let expired_from = (now - 200).to_string();
     let expired_until = (now - 100).to_string();
@@ -381,7 +381,7 @@ fn test_search_unaffected_by_tiered_context_config() {
     use mempal::core::types::RouteDecision;
     use mempal::search::{SearchFilters, SearchOptions, search_with_vector_options};
 
-    let (_, db) = new_db();
+    let (_tmp, db) = new_db();
     insert(&db, &make_drawer("search-drawer-1", "general", 1, 0));
 
     let route = RouteDecision {

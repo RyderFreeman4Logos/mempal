@@ -46,7 +46,7 @@ use db_writer_lease_liveness::{
     runtime_writer_lease_holder_should_retain, runtime_writer_metadata_with_process_identity,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 20;
+pub const CURRENT_SCHEMA_VERSION: u32 = 21;
 pub const CURRENT_VECTOR_INDEX_VERSION: &str = "v2";
 pub const VECTOR_DISTANCE_METRIC: &str = "cosine";
 /// Default SQLite page cache budget for normal CLI/daemon/MCP connections.
@@ -275,6 +275,12 @@ pub fn db_error_is_sqlite_lock(error: &DbError) -> bool {
 pub enum DbError {
     #[error("failed to create database directory for {path}")]
     CreateDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to lock write reserve {path}")]
+    WriteReserveLock {
         path: PathBuf,
         #[source]
         source: std::io::Error,
@@ -538,6 +544,9 @@ fn validate_vector_metric(metric: &str) -> Result<&str, DbError> {
 
 #[path = "db_open.rs"]
 mod db_open;
+#[path = "db_write_reserve.rs"]
+mod db_write_reserve;
+pub(crate) use db_write_reserve::ensure_write_reserve_logged;
 #[path = "db_writer_lease_fence.rs"]
 mod db_writer_lease_fence;
 pub use db_writer_lease_fence::{DrawerMergeWithNovelty, IngestBoostBatch};
@@ -558,6 +567,25 @@ impl Database {
     }
 
     pub fn insert_drawer_with_project_validity(
+        &self,
+        drawer: &Drawer,
+        project_id: Option<&str>,
+        source_root: Option<&str>,
+        valid_from: Option<&str>,
+        valid_until: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.with_write_reserve_retry("insert drawer", || {
+            self.insert_drawer_with_project_validity_once(
+                drawer,
+                project_id,
+                source_root,
+                valid_from,
+                valid_until,
+            )
+        })
+    }
+
+    fn insert_drawer_with_project_validity_once(
         &self,
         drawer: &Drawer,
         project_id: Option<&str>,
@@ -1088,29 +1116,6 @@ impl Database {
                 audit,
             },
         )
-    }
-
-    pub fn update_drawer_after_merge_and_record_novelty_audit_fenced(
-        &self,
-        lease: Option<&RuntimeWriterLease>,
-        merge: DrawerMergeWithNovelty<'_>,
-    ) -> Result<(), DbError> {
-        self.with_runtime_writer_lease_transaction(lease, "merge drawer", || {
-            self.ensure_vectors_table(merge.vector.len())?;
-            let vector_json = serde_json::to_string(merge.vector)?;
-            let content_hash = content_hash_hex(merge.merged_content);
-            self.apply_drawer_merge_update(DrawerMergeUpdate {
-                drawer_id: merge.drawer_id,
-                merged_content: merge.merged_content,
-                updated_at: merge.updated_at,
-                content_hash: &content_hash,
-                vector_json: &vector_json,
-                vector_len: merge.vector.len(),
-                expected_merge_count: merge.expected_merge_count,
-            })?;
-            self.insert_novelty_audit_row(merge.audit)?;
-            Ok(())
-        })
     }
 
     fn apply_drawer_merge_update(&self, update: DrawerMergeUpdate<'_>) -> Result<(), DbError> {
@@ -5980,6 +5985,10 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
             ensure_v15_crystallize_schema(conn, read_user_version(conn)?)?;
             continue;
         }
+        if migration.version == 21 && drawers_column_exists(conn, "admission_owner")? {
+            apply_migration_atomic(conn, &V21_ALREADY_APPLIED_MIGRATION)?;
+            continue;
+        }
         apply_migration_atomic(conn, migration)?;
         if migration.version == 17 {
             repopulate_fts_contentless(conn)?;
@@ -7081,6 +7090,10 @@ CREATE INDEX IF NOT EXISTS idx_runtime_writer_leases_mode
     ON runtime_writer_leases(mode);
 "#;
 
+const V21_MIGRATION_SQL: &str = r#"
+ALTER TABLE drawers ADD COLUMN admission_owner TEXT;
+"#;
+
 const V12_COMPACTION_SCHEMA_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_drawers_compacted_into
     ON drawers(compacted_into)
@@ -7244,6 +7257,10 @@ fn migrations() -> &'static [Migration] {
             version: 20,
             sql: V20_MIGRATION_SQL,
         },
+        Migration {
+            version: 21,
+            sql: V21_MIGRATION_SQL,
+        },
     ];
     MIGRATIONS
 }
@@ -7256,6 +7273,11 @@ struct Migration {
 const V7_ALREADY_APPLIED_MIGRATION: Migration = Migration {
     version: 7,
     sql: V7_ALREADY_APPLIED_MIGRATION_SQL,
+};
+
+const V21_ALREADY_APPLIED_MIGRATION: Migration = Migration {
+    version: 21,
+    sql: "",
 };
 
 fn register_sqlite_vec() -> Result<(), DbError> {

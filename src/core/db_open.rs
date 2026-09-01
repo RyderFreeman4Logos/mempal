@@ -192,7 +192,7 @@ impl Database {
         busy_timeout: Duration,
         admitted: bool,
     ) -> Result<Self, DbError> {
-        let admission = admitted
+        let mut admission = admitted
             .then(|| {
                 super::super::db_admission::ProfileDbAdmission::acquire(
                     path,
@@ -232,47 +232,64 @@ impl Database {
                     source,
                 })?;
             }
+            if admitted {
+                ensure_write_reserve_logged(&sqlite_path);
+            }
         }
-
         register_sqlite_vec()?;
-        let conn = match mode {
-            OpenMode::ReadOnly => Connection::open_with_flags(
+        let mut open = || {
+            #[cfg(test)]
+            super::db_write_reserve::fail_write_reserve_retry_with_sqlite_full_for_test(
                 &sqlite_path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            )?,
-            OpenMode::QueryOnly => Connection::open_with_flags(
-                &sqlite_path,
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            )?,
-            OpenMode::ReadWrite => Connection::open_with_flags(
-                &sqlite_path,
-                OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            )?,
+            )?;
+            let conn = match mode {
+                OpenMode::ReadOnly => Connection::open_with_flags(
+                    &sqlite_path,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                )?,
+                OpenMode::QueryOnly => Connection::open_with_flags(
+                    &sqlite_path,
+                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                )?,
+                OpenMode::ReadWrite => Connection::open_with_flags(
+                    &sqlite_path,
+                    OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                )?,
+            };
+            conn.busy_timeout(busy_timeout)?;
+            let schema_version = ensure_supported_schema_version(&conn)?;
+            let fork_ext_version = ensure_supported_fork_ext_version(&conn)?;
+            conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_DEFAULT)?;
+            register_math_functions(&conn)?;
+            if !mode.allows_write() {
+                conn.pragma_update(None, "query_only", "ON")?;
+            }
+            if mode.allows_write() {
+                ensure_wal_journal_mode(&conn)?;
+                conn.pragma_update(None, "synchronous", "NORMAL")?;
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                if schema_version < CURRENT_SCHEMA_VERSION || schema_repairs_required(&conn)? {
+                    apply_migrations(&conn)?;
+                }
+                if fork_ext_version < CURRENT_FORK_EXT_VERSION {
+                    db_fork_ext::apply_fork_ext_migrations(&conn)?;
+                }
+            }
+            Ok(Self {
+                conn,
+                path: sqlite_path.clone(),
+                _admission: admission.take(),
+            })
         };
-        conn.busy_timeout(busy_timeout)?;
-        let schema_version = ensure_supported_schema_version(&conn)?;
-        let fork_ext_version = ensure_supported_fork_ext_version(&conn)?;
-        conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_DEFAULT)?;
-        register_math_functions(&conn)?;
-        if !mode.allows_write() {
-            conn.pragma_update(None, "query_only", "ON")?;
+        if admitted && mode.allows_write() {
+            super::db_write_reserve::with_write_reserve_retry(
+                &sqlite_path,
+                "database bootstrap",
+                open,
+            )
+        } else {
+            open()
         }
-        if mode.allows_write() {
-            ensure_wal_journal_mode(&conn)?;
-            conn.pragma_update(None, "synchronous", "NORMAL")?;
-            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-            if schema_version < CURRENT_SCHEMA_VERSION || schema_repairs_required(&conn)? {
-                apply_migrations(&conn)?;
-            }
-            if fork_ext_version < CURRENT_FORK_EXT_VERSION {
-                db_fork_ext::apply_fork_ext_migrations(&conn)?;
-            }
-        }
-        Ok(Self {
-            conn,
-            path: sqlite_path,
-            _admission: admission,
-        })
     }
 
     pub fn conn(&self) -> &Connection {
@@ -286,8 +303,10 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    use super::super::db_write_reserve::{WRITE_RESERVE_BYTES, write_reserve_path};
     use super::*;
     use crate::core::db_admission::{DbAdmissionRequest, DbHolderClass, ProfileDbAdmission};
+    use crate::ingress_spool::AppendOutcome;
 
     fn short_tempdir() -> tempfile::TempDir {
         tempfile::TempDir::new_in("/tmp").expect("short tempdir")
@@ -438,59 +457,7 @@ mod tests {
             .expect("lease-control must accept canonical path from Database::path()");
     }
 
-    #[test]
-    fn db_open_applies_busy_timeout_before_schema_queries() {
-        let tempdir = short_tempdir();
-        let db_path = tempdir.path().join("palace.db");
-        drop(Database::open(&db_path).expect("initialize database"));
-
-        let blocker = Connection::open(&db_path).expect("open lock holder");
-        blocker
-            .pragma_update(None, "journal_mode", "DELETE")
-            .expect("select delete journal mode");
-        blocker
-            .execute_batch("BEGIN EXCLUSIVE;")
-            .expect("hold exclusive schema lock");
-
-        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
-        let open_path = db_path.clone();
-        let opener = std::thread::spawn(move || {
-            let _ = opened_tx.send(Database::open_with_busy_timeout(
-                &open_path,
-                Duration::from_millis(25),
-            ));
-        });
-
-        let opened = opened_rx.recv_timeout(Duration::from_millis(250));
-        blocker
-            .execute_batch("COMMIT;")
-            .expect("release schema lock");
-        opener.join().expect("join database opener");
-        assert!(
-            opened
-                .expect("caller-selected timeout must bound schema query")
-                .is_err(),
-            "exclusive schema lock must outlast the caller-selected busy timeout"
-        );
-    }
-
-    #[test]
-    fn current_schema_db_open_does_not_reapply_migrations_under_live_writer() {
-        let tempdir = short_tempdir();
-        let db_path = tempdir.path().join("palace.db");
-        drop(Database::open(&db_path).expect("initialize current database"));
-
-        let blocker = Connection::open(&db_path).expect("open same-version writer");
-        blocker
-            .execute_batch("BEGIN IMMEDIATE;")
-            .expect("hold same-version write transaction");
-        let opened = Database::open_with_busy_timeout(&db_path, Duration::from_millis(25));
-        blocker
-            .execute_batch("ROLLBACK;")
-            .expect("release same-version writer");
-
-        opened.expect("current schema open must not request a SQLite write lock");
-    }
+    include!("db_open_write_reserve_tests.rs");
 
     #[test]
     fn current_schema_db_open_repairs_all_legacy_structural_invariants() {

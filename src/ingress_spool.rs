@@ -21,7 +21,7 @@ const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
 thread_local! {
-    static SYNC_DIRECTORY_CALLS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static SYNC_DIRECTORY_CALLS: Cell<u64> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -469,7 +469,7 @@ fn spool_bytes(dir: &Path) -> Result<u64, IngressSpoolError> {
     Ok(total)
 }
 
-fn sync_directory(dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(dir: &Path) -> io::Result<()> {
     #[cfg(test)]
     SYNC_DIRECTORY_CALLS.with(|calls| calls.set(calls.get() + 1));
     File::open(dir)?.sync_all()

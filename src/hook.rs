@@ -357,32 +357,32 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
         },
     );
 
+    let spool_database_fallback = || {
+        let mut request = crate::hook_ipc::HookIpcEnqueueRequest::new(event.queue_kind(), &payload);
+        if let FallbackEnqueueIdentity::Idempotent { key } = fallback.identity() {
+            request.idempotency_key = key.to_string();
+        }
+        crate::ingress_spool::IngressSpool::new(&mempal_home)
+            .append(&request)
+            .context("failed to fsync hook fallback into ingress spool")
+            .map(|_| ())
+    };
     let database = match Database::open(&db_path) {
         Ok(database) => database,
         Err(error) => {
-            crate::hook_diagnostics::log_hook_failure(
-                &mempal_home,
-                event_name,
-                &crate::hook_diagnostics::HookOutcome::Dropped {
-                    error: format!("{error:#}"),
-                    stage: "db_init".to_string(),
-                },
-            );
-            return Err(error).context("failed to initialize pending queue database");
+            return spool_database_fallback().with_context(|| {
+                format!(
+                    "failed to spool hook payload after database initialization error: {error:#}"
+                )
+            });
         }
     };
     let store = match PendingMessageStore::new(&db_path) {
         Ok(store) => store,
         Err(error) => {
-            crate::hook_diagnostics::log_hook_failure(
-                &mempal_home,
-                event_name,
-                &crate::hook_diagnostics::HookOutcome::Dropped {
-                    error: format!("{error:#}"),
-                    stage: "queue_init".to_string(),
-                },
-            );
-            return Err(error).context("failed to open pending queue");
+            return spool_database_fallback().with_context(|| {
+                format!("failed to spool hook payload after queue initialization error: {error:#}")
+            });
         }
     };
     drop(database);
@@ -392,18 +392,11 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
             store.enqueue_idempotent_with_key(event.queue_kind(), &payload, key)
         }
     };
-    if let Err(error) = &enqueue_result {
-        crate::hook_diagnostics::log_hook_failure(
-            &mempal_home,
-            event_name,
-            &crate::hook_diagnostics::HookOutcome::Dropped {
-                error: format!("{error:#}"),
-                stage: "enqueue".to_string(),
-            },
-        );
+    if let Err(error) = enqueue_result {
+        return spool_database_fallback().with_context(|| {
+            format!("failed to spool hook payload after queue enqueue error: {error:#}")
+        });
     }
-    enqueue_result
-        .with_context(|| format!("failed to enqueue hook payload after {}", fallback.reason()))?;
     Ok(())
 }
 
@@ -556,6 +549,9 @@ fn capture_stdin_payload(bytes: Vec<u8>, mempal_home: &Path) -> Result<CapturedP
 
 fn spool_hook_payload(raw_payload: &str, mempal_home: &Path) -> Result<PathBuf> {
     let digest = blake3::hash(raw_payload.as_bytes()).to_hex().to_string();
+    fs::create_dir_all(mempal_home)
+        .with_context(|| format!("failed to create mempal home {}", mempal_home.display()))?;
+    let _retention_lock = crate::hook_payload::lock_for_home(mempal_home)?;
     let spool_dir = mempal_home.join(HOOK_SPOOL_DIR);
     fs::create_dir_all(&spool_dir)
         .with_context(|| format!("failed to create {}", spool_dir.display()))?;
@@ -576,14 +572,36 @@ fn spool_hook_payload(raw_payload: &str, mempal_home: &Path) -> Result<PathBuf> 
             .with_context(|| format!("failed to write {}", tmp_path.display()))?;
         file.flush()
             .with_context(|| format!("failed to flush {}", tmp_path.display()))?;
+        sync_hook_spool_payload(&file, &tmp_path)?;
     }
 
     match fs::rename(&tmp_path, &path) {
-        Ok(()) => Ok(path),
+        Ok(()) => {
+            sync_hook_spool_directory(&spool_dir)?;
+            Ok(path)
+        }
         Err(error) => {
             Err(error).with_context(|| format!("failed to publish hook spool {}", path.display()))
         }
     }
+}
+
+fn sync_hook_spool_payload(file: &fs::File, path: &Path) -> Result<()> {
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", path.display()))?;
+    #[cfg(test)]
+    crate::hook_payload::HOOK_SPOOL_SYNC_EVENTS.with(|events| events.borrow_mut().push("payload"));
+    Ok(())
+}
+fn sync_hook_spool_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .with_context(|| format!("failed to open hook spool directory {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to sync hook spool directory {}", path.display()))?;
+    #[cfg(test)]
+    crate::hook_payload::HOOK_SPOOL_SYNC_EVENTS
+        .with(|events| events.borrow_mut().push("directory"));
+    Ok(())
 }
 
 fn decode_stdin_bytes(bytes: &[u8]) -> String {
@@ -733,7 +751,7 @@ mod tests {
             "automatic hook capture must not persist oversized raw payload before LLM gate"
         );
     }
-
+    include!("hook_durable_tests.rs");
     #[test]
     fn test_small_capture_preserves_raw_payload() {
         let tmp = tempfile::TempDir::new().expect("tempdir");

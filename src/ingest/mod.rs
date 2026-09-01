@@ -710,7 +710,7 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
             link_superseded_drawer(&mut drawer, old_id);
         }
 
-        db.with_runtime_writer_lease_write(runtime_writer_lease, "insert drawer", || {
+        db.with_runtime_writer_lease_write_retry(runtime_writer_lease, "insert drawer", || {
             db.insert_drawer_with_project_validity(
                 &drawer,
                 options.project_id,
@@ -723,7 +723,7 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
             drawer_id: drawer.id.clone(),
             source,
         })?;
-        db.with_runtime_writer_lease_write(runtime_writer_lease, "insert vector", || {
+        db.with_runtime_writer_lease_write_retry(runtime_writer_lease, "insert vector", || {
             db.insert_vector_with_project(&drawer_id, &vector, options.project_id)
         })
         .map_err(|source| IngestError::InsertVector {

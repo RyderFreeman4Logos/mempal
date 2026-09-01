@@ -1,13 +1,23 @@
 //! Atomic generation fencing for runtime writer mutations.
 
 use rusqlite::{OptionalExtension, params};
+#[cfg(test)]
+use std::{
+    collections::HashSet,
+    sync::{Mutex, OnceLock},
+};
 
 use super::{
-    Database, DbError, NoveltyAuditInsert, anchor, anchor_kind_as_str, content_hash_hex,
-    encode_json, encode_optional_json, knowledge_status_as_str, knowledge_tier_as_str,
-    memory_domain_as_str, memory_kind_as_str, provenance_as_str, source_type_as_str,
+    Database, DbError, DrawerMergeUpdate, NoveltyAuditInsert, anchor, anchor_kind_as_str,
+    content_hash_hex, encode_json, encode_optional_json, knowledge_status_as_str,
+    knowledge_tier_as_str, memory_domain_as_str, memory_kind_as_str, provenance_as_str,
+    source_type_as_str,
 };
 use crate::core::types::{Drawer, RuntimeWriterLease};
+
+#[cfg(test)]
+static LEASE_FENCED_WRITES_TO_FAIL_WITH_SQLITE_FULL: OnceLock<Mutex<HashSet<std::path::PathBuf>>> =
+    OnceLock::new();
 
 /// One atomic drawer merge plus its novelty audit record.
 pub struct DrawerMergeWithNovelty<'a> {
@@ -30,6 +40,34 @@ pub struct IngestBoostBatch<'a> {
 }
 
 impl Database {
+    #[cfg(test)]
+    pub(crate) fn fail_next_lease_fenced_write_with_sqlite_full(&self) {
+        LEASE_FENCED_WRITES_TO_FAIL_WITH_SQLITE_FULL
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .expect("lock leased-write SQLITE_FULL test failures")
+            .insert(self.path.clone());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_lease_fenced_write_sqlite_full(&self) -> Result<(), DbError> {
+        let should_fail = LEASE_FENCED_WRITES_TO_FAIL_WITH_SQLITE_FULL
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .expect("lock leased-write SQLITE_FULL test failures")
+            .remove(&self.path);
+        if should_fail {
+            return Err(DbError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::DiskFull,
+                    extended_code: rusqlite::ffi::SQLITE_FULL,
+                },
+                Some("database or disk is full".to_string()),
+            )));
+        }
+        Ok(())
+    }
+
     /// Record a gating audit under the same write lock that validates `lease`.
     pub fn record_gating_audit_fenced(
         &self,
@@ -43,13 +81,71 @@ impl Database {
         let Some(lease) = lease else {
             return self.record_gating_audit(candidate_hash, decision, project_id, content);
         };
-        self.with_runtime_writer_lease_write(Some(lease), operation, || {
+        self.with_runtime_writer_lease_write_retry(Some(lease), operation, || {
+            #[cfg(test)]
+            self.take_lease_fenced_write_sqlite_full()?;
             self.record_gating_audit_in_current_transaction(
                 candidate_hash,
                 decision,
                 project_id,
                 content,
             )
+        })
+    }
+
+    pub fn update_drawer_after_merge_and_record_novelty_audit_fenced(
+        &self,
+        lease: Option<&RuntimeWriterLease>,
+        merge: DrawerMergeWithNovelty<'_>,
+    ) -> Result<(), DbError> {
+        self.update_drawer_after_merge_and_record_novelty_audit_fenced_inner(lease, merge, None)
+    }
+
+    pub fn update_drawer_after_merge_consume_candidate_and_record_novelty_audit_fenced(
+        &self,
+        lease: Option<&RuntimeWriterLease>,
+        merge: DrawerMergeWithNovelty<'_>,
+        candidate_drawer_id: &str,
+        candidate_admission_owner: &str,
+    ) -> Result<(), DbError> {
+        self.update_drawer_after_merge_and_record_novelty_audit_fenced_inner(
+            lease,
+            merge,
+            Some((candidate_drawer_id, candidate_admission_owner)),
+        )
+    }
+
+    fn update_drawer_after_merge_and_record_novelty_audit_fenced_inner(
+        &self,
+        lease: Option<&RuntimeWriterLease>,
+        merge: DrawerMergeWithNovelty<'_>,
+        candidate: Option<(&str, &str)>,
+    ) -> Result<(), DbError> {
+        self.with_runtime_writer_lease_write_retry(lease, "merge drawer", || {
+            #[cfg(test)]
+            self.take_lease_fenced_write_sqlite_full()?;
+            self.ensure_vectors_table(merge.vector.len())?;
+            let vector_json = serde_json::to_string(merge.vector)?;
+            let content_hash = content_hash_hex(merge.merged_content);
+            self.apply_drawer_merge_update(DrawerMergeUpdate {
+                drawer_id: merge.drawer_id,
+                merged_content: merge.merged_content,
+                updated_at: merge.updated_at,
+                content_hash: &content_hash,
+                vector_json: &vector_json,
+                vector_len: merge.vector.len(),
+                expected_merge_count: merge.expected_merge_count,
+            })?;
+            self.insert_novelty_audit_row(merge.audit)?;
+            if let Some((candidate_drawer_id, candidate_admission_owner)) = candidate {
+                if candidate_drawer_id != merge.drawer_id {
+                    self.conn.execute(
+                        "DELETE FROM drawers WHERE id = ?1 AND admission_owner = ?2",
+                        [candidate_drawer_id, candidate_admission_owner],
+                    )?;
+                }
+            }
+            Ok(())
         })
     }
 
@@ -191,6 +287,36 @@ impl Database {
         };
 
         self.with_runtime_writer_lease_transaction(Some(lease), operation, write)
+    }
+
+    pub(crate) fn with_runtime_writer_lease_write_retry<T, E>(
+        &self,
+        lease: Option<&RuntimeWriterLease>,
+        operation: &'static str,
+        mut write: impl FnMut() -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<DbError> + std::error::Error + 'static,
+    {
+        if !self.conn.is_autocommit() {
+            if let Some(lease) = lease {
+                self.runtime_writer_lease_cleanup_expired_tx(true)
+                    .map_err(E::from)?;
+                self.require_runtime_writer_lease_tx(lease, operation)
+                    .map_err(E::from)?;
+            }
+            return write();
+        }
+
+        self.with_write_reserve_retry(operation, || {
+            if let Some(lease) = lease {
+                self.runtime_writer_lease_cleanup_expired_tx(true)
+                    .map_err(E::from)?;
+                self.require_runtime_writer_lease_tx(lease, operation)
+                    .map_err(E::from)?;
+            }
+            write()
+        })
     }
 
     pub(super) fn with_runtime_writer_lease_transaction<T, E>(

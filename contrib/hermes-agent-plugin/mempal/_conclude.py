@@ -46,6 +46,10 @@ def conclude_side_effects(
     local_admission = (
         payload.get("state") == "local_admitted"
         or payload.get("durability", {}).get("kind") == "durable_replay_deferred"
+        or (
+            details.get("kind") == "durable_admission_deferred"
+            and details.get("error_class") == "breaker_open"
+        )
         or details.get("kind")
         in {"durable_replay_deferred", "durable_operation_pending"}
     )
@@ -130,7 +134,13 @@ def submit_conclusion(
         ))
 
     if not transport_allowed:
-        return ConcludeResult(False, _local_admission_pending_payload(key))
+        return ConcludeResult(False, _retry_payload(
+            "durable_admission_deferred",
+            None,
+            key,
+            "local_admitted",
+            "breaker_open",
+        ))
 
     deadline = time.monotonic() + max(0.0, wait_timeout)
     operation_id: Optional[str] = None
@@ -152,13 +162,13 @@ def submit_conclusion(
             ))
         operation_id = outcome.operation_id or operation_id
         if outcome.error_class == "breaker_open":
-            return ConcludeResult(
-                False,
-                _local_admission_pending_payload(
-                    key,
-                    operation_id=operation_id,
-                ),
-            )
+            return ConcludeResult(False, _retry_payload(
+                "durable_admission_deferred",
+                operation_id,
+                key,
+                "local_admitted",
+                "breaker_open",
+            ))
         if outcome.completed and outcome.drawer_id:
             return ConcludeResult(True, {
                 "result": "Fact stored.",
@@ -228,28 +238,6 @@ def _invalid_control_payload() -> Dict[str, Any]:
             "retry_safe": False,
         },
     }
-
-
-def _local_admission_pending_payload(
-    operation_key: str,
-    *,
-    operation_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    payload = {
-        "result": "Fact admitted locally; durable storage pending.",
-        "operation_key": operation_key,
-        "retry_operation_id": operation_key,
-        "state": "local_admitted",
-        "retry_safe": True,
-        "durability": {
-            "state": "pending",
-            "kind": "durable_replay_deferred",
-            "deferred_reason": "breaker_open",
-        },
-    }
-    if operation_id:
-        payload["operation_id"] = operation_id
-    return payload
 
 
 def _retry_payload(
