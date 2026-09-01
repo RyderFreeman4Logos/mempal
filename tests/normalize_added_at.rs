@@ -9,6 +9,9 @@ use mempal::core::types::{Drawer, SourceType};
 use rusqlite::params;
 use tempfile::TempDir;
 
+#[path = "support/tail_follow_lock.rs"]
+mod tail_follow_lock;
+
 fn mempal_bin() -> String {
     env!("CARGO_BIN_EXE_mempal").to_string()
 }
@@ -97,8 +100,9 @@ fn read_added_at(db_path: &Path, id: &str) -> String {
 
 // ── test_reindex_normalize_idempotent ─────────────────────────────────────────
 
-#[test]
-fn test_reindex_normalize_idempotent() {
+#[tokio::test(flavor = "current_thread")]
+async fn test_reindex_normalize_idempotent() {
+    let _guard = tail_follow_lock::guard().await;
     let (tmp, db_path) = setup();
 
     // Insert mixed rows: some Unix epoch, some already ISO 8601.
@@ -147,8 +151,9 @@ fn test_reindex_normalize_idempotent() {
 
 // ── test_reindex_normalize_batched_does_not_block_reads ───────────────────────
 
-#[test]
-fn test_reindex_normalize_batched_does_not_block_reads() {
+#[tokio::test(flavor = "current_thread")]
+async fn test_reindex_normalize_batched_does_not_block_reads() {
+    let _guard = tail_follow_lock::guard().await;
     let (tmp, db_path) = setup();
 
     // Insert a batch of rows with Unix epoch added_at.
@@ -190,8 +195,9 @@ fn test_reindex_normalize_batched_does_not_block_reads() {
 
 // ── test_tail_since_works_after_normalize ─────────────────────────────────────
 
-#[test]
-fn test_tail_since_works_after_normalize() {
+#[tokio::test(flavor = "current_thread")]
+async fn test_tail_since_works_after_normalize() {
+    let _guard = tail_follow_lock::guard().await;
     let (tmp, db_path) = setup();
 
     // Current Unix epoch in seconds.
@@ -263,8 +269,9 @@ fn test_tail_since_works_after_normalize() {
 
 // ── test_ingest_path_writes_iso_not_epoch ─────────────────────────────────────
 
-#[test]
-fn test_ingest_path_writes_iso_not_epoch() {
+#[tokio::test(flavor = "current_thread")]
+async fn test_ingest_path_writes_iso_not_epoch() {
+    let _guard = tail_follow_lock::guard().await;
     use mempal::core::utils::iso_timestamp;
 
     // The iso_timestamp() helper must produce a valid RFC 3339 UTC string.
