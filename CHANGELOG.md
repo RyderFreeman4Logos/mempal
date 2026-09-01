@@ -25,6 +25,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- Local-gate timeout wrapper reaps owned process trees, authenticates idle `sccache` via `/proc/<pid>/exe`, and treats absent `/proc` snapshots as process exit (#1011).
+- Isolate ingest-worker idle-backoff and cancelled async-db read-permit regressions under suite load with test-only class locks (#968, #1013).
 - Daemon SQLite writer-lease admission waits out a live maintenance holder past observed `remaining_secs` (capped) instead of exiting 75 under `RestartPreventExitStatus=75`; a live incompatible `mcp-ingest-worker` holder is still refused immediately without takeover (#916, #849).
 - Ingress: fsync before ACK and claim rename; lease-fenced exactly-once replay; REST bind precedes daemon-ready (#945).
 - Cited-recall latest-decision walks the full successor chain, filters context the same way, and requires a live correction/continuation citation (#898).
