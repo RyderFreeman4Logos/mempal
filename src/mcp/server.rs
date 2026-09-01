@@ -13599,6 +13599,7 @@ mod tests {
     use crate::core::types::{KnowledgeCard, KnowledgeEvidenceLink, KnowledgeEvidenceRole};
     use crate::embed::Embedder;
     use crate::mcp::tools::INGEST_SOURCE_TYPE_SCHEMA_DESCRIPTION;
+    use crate::observability::test_support::global_observability_test_lock;
 
     mod context_scope_schema_tests;
     mod delete_busy_retry_836_tests;
