@@ -46,7 +46,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - **Admission budget concurrent fixture**: retry profile admission Busy in oversubscribe so suite-load flock waits aren't miscounted as budget rejections.
 
 - **Hermetic live-daemon tests**: isolate REST/MCP/ingest-wait/mark-failed/dashboard so exact-gates skip live `:3080`; timeout wrapper reaps owned trees, authenticates idle sccache via exe, treats absent /proc as exit (#988, #989, #973, #991, #993, #1011).
-- **Fixture readiness**: lease isolation; waits; Busy retry; idle-backoff; cancelled-read/normalize-added-at locks (#882, #889, #890, #944, #956, #958, #961, #962, #965, #971, #975, #976/#968, #1013, #1010, #1009).
+- **Fixture readiness**: lease/wait, Busy, idle-backoff, cancelled-read/normalize-added-at (#882, #889, #890, #944, #956, #958, #961, #962, #965, #971, #975, #976/#968, #1013, #1010, #1009, #1008).
 
 - **MCP delete retry fixture**: force observed SQLite Busy before synchronized lock release (#886).
 

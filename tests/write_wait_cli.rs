@@ -126,9 +126,12 @@ fn run_cli_with_stdin(home: &Path, args: &[&str], payload: &[u8]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mempal");
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(payload).expect("write stdin payload");
-    }
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(payload)
+        .expect("write");
     child.wait_with_output().expect("wait mempal")
 }
 
