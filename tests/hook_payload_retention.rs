@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use filetime::{FileTime, set_file_mtime};
@@ -9,6 +10,22 @@ use mempal::core::{config::Config, db::Database, queue::PendingMessageStore};
 use mempal::hook::HOOK_SPOOL_DIR;
 use mempal::hook_payload::prune_hook_payloads;
 use serde_json::json;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+
+async fn retention_test_guard() -> OwnedMutexGuard<()> {
+    static GUARD: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
+    GUARD
+        .get_or_init(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+        .lock_owned()
+        .await
+}
+
+fn retention_test_guard_blocking() -> OwnedMutexGuard<()> {
+    tokio::runtime::Runtime::new()
+        .expect("retention test runtime")
+        .block_on(retention_test_guard())
+}
 
 // Bootstrap reaps stale daemon state before emitting readiness output; allow suite-load
 // scheduling latency here without changing the daemon's retention or shutdown budgets.
@@ -296,6 +313,8 @@ fn enqueue_payload_handle(store: &PendingMessageStore, path: &Path) {
 
 #[test]
 fn hook_payload_retention_prunes_only_old_unreferenced_files() {
+    // ponytail: one target-wide lock; split by resource if throughput matters.
+    let _guard = retention_test_guard_blocking();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mempal_home = tmp.path().join(".mempal");
     let db_path = mempal_home.join("palace.db");
@@ -339,6 +358,8 @@ fn hook_payload_retention_prunes_only_old_unreferenced_files() {
 
 #[test]
 fn hooks_payload_retention_days_defaults_to_seven_and_is_configurable() {
+    // ponytail: one target-wide lock; split by resource if throughput matters.
+    let _guard = retention_test_guard_blocking();
     let defaults = Config::parse("[hooks]\nenabled = true\n").expect("parse default retention");
     assert_eq!(defaults.hooks.payload_retention_days, 7);
 
@@ -353,6 +374,8 @@ fn hooks_payload_retention_days_defaults_to_seven_and_is_configurable() {
 
 #[test]
 fn daemon_startup_runs_hook_payload_retention_with_configured_age_budget() {
+    // Acquire before any deadline-bearing setup or timeout helper.
+    let _guard = retention_test_guard_blocking();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mempal_home = tmp.path().join(".mempal");
     let db_path = mempal_home.join("palace.db");
