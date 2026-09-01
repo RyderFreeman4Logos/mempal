@@ -1,8 +1,18 @@
 use std::io::Write;
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::*;
+
+// ponytail: one process-local class lock; split by fixture family only if throughput matters.
+static STDIO_REGRESSION_CLASS_LOCK: Mutex<()> = Mutex::new(());
+
+fn acquire_stdio_regression_class_lock() -> std::sync::MutexGuard<'static, ()> {
+    STDIO_REGRESSION_CLASS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 const CLOSED_STDIO_CASE_ENV: &str = "MEMPAL_SUPERVISOR_CLOSED_STDIO_CASE";
 const CLOSED_STDIO_FIXTURE_TEST: &str =
@@ -52,6 +62,7 @@ fn parse_identities(bytes: &[u8]) -> Vec<ProcessIdentity> {
 
 #[test]
 fn closed_parent_stdio_fixture() {
+    let _class_lock = acquire_stdio_regression_class_lock();
     let Ok(case) = std::env::var(CLOSED_STDIO_CASE_ENV) else {
         return;
     };
@@ -79,6 +90,7 @@ fn closed_parent_stdio_fixture() {
 
 #[test]
 fn pipe_holder_fixture() {
+    let _class_lock = acquire_stdio_regression_class_lock();
     let Ok(()) = std::env::var(PIPE_HOLDER_CASE_ENV).map(|_| ()) else {
         return;
     };
@@ -107,6 +119,7 @@ fn pipe_holder_fixture() {
 
 #[test]
 fn setup_handshake_stall_is_fenced_reaped_and_bounded() {
+    let _class_lock = acquire_stdio_regression_class_lock();
     let (gate, child_gate) = TestSetupGate::new().expect("create setup gate");
     let mut spec = SpawnSpec::new("/bin/true").expect("absolute true executable");
     spec.setup_gate(child_gate);
@@ -137,6 +150,7 @@ fn setup_handshake_stall_is_fenced_reaped_and_bounded() {
 
 #[test]
 fn exited_leader_with_pipe_holding_descendant_is_fenced_before_reap() {
+    let _class_lock = acquire_stdio_regression_class_lock();
     let started = Instant::now();
     let timeout = Duration::from_secs(2);
     let output = DeadlineChild::output(
@@ -180,6 +194,7 @@ fn exited_leader_with_pipe_holding_descendant_is_fenced_before_reap() {
 
 #[test]
 fn closed_parent_stdio_preserves_capture_and_piped_input_channels() {
+    let _class_lock = acquire_stdio_regression_class_lock();
     for closed_fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
         for mode in ["capture", "piped-input"] {
             let output = DeadlineChild::output(

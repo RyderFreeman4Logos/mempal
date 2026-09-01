@@ -10,7 +10,8 @@ StartLimitIntervalSec=10min
 StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 ExecStart=/usr/local/bin/mempal daemon --foreground
 Restart=always
 RestartSec=3

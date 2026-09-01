@@ -26,7 +26,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ### Fixed
 
 - Daemon SQLite writer-lease waits out a live maintenance holder past capped `remaining_secs` instead of exit 75; a live incompatible `mcp-ingest-worker` holder is still refused without takeover (#916, #849).
-- Ingress: fsync before ACK and claim rename; lease-fenced exactly-once replay; REST bind precedes daemon-ready (#945). Persist/spool before model and on SQLite/breaker-open; stall keeps REST (#986, #1000, #987).
+- Ingress: fsync before ACK; lease-fenced replay; REST bind/systemd READY precede daemon-ready (#945). Persist/spool before model and on SQLite/breaker-open; stall keeps REST (#986, #1000, #987).
 - Cited-recall latest-decision walks the full successor chain, filters context the same way, and requires a live correction/continuation citation (#898).
 - Codex snapshots atomically remove superseded turns/vectors and fail closed on ambiguity (#896).
 - MCP search shares a deadline and releases reads before responding (#881).
