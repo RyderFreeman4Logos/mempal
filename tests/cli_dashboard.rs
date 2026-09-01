@@ -16,6 +16,9 @@ use mempal::observability::{self, TailFollowEvent, TailFollowFilters, TailFollow
 use mempal::session_review::append_hooks_raw_metadata;
 use rusqlite::params;
 use tempfile::TempDir;
+#[path = "support/tail_follow_lock.rs"]
+mod tail_follow_lock;
+use tail_follow_lock::guard;
 
 fn mempal_bin() -> String {
     env!("CARGO_BIN_EXE_mempal").to_string()
@@ -724,6 +727,7 @@ fn test_tail_default_prints_recent_20() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_tail_follow_coalesces_event_storm() {
+    let _guard = guard().await;
     let env = DashboardEnv::new();
     for index in 0..20 {
         insert_drawer(
@@ -738,13 +742,11 @@ async fn test_tail_follow_coalesces_event_storm() {
             ),
         );
     }
-
     let db = Database::open_read_only(&env.db_path).expect("open readonly db");
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     for _ in 0..120 {
         tx.send(TailFollowEvent::Notify).expect("send notify");
     }
-
     let started = Instant::now();
     let batch = observability::collect_tail_follow_batch(
         &db,
@@ -760,9 +762,8 @@ async fn test_tail_follow_coalesces_event_storm() {
     )
     .await
     .expect("collect follow batch");
-
     assert_eq!(batch.wake, TailFollowWake::Notify);
-    assert_eq!(batch.lines.len(), 20, "{batch:?}");
+    assert_eq!(batch.lines.len(), 20);
     assert!(
         started.elapsed() >= Duration::from_millis(200),
         "event storm was not debounced: {:?}",
@@ -781,9 +782,9 @@ async fn test_tail_follow_coalesces_event_storm() {
             .is_some_and(|line| line.contains("storm-19"))
     );
 }
-
-#[test]
-fn test_tail_follow_sees_new_drawers() {
+#[tokio::test(flavor = "current_thread")]
+async fn test_tail_follow_sees_new_drawers() {
+    let _guard = guard().await;
     let env = DashboardEnv::new();
     insert_drawer(
         &env.db_path,
@@ -799,7 +800,6 @@ fn test_tail_follow_sees_new_drawers() {
     let mut child = spawn_mempal(&env.home, env.cwd(), &["tail", "--follow", "--limit", "1"]);
     let output_lines = child_output_lines(&mut child);
     let (seed_lines, _) = read_lines_until(&output_lines, 1, Duration::from_secs(10));
-
     insert_drawer(
         &env.db_path,
         &drawer_seed(
@@ -811,15 +811,13 @@ fn test_tail_follow_sees_new_drawers() {
             2,
         ),
     );
-
     let (new_lines, _) = read_lines_until(&output_lines, 1, Duration::from_secs(10));
     let _ = child.kill();
     let _ = child.wait();
-
-    assert_eq!(seed_lines.len(), 1, "{seed_lines:?}");
-    assert!(seed_lines[0].contains("follow-seed"), "{seed_lines:?}");
-    assert_eq!(new_lines.len(), 1, "{new_lines:?}");
-    assert!(new_lines[0].contains("follow-new"), "{new_lines:?}");
+    assert_eq!(seed_lines.len(), 1);
+    assert!(seed_lines[0].contains("follow-seed"));
+    assert_eq!(new_lines.len(), 1);
+    assert!(new_lines[0].contains("follow-new"));
 }
 
 #[test]
@@ -1098,11 +1096,11 @@ fn test_view_project_allows_cross_project_vector_diagnostics() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_tail_follow_fallback_on_inotify_silence() {
+    let _guard = guard().await;
     let env = DashboardEnv::new();
     let db = Database::open_read_only(&env.db_path).expect("open readonly db");
     let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let db_path = env.db_path.clone();
-
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(200));
         insert_drawer(
@@ -1117,7 +1115,6 @@ async fn test_tail_follow_fallback_on_inotify_silence() {
             ),
         );
     });
-
     let started = Instant::now();
     let batch = observability::collect_tail_follow_batch(
         &db,
@@ -1134,14 +1131,10 @@ async fn test_tail_follow_fallback_on_inotify_silence() {
     .await
     .expect("collect fallback batch");
 
-    assert_eq!(batch.wake, TailFollowWake::Tick, "{batch:?}");
-    assert!(
-        started.elapsed() >= Duration::from_millis(3000),
-        "timeout fallback fired too early: {:?}",
-        started.elapsed()
-    );
-    assert_eq!(batch.lines.len(), 1, "{batch:?}");
-    assert!(batch.lines[0].contains("fallback-new"), "{batch:?}");
+    assert_eq!(batch.wake, TailFollowWake::Tick);
+    assert!(started.elapsed() >= Duration::from_millis(3000));
+    assert_eq!(batch.lines.len(), 1);
+    assert!(batch.lines[0].contains("fallback-new"));
 }
 
 #[test]
