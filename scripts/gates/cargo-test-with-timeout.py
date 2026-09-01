@@ -90,14 +90,14 @@ class Supervisor:
         try:
             pidfd = open_pidfd(snapshot.identity)
         except ValueError:
-            # A pidfd identity race may mean the scanned process already exited;
-            # only retain uncertainty if the same identity remains or revalidation fails.
+            # Only an absent revalidation proves the scanned process exited;
+            # any surviving identity keeps cleanup fail-closed.
             try:
                 current = read_snapshot(pid)
             except (OSError, ValueError):
                 self.ownership_uncertain = True
             else:
-                if current is not None and current.identity == snapshot.identity:
+                if current is not None:
                     self.ownership_uncertain = True
             return
         except OSError:
