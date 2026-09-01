@@ -89,7 +89,18 @@ class Supervisor:
             return
         try:
             pidfd = open_pidfd(snapshot.identity)
-        except (OSError, ValueError):
+        except ValueError:
+            # Only an absent revalidation proves the scanned process exited;
+            # any surviving identity keeps cleanup fail-closed.
+            try:
+                current = read_snapshot(pid)
+            except (OSError, ValueError):
+                self.ownership_uncertain = True
+            else:
+                if current is not None:
+                    self.ownership_uncertain = True
+            return
+        except OSError:
             self.ownership_uncertain = True
             return
         self.seen_identities[pid] = snapshot.identity
