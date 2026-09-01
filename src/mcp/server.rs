@@ -13966,6 +13966,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_only_read_preserves_mcp_error_data() {
+        let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (_tempdir, _db_path, server) = setup_server();
 
         let error = server
@@ -13985,6 +13986,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_only_read_bypasses_writer_capable_async_db_open_failure() {
+        let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (_tempdir, db_path, server) = setup_server();
         let query_only_async_db =
             QueryOnlyAsyncDb::open(&db_path, 4).expect("open query-only async db fixture");
@@ -14183,6 +14185,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_mcp_scoped_wait_holder_does_not_suppress_scoped_processing() {
+        let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (_tempdir, db_path, server) = setup_server();
         let scoped_wait_lease = Database::open(&db_path)
             .expect("open db")
@@ -15193,6 +15196,7 @@ quality_policy = "llm_required_for_keep"
     #[cfg(unix)]
     #[tokio::test]
     async fn test_mcp_ingest_wait_polls_daemon_admitted_operation_until_terminal() {
+        let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (tempdir, db_path, server) = setup_server();
         let daemon_lease = hold_daemon_writer_lease(&db_path);
         let (listener, _socket_guard) =
@@ -15280,6 +15284,7 @@ quality_policy = "llm_required_for_keep"
     #[cfg(unix)]
     #[tokio::test]
     async fn test_mcp_ingest_wait_daemon_admitted_timeout_uses_caller_budget() {
+        let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (tempdir, db_path, server) = setup_server();
         let daemon_lease = hold_daemon_writer_lease(&db_path);
         let (listener, _socket_guard) =
@@ -15538,6 +15543,7 @@ quality_policy = "llm_required_for_keep"
 
     #[tokio::test]
     async fn test_unbounded_scoped_wait_retries_transient_claim_sqlite_lock() {
+        let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (_tempdir, db_path, server) = setup_server();
         let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
             .with_claim_lock_failures_for_test(2);
