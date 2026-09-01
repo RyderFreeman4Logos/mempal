@@ -41,24 +41,14 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - **Daemon SQLite busy**: lease renew retries Busy/locked (#929); startup busy/lock exits 75; systemd avoids churn beside extra MCP holders (#931); post-merge REST install recycles daemon (#928, #940); Hermes writes authoritative; local conclusions avoid breaker retrips (#941).
 
-- **MCP search test deadlines**: `with_mcp_deadline_for_test` bounds embed and
-  DB/route paths so deadline-diagnostic fixtures cannot hang on 240s embed
-  timeout under suite load.
+- **MCP search test deadlines**: `with_mcp_deadline_for_test` bounds embed and DB/route paths so deadline fixtures cannot hang on 240s embed timeout.
 
-- **Admission budget concurrent fixture**: retry profile admission `Busy`
-  contention in oversubscribe test so suite-load flock waits aren't
-  miscounted as budget rejections.
+- **Admission budget concurrent fixture**: retry profile admission Busy in oversubscribe so suite-load flock waits aren't miscounted as budget rejections.
 
-- **Hermetic live-daemon tests**: isolate REST ports, MCP coexistence,
-  ingest-wait, mark-failed contention, and dashboard admission fixtures
-  so exact-gates do not bind live `:3080` or reconstruct admission locks
-  per poll (#988, #989, #973, #991, #993).
-- **Fixture readiness**: isolate ingest/async_db leases; bound waits;
-  retry Busy through deadline (#882, #889, #890, #944, #956, #958, #961,
-  #962, #965, #971, #975, #976).
+- **Hermetic live-daemon tests**: isolate REST/MCP/ingest-wait/mark-failed/dashboard so exact-gates skip live `:3080`; timeout wrapper reaps owned trees, authenticates idle sccache via exe, treats absent /proc as exit (#988, #989, #973, #991, #993, #1011).
+- **Fixture readiness**: isolate ingest/async_db leases; bound waits; retry Busy; ingest-worker idle-backoff and cancelled-read class locks (#882, #889, #890, #944, #956, #958, #961, #962, #965, #971, #975, #976, #968, #1013).
 
-- **MCP delete retry fixture**: force observed SQLite Busy before synchronized
-  lock release, eliminating the 5.5s/9s race (#886).
+- **MCP delete retry fixture**: force observed SQLite Busy before synchronized lock release (#886).
 
 - **Daemon supervisor cooldowns**: wait through active restart-budget
   cooldowns and retry bootstrap in-process; true temporary refusals retain

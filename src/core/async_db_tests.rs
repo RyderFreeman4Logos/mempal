@@ -2,6 +2,9 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
+// ponytail: class-wide lock for cancellation timing; split when the tests no longer share executor pressure.
+static CANCELLED_READ_PERMIT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn short_tempdir() -> tempfile::TempDir {
     tempfile::TempDir::new_in("/tmp").expect("short tempdir")
 }
@@ -240,6 +243,7 @@ async fn reader_only_async_pool_runs_bounded_read_without_writer() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_db_error_read_keeps_permit_until_checkin() {
+    let _cancelled_read_permit_lock = CANCELLED_READ_PERMIT_TEST_LOCK.lock().await;
     let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1).expect("open async db");
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -275,6 +279,7 @@ async fn cancelled_db_error_read_keeps_permit_until_checkin() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_anyhow_read_keeps_permit_until_checkin() {
+    let _cancelled_read_permit_lock = CANCELLED_READ_PERMIT_TEST_LOCK.lock().await;
     let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1).expect("open async db");
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
