@@ -4055,6 +4055,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_embedder_from_config_defers_explicit_model2vec_construction() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut config = Config {
             db_path: tmp.path().join("palace.db").display().to_string(),
@@ -4086,6 +4087,7 @@ mod tests {
     #[tokio::test]
     #[cfg(not(feature = "model2vec"))]
     async fn daemon_embedder_from_config_rejects_small_local_without_model2vec_feature() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut config = Config {
             db_path: tmp.path().join("palace.db").display().to_string(),
@@ -4109,6 +4111,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_embedder_marks_cache_loaded_only_after_first_embed() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut config = Config {
             db_path: tmp.path().join("palace.db").display().to_string(),
@@ -4313,6 +4316,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_endpoint_recovery_requeues_only_retryable_failed_model_tasks() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         Database::open(&db_path).expect("open db");
@@ -4390,6 +4394,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_endpoint_recovery_retries_budget_skipped_ingest_while_healthy() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         Database::open(&db_path).expect("open db");
@@ -4700,6 +4705,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_daemon_claim_skips_ingest_async_rows() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         Database::open(&db_path).expect("open db");
@@ -4734,135 +4740,6 @@ mod tests {
             .expect("async ingest row remains pending for its dedicated worker");
         assert_eq!(ingest_status.op_state, "queued");
         assert!(ingest_status.claimed_at.is_none());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_bounded_hook_worker_continues_claiming_after_completed_batch() {
-        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
-        let _shutdown_guard = ShutdownResetGuard::new();
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = tmp.path().join("palace.db");
-        let mempal_home = tmp.path().join(".mempal");
-        std::fs::create_dir_all(&mempal_home).expect("create mempal home");
-        Database::open(&db_path).expect("open db");
-        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
-        let store = PendingMessageStore::new(&db_path).expect("store");
-        let async_store = AsyncPendingMessageStore::from_store(store.clone());
-
-        for label in ["first", "second"] {
-            let hook_payload = serde_json::json!({
-                "tool_name": "Bash",
-                "input": format!("printf {label}"),
-                "output": label,
-                "exit_code": 0
-            })
-            .to_string();
-            let envelope = CapturedHookEnvelope {
-                event: HookEvent::PostToolUse.display_name().to_string(),
-                kind: HookEvent::PostToolUse.queue_kind().to_string(),
-                agent: "codex".to_string(),
-                captured_at: "2026-05-01T12:34:56Z".to_string(),
-                claude_cwd: tmp.path().to_string_lossy().to_string(),
-                payload: Some(hook_payload.clone()),
-                payload_path: None,
-                payload_preview: None,
-                original_size_bytes: hook_payload.len(),
-                truncated: false,
-            };
-            let payload = serde_json::to_string(&envelope).expect("serialize envelope");
-            store
-                .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
-                .expect("enqueue hook envelope");
-        }
-
-        let config = Config::default();
-        assert!(
-            !config.llm.enabled,
-            "test runtime config must keep LLM disabled"
-        );
-        let idle_observer = Arc::new(Notify::new());
-        let worker = tokio::spawn(run_hook_worker(
-            HookWorkerState {
-                async_db,
-                db_path: db_path.clone(),
-                store: async_store,
-                worker_id: "bounded-continuation-worker".to_string(),
-                embedder: Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
-                    StaticEmbedder,
-                ))),
-                prototype_classifier: Arc::new(ArcSwap::from_pointee(None)),
-                llm_gate: None,
-                config: Arc::new(config),
-                mempal_home,
-                write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
-                runtime_writer_lease: None,
-                idle_observer: Some(Arc::clone(&idle_observer)),
-            },
-            60,
-            Duration::from_millis(10),
-        ));
-
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let completed: i64 = rusqlite::Connection::open(&db_path)
-                    .expect("open sqlite")
-                    .query_row(
-                        "SELECT COUNT(*) FROM pending_message_completions WHERE kind = ?1",
-                        [HookEvent::PostToolUse.queue_kind()],
-                        |row| row.get(0),
-                    )
-                    .expect("count completions");
-                if completed == 2 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("worker should continue claiming after first completion");
-
-        let stats = store.stats().expect("queue stats");
-        assert_eq!(stats.pending, 0);
-        assert_eq!(stats.claimed, 0);
-
-        let hook_row = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let telemetry_db = Database::open(&db_path).expect("open telemetry db");
-                let telemetry = operation_telemetry_summary(
-                    &telemetry_db,
-                    OperationTelemetrySummaryOptions {
-                        since_unix_ms: None,
-                        limit: 10,
-                    },
-                )
-                .expect("summarize daemon hook telemetry");
-                if let Some(row) = telemetry.into_iter().find(|row| {
-                    row.source == "daemon"
-                        && row.operation == "hook hook_post_tool"
-                        && row.call_site == "daemon.hook_worker.message"
-                        && row.operation_count == 2
-                }) {
-                    break row;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("daemon hook operation telemetry should record both completed hooks");
-        assert_eq!(hook_row.operation_count, 2);
-        assert_eq!(hook_row.success_count, 2);
-        assert_eq!(hook_row.error_count, 0);
-
-        tokio::time::timeout(Duration::from_secs(5), idle_observer.notified())
-            .await
-            .expect("worker should enter idle after completing queued hooks");
-
-        request_shutdown();
-        tokio::time::timeout(Duration::from_secs(1), worker)
-            .await
-            .expect("worker should observe shutdown")
-            .expect("worker task should not panic");
     }
 
     #[cfg(unix)]
@@ -4915,6 +4792,9 @@ mod tests {
 
     #[path = "spool_settlement_tests.rs"]
     mod spool_settlement_tests;
+
+    #[path = "hook_worker_tests.rs"]
+    mod hook_worker_tests;
 
     #[test]
     fn test_daemon_fenced_write_rejects_takeover_after_preflight() {
@@ -4999,6 +4879,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hook_worker_stops_before_drawer_write_after_writer_lease_loss() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let mempal_home = tmp.path().join(".mempal");
@@ -5201,90 +5082,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bounded_hook_worker_heartbeats_with_claim_worker_id() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = tmp.path().join("palace.db");
-        let mempal_home = tmp.path().join(".mempal");
-        std::fs::create_dir_all(&mempal_home).expect("create mempal home");
-        Database::open(&db_path).expect("open db");
-        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
-        let store = PendingMessageStore::new(&db_path).expect("store");
-        let async_store = AsyncPendingMessageStore::from_store(store.clone());
-
-        let hook_payload = serde_json::json!({
-            "tool_name": "Bash",
-            "input": "printf heartbeat",
-            "output": "ok",
-            "exit_code": 0
-        })
-        .to_string();
-        let envelope = CapturedHookEnvelope {
-            event: HookEvent::PostToolUse.display_name().to_string(),
-            kind: HookEvent::PostToolUse.queue_kind().to_string(),
-            agent: "codex".to_string(),
-            captured_at: "2026-05-01T12:34:56Z".to_string(),
-            claude_cwd: tmp.path().to_string_lossy().to_string(),
-            payload: Some(hook_payload.clone()),
-            payload_path: None,
-            payload_preview: None,
-            original_size_bytes: hook_payload.len(),
-            truncated: false,
-        };
-        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
-        let queued_id = store
-            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
-            .expect("enqueue hook envelope");
-        let worker_id = "bounded-hook-worker";
-        let message = store
-            .claim_next(worker_id, 60)
-            .expect("claim next")
-            .expect("claimed message");
-        assert_eq!(message.id, queued_id);
-
-        let stale_heartbeat_at = unix_now_secs() - 30;
-        rusqlite::Connection::open(&db_path)
-            .expect("open sqlite")
-            .execute(
-                "UPDATE pending_messages SET claimed_at = ?2, heartbeat_at = ?2 WHERE id = ?1",
-                rusqlite::params![queued_id, stale_heartbeat_at],
-            )
-            .expect("age heartbeat");
-
-        let config = Config::default();
-        assert!(
-            !config.llm.enabled,
-            "test runtime config must keep LLM disabled"
-        );
-        super::process_hook_worker_message(
-            HookWorkerState {
-                async_db,
-                db_path: db_path.clone(),
-                store: async_store,
-                worker_id: worker_id.to_string(),
-                embedder: std::sync::Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
-                    HeartbeatProbeEmbedder {
-                        db_path,
-                        message_id: message.id.clone(),
-                        stale_heartbeat_at,
-                        attempts: AtomicUsize::new(0),
-                    },
-                ))),
-                prototype_classifier: std::sync::Arc::new(ArcSwap::from_pointee(None)),
-                llm_gate: None,
-                config: std::sync::Arc::new(config),
-                mempal_home,
-                write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
-                runtime_writer_lease: None,
-                idle_observer: None,
-            },
-            message,
-            60,
-        )
-        .await;
-    }
-
-    #[tokio::test]
     async fn test_hook_worker_retries_stale_novelty_merge_without_overwrite() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let mempal_home = tmp.path().join(".mempal");
@@ -5768,6 +5567,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_daemon_uses_envelope_captured_at_for_drawer_added_at() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -5839,6 +5639,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_reject_after_unavailable_model_retains_raw_payload() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -5997,6 +5798,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_model_rejection_keeps_raw_payload_referenced_by_another_drawer() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -6056,6 +5858,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_default_score_keep_precedes_durable_insert() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut llm_server = mockito::Server::new_async().await;
         let llm_mock = llm_server
@@ -6207,6 +6010,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_prototype_hard_reject_bypasses_llm_gate() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -6318,6 +6122,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_soft_prototype_reject_persists_before_llm_retry() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -6430,6 +6235,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_llm_gate_preserves_classifier_audit() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut llm_server = mockito::Server::new_async().await;
         let llm_mock = llm_server
@@ -6562,6 +6368,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_malformed_llm_gate_persists_before_retry() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut llm_server = mockito::Server::new_async().await;
         let llm_mock = llm_server
@@ -6676,6 +6483,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_llm_reject_retains_payload_for_pruner() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut llm_server = mockito::Server::new_async().await;
         let llm_mock = llm_server
@@ -6795,6 +6603,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_truncated_reject_preserves_untrusted_payload_path() {
+        let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut llm_server = mockito::Server::new_async().await;
         let llm_mock = llm_server
