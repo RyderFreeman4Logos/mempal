@@ -265,6 +265,78 @@ fn write_error_is_sqlite_full<E: std::error::Error + 'static>(error: &E) -> bool
     false
 }
 
+#[cfg(test)]
+static WRITE_RESERVE_RETRY_SQLITE_FULL_TEST_PATH: OnceLock<Mutex<Option<PathBuf>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn fail_next_write_reserve_retry_with_sqlite_full(path: &Path) {
+    WRITE_RESERVE_RETRY_SQLITE_FULL_TEST_PATH
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("write-reserve SQLite_FULL test hook mutex")
+        .replace(path.to_path_buf());
+}
+
+#[cfg(test)]
+pub(crate) fn fail_write_reserve_retry_with_sqlite_full_for_test(
+    path: &Path,
+) -> Result<(), DbError> {
+    let should_fail = WRITE_RESERVE_RETRY_SQLITE_FULL_TEST_PATH
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|mut path_to_fail| {
+            path_to_fail
+                .as_ref()
+                .filter(|configured_path| configured_path.as_path() == path)
+                .is_some()
+                .then(|| path_to_fail.take())
+                .flatten()
+        })
+        .is_some();
+    if should_fail {
+        return Err(DbError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DiskFull,
+                extended_code: rusqlite::ffi::SQLITE_FULL,
+            },
+            Some("database or disk is full".to_string()),
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn with_write_reserve_retry<T, E>(
+    database_path: &Path,
+    operation: &'static str,
+    mut write: impl FnMut() -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<DbError> + std::error::Error + 'static,
+{
+    let _reserve_lock = WriteReserveLock::acquire(database_path).map_err(|source| {
+        E::from(DbError::WriteReserveLock {
+            path: write_reserve_lock_path(database_path),
+            source,
+        })
+    })?;
+    let mut reserve_consumed = false;
+    loop {
+        match write() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if !reserve_consumed
+                    && write_error_is_sqlite_full(&error)
+                    && consume_write_reserve(database_path, operation) =>
+            {
+                reserve_consumed = true;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl Database {
     pub(crate) fn with_write_reserve_retry<T, E>(
         &self,
@@ -277,14 +349,7 @@ impl Database {
         if !self.conn.is_autocommit() {
             return write();
         }
-        let _reserve_lock = WriteReserveLock::acquire(&self.path).map_err(|source| {
-            E::from(DbError::WriteReserveLock {
-                path: write_reserve_lock_path(&self.path),
-                source,
-            })
-        })?;
-        let mut reserve_consumed = false;
-        loop {
+        with_write_reserve_retry(&self.path, operation, || {
             let begin = crate::core::sqlite_retry::retry_content_mutation_sqlite_lock_until(
                 Instant::now() + RUNTIME_WRITER_LEASE_TRANSACTION_RETRY_DEADLINE,
                 || {
@@ -295,44 +360,23 @@ impl Database {
                 db_error_is_sqlite_lock,
             );
             if let Err(error) = begin {
-                if !reserve_consumed
-                    && write_error_is_sqlite_full(&error)
-                    && consume_write_reserve(&self.path, operation)
-                {
-                    reserve_consumed = true;
-                    continue;
-                }
                 return Err(E::from(error));
             }
 
             match write() {
                 Ok(value) => match self.conn.execute_batch("COMMIT") {
-                    Ok(()) => return Ok(value),
-                    Err(commit_error) => {
+                    Ok(()) => Ok(value),
+                    Err(error) => {
                         let _ = self.conn.execute_batch("ROLLBACK");
-                        if !reserve_consumed
-                            && write_error_is_sqlite_full(&commit_error)
-                            && consume_write_reserve(&self.path, operation)
-                        {
-                            reserve_consumed = true;
-                            continue;
-                        }
-                        return Err(E::from(DbError::from(commit_error)));
+                        Err(E::from(DbError::from(error)))
                     }
                 },
                 Err(error) => {
                     let _ = self.conn.execute_batch("ROLLBACK");
-                    if !reserve_consumed
-                        && write_error_is_sqlite_full(&error)
-                        && consume_write_reserve(&self.path, operation)
-                    {
-                        reserve_consumed = true;
-                        continue;
-                    }
-                    return Err(error);
+                    Err(error)
                 }
             }
-        }
+        })
     }
 }
 
