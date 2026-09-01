@@ -8,6 +8,9 @@ use mempal::core::utils::build_triple_id;
 use serde_json::Value;
 use tempfile::TempDir;
 
+#[path = "support/tail_follow_lock.rs"]
+mod tail_follow_lock;
+
 const NOW: u64 = 1_800_000_000;
 const NOW_RFC3339: &str = "2027-01-15T08:00:00Z";
 
@@ -134,8 +137,9 @@ fn snapshot(db_path: &Path) -> DbSnapshot {
     }
 }
 
-#[test]
-fn reflect_cli_deterministic_json_reports_source_backed_categories() {
+#[tokio::test(flavor = "current_thread")]
+async fn reflect_cli_deterministic_json_reports_source_backed_categories() {
+    let _guard = tail_follow_lock::guard().await;
     let env = CliEnv::new_with_remote_embed_config();
     seed_reflection_findings(&env.db());
     let before = snapshot(&env.db_path);
@@ -173,8 +177,9 @@ fn reflect_cli_deterministic_json_reports_source_backed_categories() {
     assert_eq!(snapshot(&env.db_path), before);
 }
 
-#[test]
-fn reflect_help_documents_deterministic_mode() {
+#[tokio::test(flavor = "current_thread")]
+async fn reflect_help_documents_deterministic_mode() {
+    let _guard = tail_follow_lock::guard().await;
     let env = CliEnv::new_with_remote_embed_config();
 
     let output = env.run(&["reflect", "--help"]);
