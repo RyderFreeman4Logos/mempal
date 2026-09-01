@@ -21,6 +21,10 @@ mod local_gate_pid_safety;
 #[cfg(unix)]
 use local_gate_child::{capture_recorded_process, spawn_in_own_session};
 
+#[cfg(target_os = "linux")]
+#[path = "support/local_gate_timeout_absent_snapshot_tests.rs"]
+mod local_gate_timeout_absent_snapshot_tests;
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }

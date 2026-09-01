@@ -136,11 +136,11 @@ class Supervisor:
             if identity is None:
                 continue
             current = snapshots.get(pid)
-            if current is not None and current.identity != identity:
+            if current is None or current.identity != identity:
                 if handle.pidfd is not None:
                     os.close(handle.pidfd)
-                # A different start time proves the owned process exited; the new
-                # process is unrelated and must not make cleanup fail closed.
+                # An absent or different identity proves the owned process exited;
+                # it must not make cleanup fail closed.
                 del self.owned[pid]
                 continue
             owned_identities.add(identity)
@@ -374,10 +374,6 @@ class Supervisor:
                 continue
             snapshot = snapshots.get(pid)
             if snapshot is None or snapshot.identity != handle.identity:
-                print(
-                    f" pid={pid} start_time={handle.identity.start_time} comm='?' ppid=?",
-                    file=sys.stderr,
-                )
                 continue
             if snapshot.state in ("Z", "X"):
                 continue
