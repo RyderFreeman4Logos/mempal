@@ -99,6 +99,20 @@ class Supervisor:
         else:
             self.owned[pid] = OwnedProcess(snapshot.identity, pidfd)
 
+    def _is_idle_sccache(self, snapshot: Snapshot) -> bool:
+        if snapshot.parent_pid != self.supervisor_pid:
+            return False
+        try:
+            executable = os.readlink(f"/proc/{snapshot.identity.pid}/exe")
+            current = read_snapshot(snapshot.identity.pid)
+        except (OSError, ValueError):
+            return False
+        return (
+            current is not None
+            and current.identity == snapshot.identity
+            and Path(executable.removesuffix(" (deleted)")).name == "sccache"
+        )
+
     def discover(self) -> dict[int, Snapshot]:
         try:
             snapshots = scan_snapshots()
@@ -137,9 +151,7 @@ class Supervisor:
                 pid = snapshot.identity.pid
                 if pid == self.supervisor_pid or pid in self.owned:
                     continue
-                # A direct sccache child is its persistent cache server reparented to
-                # the subreaper, not work owned by this gate invocation.
-                if snapshot.parent_pid == self.supervisor_pid and snapshot.comm == "sccache":
+                if self._is_idle_sccache(snapshot):
                     continue
                 parent = snapshots.get(snapshot.parent_pid)
                 if snapshot.parent_pid == self.supervisor_pid or (
