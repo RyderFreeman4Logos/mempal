@@ -720,9 +720,9 @@ mod tests {
         );
         assert_process_identity_gone_within(escaped, Duration::from_secs(1));
     }
-
     #[test]
     fn rest_gate_fuser_diagnostic_cannot_outlive_lock_budget() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let fixture = tempfile::tempdir().expect("create fuser-timeout fixture");
         let bin_dir = fixture.path().join("bin");
         fs::create_dir(&bin_dir).expect("create fixture bin directory");
