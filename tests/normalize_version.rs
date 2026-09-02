@@ -9,10 +9,11 @@ use mempal::mcp::MempalMcpServer;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
 use std::process::Command;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
+
+include!("support/tail_follow_lock.rs");
 
 struct StubEmbedder;
 
@@ -629,6 +630,7 @@ async fn test_reindex_force_reprocesses_all() {
 
 #[tokio::test]
 async fn test_project_source_reindex_two_projects_same_relative_file() {
+    let _guard = guard().await;
     let tmp = TempDir::new().expect("tempdir");
     let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
     let project_a = tmp.path().join("project-a");
@@ -942,8 +944,9 @@ async fn test_status_exposes_stale_count() {
     assert_eq!(status.stale_drawer_count, 5);
 }
 
-#[test]
-fn test_reindex_respects_per_source_lock() {
+#[tokio::test(flavor = "current_thread")]
+async fn test_reindex_respects_per_source_lock() {
+    let _guard = guard().await;
     let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     let db = Database::open(&db_path).expect("open db");
@@ -951,19 +954,15 @@ fn test_reindex_respects_per_source_lock() {
     std::fs::write(&source, "fresh locked source").expect("write locked source");
     let source_file = source.to_string_lossy().to_string();
     insert_versioned_drawer(&db, "drawer_locked", &source_file, "old locked", 0);
-    drop(db);
-
     let key = source_key(std::path::Path::new(&source_file));
     let guard = acquire_source_lock(tmp.path(), &key, Duration::from_secs(1))
         .expect("acquire manual source lock");
-    let thread_db_path = db_path.clone();
     let handle = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
         runtime.block_on(async move {
-            let db = Database::open(&thread_db_path).expect("open db in thread");
             reindex_sources(
                 &db,
                 &StubEmbedder,
