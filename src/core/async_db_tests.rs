@@ -38,7 +38,9 @@ async fn t1_runtime_liveness_read_off_runtime() {
     assert!(observed >= 5, "ticker advanced only {observed} times");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// The read closures run on Tokio's blocking pool; keep the coordinator off the
+// suite's worker-pool contention so readiness events remain the only gate.
+#[tokio::test(flavor = "current_thread")]
 async fn t2_read_concurrency_up_to_n() {
     let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 4).expect("open async db");

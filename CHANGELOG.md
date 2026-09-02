@@ -43,10 +43,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - **MCP search test deadlines**: `with_mcp_deadline_for_test` bounds embed and DB/route paths so deadline fixtures cannot hang on 240s embed timeout.
 
-- **Admission budget concurrent fixture**: retry profile admission Busy in oversubscribe so suite-load flock waits aren't miscounted as budget rejections.
+- **Admission budget fixture**: retry profile admission Busy in oversubscribe so suite-load flock waits aren't budget rejections.
 
 - **Hermetic live-daemon tests**: isolate REST/MCP/ingest-wait/mark-failed/dashboard so exact-gates skip live `:3080`; timeout wrapper reaps owned trees, authenticates idle sccache via exe, treats absent /proc as exit (#988, #989, #973, #991, #993, #1011).
-- Lease/Busy/backoff/cancel (#882/#889/#890,#944/#956,#958/#961/#962/#965/#971/#975/#976/#968,#1013,#1010,#1009,#1008,#1023/#1024,#1006/#1007,#1027,#1005,#1029,#1004,#1031).
+- Lease/Busy/backoff/cancel (#882/#889/#890,#944/#956/#958/#961/#962/#965/#971/#975/#976/#968,#1013,#1010,#1009,#1008,#1023/#1024,#1006/#1007,#1027,#1005,#1029,#1004,#1031,#980).
 
 - **MCP delete retry fixture**: force observed SQLite Busy before synchronized lock release (#886).
 
