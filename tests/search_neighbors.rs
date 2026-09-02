@@ -408,7 +408,7 @@ fn write_cli_api_config(home: &Path, endpoint: &str) {
     fs::write(
         config_path,
         format!(
-            "[embed]\nbackend = \"api\"\napi_endpoint = \"{endpoint}\"\napi_model = \"test-model\"\n\n[embed.openai_compat]\ndim = 384\n"
+            "[embed]\nbackend = \"api\"\napi_endpoint = \"{endpoint}\"\napi_model = \"test-model\"\n\n[embed.openai_compat]\ndim = 384\n\n[config_hot_reload]\nenabled = false\n"
         ),
     )
     .expect("write cli config");
@@ -454,7 +454,10 @@ fn start_openai_embedding_stub(
     let address = listener.local_addr().expect("local addr");
     let expected_query = expected_query.to_string();
     let handle = thread::spawn(move || {
-        let (mut stream, _) = (0..50)
+        // Full-suite load can delay the CLI child past the old 5s accept budget
+        // while the product search deadline is still 120s. Keep the outer
+        // product deadline unchanged; only widen the fixture accept window.
+        let (mut stream, _) = (0..300)
             .find_map(|_| match listener.accept() {
                 Ok(connection) => Some(connection),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

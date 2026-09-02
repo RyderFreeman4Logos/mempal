@@ -3,13 +3,14 @@ use std::fs;
 use std::io::{Read, Write};
 #[cfg(feature = "integration")]
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 #[cfg(feature = "integration")]
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mempal::core::db::{Database, apply_fork_ext_migrations_to};
+use mempal::core::db_admission::ProfileDbAdmission;
 use mempal::core::queue::{
     PendingMessageStore, QueueConfig, QueueFailureDisposition, QueueFailureFilter,
 };
@@ -36,12 +37,12 @@ fn new_store(config: QueueConfig) -> (TempDir, PathBuf, PendingMessageStore) {
     (tmp, db_path, store)
 }
 
-fn setup_home() -> (TempDir, PathBuf) {
+fn setup_home_with_database() -> (TempDir, PathBuf, Database) {
     let tmp = TempDir::new().expect("tempdir");
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
     let db_path = mempal_home.join("palace.db");
-    Database::open(&db_path).expect("open db");
+    let db = Database::open(&db_path).expect("open db");
     fs::write(
         mempal_home.join("config.toml"),
         format!(
@@ -52,6 +53,11 @@ db_path = "{}"
         ),
     )
     .expect("write config");
+    (tmp, db_path, db)
+}
+
+fn setup_home() -> (TempDir, PathBuf) {
+    let (tmp, db_path, _db) = setup_home_with_database();
     (tmp, db_path)
 }
 
@@ -118,8 +124,7 @@ fn test_status_command_warns_on_corrupt_daemon_pidfile() {
     );
 }
 
-fn insert_status_drawer(db_path: &Path, id: &str, source_type: SourceType) {
-    let db = Database::open(db_path).expect("open db for status drawer");
+fn insert_status_drawer(db: &Database, id: &str, source_type: SourceType) {
     let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
         id: id.to_string(),
         content: format!("status fixture {id}"),
@@ -134,8 +139,7 @@ fn insert_status_drawer(db_path: &Path, id: &str, source_type: SourceType) {
     db.insert_drawer(&drawer).expect("insert status drawer");
 }
 
-fn recreate_vectors_with_metric(db_path: &Path, metric: &str) {
-    let db = Database::open(db_path).expect("open db for vector table");
+fn recreate_vectors_with_metric(db: &Database, metric: &str) {
     db.conn()
         .execute_batch(&format!(
             r#"
@@ -501,8 +505,8 @@ fn test_oldest_pending_age_none_when_empty() {
 
 #[test]
 fn test_status_command_shows_queue_stats() {
-    let (home, db_path) = setup_home();
-    insert_status_drawer(&db_path, "drawer-status-user", SourceType::UserExplicit);
+    let (home, db_path, db) = setup_home_with_database();
+    insert_status_drawer(&db, "drawer-status-user", SourceType::UserExplicit);
     let store = PendingMessageStore::with_config(
         &db_path,
         QueueConfig {
@@ -626,8 +630,10 @@ fn test_status_command_live_queue_counts_ignore_stale_completion_op_state() {
 
 #[test]
 fn test_status_command_shows_vector_index_stale_flag() {
-    let (home, db_path) = setup_home();
-    recreate_vectors_with_metric(&db_path, "l2");
+    let (home, db_path, db) = setup_home_with_database();
+    let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("snapshot fixture admission");
+    assert_eq!(snapshot.active_holders, 1);
+    recreate_vectors_with_metric(&db, "l2");
 
     let output = Command::new(mempal_bin())
         .arg("status")
@@ -640,18 +646,12 @@ fn test_status_command_shows_vector_index_stale_flag() {
     assert!(stdout.contains("vector_index_stale: true"), "{stdout}");
 }
 
-/// #302 regression: an empty-but-correct-metric `drawer_vectors` table (0 rows,
-/// cosine, with drawers present) is silently healthy to the #295 metric-only
-/// staleness check. `mempal status` MUST surface the empty state via
-/// `vector_index_empty: true` / `vector_rows: 0` while still reporting
-/// `vector_index_stale: false` (the cosine metric is correct). Fails red
-/// against pre-#302 code, which has no empty/row-count signal.
 #[test]
 fn test_status_command_flags_empty_vector_table() {
-    let (home, db_path) = setup_home();
-    insert_status_drawer(&db_path, "drawer-empty-1", SourceType::AgentInference);
+    let (home, _db_path, db) = setup_home_with_database();
+    insert_status_drawer(&db, "drawer-empty-1", SourceType::AgentInference);
     // Correct (cosine) metric but zero rows: the post-recreate empty-table state.
-    recreate_vectors_with_metric(&db_path, "cosine");
+    recreate_vectors_with_metric(&db, "cosine");
 
     let output = Command::new(mempal_bin())
         .arg("status")
