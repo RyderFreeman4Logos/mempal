@@ -15024,6 +15024,7 @@ quality_policy = "llm_required_for_keep"
     #[cfg(unix)]
     #[tokio::test]
     async fn test_mcp_ingest_persisted_ack_lost_fails_closed_without_replay_advice() {
+        let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (tempdir, db_path, server) = setup_server();
         let queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
             .with_enqueue_lock_failures_for_test(100)
