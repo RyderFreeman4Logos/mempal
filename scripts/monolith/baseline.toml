@@ -659,10 +659,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/write_wait_cli.rs"
 kind = "test"
-baseline_tokens = 16197
-baseline_lines = 2030
-issue = "843"
-rationale = "#843 adds locked and holder-budget stdin wait JSON no-write receipt regressions and aligns foreground-daemon SIGTERM wait with product drain grace; exact no-growth ratchet."
+baseline_tokens = 16224
+baseline_lines = 2034
+issue = "1004"
+rationale = "#1004 retains owned database fixtures while exercising wait-path admission under suite load; exact no-growth ratchet."
 
 [[files]]
 path = "tests/xurl_embed.rs"
