@@ -16969,6 +16969,10 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_ingest_dry_run_returns_error_when_preview_exceeds_deadline() {
+        let _observability_lock =
+            crate::observability::test_support::global_observability_test_lock()
+                .lock_owned()
+                .await;
         let (_tempdir, _db_path, server) = setup_server();
         let server = server
             .with_ingest_processing_delay_for_test(Duration::from_millis(150))
