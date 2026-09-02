@@ -53,10 +53,15 @@ fn mempal_bin() -> String {
     env!("CARGO_BIN_EXE_mempal").to_string()
 }
 
-fn setup_home() -> TempDir {
+fn setup_home_with_database() -> (TempDir, Database) {
     let tmp = TempDir::new_in("/tmp").expect("short tempdir");
     fs::create_dir_all(tmp.path().join(".mempal")).expect("create mempal home");
-    Database::open(&tmp.path().join(".mempal/palace.db")).expect("open db");
+    let db = Database::open(&tmp.path().join(".mempal/palace.db")).expect("open db");
+    (tmp, db)
+}
+
+fn setup_home() -> TempDir {
+    let (tmp, _db) = setup_home_with_database();
     tmp
 }
 
@@ -750,8 +755,7 @@ fn assert_stdin_audit_entry(
     assert_eq!(entry["dropped_by_gate"], expected_dropped_by_gate);
 }
 
-fn insert_fact_check_contradiction(home: &Path) {
-    let db = Database::open(&home.join(".mempal/palace.db")).expect("open db");
+fn insert_fact_check_contradiction(db: &Database) {
     let triple = Triple {
         id: build_triple_id("Bob", "husband_of", "Alice"),
         subject: "Bob".to_string(),
@@ -1776,8 +1780,8 @@ async fn test_ingest_wait_exact_duplicate_matches_non_wait_plain_and_json_output
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ingest_wait_rejected_matches_non_wait_output_and_audit() {
-    let wait_home = setup_home();
-    let direct_home = setup_home();
+    let (wait_home, wait_db) = setup_home_with_database();
+    let (direct_home, direct_db) = setup_home_with_database();
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
     let wait_config = write_config(wait_home.path(), &format!("http://{addr}/v1"));
     let direct_config = write_config(direct_home.path(), &format!("http://{addr}/v1"));
@@ -1796,8 +1800,8 @@ async fn test_ingest_wait_rejected_matches_non_wait_output_and_audit() {
             .expect("append gating config");
         }
     }
-    insert_fact_check_contradiction(wait_home.path());
-    insert_fact_check_contradiction(direct_home.path());
+    insert_fact_check_contradiction(&wait_db);
+    insert_fact_check_contradiction(&direct_db);
 
     let payload = serde_json::json!({
         "content": "Bob is Alice's brother.",
