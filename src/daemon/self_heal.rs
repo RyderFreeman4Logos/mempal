@@ -3,6 +3,8 @@ use std::io::ErrorKind;
 #[cfg(unix)]
 use std::sync::Arc;
 #[cfg(all(test, unix))]
+use std::sync::OnceLock;
+#[cfg(all(test, unix))]
 use std::sync::atomic::AtomicUsize;
 #[cfg(all(test, unix))]
 use std::sync::atomic::Ordering;
@@ -237,6 +239,42 @@ fn hook_ipc_handler_counts_for_test() -> (usize, usize) {
     )
 }
 
+#[cfg(all(test, unix))]
+static HOOK_IPC_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+#[cfg(all(test, unix))]
+async fn lock_hook_ipc_tests() -> (
+    tokio::sync::MutexGuard<'static, ()>,
+    tokio::sync::OwnedMutexGuard<()>,
+) {
+    let handler_guard = HOOK_IPC_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let shutdown_guard = super::global_shutdown_test_lock().lock_owned().await;
+    (handler_guard, shutdown_guard)
+}
+
+#[cfg(all(test, unix))]
+async fn wait_for_active_handler_count(expected: usize, label: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let (active, _) = hook_ipc_handler_counts_for_test();
+            if active == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let (active, peak) = hook_ipc_handler_counts_for_test();
+        panic!(
+            "hook IPC active handler count did not return to {expected} after {label}; active={active}, peak={peak}"
+        );
+    });
+}
+
 #[cfg(unix)]
 async fn handle_hook_ipc_connection(
     mut stream: tokio::net::UnixStream,
@@ -335,6 +373,10 @@ fn is_hook_ipc_peer_disconnect(error: &anyhow::Error) -> bool {
 #[cfg(all(test, unix))]
 #[path = "self_heal_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "self_heal_tests_hook_ipc_spool_ack_1003.rs"]
+mod hook_ipc_spool_ack_1003_tests;
 
 #[cfg(all(test, unix))]
 #[path = "self_heal_replay_tests.rs"]

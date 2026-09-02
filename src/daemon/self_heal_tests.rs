@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::core::db::Database;
@@ -21,21 +21,6 @@ impl Drop for ShutdownResetGuard {
     fn drop(&mut self) {
         super::super::reset_shutdown_request();
     }
-}
-
-// These tests share test-only handler counters and the process-wide shutdown flag.
-static HOOK_IPC_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-
-async fn lock_hook_ipc_tests() -> (
-    tokio::sync::MutexGuard<'static, ()>,
-    tokio::sync::OwnedMutexGuard<()>,
-) {
-    let handler_guard = HOOK_IPC_TEST_LOCK
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
-    let shutdown_guard = super::super::global_shutdown_test_lock().lock_owned().await;
-    (handler_guard, shutdown_guard)
 }
 
 fn short_tempdir() -> tempfile::TempDir {
@@ -100,26 +85,6 @@ fn sqlite_db_fd_count(db_path: &Path) -> usize {
 }
 
 #[cfg(target_os = "linux")]
-async fn wait_for_active_handler_count(expected: usize, label: &str) {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let (active, _) = super::hook_ipc_handler_counts_for_test();
-            if active == expected {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        let (active, peak) = super::hook_ipc_handler_counts_for_test();
-        panic!(
-            "hook IPC active handler count did not return to {expected} after {label}; active={active}, peak={peak}"
-        );
-    });
-}
-
-#[cfg(target_os = "linux")]
 async fn send_hook_ipc_client(
     mempal_home: PathBuf,
     request: crate::hook_ipc::HookIpcEnqueueRequest,
@@ -157,15 +122,18 @@ async fn send_contention_wave(
         );
         let client_request = request.clone();
         requests.push(request);
-        tasks.push(send_hook_ipc_client(
+        tasks.push(tokio::spawn(send_hook_ipc_client(
             mempal_home.to_path_buf(),
             client_request,
-        ));
+        )));
     }
 
     let mut outcomes = Vec::with_capacity(count);
     for (request, task) in requests.into_iter().zip(tasks) {
-        outcomes.push((request, task.await));
+        outcomes.push((
+            request,
+            task.await.expect("hook IPC client task should not panic"),
+        ));
     }
     outcomes
 }
@@ -216,7 +184,7 @@ async fn send_hook_ipc_request(
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_hook_ipc_readiness_does_not_persist_queue_row() {
-    let _test_guard = lock_hook_ipc_tests().await;
+    let _test_guard = super::lock_hook_ipc_tests().await;
     super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
     let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
@@ -258,7 +226,7 @@ async fn test_hook_ipc_readiness_does_not_persist_queue_row() {
 
 #[tokio::test]
 async fn test_hook_ipc_ack_replays_from_durable_spool() {
-    let _test_guard = lock_hook_ipc_tests().await;
+    let _test_guard = super::lock_hook_ipc_tests().await;
     super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
     let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
@@ -297,90 +265,8 @@ async fn test_hook_ipc_ack_replays_from_durable_spool() {
 }
 
 #[tokio::test]
-async fn test_hook_ipc_spools_before_ack_when_sqlite_locked() {
-    let _test_guard = lock_hook_ipc_tests().await;
-    super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
-    let tmp = short_tempdir();
-    let db_path = tmp.path().join("palace.db");
-    Database::open(&db_path).expect("open db");
-    let lock_conn = rusqlite::Connection::open(&db_path).expect("open lock connection");
-    lock_conn
-        .execute_batch("BEGIN IMMEDIATE;")
-        .expect("hold SQLite write lock");
-
-    let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
-    let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
-    let request = crate::hook_ipc::HookIpcEnqueueRequest::new(
-        HookEvent::UserPromptSubmit.queue_kind(),
-        r#"{"event":"UserPromptSubmit","payload":"durable after lock"}"#,
-    );
-    let spool = Arc::new(crate::ingress_spool::IngressSpool::new(tmp.path()));
-
-    let (mut client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let handler = tokio::spawn(super::handle_hook_ipc_connection(
-        server,
-        store,
-        observer,
-        spool.clone(),
-    ));
-    wait_for_active_handler_count(1, "starting locked SQLite enqueue").await;
-    let mut frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
-    frame.push(b'\n');
-    tokio::io::AsyncWriteExt::write_all(&mut client, &frame)
-        .await
-        .expect("write request");
-    tokio::io::AsyncWriteExt::flush(&mut client)
-        .await
-        .expect("flush request");
-
-    let response = tokio::time::timeout(crate::hook_ipc::HOOK_IPC_TIMEOUT, async {
-        let mut reader = tokio::io::BufReader::new(client);
-        let mut line = String::new();
-        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
-            .await
-            .expect("read response");
-        handler.await.expect("handler task");
-        serde_json::from_str(line.trim()).expect("hook IPC response")
-    })
-    .await
-    .expect("locked SQLite enqueue must ACK from the fsynced spool");
-    match response {
-        crate::hook_ipc::HookIpcEnqueueResponse::Accepted => {}
-        crate::hook_ipc::HookIpcEnqueueResponse::Error { message } => {
-            panic!("durable spool should ACK before SQLite replay: {message}")
-        }
-    }
-    let count_while_locked: i64 = rusqlite::Connection::open(&db_path)
-        .expect("open read connection")
-        .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
-            row.get(0)
-        })
-        .expect("count pending while locked");
-    assert_eq!(count_while_locked, 0);
-
-    lock_conn.execute_batch("ROLLBACK;").expect("release lock");
-    let replay_store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
-    assert_eq!(
-        spool.drain_once(&replay_store).await.expect("replay spool"),
-        1
-    );
-    let stored_id =
-        PendingMessageStore::idempotent_message_id(&request.kind, &request.idempotency_key);
-    let (count_after_unlock, actual_id): (i64, String) = rusqlite::Connection::open(&db_path)
-        .expect("open read connection")
-        .query_row(
-            "SELECT COUNT(*), COALESCE(MAX(id), '') FROM pending_messages",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("query pending after unlock");
-    assert_eq!(count_after_unlock, 1);
-    assert_eq!(stored_id, actual_id);
-}
-
-#[tokio::test]
 async fn test_hook_ipc_stalled_request_times_out_without_persisting() {
-    let _test_guard = lock_hook_ipc_tests().await;
+    let _test_guard = super::lock_hook_ipc_tests().await;
     super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
     let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
@@ -430,7 +316,7 @@ async fn test_hook_ipc_stalled_request_times_out_without_persisting() {
 
 #[tokio::test]
 async fn test_hook_ipc_ack_does_not_wait_for_slow_sqlite_replay() {
-    let _test_guard = lock_hook_ipc_tests().await;
+    let _test_guard = super::lock_hook_ipc_tests().await;
     super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
     let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
@@ -522,7 +408,7 @@ async fn test_hook_ipc_ack_does_not_wait_for_slow_sqlite_replay() {
 
 #[tokio::test]
 async fn test_hook_ipc_closed_peer_write_is_debug_only() {
-    let _test_guard = lock_hook_ipc_tests().await;
+    let _test_guard = super::lock_hook_ipc_tests().await;
     super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
     let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
@@ -572,7 +458,7 @@ async fn test_hook_ipc_closed_peer_write_is_debug_only() {
 
 #[tokio::test]
 async fn test_hook_ipc_listener_bounds_active_handlers() {
-    let _test_guard = lock_hook_ipc_tests().await;
+    let _test_guard = super::lock_hook_ipc_tests().await;
     let _shutdown_guard = ShutdownResetGuard::new();
     super::reset_hook_ipc_handler_counters_for_test();
     let tmp = short_tempdir();
@@ -648,7 +534,7 @@ async fn test_hook_ipc_listener_bounds_active_handlers() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_hook_ipc_listener_recovers_after_real_sqlite_contention() {
-    let _test_guard = lock_hook_ipc_tests().await;
+    let _test_guard = super::lock_hook_ipc_tests().await;
     let _shutdown_guard = ShutdownResetGuard::new();
     super::reset_hook_ipc_handler_counters_for_test();
     let tmp = short_tempdir();
@@ -679,7 +565,7 @@ async fn test_hook_ipc_listener_recovers_after_real_sqlite_contention() {
         let wave_outcomes = send_contention_wave(&mempal_home, wave, 4).await;
         assert_all_accepted(&wave_outcomes);
         spooled_count += wave_outcomes.len();
-        wait_for_active_handler_count(0, "contention wave").await;
+        super::wait_for_active_handler_count(0, "contention wave").await;
         assert_eq!(pending_message_total(&db_path), 0);
         let fd_count = sqlite_db_fd_count(&db_path);
         assert!(
@@ -713,7 +599,7 @@ async fn test_hook_ipc_listener_recovers_after_real_sqlite_contention() {
         sentinel_outcome,
         crate::hook_ipc::HookIpcClientOutcome::Accepted
     );
-    wait_for_active_handler_count(0, "sentinel recovery request").await;
+    super::wait_for_active_handler_count(0, "sentinel recovery request").await;
     let expected_total = i64::try_from(spooled_count + 1).expect("request count fits i64");
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {

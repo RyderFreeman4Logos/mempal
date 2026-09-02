@@ -105,6 +105,17 @@ pub(super) fn drawers_source_type_check_is_current(table_sql: &str) -> bool {
     .all(|source_type| table_sql.contains(source_type))
 }
 
+#[cfg(test)]
+fn db_open_busy_fixture_lock() -> &'static std::sync::Mutex<()> {
+    // ponytail: one process-global fixture lock; split by contention domain if throughput matters.
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(std::sync::Mutex::default)
+}
+
+#[cfg(test)]
+#[path = "db_open_tests_schema_repair_1003.rs"]
+mod schema_repair_busy_1003_tests;
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         Self::open_with_mode(path, OpenMode::ReadWrite, true)
@@ -461,6 +472,9 @@ mod tests {
 
     #[test]
     fn current_schema_db_open_repairs_all_legacy_structural_invariants() {
+        let _fixture_guard = super::db_open_busy_fixture_lock()
+            .lock()
+            .expect("serialize database busy fixtures");
         let mut columns = V5_DRAWER_COLUMN_MIGRATIONS
             .iter()
             .map(|column| ("V5", "drawers", column.name))
@@ -611,49 +625,6 @@ mod tests {
                 "{repair} invariant was not repaired"
             );
         }
-    }
-
-    #[test]
-    fn repair_required_current_schema_open_fails_bounded_then_repairs_after_writer_release() {
-        let tempdir = short_tempdir();
-        let db_path = tempdir.path().join("palace.db");
-        drop(Database::open(&db_path).expect("initialize current database"));
-
-        let blocker = Connection::open(&db_path).expect("open migration blocker");
-        blocker
-            .execute_batch("DROP INDEX idx_drawers_supersedes; BEGIN IMMEDIATE;")
-            .expect("damage current schema and hold writer lock");
-        assert!(
-            schema_repairs_required(&blocker).expect("inspect repair-required fixture"),
-            "fixture must require structural repair"
-        );
-
-        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
-        let open_path = db_path.clone();
-        let opener = std::thread::spawn(move || {
-            let _ = opened_tx.send(Database::open_with_busy_timeout(
-                &open_path,
-                Duration::from_millis(25),
-            ));
-        });
-        let opened = opened_rx.recv_timeout(Duration::from_millis(250));
-        blocker
-            .execute_batch("ROLLBACK;")
-            .expect("release migration blocker");
-        opener.join().expect("join blocked database opener");
-        let error = match opened.expect("busy timeout must bound repair-required open") {
-            Ok(_) => panic!("repair-required open must not bypass the live writer"),
-            Err(error) => error,
-        };
-        assert!(
-            db_error_is_sqlite_lock(&error),
-            "repair-required open returned the wrong error: {error}"
-        );
-        let repaired = Database::open(&db_path).expect("repair after writer release");
-        assert!(
-            !schema_repairs_required(repaired.conn()).expect("validate repair after release"),
-            "released fixture was not repaired"
-        );
     }
 
     #[test]
