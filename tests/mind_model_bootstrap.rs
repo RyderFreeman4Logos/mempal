@@ -1505,6 +1505,8 @@ async fn test_dao_tian_rejects_noncanonical_status() {
 #[tokio::test]
 async fn test_mcp_ingest_same_content_different_anchors_stays_distinct() {
     let (_tmp, db, server) = setup_mcp_server();
+    let db_path = db.path().to_path_buf();
+    drop(db);
     let first = server
         .ingest_json_for_test(json!({
             "content": "Anchor-local memory body",
@@ -1531,6 +1533,7 @@ async fn test_mcp_ingest_same_content_different_anchors_stays_distinct() {
         .expect("second ingest should succeed");
 
     assert_ne!(first.drawer_id, second.drawer_id);
+    let db = Database::open(&db_path).expect("reopen db after MCP ingests");
     let first_drawer = db
         .get_drawer(&first.drawer_id)
         .expect("load first drawer")
