@@ -201,12 +201,17 @@ struct TestEnv {
 
 impl TestEnv {
     fn new(config_body: &str) -> Self {
+        let (env, _db) = Self::new_with_database(config_body);
+        env
+    }
+
+    fn new_with_database(config_body: &str) -> (Self, Database) {
         let tmp = TempDir::new_in("/tmp").expect("external tempdir");
         let home = tmp.path().to_path_buf();
         let mempal_home = home.join(".mempal");
         fs::create_dir_all(&mempal_home).expect("create mempal home");
         let db_path = mempal_home.join("palace.db");
-        Database::open(&db_path).expect("open db");
+        let db = Database::open(&db_path).expect("open db");
         let config_path = mempal_home.join("config.toml");
         fs::write(
             &config_path,
@@ -224,12 +229,15 @@ enabled = false
             ),
         )
         .expect("write config");
-        Self {
-            _tmp: tmp,
-            home,
-            db_path,
-            config_path,
-        }
+        (
+            Self {
+                _tmp: tmp,
+                home,
+                db_path,
+                config_path,
+            },
+            db,
+        )
     }
 
     fn config(&self) -> Config {
@@ -1659,7 +1667,7 @@ backend = "unsupported-backend"
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tier1_skips_short_content() {
     let _guard = test_guard().await;
-    let env = TestEnv::new("[gating]\nenabled = true\n");
+    let (env, db) = TestEnv::new_with_database("[gating]\nenabled = true\n");
     let config = env.config();
     let server = MempalMcpServer::new_with_factory_and_config(
         env.db_path.clone(),
@@ -1669,10 +1677,10 @@ async fn test_tier1_skips_short_content() {
     .expect("create MCP server");
 
     let response = ingest_mcp(&server, "tiny").await;
-    let rows = gating_rows(&env.db());
+    let rows = gating_rows(&db);
 
     assert!(response.dropped);
-    assert_eq!(env.db().drawer_count().expect("drawer count"), 0);
+    assert_eq!(db.drawer_count().expect("drawer count"), 0);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].decision, "skip");
     assert_eq!(rows[0].tier, 1);
@@ -2457,17 +2465,10 @@ async fn test_gating_tier3_multichunk_rejects_all_drawers() {
 
     // Start a mock LLM server that always returns a reject verdict (score=0.1 < threshold=0.5).
     let mut mock_server = mockito::Server::new_async().await;
-    let _reject_mock = mock_server
-        .mock("POST", "/v1/chat/completions")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(r#"{"id":"test","choices":[{"message":{"role":"assistant","content":"{\"verdict\":\"reject\",\"score\":0.1}"},"finish_reason":"stop"}],"model":"test","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#)
-        .create_async()
-        .await;
 
     // Use a very small chunker so the content splits into multiple chunks.
     // target_tokens=5, max_tokens=10, overlap_tokens=2 — content ~60 chars splits into 2+ chunks.
-    let env = TestEnv::new(&format!(
+    let (env, db) = TestEnv::new_with_database(&format!(
         r#"
 [llm]
 enabled = true
@@ -2494,6 +2495,13 @@ threshold = 0.5
 "#,
         mock_server.url()
     ));
+    let _reject_mock = mock_server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"test","choices":[{"message":{"role":"assistant","content":"{\"verdict\":\"reject\",\"score\":0.1}"},"finish_reason":"stop"}],"model":"test","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#)
+        .create_async()
+        .await;
 
     let config = env.config();
     // Prototype vec far from ambiguous content vec → triggers Tier 3.
@@ -2519,15 +2527,15 @@ threshold = 0.5
         "multi-chunk ingest should fail-open before LLM verdict"
     );
 
-    let initial_count = env.db().drawer_count().expect("drawer count");
+    let initial_count = db.drawer_count().expect("drawer count");
     assert!(
         initial_count >= 2,
         "content must produce at least 2 chunks, got {initial_count}"
     );
 
-    // Exactly one LLM task enqueued for the whole ingest (not one per chunk).
+    // Exactly one LLM task is enqueued for the whole ingest, regardless of chunk count.
     assert_eq!(
-        pending_llm_task_count(&env.db()),
+        pending_llm_task_count(&db),
         1,
         "exactly one LLM gating task per ingest, regardless of chunk count"
     );
@@ -2557,7 +2565,6 @@ threshold = 0.5
     };
     let client = LlmClient::from_config(&llm_config).expect("build LLM client");
     let status = LlmStatus::new(5);
-    let db = env.db();
     let judge_config = Config {
         ingest_gating: IngestGatingConfig {
             llm_judge: Some(LlmJudgeConfig {
@@ -2575,7 +2582,7 @@ threshold = 0.5
 
     // All chunk drawers must be soft-deleted after rejection.
     assert_eq!(
-        env.db().drawer_count().expect("drawer count after reject"),
+        db.drawer_count().expect("drawer count after reject"),
         0,
         "LLM reject must soft-delete ALL chunk drawers, not just the first"
     );
