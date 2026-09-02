@@ -8,11 +8,15 @@ const _: fn() = cli_deadline::reference_shared_cli_deadline_api;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use cli_deadline::{push_args, run_cli_output, with_home};
 use mempal::core::db::Database;
 use tempfile::TempDir;
+
+// ponytail: one daemon-readiness test-binary lock; split by fixture family if throughput matters.
+static DAEMON_READINESS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn daemon_runtime_dir(home: &Path) -> PathBuf {
     home.join(".mempal/runtime")
@@ -115,6 +119,9 @@ impl Drop for DaemonCleanup {
 
 #[test]
 fn test_daemon_wait_after_restart_requires_status_and_write_transport_readiness() {
+    let _test_lock = DAEMON_READINESS_TEST_LOCK
+        .lock()
+        .expect("daemon readiness test lock");
     let (tmp, db_path) = setup_daemon_home();
     let _cleanup = DaemonCleanup {
         db_path: db_path.clone(),
@@ -180,6 +187,9 @@ fn test_daemon_wait_after_restart_requires_status_and_write_transport_readiness(
 
 #[test]
 fn test_daemon_wait_timeout_is_explicit_and_redacted() {
+    let _test_lock = DAEMON_READINESS_TEST_LOCK
+        .lock()
+        .expect("daemon readiness test lock");
     let (tmp, db_path) = setup_daemon_home();
 
     let output = run_daemon(
