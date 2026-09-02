@@ -200,6 +200,7 @@ mod regression_tests {
 
     #[test]
     fn gate_child_terminates_post_reap_non_pipe_setsid_descendant() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let fixture = tempfile::tempdir().expect("create non-pipe escaped-descendant fixture");
         let release_file = fixture.path().join("release");
         let started_file = fixture.path().join("started");
@@ -267,6 +268,7 @@ mod regression_tests {
 
     #[test]
     fn gate_child_terminates_closed_pipe_descendant_by_ownership_token() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let fixture = tempfile::tempdir().expect("create closed-pipe descendant fixture");
         let release_file = fixture.path().join("release");
         let started_file = fixture.path().join("started");
@@ -436,6 +438,7 @@ mod regression_tests {
 
     #[test]
     fn gate_child_terminates_setsid_descendant_created_by_term_handler() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let fixture = tempfile::tempdir().expect("create TERM-handler escape fixture");
         let pid_file = fixture.path().join("escaped.pid");
         let armed_file = fixture.path().join("term-handler-armed");
