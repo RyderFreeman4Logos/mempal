@@ -1,5 +1,8 @@
 #[test]
 fn db_open_applies_busy_timeout_before_schema_queries() {
+    let _fixture_guard = super::db_open_busy_fixture_lock()
+        .lock()
+        .expect("serialize database busy fixtures");
     let tempdir = short_tempdir();
     let db_path = tempdir.path().join("palace.db");
     drop(Database::open(&db_path).expect("initialize database"));
@@ -143,6 +146,9 @@ fn filesystem_free_bytes(path: &Path) -> u64 {
 
 #[test]
 fn current_schema_db_open_does_not_reapply_migrations_under_live_writer() {
+    let _fixture_guard = super::db_open_busy_fixture_lock()
+        .lock()
+        .expect("serialize database busy fixtures");
     let tempdir = short_tempdir();
     let db_path = tempdir.path().join("palace.db");
     drop(Database::open(&db_path).expect("initialize current database"));
