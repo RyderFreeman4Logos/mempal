@@ -169,6 +169,10 @@ async fn write_observer_record_queue_error_non_lock_still_allows_recovery() {
 
 #[tokio::test(start_paused = true, flavor = "current_thread")]
 async fn daemon_ingest_claim_contention_suppresses_stall_restart() {
+    let _worker_lifecycle_lock =
+        crate::observability::test_support::global_ingest_worker_lifecycle_test_lock()
+            .lock_owned()
+            .await;
     let _observability_lock = crate::observability::test_support::global_observability_test_lock()
         .lock_owned()
         .await;
