@@ -6,6 +6,12 @@ pub(crate) fn global_observability_test_lock() -> Arc<tokio::sync::Mutex<()>> {
     Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
 }
 
+pub(crate) fn global_ingest_worker_lifecycle_test_lock() -> Arc<tokio::sync::Mutex<()>> {
+    // ponytail: one process-wide lifecycle lock; split when backoff becomes worker-scoped.
+    static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
+}
+
 pub(crate) use super::reset_io_burst_for_tests;
 
 pub(crate) fn reset_ingest_worker_backoff_for_tests() {

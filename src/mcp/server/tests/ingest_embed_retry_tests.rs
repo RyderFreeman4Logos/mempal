@@ -34,6 +34,10 @@ impl crate::embed::EmbedderFactory for FailOnceEmbedderFactory {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_mcp_async_ingest_transient_write_lock_requeues_instead_of_failing() {
+    let _worker_lifecycle_lock =
+        crate::observability::test_support::global_ingest_worker_lifecycle_test_lock()
+            .lock_owned()
+            .await;
     let _observability_lock =
         crate::observability::test_support::global_observability_test_lock()
             .lock_owned()

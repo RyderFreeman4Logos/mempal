@@ -13599,7 +13599,9 @@ mod tests {
     use crate::core::types::{KnowledgeCard, KnowledgeEvidenceLink, KnowledgeEvidenceRole};
     use crate::embed::Embedder;
     use crate::mcp::tools::INGEST_SOURCE_TYPE_SCHEMA_DESCRIPTION;
-    use crate::observability::test_support::global_observability_test_lock;
+    use crate::observability::test_support::{
+        global_ingest_worker_lifecycle_test_lock, global_observability_test_lock,
+    };
 
     mod context_scope_schema_tests;
     mod delete_busy_retry_836_tests;
@@ -16312,11 +16314,6 @@ pattern_boost = 0.2
         );
     }
 
-    // ponytail: class-wide lock for shared backoff state; split if it becomes worker-scoped.
-    #[cfg(test)]
-    static INGEST_WORKER_LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> =
-        tokio::sync::Mutex::const_new(());
-
     fn assert_ingest_worker_backoff_snapshot(
         expected_retry_count: u64,
         expected_next_delay_ms: u64,
@@ -17118,7 +17115,9 @@ pattern_boost = 0.2
 
     #[tokio::test(start_paused = true, flavor = "current_thread")]
     async fn test_mcp_async_ingest_worker_backs_off_when_claim_is_locked() {
-        let _worker_lifecycle_lock = INGEST_WORKER_LIFECYCLE_TEST_LOCK.lock().await;
+        let _worker_lifecycle_lock = global_ingest_worker_lifecycle_test_lock()
+            .lock_owned()
+            .await;
         let _observability_lock =
             crate::observability::test_support::global_observability_test_lock()
                 .lock_owned()
@@ -17203,7 +17202,9 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_async_ingest_worker_stops_on_terminal_claim_failure() {
-        let _worker_lifecycle_lock = INGEST_WORKER_LIFECYCLE_TEST_LOCK.lock().await;
+        let _worker_lifecycle_lock = global_ingest_worker_lifecycle_test_lock()
+            .lock_owned()
+            .await;
         let _observability_lock =
             crate::observability::test_support::global_observability_test_lock()
                 .lock_owned()
