@@ -16,7 +16,7 @@ fn default_importance_config() -> ImportanceConfig {
     ImportanceConfig::default()
 }
 
-fn setup_home(tmp: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+fn setup_home(tmp: &TempDir) -> (std::path::PathBuf, Database) {
     let home = tmp.path().join("home");
     let mempal_home = home.join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create .mempal dir");
@@ -34,17 +34,16 @@ backend = "stub"
         ),
     )
     .expect("write config");
-    Database::open(&db_path).expect("initialize db");
-    (home, db_path)
+    let db = Database::open(&db_path).expect("initialize db");
+    (home, db)
 }
 
-fn insert_test_drawer(db_path: &std::path::Path, id: &str, wing: &str, importance: i32) {
+fn insert_test_drawer(db: &Database, id: &str, wing: &str, importance: i32) {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(1_746_000_000);
-    let db = Database::open(db_path).expect("open db");
     db.insert_drawer(&Drawer {
         id: id.to_string(),
         content: format!("test content for {id}"),
@@ -66,8 +65,7 @@ fn insert_test_drawer(db_path: &std::path::Path, id: &str, wing: &str, importanc
         .expect("backfill initial effective_importance");
 }
 
-fn read_effective_importance(db_path: &std::path::Path, id: &str) -> f64 {
-    let db = Database::open(db_path).expect("open db");
+fn read_effective_importance(db: &Database, id: &str) -> f64 {
     db.conn()
         .query_row(
             "SELECT COALESCE(effective_importance, CAST(COALESCE(importance, 0) AS REAL)) FROM drawers WHERE id = ?1",
@@ -77,8 +75,7 @@ fn read_effective_importance(db_path: &std::path::Path, id: &str) -> f64 {
         .expect("read effective_importance")
 }
 
-fn read_access_count(db_path: &std::path::Path, id: &str) -> i64 {
-    let db = Database::open(db_path).expect("open db");
+fn read_access_count(db: &Database, id: &str) -> i64 {
     db.conn()
         .query_row(
             "SELECT COALESCE(access_count, 0) FROM drawers WHERE id = ?1",
@@ -88,8 +85,7 @@ fn read_access_count(db_path: &std::path::Path, id: &str) -> i64 {
         .expect("read access_count")
 }
 
-fn read_last_accessed_at(db_path: &std::path::Path, id: &str) -> Option<i64> {
-    let db = Database::open(db_path).expect("open db");
+fn read_last_accessed_at(db: &Database, id: &str) -> Option<i64> {
     db.conn()
         .query_row(
             "SELECT last_accessed_at FROM drawers WHERE id = ?1",
@@ -185,7 +181,7 @@ fn test_fork_ext_migration_v10_sets_effective_importance_from_importance() {
     .expect("insert drawer");
 
     // effective_importance should be readable and >= 0
-    let eff = read_effective_importance(&db_path, "drawer-imp-check");
+    let eff = read_effective_importance(&db, "drawer-imp-check");
     assert!(
         eff >= 0.0,
         "effective_importance should be non-negative: {eff}"
@@ -195,16 +191,15 @@ fn test_fork_ext_migration_v10_sets_effective_importance_from_importance() {
 #[test]
 fn test_search_hit_updates_access_fields_async() {
     let tmp = TempDir::new().expect("tempdir");
-    let (_, db_path) = setup_home(&tmp);
+    let (_, db) = setup_home(&tmp);
 
-    insert_test_drawer(&db_path, "drawer-access-test", "default", 2);
+    insert_test_drawer(&db, "drawer-access-test", "default", 2);
 
     // Verify initial state
-    assert_eq!(read_access_count(&db_path, "drawer-access-test"), 0);
-    assert!(read_last_accessed_at(&db_path, "drawer-access-test").is_none());
+    assert_eq!(read_access_count(&db, "drawer-access-test"), 0);
+    assert!(read_last_accessed_at(&db, "drawer-access-test").is_none());
 
     // Directly call the DB function that the async search path calls
-    let db = Database::open(&db_path).expect("open db");
     use std::time::{SystemTime, UNIX_EPOCH};
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -221,12 +216,12 @@ fn test_search_hit_updates_access_fields_async() {
     .expect("update access fields");
 
     assert_eq!(
-        read_access_count(&db_path, "drawer-access-test"),
+        read_access_count(&db, "drawer-access-test"),
         1,
         "access_count should be incremented"
     );
     assert!(
-        read_last_accessed_at(&db_path, "drawer-access-test").is_some(),
+        read_last_accessed_at(&db, "drawer-access-test").is_some(),
         "last_accessed_at should be set"
     );
 }
@@ -234,14 +229,13 @@ fn test_search_hit_updates_access_fields_async() {
 #[test]
 fn test_session_ingest_boosts_hit_drawers() {
     let tmp = TempDir::new().expect("tempdir");
-    let (_, db_path) = setup_home(&tmp);
+    let (_, db) = setup_home(&tmp);
 
-    insert_test_drawer(&db_path, "drawer-boost-test", "default", 2);
+    insert_test_drawer(&db, "drawer-boost-test", "default", 2);
 
-    let initial_eff = read_effective_importance(&db_path, "drawer-boost-test");
+    let initial_eff = read_effective_importance(&db, "drawer-boost-test");
 
     // Simulate the boost that mempal_ingest applies after search hits
-    let db = Database::open(&db_path).expect("open db");
     use std::time::{SystemTime, UNIX_EPOCH};
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -258,7 +252,7 @@ fn test_session_ingest_boosts_hit_drawers() {
     )
     .expect("apply ingest boost");
 
-    let boosted_eff = read_effective_importance(&db_path, "drawer-boost-test");
+    let boosted_eff = read_effective_importance(&db, "drawer-boost-test");
     assert!(
         boosted_eff > initial_eff,
         "boost must increase effective_importance: {boosted_eff} > {initial_eff}"
@@ -268,12 +262,11 @@ fn test_session_ingest_boosts_hit_drawers() {
 #[test]
 fn test_stale_kg_triple_penalizes_importance() {
     let tmp = TempDir::new().expect("tempdir");
-    let (_, db_path) = setup_home(&tmp);
+    let (_, db) = setup_home(&tmp);
 
-    insert_test_drawer(&db_path, "drawer-stale-test", "default", 3);
+    insert_test_drawer(&db, "drawer-stale-test", "default", 3);
 
     // Set effective_importance to 3.0 explicitly
-    let db = Database::open(&db_path).expect("open db");
     db.conn()
         .execute(
             "UPDATE drawers SET effective_importance = 3.0 WHERE id = 'drawer-stale-test'",
@@ -300,7 +293,7 @@ fn test_stale_kg_triple_penalizes_importance() {
     db.apply_stale_penalty_to_drawer("drawer-stale-test", config.stale_penalty)
         .expect("apply stale penalty");
 
-    let penalized_eff = read_effective_importance(&db_path, "drawer-stale-test");
+    let penalized_eff = read_effective_importance(&db, "drawer-stale-test");
     let expected = 3.0 * config.stale_penalty;
     assert!(
         (penalized_eff - expected).abs() < 1e-6,
@@ -327,13 +320,12 @@ fn test_stale_kg_triple_penalizes_importance() {
 #[test]
 fn test_audit_stale_surfaces_decayed_drawers() {
     let tmp = TempDir::new().expect("tempdir");
-    let (home, db_path) = setup_home(&tmp);
+    let (home, db) = setup_home(&tmp);
 
-    insert_test_drawer(&db_path, "drawer-low-imp", "default", 1);
-    insert_test_drawer(&db_path, "drawer-high-imp", "default", 3);
+    insert_test_drawer(&db, "drawer-low-imp", "default", 1);
+    insert_test_drawer(&db, "drawer-high-imp", "default", 3);
 
     // Set explicit effective_importance values
-    let db = Database::open(&db_path).expect("open db");
     db.conn()
         .execute(
             "UPDATE drawers SET effective_importance = 0.4 WHERE id = 'drawer-low-imp'",
@@ -420,10 +412,11 @@ fn test_search_result_dto_includes_effective_importance() {
 #[test]
 fn test_recompute_all_effective_importance_cli() {
     let tmp = TempDir::new().expect("tempdir");
-    let (home, db_path) = setup_home(&tmp);
+    let (home, db) = setup_home(&tmp);
 
-    insert_test_drawer(&db_path, "drawer-recompute-1", "default", 2);
-    insert_test_drawer(&db_path, "drawer-recompute-2", "default", 4);
+    insert_test_drawer(&db, "drawer-recompute-1", "default", 2);
+    insert_test_drawer(&db, "drawer-recompute-2", "default", 4);
+    drop(db);
 
     let output = Command::new(mempal_bin())
         .env("HOME", &home)
