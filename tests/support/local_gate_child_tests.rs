@@ -451,9 +451,9 @@ mod tests {
             "a read-end-only sibling must not be signaled by pipe fallback cleanup: {fallback_error}"
         );
     }
-
     #[test]
     fn reaped_leader_performs_a_final_pipe_descendant_discovery() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let fixture = tempfile::tempdir().expect("create post-reap escape fixture");
         let release_file = fixture.path().join("release");
         let ready_file = fixture.path().join("ready");
@@ -503,7 +503,6 @@ mod tests {
         );
         assert_process_identity_gone_within(escaped, Duration::from_secs(1));
     }
-
     #[test]
     fn discovers_children_created_by_non_leader_threads() {
         let parent_pid = i32::try_from(std::process::id()).expect("test process PID fits i32");
@@ -579,7 +578,6 @@ mod tests {
         cleanup_result.expect("pipe cleanup must complete after scanning unrelated processes");
         unrelated_cleanup.expect("clean up non-UTF-8 comm fixture");
     }
-
     #[test]
     fn gate_child_wait_timeout_reaps_descendants_that_hold_pipes() {
         let fixture = tempfile::tempdir().expect("create pipe-holder fixture");
@@ -622,6 +620,7 @@ mod tests {
     }
     #[test]
     fn gate_child_timeout_terminates_setsid_escape_without_hanging() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let fixture = tempfile::tempdir().expect("create setsid pipe-holder fixture");
         let ready_file = fixture.path().join("ready");
         let pid_file = fixture.path().join("pid");
@@ -653,6 +652,7 @@ mod tests {
 
     #[test]
     fn gate_child_drop_terminates_setsid_escape_without_hanging() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let fixture = tempfile::tempdir().expect("create setsid drop fixture");
         let ready_file = fixture.path().join("ready");
         let pid_file = fixture.path().join("pid");
@@ -680,9 +680,9 @@ mod tests {
         );
         assert_process_identity_gone_within(escaped, Duration::from_secs(1));
     }
-
     #[test]
     fn gate_child_reaps_setsid_escape_after_leader_exits() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let fixture = tempfile::tempdir().expect("create exited-leader fixture");
         let ready_file = fixture.path().join("ready");
         let pid_file = fixture.path().join("pid");

@@ -28,8 +28,6 @@ const ASYNC_DB_CONNECTION_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const COEXISTENCE_DRAWER_ID: &str = "issue-853-live-mcp";
 const MCP_DESCENDANT_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const MCP_DESCENDANT_REAP_POLL_INTERVAL: Duration = Duration::from_millis(50);
-// ponytail: serialize MCP child fixtures in this binary; split by family if throughput matters.
-static PROCESS_LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct TestHome {
     _tempdir: TempDir,
@@ -437,14 +435,14 @@ async fn assert_daemon_coexists_with_mcp_count(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_coexists_with_one_and_two_writer_capable_mcp_servers() -> Result<()> {
-    let _process_lock = PROCESS_LIFECYCLE_TEST_LOCK.lock().await;
+    let _process_lock = local_gate_child::PROCESS_LIFECYCLE_TEST_LOCK.lock().await;
     assert_daemon_coexists_with_mcp_count(1, true).await?;
     assert_daemon_coexists_with_mcp_count(2, true).await
 }
 
 #[tokio::test]
 async fn mcp_lifecycle_timeouts_reap_hostile_children() -> Result<()> {
-    let _process_lock = PROCESS_LIFECYCLE_TEST_LOCK.lock().await;
+    let _process_lock = local_gate_child::PROCESS_LIFECYCLE_TEST_LOCK.lock().await;
     let tempdir = TempDir::new_in("/tmp").context("create hostile MCP test directory")?;
     let initialize_descendant = tempdir.path().join("initialize-descendant.pid");
     let mut initializing = spawn_hostile_mcp(false, &initialize_descendant)?;
@@ -487,7 +485,7 @@ async fn mcp_lifecycle_timeouts_reap_hostile_children() -> Result<()> {
 
 #[tokio::test]
 async fn mcp_drop_fences_descendant_after_malformed_initialize() -> Result<()> {
-    let _process_lock = PROCESS_LIFECYCLE_TEST_LOCK.lock().await;
+    let _process_lock = local_gate_child::PROCESS_LIFECYCLE_TEST_LOCK.lock().await;
     let tempdir = TempDir::new_in("/tmp").context("create malformed MCP test directory")?;
     let descendant = tempdir.path().join("malformed-initialize-descendant.pid");
     let mut client = spawn_malformed_initialize_mcp(&descendant)?;
@@ -507,7 +505,7 @@ async fn mcp_drop_fences_descendant_after_malformed_initialize() -> Result<()> {
 
 #[tokio::test]
 async fn mcp_graceful_shutdown_fences_surviving_descendant_before_reap() -> Result<()> {
-    let _process_lock = PROCESS_LIFECYCLE_TEST_LOCK.lock().await;
+    let _process_lock = local_gate_child::PROCESS_LIFECYCLE_TEST_LOCK.lock().await;
     let tempdir = TempDir::new_in("/tmp").context("create graceful MCP test directory")?;
     let descendant = tempdir.path().join("graceful-descendant.pid");
     let mut client = spawn_graceful_mcp_with_descendant(&descendant)?;
@@ -521,7 +519,7 @@ async fn mcp_graceful_shutdown_fences_surviving_descendant_before_reap() -> Resu
 
 #[tokio::test]
 async fn process_exit_check_never_signals_reused_pid() -> Result<()> {
-    let _process_lock = PROCESS_LIFECYCLE_TEST_LOCK.lock().await;
+    let _process_lock = local_gate_child::PROCESS_LIFECYCLE_TEST_LOCK.lock().await;
     let tempdir = TempDir::new_in("/tmp").context("create reused PID test directory")?;
     let identity_path = tempdir.path().join("reused.identity");
     let pid = std::process::id() as i32;

@@ -16759,10 +16759,13 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_ingest_wait_budget_includes_queue_admission() {
+        let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (_tempdir, db_path, server) = setup_server();
         let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
             .with_blocking_delay(Duration::from_millis(1200));
-        let server = server.with_async_queue_for_test(async_queue);
+        let server = server
+            .with_async_queue_for_test(async_queue)
+            .with_daemon_writer_lease_check_error_for_test("skip unrelated lease probe");
 
         let response = tokio::time::timeout(
             Duration::from_millis(1700),

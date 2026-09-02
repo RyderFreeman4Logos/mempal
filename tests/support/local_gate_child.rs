@@ -764,6 +764,20 @@ fn receive_pipe_output(
     }
 }
 
+#[cfg(test)]
+// ponytail: one process-lifecycle class lock; split by fixture family if throughput matters.
+pub(crate) static PROCESS_LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+fn process_lifecycle_test_lock_blocking() -> tokio::sync::MutexGuard<'static, ()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build process lifecycle test lock runtime")
+        .block_on(PROCESS_LIFECYCLE_TEST_LOCK.lock())
+}
+
 include!("local_gate_child_tests.rs");
 include!("local_gate_child_regression_tests.rs");
 include!("local_gate_monitor_tests.rs");
