@@ -16596,7 +16596,8 @@ pattern_boost = 0.2
         let (_tempdir, _db_path, server) = setup_server();
         let server = server
             .with_ingest_warning_snapshot_delay_for_test(Duration::from_millis(150))
-            .with_mcp_deadline_for_test(Duration::from_millis(20));
+            .with_mcp_deadline_for_test(Duration::from_millis(20))
+            .with_daemon_writer_lease_check_error_for_test("skip unrelated lease probe");
 
         let result = tokio::time::timeout(
             Duration::from_millis(500),
