@@ -20,8 +20,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - `cowork_peek_command`/`mempal_peek_partner` cwd flag peeks a partner session per project (P108).
 - Ingest tool/protocol text steers knowledge-only fields to distill before rejection (P107).
 - `upstream-sync` skill with `.upstream-sync.json` for selective upstream ports.
-- Full smoke coverage for enabled search rerankers, including fallback-warning units.
-- Search latency note for #652: hybrid pipeline, sqlite-vec shape, brute-force scan path.
+- Reranker smoke and #652 latency note (hybrid/sqlite-vec/brute-force).
 
 ### Fixed
 
@@ -40,10 +39,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - **Hermes receipts**: scoped smoke ingest inline; live-daemon polls `created_drawer_ids`; already-soft-deleted `mempal_delete` succeeds; cleanup IDs survive CLI/MCP/REST decode; breaker-open conclude replay is structured pending success, not tool error; open REST/Hermes breakers admit `mempal_search`/`mempal_profile` probes with typed/redacted payloads; daemon down with ≥100 pending → `doctor`/`status`/MCP doctor emit high-severity typed availability signal; unreadable config/queue stats/unverified PIDs → privacy-safe `unavailable`; recovery: drain, terminal failures, no DB edits; saturated MCP holder-budget no-write receipts and owner-bound smoke cleanup prevent false receipts/cross-operation cleanup IDs; MCP empty/invalid/failed roots resolve to no project (#871, #876, #888, #918, #921, #923, #924, #927, #936).
 
 - **Daemon SQLite busy**: lease renew retries Busy/locked (#929); startup busy/lock exits 75; systemd avoids churn beside extra MCP holders (#931); post-merge REST install recycles daemon (#928, #940); Hermes writes authoritative; local conclusions avoid breaker retrips (#941).
-- **MCP search deadlines**: `with_mcp_deadline_for_test` bounds embed and DB/route paths so deadline fixtures cannot hang on 240s embed timeout.
+- **MCP search deadlines**: test helper bounds embed/DB/route so fixtures cannot hang on 240s.
 - **Admission fixture**: retry admission Busy in oversubscribe; suite waits aren't budget failures.
 - **Hermetic live-daemon tests**: isolate REST/MCP/ingest-wait/mark-failed/dashboard so exact-gates skip live `:3080`; timeout wrapper reaps owned trees, authenticates idle sccache via exe, treats absent /proc as exit (#988, #989, #973, #991, #993, #1011).
-- Lease/Busy/backoff/cancel (#882/#889/#890,#944/#956/#958/#961/#962/#965/#971/#975/#976/#968,#1013,#1010,#1009,#1008,#1023/#1024,#1006/#1007,#1027,#1005,#1029,#1004,#1031,#980,#1003,#1002,#1001).
+- Lease/Busy/backoff/cancel (#882/#889/#890,#944/#956/#958/#961/#962/#965/#971/#975/#976/#968,#1013,#1010,#1009,#1008,#1023/#1024,#1006/#1007,#1027,#1005,#1029,#1004,#1031,#980,#1003,#1002,#1001,#1035).
 - **MCP delete retry fixture**: force observed SQLite Busy before synchronized lock release (#886).
 
 - **Daemon supervisor cooldowns**: wait through active restart-budget

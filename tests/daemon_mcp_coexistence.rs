@@ -435,12 +435,14 @@ async fn assert_daemon_coexists_with_mcp_count(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_coexists_with_one_and_two_writer_capable_mcp_servers() -> Result<()> {
+    let _process_lock = local_gate_child::process_lifecycle_test_lock().lock().await;
     assert_daemon_coexists_with_mcp_count(1, true).await?;
     assert_daemon_coexists_with_mcp_count(2, true).await
 }
 
 #[tokio::test]
 async fn mcp_lifecycle_timeouts_reap_hostile_children() -> Result<()> {
+    let _process_lock = local_gate_child::process_lifecycle_test_lock().lock().await;
     let tempdir = TempDir::new_in("/tmp").context("create hostile MCP test directory")?;
     let initialize_descendant = tempdir.path().join("initialize-descendant.pid");
     let mut initializing = spawn_hostile_mcp(false, &initialize_descendant)?;
@@ -483,6 +485,7 @@ async fn mcp_lifecycle_timeouts_reap_hostile_children() -> Result<()> {
 
 #[tokio::test]
 async fn mcp_drop_fences_descendant_after_malformed_initialize() -> Result<()> {
+    let _process_lock = local_gate_child::process_lifecycle_test_lock().lock().await;
     let tempdir = TempDir::new_in("/tmp").context("create malformed MCP test directory")?;
     let descendant = tempdir.path().join("malformed-initialize-descendant.pid");
     let mut client = spawn_malformed_initialize_mcp(&descendant)?;
@@ -502,6 +505,7 @@ async fn mcp_drop_fences_descendant_after_malformed_initialize() -> Result<()> {
 
 #[tokio::test]
 async fn mcp_graceful_shutdown_fences_surviving_descendant_before_reap() -> Result<()> {
+    let _process_lock = local_gate_child::process_lifecycle_test_lock().lock().await;
     let tempdir = TempDir::new_in("/tmp").context("create graceful MCP test directory")?;
     let descendant = tempdir.path().join("graceful-descendant.pid");
     let mut client = spawn_graceful_mcp_with_descendant(&descendant)?;
@@ -515,6 +519,7 @@ async fn mcp_graceful_shutdown_fences_surviving_descendant_before_reap() -> Resu
 
 #[tokio::test]
 async fn process_exit_check_never_signals_reused_pid() -> Result<()> {
+    let _process_lock = local_gate_child::process_lifecycle_test_lock().lock().await;
     let tempdir = TempDir::new_in("/tmp").context("create reused PID test directory")?;
     let identity_path = tempdir.path().join("reused.identity");
     let pid = std::process::id() as i32;
@@ -544,6 +549,7 @@ async fn process_exit_check_never_signals_reused_pid() -> Result<()> {
 
 #[test]
 fn daemon_refuses_a_live_incompatible_writer_lease_without_takeover() -> Result<()> {
+    let _process_lock = local_gate_child::process_lifecycle_test_lock_blocking();
     let test_home = TestHome::new()?;
     let lease_db = Database::open(&test_home.db_path).context("open writer lease fixture")?;
     let lease = lease_db
