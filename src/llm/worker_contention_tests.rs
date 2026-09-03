@@ -2,6 +2,7 @@ use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_worker_successful_claim_clears_observed_contention() {
+    let _worker_guard = crate::llm::global_llm_worker_test_lock().lock_owned().await;
     let _guard = crate::core::config::global_config_test_lock()
         .lock_owned()
         .await;
@@ -121,6 +122,7 @@ async fn test_worker_successful_claim_clears_observed_contention() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_worker_survives_mark_failed_lock_contention() {
+    let _worker_guard = crate::llm::global_llm_worker_test_lock().lock_owned().await;
     let _guard = crate::core::config::global_config_test_lock()
         .lock_owned()
         .await;

@@ -399,6 +399,7 @@ impl Drop for ConfigHarnessResetGuard {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_worker_observes_client_preparation_release_lock() {
+    let _worker_guard = crate::llm::global_llm_worker_test_lock().lock_owned().await;
     let _guard = crate::core::config::global_config_test_lock()
         .lock_owned()
         .await;
@@ -459,6 +460,7 @@ async fn test_worker_observes_client_preparation_release_lock() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_worker_survives_confirm_lock_contention() {
+    let _worker_guard = crate::llm::global_llm_worker_test_lock().lock_owned().await;
     let _guard = crate::core::config::global_config_test_lock()
         .lock_owned()
         .await;
@@ -525,6 +527,7 @@ async fn test_worker_survives_confirm_lock_contention() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_worker_uses_reloaded_client_when_generation_changes_before_claim_returns() {
+    let _worker_guard = crate::llm::global_llm_worker_test_lock().lock_owned().await;
     let _guard = crate::core::config::global_config_test_lock()
         .lock_owned()
         .await;
@@ -615,6 +618,7 @@ async fn test_worker_uses_reloaded_client_when_generation_changes_before_claim_r
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_worker_gating_uses_endpoint_pool_fallback() {
+    let _worker_guard = crate::llm::global_llm_worker_test_lock().lock_owned().await;
     let _guard = crate::core::config::global_config_test_lock()
         .lock_owned()
         .await;
