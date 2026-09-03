@@ -340,10 +340,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/llm/worker.rs"
 kind = "source"
-baseline_tokens = 7113
-baseline_lines = 897
-issue = "858"
-rationale = "#858 LLM heartbeat/confirm/mark_failed/release paths record typed queue SQLite contention; exact no-growth ratchet."
+baseline_tokens = 7168
+baseline_lines = 903
+issue = "1052"
+rationale = "#1052 holds the process-wide worker-test lock on LlmClientRuntime for the runtime lifetime so rest-lib worker tests serialize without per-test locks; exact no-growth ratchet."
 
 [[files]]
 path = "src/longmemeval.rs"

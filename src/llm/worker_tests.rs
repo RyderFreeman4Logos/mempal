@@ -399,7 +399,6 @@ impl Drop for ConfigHarnessResetGuard {
 }
 
 fn with_isolated_llm_worker_runtime(test: impl std::future::Future<Output = ()>) {
-    let _worker_guard = crate::llm::global_llm_worker_test_lock().blocking_lock_owned();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()

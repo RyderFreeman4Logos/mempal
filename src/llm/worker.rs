@@ -67,10 +67,14 @@ impl LlmClientConfigSignature {
 pub struct LlmClientRuntime {
     router: Option<Arc<LlmRouter>>,
     signature: LlmClientConfigSignature,
+    #[cfg(test)]
+    _worker_test_lock: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl LlmClientRuntime {
     pub fn new(config: &LlmConfig) -> Self {
+        #[cfg(test)]
+        let _worker_test_lock = super::acquire_llm_worker_test_lock();
         let router = match LlmRouter::from_config(config) {
             Ok(router) => Some(Arc::new(router)),
             Err(error) => {
@@ -81,6 +85,8 @@ impl LlmClientRuntime {
         Self {
             router,
             signature: LlmClientConfigSignature::new(config, &RemoteCallPolicyConfig::default()),
+            #[cfg(test)]
+            _worker_test_lock,
         }
     }
 

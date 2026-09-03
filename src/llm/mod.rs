@@ -19,3 +19,12 @@ pub(crate) fn global_llm_worker_test_lock() -> Arc<tokio::sync::Mutex<()>> {
     static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
     Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
 }
+
+#[cfg(test)]
+pub(crate) fn acquire_llm_worker_test_lock() -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = global_llm_worker_test_lock();
+    // blocking_lock_owned panics inside Tokio; off-thread acquire is safe from async tests.
+    std::thread::spawn(move || lock.blocking_lock_owned())
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
