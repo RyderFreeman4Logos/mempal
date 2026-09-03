@@ -16059,6 +16059,9 @@ quality_policy = "llm_required_for_keep"
             let tempdir = tempfile::tempdir().expect("config override tempdir");
             let path = tempdir.path().join("override.toml");
             fs::write(&path, toml_contents).expect("write config override");
+            // Stop leaked suite watchers before merge-reload so privacy/config
+            // overrides are not clobbered by an unlocked hot-reload thread.
+            crate::core::config::ConfigHandle::harness_reset();
             crate::core::config::ConfigHandle::harness_reload_from_path(&path);
             Self {
                 _lock: lock,
