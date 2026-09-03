@@ -16677,6 +16677,9 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_ingest_replacement_target_retries_transient_sqlite_lock() {
+        let _worker_lifecycle_lock = global_ingest_worker_lifecycle_test_lock()
+            .lock_owned()
+            .await;
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("palace.db");
         Database::open(&db_path).expect("open db");
