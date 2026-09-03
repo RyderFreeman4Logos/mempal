@@ -2,6 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn test_mcp_ingest_smoke_mode_rejects_non_smoke_scope() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, _db_path, server) = setup_server();
 
     let error = match server
@@ -28,6 +29,7 @@ async fn test_mcp_ingest_smoke_mode_rejects_non_smoke_scope() {
 
 #[tokio::test]
 async fn test_mcp_ingest_smoke_mode_uses_deterministic_local_vector() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let _tempdir = tempfile::tempdir().expect("tempdir");
     let db_path = _tempdir.path().join("palace.db");
     Database::open(&db_path).expect("open db");
@@ -101,6 +103,7 @@ enabled = false
 
 #[tokio::test]
 async fn test_mcp_smoke_wait_processes_without_background_worker() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, _db_path, server) = setup_server();
     server.ingest_worker_started.store(true, Ordering::SeqCst);
 
@@ -128,6 +131,7 @@ async fn test_mcp_smoke_wait_processes_without_background_worker() {
 
 #[tokio::test]
 async fn test_mcp_smoke_zero_wait_starts_background_worker() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, _db_path, server) = setup_server();
 
     let response = server
@@ -160,6 +164,7 @@ async fn test_mcp_smoke_zero_wait_starts_background_worker() {
 
 #[tokio::test]
 async fn test_mcp_positive_smoke_timeout_retains_completion_owner() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, _db_path, server) = setup_server();
     let server = server.with_ingest_processing_delay_for_test(Duration::from_secs(1));
 
@@ -197,6 +202,7 @@ async fn test_mcp_positive_smoke_timeout_retains_completion_owner() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_mcp_smoke_wait_real_source_lock_times_out_without_blocking_runtime() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
     let request = IngestRequest {
         content: "real source lock must not block bounded smoke wait".to_string(),
@@ -265,6 +271,7 @@ async fn test_mcp_smoke_wait_real_source_lock_times_out_without_blocking_runtime
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_mcp_scoped_finite_wait_real_source_lock_runs_off_runtime_and_retains_claim_owner() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
     let request = IngestRequest {
         content: "ordinary finite wait source-lock contention ".repeat(1_000),
@@ -349,6 +356,7 @@ async fn test_mcp_scoped_finite_wait_real_source_lock_runs_off_runtime_and_retai
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_mcp_scoped_finite_lease_timeout_releases_late_acquisition() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let _observability_lock = crate::observability::test_support::global_observability_test_lock()
         .lock_owned()
         .await;
@@ -453,6 +461,7 @@ async fn test_mcp_scoped_smoke_wait_bounds_lease_check_to_remaining_budget() {
 
 #[tokio::test]
 async fn test_mcp_scoped_smoke_preflight_uses_remaining_request_budget() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let _observability_lock = crate::observability::test_support::global_observability_test_lock()
         .lock_owned()
         .await;
@@ -486,6 +495,7 @@ async fn test_mcp_scoped_smoke_preflight_uses_remaining_request_budget() {
 
 #[tokio::test]
 async fn test_mcp_smoke_wait_writer_lease_error_releases_and_starts_drain() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
     let server = server
         .with_ingest_writer_lease_failures_for_test(1)
@@ -536,6 +546,7 @@ async fn test_mcp_smoke_wait_writer_lease_error_releases_and_starts_drain() {
 
 #[tokio::test]
 async fn test_mcp_smoke_ingest_wait_update_and_status_return_created_ids() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
 
     let response = server

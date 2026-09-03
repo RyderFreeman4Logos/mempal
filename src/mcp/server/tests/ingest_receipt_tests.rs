@@ -2,6 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn test_self_held_queue_lock_fails_before_returning_receipts() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
     let queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
         .with_enqueue_lock_failures_for_test(100);
@@ -50,6 +51,7 @@ async fn test_self_held_queue_lock_fails_before_returning_receipts() {
 
 #[tokio::test]
 async fn test_self_held_queue_lock_under_daemon_lease_does_not_start_local_worker() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
     let queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
         .with_enqueue_lock_failures_for_test(1);
@@ -101,6 +103,7 @@ async fn test_self_held_queue_lock_under_daemon_lease_does_not_start_local_worke
 
 #[tokio::test]
 async fn test_cli_style_operation_wait_follows_live_daemon_receipt_to_created_ids() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
     let daemon_lease = hold_daemon_writer_lease(&db_path);
     let waiter = server

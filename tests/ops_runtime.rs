@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use mempal::core::db::{CURRENT_SCHEMA_VERSION, Database};
@@ -15,6 +15,14 @@ fn mempal_bin() -> String {
 
 static LOAD_DOTENV: OnceLock<()> = OnceLock::new();
 const CLI_TIMEOUT: Duration = Duration::from_secs(10);
+// ponytail: one process-local class lock; split by fixture family only if throughput matters.
+static QUEUE_FAILURE_CLASS_LOCK: Mutex<()> = Mutex::new(());
+
+fn acquire_queue_failure_class_lock() -> std::sync::MutexGuard<'static, ()> {
+    QUEUE_FAILURE_CLASS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 struct OwnedTestChild(Child);
 
@@ -455,6 +463,7 @@ fn test_cli_doctor_rejects_unrelated_live_pid_as_daemon_identity() {
 #[test]
 
 fn test_cli_doctor_reports_queue_failure_classes() {
+    let _class_lock = acquire_queue_failure_class_lock();
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
     fs::write(
@@ -539,6 +548,7 @@ fn test_cli_doctor_reports_queue_failure_classes() {
 
 #[test]
 fn test_cli_daemon_status_reports_queue_failure_classes() {
+    let _class_lock = acquire_queue_failure_class_lock();
     let home = TempDir::new_in("/tmp").expect("home");
     let mempal_home = home.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
@@ -546,34 +556,13 @@ fn test_cli_daemon_status_reports_queue_failure_classes() {
     fs::write(
         mempal_home.join("config.toml"),
         format!(
-            "db_path = \"{}\"\n\n[embedder]\nbackend = \"stub\"\n\n[hooks]\nenabled = true\ndaemon_poll_interval_ms = 60000\n\n[daemon]\nlog_path = \"{}\"\n\n[api]\nenabled = false\n",
+            "db_path = \"{}\"\n\n[embed]\nbackend = \"openai_compat\"\nbase_url = \"http://127.0.0.1:1/v1\"\n\n[hooks]\nenabled = true\ndaemon_poll_interval_ms = 60000\n\n[daemon]\nlog_path = \"{}\"\n\n[api]\nenabled = false\n",
             db_path.display(),
             mempal_home.join("daemon.log").display(),
         ),
     )
     .expect("write isolated daemon config");
     Database::open(&db_path).expect("open db");
-
-    let mut command = Command::new(mempal_bin());
-    command
-        .args(["daemon", "--foreground"])
-        .env("HOME", home.path())
-        .env(
-            mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
-            mempal_home.join("runtime"),
-        )
-        .env_remove("MEMPAL_EMBED_BACKEND")
-        .env_remove("MEMPAL_EMBED_BASE_URL")
-        .env_remove("MEMPAL_EMBED_MODEL")
-        .env_remove("MEMPAL_EMBED_DIM")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let _daemon = OwnedTestChild(command.spawn().expect("start daemon"));
-
-    let ready = run_daemon(&home, &["daemon", "wait", "--timeout-secs", "10"]);
-    assert_success(&ready);
-
     let store = PendingMessageStore::new_without_reclaim(&db_path);
 
     let retryable = store
@@ -598,6 +587,26 @@ fn test_cli_daemon_status_reports_queue_failure_classes() {
         )
         .expect("mark terminal failed");
     drop(store);
+
+    let mut command = Command::new(mempal_bin());
+    command
+        .args(["daemon", "--foreground"])
+        .env("HOME", home.path())
+        .env(
+            mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
+            mempal_home.join("runtime"),
+        )
+        .env("MEMPAL_EMBED_BACKEND", "openai_compat")
+        .env("MEMPAL_EMBED_BASE_URL", "http://127.0.0.1:1/v1")
+        .env_remove("MEMPAL_EMBED_MODEL")
+        .env_remove("MEMPAL_EMBED_DIM")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _daemon = OwnedTestChild(command.spawn().expect("start daemon"));
+
+    let ready = run_daemon(&home, &["daemon", "wait", "--timeout-secs", "10"]);
+    assert_success(&ready);
 
     let output = run_daemon(&home, &["daemon", "status"]);
     assert_success(&output);

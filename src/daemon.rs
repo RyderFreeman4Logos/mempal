@@ -493,9 +493,7 @@ pub struct HookLlmGateRuntime {
 impl HookLlmGateRuntime {
     pub fn new(config: &crate::core::config::LlmConfig) -> Self {
         Self {
-            client_runtime: Arc::new(Mutex::new(crate::llm::worker::LlmClientRuntime::new(
-                config,
-            ))),
+            client_runtime: crate::llm::worker::SharedLlmClientRuntime::new(config),
             status: Arc::new(crate::llm::LlmStatus::new(10)),
         }
     }
@@ -3294,6 +3292,13 @@ fn shutdown_notify() -> &'static Notify {
 
 #[cfg(test)]
 pub(crate) fn global_shutdown_test_lock() -> Arc<tokio::sync::Mutex<()>> {
+    static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
+}
+
+#[cfg(test)]
+pub(crate) fn global_rest_listen_test_lock() -> Arc<tokio::sync::Mutex<()>> {
+    // ponytail: process-wide REST-listen class lock; split by listener family if throughput matters.
     static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
     Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
 }

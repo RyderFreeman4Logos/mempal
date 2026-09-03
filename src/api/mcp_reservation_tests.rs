@@ -2,6 +2,9 @@ use super::*;
 
 #[tokio::test]
 async fn daemon_mcp_listen_port_reserves_session_activity_before_eviction() -> Result<()> {
+    let _rest_listen = crate::daemon::global_rest_listen_test_lock()
+        .lock_owned()
+        .await;
     let (_tempdir, db_path, _config, server) = fixture()?;
     let daemon_db =
         AsyncDb::open_for(&db_path, 4, DbHolderClass::Daemon).context("open daemon-owned pool")?;
@@ -97,6 +100,9 @@ async fn daemon_mcp_listen_port_reserves_session_activity_before_eviction() -> R
 
 #[tokio::test]
 async fn daemon_mcp_listen_port_rejects_expired_session_on_lookup() -> Result<()> {
+    let _rest_listen = crate::daemon::global_rest_listen_test_lock()
+        .lock_owned()
+        .await;
     let (_tempdir, db_path, _config, server) = fixture()?;
     let daemon_db =
         AsyncDb::open_for(&db_path, 4, DbHolderClass::Daemon).context("open daemon-owned pool")?;
@@ -151,6 +157,9 @@ async fn daemon_mcp_listen_port_rejects_expired_session_on_lookup() -> Result<()
 
 #[tokio::test(flavor = "current_thread")]
 async fn daemon_mcp_listen_port_releases_pending_session_on_initialize_cancel() -> Result<()> {
+    let _rest_listen = crate::daemon::global_rest_listen_test_lock()
+        .lock_owned()
+        .await;
     let (_tempdir, db_path, _config, server) = fixture()?;
     let daemon_db =
         AsyncDb::open_for(&db_path, 4, DbHolderClass::Daemon).context("open daemon-owned pool")?;

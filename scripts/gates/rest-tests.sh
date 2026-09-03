@@ -150,7 +150,10 @@ echo "rest target batch size: ${REST_TEST_TARGETS_PER_BATCH}"
 echo "rest cargo target dir: ${CARGO_TARGET_DIR}"
 echo "rest cargo build jobs: ${CARGO_BUILD_JOBS}"
 
-run_cargo_test --workspace --features rest --lib --bins
+# #1052: rest-lib test_worker_* observer/contention tests get their own cargo
+# process instead of running inside the parallel --lib suite.
+run_cargo_test --workspace --features rest --lib --bins -- --skip test_worker_
+run_cargo_test --workspace --features rest --lib test_worker_
 run_cargo_test --workspace --features rest --doc
 clean_mempal_artifacts
 

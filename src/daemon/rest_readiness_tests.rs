@@ -21,8 +21,8 @@ use crate::{
 };
 
 use super::{
-    global_shutdown_test_lock, notify_systemd_ready, request_shutdown, reset_shutdown_request,
-    run_loop,
+    global_rest_listen_test_lock, global_shutdown_test_lock, notify_systemd_ready,
+    request_shutdown, reset_shutdown_request, run_loop,
 };
 
 static NOTIFY_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -91,10 +91,14 @@ async fn receive_notify_packet(
         Err(_) => None,
     }
 }
-async fn acquire_shutdown_test_lock() -> tokio::sync::OwnedMutexGuard<()> {
+async fn acquire_shutdown_test_lock() -> (
+    tokio::sync::OwnedMutexGuard<()>,
+    tokio::sync::OwnedMutexGuard<()>,
+) {
+    let rest = global_rest_listen_test_lock().lock_owned().await;
     let lock = global_shutdown_test_lock().lock_owned().await;
     reset_shutdown_request();
-    lock
+    (rest, lock)
 }
 async fn assert_no_ready_packet(socket: &tokio::net::UnixDatagram, message: &str) {
     assert!(
@@ -335,8 +339,6 @@ async fn daemon_ready_requires_a_serving_rest_listener_and_rejects_bind_failure(
 }
 #[tokio::test]
 async fn systemd_ready_rejects_a_writer_lease_lost_after_admission() {
-    let _shutdown_lock = acquire_shutdown_test_lock().await;
-
     let tempdir = tempfile::tempdir().expect("create stale writer lease fixture");
     let notify_path = tempdir.path().join("notify.sock");
     let notify_socket = tokio::net::UnixDatagram::bind(&notify_path)
@@ -345,7 +347,6 @@ async fn systemd_ready_rejects_a_writer_lease_lost_after_admission() {
         &tempdir,
         "127.0.0.1:0".parse().expect("parse ephemeral REST address"),
     );
-    let _process_env = NotifySocketEnv::set_with_home(&notify_path, tempdir.path());
     let (events, _receiver) = tokio::sync::mpsc::channel(16);
     let context = bootstrap_fixture(config_path, &tempdir, events).await;
     context
@@ -366,6 +367,8 @@ async fn systemd_ready_rejects_a_writer_lease_lost_after_admission() {
              END;",
         )
         .expect("install stale writer lease fixture trigger");
+    let _shutdown_lock = acquire_shutdown_test_lock().await;
+    let _process_env = NotifySocketEnv::set_with_home(&notify_path, tempdir.path());
     let result = run_loop_with_timeout(context).await;
     assert_no_ready_packet(&notify_socket, "stale writer lease must not send READY=1").await;
     let error = result.expect_err("stale writer lease must fail final readiness");
@@ -413,6 +416,7 @@ fn fill_notify_receiver_queue(path: &Path) -> Vec<StdUnixDatagram> {
 #[cfg(target_os = "linux")]
 #[test]
 fn systemd_notify_returns_bounded_error_when_receiver_queue_is_full() {
+    let _rest_lock = global_rest_listen_test_lock().blocking_lock_owned();
     let tempdir = tempfile::tempdir().expect("create full notification queue fixture");
     let notify_path = tempdir.path().join("notify.sock");
     let receiver = StdUnixDatagram::bind(&notify_path).expect("bind full notification receiver");
@@ -470,13 +474,12 @@ fn systemd_notify_returns_bounded_error_when_receiver_queue_is_full() {
 }
 #[tokio::test]
 async fn systemd_notify_empty_socket_values_fail_bounded_without_leaking_value() {
-    let _shutdown_lock = acquire_shutdown_test_lock().await;
-
     for value in [OsString::new(), OsString::from("@")] {
         let tempdir = tempfile::tempdir().expect("create empty notification fixture");
         let (_db_path, config_path) = write_fixture(&tempdir, "127.0.0.1:0".parse().unwrap());
         let (events, _receiver) = tokio::sync::mpsc::channel(16);
         let context = bootstrap_fixture(config_path, &tempdir, events).await;
+        let _shutdown_lock = acquire_shutdown_test_lock().await;
         let result = {
             let _notify_env = NotifySocketEnv::set_value(value.clone());
             run_loop_with_timeout(context).await
@@ -499,6 +502,7 @@ async fn systemd_notify_empty_socket_values_fail_bounded_without_leaking_value()
 fn systemd_notify_rejects_bound_empty_abstract_address_without_sending() {
     use std::io::ErrorKind;
 
+    let _rest_lock = global_rest_listen_test_lock().blocking_lock_owned();
     let address = UnixSocketAddr::from_abstract_name("")
         .expect("empty abstract address should be constructible");
     let receiver = StdUnixDatagram::bind_addr(&address).expect("bind empty abstract receiver");
@@ -527,6 +531,7 @@ fn systemd_notify_rejects_bound_empty_abstract_address_without_sending() {
 #[cfg(target_os = "linux")]
 #[test]
 fn systemd_notify_delivers_to_non_unicode_abstract_address() {
+    let _rest_lock = global_rest_listen_test_lock().blocking_lock_owned();
     let abstract_name = b"mempal-\xff".to_vec();
     let address = UnixSocketAddr::from_abstract_name(&abstract_name)
         .expect("non-Unicode abstract address should be constructible");
@@ -566,10 +571,9 @@ fn systemd_notify_delivers_to_non_unicode_abstract_address() {
 }
 #[tokio::test]
 async fn systemd_notify_send_failure_is_propagated_without_leaking_socket_path() {
-    let _shutdown_lock = acquire_shutdown_test_lock().await;
-
     let tempdir = tempfile::tempdir().expect("create notification failure fixture");
     let notify_path = tempdir.path().join("notify-secret-path.sock");
+    let _shutdown_lock = acquire_shutdown_test_lock().await;
     let api_addr = reserve_rest_address().await;
     let (db_path, config_path) = write_fixture(&tempdir, api_addr);
     let (events, _receiver) = tokio::sync::mpsc::channel(16);
@@ -594,9 +598,8 @@ async fn systemd_notify_send_failure_is_propagated_without_leaking_socket_path()
 }
 #[tokio::test]
 async fn run_loop_timeout_drains_children_before_restoring_notify_environment() {
-    let _shutdown_lock = acquire_shutdown_test_lock().await;
-
     let tempdir = tempfile::tempdir().expect("create timeout cleanup fixture");
+    let _shutdown_lock = acquire_shutdown_test_lock().await;
     let api_addr = reserve_rest_address().await;
     let (_db_path, config_path) = write_fixture(&tempdir, api_addr);
     let (events, _receiver) = tokio::sync::mpsc::channel(16);
@@ -616,13 +619,12 @@ async fn run_loop_timeout_drains_children_before_restoring_notify_environment() 
 }
 #[tokio::test]
 async fn systemd_notify_non_unicode_socket_value_is_an_error() {
-    let _shutdown_lock = acquire_shutdown_test_lock().await;
-
     let tempdir = tempfile::tempdir().expect("create non-Unicode notification fixture");
     let (_db_path, config_path) = write_fixture(&tempdir, "127.0.0.1:0".parse().unwrap());
     let (events, _receiver) = tokio::sync::mpsc::channel(16);
     let context = bootstrap_fixture(config_path, &tempdir, events).await;
 
+    let _shutdown_lock = acquire_shutdown_test_lock().await;
     let result = {
         let _notify_env = NotifySocketEnv::set_value(OsString::from_vec(vec![
             b'/', b'n', b'o', b't', b'i', b'f', b'y', b'-', 0xff,
@@ -639,14 +641,13 @@ async fn systemd_notify_non_unicode_socket_value_is_an_error() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn systemd_notify_abstract_address_errors_are_propagated() {
-    let _shutdown_lock = acquire_shutdown_test_lock().await;
-
     let tempdir = tempfile::tempdir().expect("create abstract notification fixture");
     let abstract_name = "x".repeat(256);
     let (_db_path, config_path) = write_fixture(&tempdir, "127.0.0.1:0".parse().unwrap());
     let (events, _receiver) = tokio::sync::mpsc::channel(16);
     let context = bootstrap_fixture(config_path, &tempdir, events).await;
 
+    let _shutdown_lock = acquire_shutdown_test_lock().await;
     let result = {
         let _notify_env = NotifySocketEnv::set_value(OsString::from(format!("@{abstract_name}")));
         run_loop_with_timeout(context).await
@@ -664,8 +665,6 @@ async fn systemd_notify_abstract_address_errors_are_propagated() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn systemd_notify_supports_linux_abstract_namespace() {
-    let _shutdown_lock = acquire_shutdown_test_lock().await;
-
     let tempdir = tempfile::tempdir().expect("create abstract notification fixture");
     let abstract_name = format!("mempal-notify-{}", std::process::id());
     let address = UnixSocketAddr::from_abstract_name(&abstract_name).expect("abstract address");
@@ -679,6 +678,7 @@ async fn systemd_notify_supports_linux_abstract_namespace() {
     let (events, _receiver) = tokio::sync::mpsc::channel(16);
     let context = bootstrap_fixture(config_path, &tempdir, events).await;
 
+    let _shutdown_lock = acquire_shutdown_test_lock().await;
     let (packet, second_packet, run_result) = {
         let _notify_env = NotifySocketEnv::set_value(OsString::from(format!("@{abstract_name}")));
         let run_task = tokio::spawn(async move { run_loop(&context).await });
@@ -700,8 +700,6 @@ async fn systemd_notify_supports_linux_abstract_namespace() {
 }
 #[tokio::test]
 async fn systemd_notify_fails_when_api_is_disabled() {
-    let _shutdown_lock = acquire_shutdown_test_lock().await;
-
     let tempdir = tempfile::tempdir().expect("create API-disabled notification fixture");
     let notify_path = tempdir.path().join("notify.sock");
     let notify_socket = tokio::net::UnixDatagram::bind(&notify_path)
@@ -711,6 +709,7 @@ async fn systemd_notify_fails_when_api_is_disabled() {
     let (events, _receiver) = tokio::sync::mpsc::channel(16);
     let context = bootstrap_fixture(config_path, &tempdir, events).await;
 
+    let _shutdown_lock = acquire_shutdown_test_lock().await;
     let result = {
         let _notify_env = NotifySocketEnv::set(&notify_path);
         run_loop_with_timeout(context).await
@@ -728,9 +727,8 @@ async fn systemd_notify_fails_when_api_is_disabled() {
 }
 #[tokio::test]
 async fn recovery_publication_failure_returns_error_without_ready_or_child_leaks() {
-    let _shutdown_lock = acquire_shutdown_test_lock().await;
-
     let tempdir = tempfile::tempdir().expect("create recovery publication fixture");
+    let _shutdown_lock = acquire_shutdown_test_lock().await;
     let api_addr = reserve_rest_address().await;
     let (db_path, config_path) = write_fixture(&tempdir, api_addr);
     let notify_path = tempdir.path().join("notify.sock");

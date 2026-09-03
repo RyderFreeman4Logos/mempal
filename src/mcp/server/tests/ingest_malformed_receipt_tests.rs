@@ -1,5 +1,6 @@
 #[tokio::test(flavor = "current_thread")]
 async fn test_mcp_async_ingest_malformed_payload_records_failed_receipt() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
     let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
     let operation_id = queue
@@ -40,6 +41,7 @@ async fn test_mcp_async_ingest_malformed_payload_records_failed_receipt() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_mcp_async_ingest_failure_receipt_retries_transient_sqlite_lock() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
     let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
     let operation_id = queue
@@ -80,6 +82,7 @@ async fn test_mcp_async_ingest_failure_receipt_retries_transient_sqlite_lock() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_mcp_scoped_finite_malformed_payload_completion_lock_releases_claim() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
     let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
     let operation_id = queue
@@ -124,6 +127,7 @@ async fn test_mcp_scoped_finite_malformed_payload_completion_lock_releases_claim
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_mcp_scoped_expired_malformed_payload_retries_claim_release() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
     let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
     let operation_id = queue
@@ -158,6 +162,7 @@ async fn test_mcp_scoped_expired_malformed_payload_retries_claim_release() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_mcp_scoped_post_claim_expiry_retries_release_lock() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
     let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
         .with_claim_blocking_delay(Duration::from_millis(1500))
@@ -194,6 +199,7 @@ async fn test_mcp_scoped_post_claim_expiry_retries_release_lock() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_mcp_scoped_finite_malformed_payload_real_sqlite_lock_respects_budget() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
     let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
     let operation_id = queue

@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 9326
-baseline_lines = 626
-issue = "993"
-rationale = "#993/#988/#989/#973/#991 changelog-check requires Unreleased isolation notes; CHANGELOG.md growth is unavoidable, exact no-growth ratchet."
+baseline_tokens = 9335
+baseline_lines = 612
+issue = "1051"
+rationale = "#1051 adds the Unreleased rest_readiness writer-lease-lost isolation note; changelog growth is unavoidable, exact no-growth ratchet."
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
 kind = "source"
@@ -340,10 +340,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "src/llm/worker.rs"
 kind = "source"
-baseline_tokens = 7113
-baseline_lines = 897
-issue = "858"
-rationale = "#858 LLM heartbeat/confirm/mark_failed/release paths record typed queue SQLite contention; exact no-growth ratchet."
+baseline_tokens = 7280
+baseline_lines = 920
+issue = "1052"
+rationale = "#1052 holds the process-wide worker-test lock on SharedLlmClientRuntime until Drop so rest-lib worker start/claim paths serialize without per-test locks; exact no-growth ratchet."
 
 [[files]]
 path = "src/longmemeval.rs"
@@ -531,10 +531,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/judge_gating.rs"
 kind = "test"
-baseline_tokens = 22347
-baseline_lines = 2984
-issue = "1006"
-rationale = "#1006 adds direct database fixture ownership needed to serialize admission-sensitive setup; no-growth ratchet."
+baseline_tokens = 22356
+baseline_lines = 2982
+issue = "1050"
+rationale = "#1050 reuses the direct database fixture handle for judge_gating status-metrics isolation; exact no-growth ratchet."
 
 [[files]]
 path = "tests/knowledge_lifecycle.rs"

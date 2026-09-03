@@ -13600,7 +13600,7 @@ mod tests {
     use crate::embed::Embedder;
     use crate::mcp::tools::INGEST_SOURCE_TYPE_SCHEMA_DESCRIPTION;
     use crate::observability::test_support::{
-        global_ingest_worker_lifecycle_test_lock, global_observability_test_lock,
+        acquire_ingest_worker_lifecycle_lock, global_observability_test_lock,
     };
 
     mod context_scope_schema_tests;
@@ -14187,9 +14187,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_mcp_scoped_wait_holder_does_not_suppress_scoped_processing() {
-        let _worker_lifecycle_lock = global_ingest_worker_lifecycle_test_lock()
-            .lock_owned()
-            .await;
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (_tempdir, db_path, server) = setup_server();
         let scoped_wait_lease = Database::open(&db_path)
@@ -15835,9 +15833,7 @@ quality_policy = "llm_required_for_keep"
 
     #[tokio::test]
     async fn test_mcp_ingest_enqueue_extends_retry_for_self_held_sqlite_lock() {
-        let _worker_lifecycle_lock = global_ingest_worker_lifecycle_test_lock()
-            .lock_owned()
-            .await;
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let lock = hold_sqlite_write_lock(db_path.clone(), Duration::from_millis(5_500));
 
@@ -16677,6 +16673,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_ingest_replacement_target_retries_transient_sqlite_lock() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("palace.db");
         Database::open(&db_path).expect("open db");
@@ -17126,9 +17123,7 @@ pattern_boost = 0.2
 
     #[tokio::test(start_paused = true, flavor = "current_thread")]
     async fn test_mcp_async_ingest_worker_backs_off_when_claim_is_locked() {
-        let _worker_lifecycle_lock = global_ingest_worker_lifecycle_test_lock()
-            .lock_owned()
-            .await;
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let _observability_lock =
             crate::observability::test_support::global_observability_test_lock()
                 .lock_owned()
@@ -17213,9 +17208,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_async_ingest_worker_stops_on_terminal_claim_failure() {
-        let _worker_lifecycle_lock = global_ingest_worker_lifecycle_test_lock()
-            .lock_owned()
-            .await;
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let _observability_lock =
             crate::observability::test_support::global_observability_test_lock()
                 .lock_owned()

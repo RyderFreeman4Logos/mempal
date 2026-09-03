@@ -23,6 +23,7 @@ struct LiveMcp {
     client: reqwest::Client,
     stop: Arc<Notify>,
     task: JoinHandle<()>,
+    _rest_listen: tokio::sync::OwnedMutexGuard<()>,
 }
 
 fn fixture() -> Result<(TempDir, PathBuf, Config, MempalMcpServer)> {
@@ -52,6 +53,9 @@ async fn live_mcp_at(bind_addr: &str) -> Result<(TempDir, LiveMcp)> {
     let (tempdir, db_path, _config, server) = fixture()?;
     let daemon_db =
         AsyncDb::open_for(&db_path, 4, DbHolderClass::Daemon).context("open daemon-owned pool")?;
+    let rest_listen = crate::daemon::global_rest_listen_test_lock()
+        .lock_owned()
+        .await;
     let listener = TcpListener::bind(bind_addr).await?;
     let address = listener.local_addr()?;
     let server = server.with_daemon_owned_async_db(daemon_db);
@@ -80,6 +84,7 @@ async fn live_mcp_at(bind_addr: &str) -> Result<(TempDir, LiveMcp)> {
             client: reqwest::Client::new(),
             stop,
             task,
+            _rest_listen: rest_listen,
         },
     ))
 }
@@ -124,6 +129,9 @@ async fn live_mcp_with_projects() -> Result<(TempDir, LiveMcp)> {
     }
     let daemon_db =
         AsyncDb::open_for(&db_path, 4, DbHolderClass::Daemon).context("open daemon-owned pool")?;
+    let rest_listen = crate::daemon::global_rest_listen_test_lock()
+        .lock_owned()
+        .await;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = server.with_daemon_owned_async_db(daemon_db);
@@ -146,6 +154,7 @@ async fn live_mcp_with_projects() -> Result<(TempDir, LiveMcp)> {
             client: reqwest::Client::new(),
             stop,
             task,
+            _rest_listen: rest_listen,
         },
     ))
 }
@@ -681,6 +690,9 @@ async fn daemon_mcp_listen_port_serves_status_and_search() -> Result<()> {
 async fn daemon_mcp_listen_port_reuses_daemon_holder() -> Result<()> {
     let (_tempdir, db_path, _config, server) = fixture()?;
     let before = ProfileDbAdmission::snapshot(&db_path).context("snapshot before MCP HTTP")?;
+    let rest_listen = crate::daemon::global_rest_listen_test_lock()
+        .lock_owned()
+        .await;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let daemon_db =
@@ -701,6 +713,7 @@ async fn daemon_mcp_listen_port_reuses_daemon_holder() -> Result<()> {
         client: reqwest::Client::new(),
         stop: stop_signal,
         task,
+        _rest_listen: rest_listen,
     };
     let result = async {
         let session_id = initialize(&live).await?;
