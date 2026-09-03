@@ -11,8 +11,21 @@ use super::{
     reset_shutdown_request, run_loop,
 };
 
+struct ConfigHarnessResetGuard;
+
+impl Drop for ConfigHarnessResetGuard {
+    fn drop(&mut self) {
+        crate::core::config::ConfigHandle::harness_reset();
+    }
+}
+
 #[tokio::test]
 async fn daemon_mcp_listen_port_completes_wait_ingest_when_hooks_disabled() {
+    let _config_lock = crate::core::config::global_config_test_lock()
+        .lock_owned()
+        .await;
+    let _config_reset = ConfigHarnessResetGuard;
+    crate::core::config::ConfigHandle::harness_reset();
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let _rest_lock = global_rest_listen_test_lock().lock_owned().await;
     let _shutdown_lock = global_shutdown_test_lock().lock_owned().await;
