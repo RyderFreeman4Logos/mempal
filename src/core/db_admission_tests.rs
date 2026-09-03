@@ -188,6 +188,9 @@ fn live_foreign_namespace_owner_keeps_multiple_registrations() {
 #[cfg(target_os = "linux")]
 #[test]
 fn repeated_smoke_style_crash_reap_cycles_do_not_grow_holder_state() {
+    let _worker_lifecycle_lock =
+        crate::observability::test_support::global_ingest_worker_lifecycle_test_lock()
+            .blocking_lock_owned();
     let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&db_path).expect("admission paths");
@@ -288,6 +291,9 @@ fn orphan_sweep_retries_after_a_later_verifiable_pass() {
 #[cfg(target_os = "linux")]
 #[test]
 fn repeated_orphan_recovery_does_not_grow_current_lease_entries() {
+    let _worker_lifecycle_lock =
+        crate::observability::test_support::global_ingest_worker_lifecycle_test_lock()
+            .blocking_lock_owned();
     let temp = short_tempdir();
     let db_path = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&db_path).expect("admission paths");
