@@ -15835,6 +15835,9 @@ quality_policy = "llm_required_for_keep"
 
     #[tokio::test]
     async fn test_mcp_ingest_enqueue_extends_retry_for_self_held_sqlite_lock() {
+        let _worker_lifecycle_lock = global_ingest_worker_lifecycle_test_lock()
+            .lock_owned()
+            .await;
         let (_tempdir, db_path, server) = setup_server();
         let lock = hold_sqlite_write_lock(db_path.clone(), Duration::from_millis(5_500));
 
