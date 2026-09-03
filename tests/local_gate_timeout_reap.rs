@@ -300,6 +300,7 @@ finally:
 #[cfg(unix)]
 #[test]
 fn cargo_test_wrapper_timeout_reaps_a_term_ignoring_descendant() {
+    let _process_lock = local_gate_child::PROCESS_LIFECYCLE_TEST_LOCK.blocking_lock();
     let script = repo_root().join("scripts/gates/cargo-test-with-timeout.sh");
     let fixture = tempfile::tempdir().expect("create timeout-tree fixture");
     let identity_file = fixture.path().join("descendant-identity");
@@ -375,6 +376,7 @@ fn cargo_test_wrapper_timeout_reaps_a_term_ignoring_descendant() {
 #[cfg(unix)]
 #[test]
 fn cargo_test_wrapper_timeout_reaps_nested_setsid_descendant_and_drains_pipes() {
+    let _process_lock = local_gate_child::PROCESS_LIFECYCLE_TEST_LOCK.blocking_lock();
     let script = repo_root().join("scripts/gates/cargo-test-with-timeout.sh");
     let fixture = tempfile::tempdir().expect("create nested-session fixture");
     let identity_file = fixture.path().join("descendant-identity");
@@ -431,6 +433,7 @@ fn cargo_test_wrapper_timeout_reaps_nested_setsid_descendant_and_drains_pipes() 
 #[cfg(unix)]
 #[test]
 fn cargo_test_wrapper_reaps_descendant_after_leader_exits_and_drains_pipes() {
+    let _process_lock = local_gate_child::PROCESS_LIFECYCLE_TEST_LOCK.blocking_lock();
     let script = repo_root().join("scripts/gates/cargo-test-with-timeout.sh");
     let fixture = tempfile::tempdir().expect("create early-exit fixture");
     let identity_file = fixture.path().join("descendant-identity");
@@ -487,6 +490,7 @@ fn cargo_test_wrapper_reaps_descendant_after_leader_exits_and_drains_pipes() {
 #[cfg(unix)]
 #[test]
 fn cargo_test_wrapper_reaps_non_utf8_task_name_after_leader_exits() {
+    let _process_lock = local_gate_child::PROCESS_LIFECYCLE_TEST_LOCK.blocking_lock();
     let script = repo_root().join("scripts/gates/cargo-test-with-timeout.sh");
     let fixture = tempfile::tempdir().expect("create non-UTF-8 task-name fixture");
     let identity_file = fixture.path().join("descendant-identity");

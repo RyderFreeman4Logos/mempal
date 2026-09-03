@@ -78,6 +78,7 @@ pub(super) fn terminate_recorded_processes(processes: &[RecordedProcessIdentity]
 
 #[test]
 fn recorded_pid_reuse_is_refused_without_signaling_the_live_process() {
+    let _process_lock = super::local_gate_child::PROCESS_LIFECYCLE_TEST_LOCK.blocking_lock();
     let fixture = tempfile::tempdir().expect("create PID-reuse fixture");
     let identity_file = fixture.path().join("identity");
     let ready_file = fixture.path().join("ready");
