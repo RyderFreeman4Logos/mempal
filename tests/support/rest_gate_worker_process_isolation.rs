@@ -1,25 +1,25 @@
-use std::time::Duration;
+use std::process::{Command, Stdio};
 
-use crate::{repo_root, run_bash_script};
+use crate::repo_root;
 
 #[test]
 fn rest_gate_runs_lib_worker_tests_in_a_dedicated_cargo_process() {
     let script = repo_root().join("scripts/gates/rest-tests.sh");
     let fixture = tempfile::tempdir().expect("create dry-run fixture");
     let target = fixture.path().join("target");
-    let output = run_bash_script(
-        &script,
-        &[],
-        &[
-            ("REST_GATE_DRY_RUN", "1"),
-            (
-                "REST_GATE_TARGET_DIR",
-                target.to_str().expect("UTF-8 target path"),
-            ),
-            ("REST_TEST_TARGETS_PER_BATCH", "999"),
-        ],
-        Duration::from_secs(10),
-    );
+    let output = Command::new("/bin/bash")
+        .arg(&script)
+        .current_dir(repo_root())
+        .env("REST_GATE_DRY_RUN", "1")
+        .env(
+            "REST_GATE_TARGET_DIR",
+            target.to_str().expect("UTF-8 target path"),
+        )
+        .env("REST_TEST_TARGETS_PER_BATCH", "999")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run rest-tests dry-run");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
