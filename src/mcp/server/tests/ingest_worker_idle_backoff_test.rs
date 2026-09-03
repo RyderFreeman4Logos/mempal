@@ -20,9 +20,7 @@ async fn wait_for_io_burst_path_sample_count(
 
 #[tokio::test(start_paused = true, flavor = "current_thread")]
 async fn test_mcp_async_ingest_worker_backs_off_when_idle() {
-    let _worker_lifecycle_lock = global_ingest_worker_lifecycle_test_lock()
-        .lock_owned()
-        .await;
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let _observability_lock = crate::observability::test_support::global_observability_test_lock()
         .lock_owned()
         .await;

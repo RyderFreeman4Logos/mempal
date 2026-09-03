@@ -35,9 +35,7 @@ impl crate::embed::EmbedderFactory for FailOnceEmbedderFactory {
 #[tokio::test(flavor = "current_thread")]
 async fn test_mcp_async_ingest_transient_write_lock_requeues_instead_of_failing() {
     let _worker_lifecycle_lock =
-        crate::observability::test_support::global_ingest_worker_lifecycle_test_lock()
-            .lock_owned()
-            .await;
+        crate::observability::test_support::acquire_ingest_worker_lifecycle_lock().await;
     let _observability_lock =
         crate::observability::test_support::global_observability_test_lock()
             .lock_owned()
@@ -139,6 +137,8 @@ async fn test_mcp_async_ingest_transient_write_lock_requeues_instead_of_failing(
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_mcp_async_ingest_embed_failure_requeues_only_when_retryable() {
+    let _worker_lifecycle_lock =
+        crate::observability::test_support::acquire_ingest_worker_lifecycle_lock().await;
     for retryable in [true, false] {
         let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
         let db_path = tempdir.path().join("palace.db");
