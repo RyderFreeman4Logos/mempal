@@ -23,6 +23,15 @@ const MIB: u64 = 1024 * 1024;
 const ADMISSION_FIXTURE_OUTPUT_BOUND: Duration = Duration::from_secs(30);
 const CLEANUP_RETRY: Duration = Duration::from_secs(5);
 
+// ponytail: one process-local db-admission class lock; split by fixture family if throughput matters.
+static DB_ADMISSION_CLASS_LOCK: Mutex<()> = Mutex::new(());
+
+fn db_admission_class_lock() -> std::sync::MutexGuard<'static, ()> {
+    DB_ADMISSION_CLASS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn request(class: DbHolderClass, cache_mib: u64) -> DbAdmissionRequest {
     DbAdmissionRequest::new(class, 1, cache_mib * MIB)
 }
@@ -186,6 +195,7 @@ fn bounded_output_wait_reports_missing_executable_as_failed() {
 
 #[test]
 fn exact_profile_budget_is_admitted_and_excess_is_rejected() {
+    let _class_lock = db_admission_class_lock();
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     // Disable reserved seats for this exact-fill contract.
@@ -226,6 +236,7 @@ fn exact_profile_budget_is_admitted_and_excess_is_rejected() {
 
 #[test]
 fn dropping_holder_returns_profile_capacity() {
+    let _class_lock = db_admission_class_lock();
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     let config = DbAdmissionConfig::new(1, 16 * MIB).with_reserved_service_holders(0);
@@ -244,6 +255,7 @@ fn dropping_holder_returns_profile_capacity() {
 
 #[test]
 fn reserved_service_slots_admit_mcp_after_transient_fill() {
+    let _class_lock = db_admission_class_lock();
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     // max=3, reserve=1: two transient holders fill the non-reserved seats; MCP
@@ -276,6 +288,7 @@ fn reserved_service_slots_admit_mcp_after_transient_fill() {
 
 #[test]
 fn stale_holders_are_reaped_before_budget_check_and_service_opens() {
+    let _class_lock = db_admission_class_lock();
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     let config = DbAdmissionConfig::new(2, 32 * MIB).with_reserved_service_holders(0);
@@ -323,6 +336,7 @@ fn stale_holders_are_reaped_before_budget_check_and_service_opens() {
 
 #[test]
 fn concurrent_registration_never_oversubscribes_profile_budget() {
+    let _class_lock = db_admission_class_lock();
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = Arc::new(tmp.path().join("palace.db"));
     let start = Arc::new(Barrier::new(5));
@@ -393,6 +407,7 @@ fn concurrent_registration_never_oversubscribes_profile_budget() {
 
 #[test]
 fn async_pool_holds_admission_for_its_full_lifetime() {
+    let _class_lock = db_admission_class_lock();
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     let pool = AsyncDb::open_for(&db_path, 2, DbHolderClass::Mcp).expect("async pool");
@@ -481,6 +496,7 @@ fn deadline_child_retains_tail_diagnostics_after_capture_limit() {
 
 #[test]
 fn status_remains_available_when_holder_budget_is_exhausted() {
+    let _class_lock = db_admission_class_lock();
     let tmp = tempfile::tempdir().expect("tempdir");
     let home = tmp.path().join("home");
     let mempal_home = home.join(".mempal");
@@ -570,6 +586,7 @@ fn pid_namespace_mcp_holder_is_reaped_after_forced_exit_when_supported() {
         Err(error) => panic!("unshare capability probe failed: {error}"),
     }
 
+    let _class_lock = db_admission_class_lock();
     let tmp = tempfile::tempdir().expect("tempdir");
     let home = tmp.path().join("home");
     let mempal_home = home.join(".mempal");
