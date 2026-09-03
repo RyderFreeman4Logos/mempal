@@ -31,7 +31,7 @@ use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
 #[rustfmt::skip]
-macro_rules! retry_busy { ($s:expr, $q:expr, $t:expr) => {{ timeout(Duration::from_secs(2), async { loop { match $s.context_json_for_test(json!({ "query": $q, "cwd": ($t).to_str().unwrap() })).await { Ok(v) => break Ok(v), Err(e) if e.message.contains("database admission state is busy after 250ms:") => sleep(Duration::from_millis(2)).await, Err(e) => break Err(e), } } }).await.expect("timeout").unwrap() }}; }
+macro_rules! retry_busy { ($s:expr, $q:expr, $t:expr) => {{ match timeout(Duration::from_secs(2), async { loop { match $s.context_json_for_test(json!({ "query": $q, "cwd": ($t).to_str().unwrap() })).await { Ok(v) => break Ok(v), Err(e) if e.message.contains("database admission state is busy after 250ms:") => sleep(Duration::from_millis(2)).await, Err(e) => break Err(e), } } }).await { Ok(Ok(v)) => v, result => panic!("context: {:?}", result) } }}; }
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -486,7 +486,6 @@ fn test_pattern_promotes_to_active_at_threshold() {
 
 // boost
 
-// model_id that apply_pattern_boost derives for config backend = "stub".
 const STUB_MODEL_ID: &str = "";
 
 #[tokio::test]
