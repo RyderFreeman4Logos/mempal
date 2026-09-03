@@ -41,12 +41,10 @@ fn test_worker_successful_claim_clears_observed_contention() {
         let async_store = AsyncPendingMessageStore::from_store(store.clone())
             .with_claim_lock_failures_for_test(1);
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
-        let client_runtime = Arc::new(Mutex::new(LlmClientRuntime::new(
-            &ConfigHandle::current().llm,
-        )));
+        let client_runtime = SharedLlmClientRuntime::new(&ConfigHandle::current().llm);
         let (runtime_locked_tx, runtime_locked_rx) = std::sync::mpsc::sync_channel(1);
         let (runtime_release_tx, runtime_release_rx) = std::sync::mpsc::sync_channel(1);
-        let locked_runtime = Arc::clone(&client_runtime);
+        let locked_runtime = client_runtime.clone();
         let runtime_holder = std::thread::spawn(move || {
             let _guard = locked_runtime.lock().expect("lock LLM client runtime");
             runtime_locked_tx
@@ -165,9 +163,7 @@ fn test_worker_survives_mark_failed_lock_contention() {
         let async_store = AsyncPendingMessageStore::from_store(store.clone())
             .with_complete_lock_failures_for_test(1);
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
-        let client_runtime = Arc::new(Mutex::new(LlmClientRuntime::new(
-            &ConfigHandle::current().llm,
-        )));
+        let client_runtime = SharedLlmClientRuntime::new(&ConfigHandle::current().llm);
         let test_lease = db
             .runtime_writer_lease_acquire("sqlite-writer", "test", "llm-worker-test", 300, None)
             .expect("acquire test lease")
@@ -244,9 +240,7 @@ fn test_worker_gating_uses_endpoint_pool_fallback() {
 
         let async_store = AsyncPendingMessageStore::from_store(store.clone());
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
-        let client_runtime = Arc::new(Mutex::new(LlmClientRuntime::new(
-            &ConfigHandle::current().llm,
-        )));
+        let client_runtime = SharedLlmClientRuntime::new(&ConfigHandle::current().llm);
         let test_lease = db
             .runtime_writer_lease_acquire("sqlite-writer", "test", "llm-worker-test", 300, None)
             .expect("acquire test lease")

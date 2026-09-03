@@ -493,9 +493,7 @@ pub struct HookLlmGateRuntime {
 impl HookLlmGateRuntime {
     pub fn new(config: &crate::core::config::LlmConfig) -> Self {
         Self {
-            client_runtime: Arc::new(Mutex::new(crate::llm::worker::LlmClientRuntime::new(
-                config,
-            ))),
+            client_runtime: crate::llm::worker::SharedLlmClientRuntime::new(config),
             status: Arc::new(crate::llm::LlmStatus::new(10)),
         }
     }

@@ -435,9 +435,7 @@ fn test_worker_observes_client_preparation_release_lock() {
         let async_store =
             AsyncPendingMessageStore::from_store(store).with_release_lock_failures_for_test(1);
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
-        let client_runtime = Arc::new(Mutex::new(LlmClientRuntime::new(
-            &ConfigHandle::current().llm,
-        )));
+        let client_runtime = SharedLlmClientRuntime::new(&ConfigHandle::current().llm);
         let test_lease = db
             .runtime_writer_lease_acquire("sqlite-writer", "test", "llm-worker-test", 300, None)
             .expect("acquire test lease")
@@ -507,9 +505,7 @@ fn test_worker_survives_confirm_lock_contention() {
         let async_store = AsyncPendingMessageStore::from_store(store.clone())
             .with_complete_lock_failures_for_test(1);
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
-        let client_runtime = Arc::new(Mutex::new(LlmClientRuntime::new(
-            &ConfigHandle::current().llm,
-        )));
+        let client_runtime = SharedLlmClientRuntime::new(&ConfigHandle::current().llm);
         let test_lease = db
             .runtime_writer_lease_acquire("sqlite-writer", "test", "llm-worker-test", 300, None)
             .expect("acquire test lease")
@@ -586,9 +582,7 @@ fn test_worker_uses_reloaded_client_when_generation_changes_before_claim_returns
         let async_store = AsyncPendingMessageStore::from_store(store)
             .with_blocking_delay(Duration::from_millis(500));
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
-        let client_runtime = Arc::new(Mutex::new(LlmClientRuntime::new(
-            &ConfigHandle::current().llm,
-        )));
+        let client_runtime = SharedLlmClientRuntime::new(&ConfigHandle::current().llm);
         let test_lease = db
             .runtime_writer_lease_acquire("sqlite-writer", "test", "llm-worker-test", 300, None)
             .expect("acquire test lease")

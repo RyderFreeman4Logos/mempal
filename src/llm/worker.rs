@@ -67,14 +67,10 @@ impl LlmClientConfigSignature {
 pub struct LlmClientRuntime {
     router: Option<Arc<LlmRouter>>,
     signature: LlmClientConfigSignature,
-    #[cfg(test)]
-    _worker_test_lock: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl LlmClientRuntime {
     pub fn new(config: &LlmConfig) -> Self {
-        #[cfg(test)]
-        let _worker_test_lock = super::acquire_llm_worker_test_lock();
         let router = match LlmRouter::from_config(config) {
             Ok(router) => Some(Arc::new(router)),
             Err(error) => {
@@ -85,8 +81,6 @@ impl LlmClientRuntime {
         Self {
             router,
             signature: LlmClientConfigSignature::new(config, &RemoteCallPolicyConfig::default()),
-            #[cfg(test)]
-            _worker_test_lock,
         }
     }
 
@@ -111,7 +105,30 @@ impl LlmClientRuntime {
     }
 }
 
-pub type SharedLlmClientRuntime = Arc<Mutex<LlmClientRuntime>>;
+#[derive(Clone)]
+pub struct SharedLlmClientRuntime {
+    inner: Arc<Mutex<LlmClientRuntime>>,
+    #[cfg(test)]
+    _worker_test_lock: Arc<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl SharedLlmClientRuntime {
+    pub fn new(config: &LlmConfig) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(LlmClientRuntime::new(config))),
+            #[cfg(test)]
+            // ponytail: process-wide worker-lifetime lock; split by worker fixture if throughput matters.
+            _worker_test_lock: Arc::new(super::acquire_llm_worker_test_lock()),
+        }
+    }
+}
+
+impl std::ops::Deref for SharedLlmClientRuntime {
+    type Target = Mutex<LlmClientRuntime>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
 
 async fn client_for_claimed_generation(
     client_runtime: &SharedLlmClientRuntime,
