@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 9332
+baseline_tokens = 9335
 baseline_lines = 612
-issue = "1050"
-rationale = "#1050 adds the Unreleased judge_gating status-metrics isolation note; changelog growth is unavoidable, exact no-growth ratchet."
+issue = "1051"
+rationale = "#1051 adds the Unreleased rest_readiness writer-lease-lost isolation note; changelog growth is unavoidable, exact no-growth ratchet."
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
 kind = "source"

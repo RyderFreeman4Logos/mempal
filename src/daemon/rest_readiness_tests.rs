@@ -10,7 +10,7 @@ use std::{
     ffi::OsString,
     net::SocketAddr,
     path::Path,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::Duration,
 };
 
@@ -91,10 +91,18 @@ async fn receive_notify_packet(
         Err(_) => None,
     }
 }
-async fn acquire_shutdown_test_lock() -> tokio::sync::OwnedMutexGuard<()> {
+fn rest_readiness_test_lock() -> Arc<tokio::sync::Mutex<()>> {
+    static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
+}
+async fn acquire_shutdown_test_lock() -> (
+    tokio::sync::OwnedMutexGuard<()>,
+    tokio::sync::OwnedMutexGuard<()>,
+) {
+    let rest = rest_readiness_test_lock().lock_owned().await;
     let lock = global_shutdown_test_lock().lock_owned().await;
     reset_shutdown_request();
-    lock
+    (rest, lock)
 }
 async fn assert_no_ready_packet(socket: &tokio::net::UnixDatagram, message: &str) {
     assert!(
@@ -413,6 +421,7 @@ fn fill_notify_receiver_queue(path: &Path) -> Vec<StdUnixDatagram> {
 #[cfg(target_os = "linux")]
 #[test]
 fn systemd_notify_returns_bounded_error_when_receiver_queue_is_full() {
+    let _rest_lock = rest_readiness_test_lock().blocking_lock_owned();
     let tempdir = tempfile::tempdir().expect("create full notification queue fixture");
     let notify_path = tempdir.path().join("notify.sock");
     let receiver = StdUnixDatagram::bind(&notify_path).expect("bind full notification receiver");
@@ -499,6 +508,7 @@ async fn systemd_notify_empty_socket_values_fail_bounded_without_leaking_value()
 fn systemd_notify_rejects_bound_empty_abstract_address_without_sending() {
     use std::io::ErrorKind;
 
+    let _rest_lock = rest_readiness_test_lock().blocking_lock_owned();
     let address = UnixSocketAddr::from_abstract_name("")
         .expect("empty abstract address should be constructible");
     let receiver = StdUnixDatagram::bind_addr(&address).expect("bind empty abstract receiver");
@@ -527,6 +537,7 @@ fn systemd_notify_rejects_bound_empty_abstract_address_without_sending() {
 #[cfg(target_os = "linux")]
 #[test]
 fn systemd_notify_delivers_to_non_unicode_abstract_address() {
+    let _rest_lock = rest_readiness_test_lock().blocking_lock_owned();
     let abstract_name = b"mempal-\xff".to_vec();
     let address = UnixSocketAddr::from_abstract_name(&abstract_name)
         .expect("non-Unicode abstract address should be constructible");
