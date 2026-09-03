@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 9329
-baseline_lines = 626
-issue = "1049"
-rationale = "#1049 adds the Unreleased admission-isolation fixture note; changelog growth is unavoidable, exact no-growth ratchet."
+baseline_tokens = 9332
+baseline_lines = 612
+issue = "1050"
+rationale = "#1050 adds the Unreleased judge_gating status-metrics isolation note; changelog growth is unavoidable, exact no-growth ratchet."
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
 kind = "source"
@@ -531,10 +531,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/judge_gating.rs"
 kind = "test"
-baseline_tokens = 22350
-baseline_lines = 2984
-issue = "1049"
-rationale = "#1049 reuses the direct database fixture handle for the disabled-short-circuit admission test; exact no-growth ratchet."
+baseline_tokens = 22356
+baseline_lines = 2982
+issue = "1050"
+rationale = "#1050 reuses the direct database fixture handle for judge_gating status-metrics isolation; exact no-growth ratchet."
 
 [[files]]
 path = "tests/knowledge_lifecycle.rs"
