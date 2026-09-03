@@ -42,7 +42,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - **MCP search deadlines**: bounds embed/DB/route; no 240s hangs.
 - **Admission fixture**: retry Busy in oversubscribe; suite waits aren't budget failures.
 - **Hermetic live-daemon tests**: isolate REST/MCP/ingest-wait/mark-failed/dashboard so exact-gates skip live `:3080`; timeout wrapper reaps owned trees, authenticates idle sccache via exe, treats absent /proc as exit (#988, #989, #973, #991, #993, #1011).
-- Lease #882/#889/#890,#944/#956,#958/#961/#962/#965/#971/#975/#976/#968,#1013,#1010,#1009,#1008,#1023/#1024,#1006/#1007,#1027,#1005,#1029,#1004,#1031,#980,#1003,#1002,#1001,#1035,#999,#998,#1037,#1038,#997,#996,#994,#1044,#990,#984,#1047,#970
+- Lease #882/#889/#890,#944/#956,#958/#961/#962/#965/#971/#975/#976/#968,#1013,#1010,#1009,#1008,#1023/#1024,#1006/#1007,#1027,#1005,#1029,#1004,#1031,#980,#1003,#1002,#1001,#1035,#999,#998,#1037,#1038,#997,#996,#994,#1044,#990,#984,#1047,#970,#1049
 - Readiness cleanup (#1040).
 - **MCP delete retry**: force SQLite Busy before synchronized lock release (#886).
 

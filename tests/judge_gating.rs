@@ -859,7 +859,7 @@ prototypes = ["valuable", "noise"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gating_disabled_short_circuits() {
     let _guard = test_guard().await;
-    let env = TestEnv::new(
+    let (env, db) = TestEnv::new_with_database(
         r#"
 [gating]
 enabled = false
@@ -882,8 +882,8 @@ prototypes = ["valuable"]
 
     assert!(!response.dropped);
     assert!(response.gating_decision.is_none());
-    assert_eq!(env.db().drawer_count().expect("drawer count"), 1);
-    assert_eq!(gating_row_count(&env.db()), 0);
+    assert_eq!(db.drawer_count().expect("drawer count"), 1);
+    assert_eq!(gating_row_count(&db), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
