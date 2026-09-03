@@ -9,6 +9,18 @@ use mempal::ingest::diary::{
 };
 use mempal::ingest::{IngestError, IngestOptions, ingest_file_with_options};
 use tempfile::TempDir;
+use tokio::sync::{Mutex, MutexGuard};
+
+// ponytail: one process-local diary-rollup class lock; split by fixture family if throughput matters.
+static DIARY_ROLLUP_CLASS_LOCK: Mutex<()> = Mutex::const_new(());
+
+async fn diary_rollup_class_lock() -> MutexGuard<'static, ()> {
+    DIARY_ROLLUP_CLASS_LOCK.lock().await
+}
+
+fn blocking_diary_rollup_class_lock() -> MutexGuard<'static, ()> {
+    DIARY_ROLLUP_CLASS_LOCK.blocking_lock()
+}
 
 struct LengthEmbedder;
 
@@ -75,6 +87,7 @@ fn vector_json(db: &Database, drawer_id: &str) -> String {
 
 #[tokio::test]
 async fn test_first_rollup_creates_day_drawer() {
+    let _class_lock = diary_rollup_class_lock().await;
     let (_tmp, db) = new_db();
     let day = "2026-04-24";
 
@@ -91,6 +104,7 @@ async fn test_first_rollup_creates_day_drawer() {
 
 #[tokio::test]
 async fn test_second_rollup_same_day_appends() {
+    let _class_lock = diary_rollup_class_lock().await;
     let (_tmp, db) = new_db();
     let day = "2026-04-24";
 
@@ -108,6 +122,7 @@ async fn test_second_rollup_same_day_appends() {
 
 #[tokio::test]
 async fn test_different_day_creates_new_rollup() {
+    let _class_lock = diary_rollup_class_lock().await;
     let (_tmp, db) = new_db();
 
     rollup(&db, "A", "claude", "2026-04-16").await;
@@ -119,6 +134,7 @@ async fn test_different_day_creates_new_rollup() {
 
 #[tokio::test]
 async fn test_different_room_separate_rollup() {
+    let _class_lock = diary_rollup_class_lock().await;
     let (_tmp, db) = new_db();
     let day = "2026-04-24";
 
@@ -132,6 +148,7 @@ async fn test_different_room_separate_rollup() {
 
 #[tokio::test]
 async fn test_rollup_wrong_wing_rejected() {
+    let _class_lock = diary_rollup_class_lock().await;
     let (_tmp, db) = new_db();
 
     let error = ingest_diary_rollup(
@@ -155,6 +172,7 @@ async fn test_rollup_wrong_wing_rejected() {
 
 #[tokio::test]
 async fn test_rollup_over_limit_rejected() {
+    let _class_lock = diary_rollup_class_lock().await;
     let (_tmp, db) = new_db();
     let day = "2026-04-24";
     let almost_full = "A".repeat(DAILY_ROLLUP_LIMIT_BYTES - 50);
@@ -185,6 +203,7 @@ async fn test_rollup_over_limit_rejected() {
 
 #[tokio::test]
 async fn test_rollup_vector_refreshed_on_upsert() {
+    let _class_lock = diary_rollup_class_lock().await;
     let (_tmp, db) = new_db();
     let day = "2026-04-24";
 
@@ -198,6 +217,7 @@ async fn test_rollup_vector_refreshed_on_upsert() {
 
 #[test]
 fn test_concurrent_rollup_same_day_serialized() {
+    let _class_lock = blocking_diary_rollup_class_lock();
     let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("init db");
@@ -234,6 +254,7 @@ fn test_concurrent_rollup_same_day_serialized() {
 
 #[tokio::test]
 async fn test_file_ingest_diary_rollup_uses_options() {
+    let _class_lock = diary_rollup_class_lock().await;
     let (tmp, db) = new_db();
     let source = tmp.path().join("entry.md");
     std::fs::write(&source, "OBSERVATION: file entry").expect("write source");
