@@ -4,10 +4,14 @@ use std::time::Duration;
 use crate::core::db::Database;
 use crate::observability::test_support::global_observability_test_lock;
 
-use super::{global_shutdown_test_lock, request_shutdown, reset_shutdown_request, run_loop};
+use super::{
+    global_rest_listen_test_lock, global_shutdown_test_lock, request_shutdown,
+    reset_shutdown_request, run_loop,
+};
 
 #[tokio::test]
 async fn daemon_mcp_listen_port_completes_wait_ingest_when_hooks_disabled() {
+    let _rest_lock = global_rest_listen_test_lock().lock_owned().await;
     let _shutdown_lock = global_shutdown_test_lock().lock_owned().await;
     let _observability_lock = global_observability_test_lock().lock_owned().await;
     let tempdir = tempfile::TempDir::new().expect("create daemon MCP fixture");

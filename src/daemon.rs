@@ -3298,6 +3298,13 @@ pub(crate) fn global_shutdown_test_lock() -> Arc<tokio::sync::Mutex<()>> {
     Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
 }
 
+#[cfg(test)]
+pub(crate) fn global_rest_listen_test_lock() -> Arc<tokio::sync::Mutex<()>> {
+    // ponytail: process-wide REST-listen class lock; split by listener family if throughput matters.
+    static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
+}
+
 #[cfg(unix)]
 fn request_shutdown_and_notify() {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
