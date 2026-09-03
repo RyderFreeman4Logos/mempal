@@ -19067,12 +19067,13 @@ prototypes = ["keep"]
 
     #[tokio::test]
     async fn test_mcp_brief_surfaces_query_read_timeout_error() {
+        let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (_tempdir, _db_path, server) = setup_server();
         let server = server
             .with_query_only_read_delay_for_test(Duration::from_millis(150))
             .with_mcp_deadline_for_test(Duration::from_millis(20));
 
-        let result = tokio::time::timeout(
+        let error = match tokio::time::timeout(
             Duration::from_millis(500),
             server.mempal_brief(Parameters(BriefMcpRequest {
                 query: "debug".to_string(),
@@ -19084,16 +19085,14 @@ prototypes = ["keep"]
             })),
         )
         .await
-        .expect("brief should return before client timeout");
-        let error = match result {
-            Ok(_) => panic!("brief must not convert read timeout to empty success"),
-            Err(error) => error,
+        {
+            Ok(Ok(_)) => "brief must not convert read timeout to empty success".to_string(),
+            Ok(Err(error)) => error.to_string(),
+            Err(error) => format!("brief should return before client timeout: {error}"),
         };
 
         assert!(
-            error
-                .to_string()
-                .contains("mempal_brief query-only database read exceeded"),
+            error.contains("mempal_brief query-only database read exceeded"),
             "unexpected error: {error}"
         );
 
