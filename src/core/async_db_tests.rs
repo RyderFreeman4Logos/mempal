@@ -248,13 +248,19 @@ async fn cancelled_db_error_read_keeps_permit_until_checkin() {
     let _cancelled_read_permit_lock = CANCELLED_READ_PERMIT_TEST_LOCK.lock().await;
     let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1).expect("open async db");
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let adb_for_cancel = adb.clone();
+    let release_for_cancel = Arc::clone(&release);
     let handle = tokio::spawn(async move {
         adb_for_cancel
             .run_read(move |_db| {
                 let _ = started_tx.send(());
-                std::thread::sleep(Duration::from_millis(300));
+                let (released, condvar) = &*release_for_cancel;
+                let released = released.lock().expect("lock read release");
+                let _released = condvar
+                    .wait_while(released, |released| !*released)
+                    .expect("wait for read release");
                 Ok::<_, DbError>(1_i64)
             })
             .await
@@ -262,15 +268,13 @@ async fn cancelled_db_error_read_keeps_permit_until_checkin() {
     started_rx.await.expect("blocking read started");
     handle.abort();
     assert!(handle.await.expect_err("cancelled").is_cancelled());
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            adb.run_read(|_db| Ok::<_, DbError>(2_i64)),
-        )
-        .await
-        .is_err()
-    );
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    let permit_lifetime = tokio::time::timeout(
+        Duration::from_millis(100),
+        adb.run_read(|_db| Ok::<_, DbError>(2_i64)),
+    )
+    .await;
+    release_readers(&release);
+    assert!(permit_lifetime.is_err());
     assert_eq!(
         adb.run_read(|_db| Ok::<_, DbError>(3_i64))
             .await
@@ -284,13 +288,19 @@ async fn cancelled_anyhow_read_keeps_permit_until_checkin() {
     let _cancelled_read_permit_lock = CANCELLED_READ_PERMIT_TEST_LOCK.lock().await;
     let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1).expect("open async db");
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let adb_for_cancel = adb.clone();
+    let release_for_cancel = Arc::clone(&release);
     let handle = tokio::spawn(async move {
         adb_for_cancel
             .run_read_anyhow(move |_db| {
                 let _ = started_tx.send(());
-                std::thread::sleep(Duration::from_millis(300));
+                let (released, condvar) = &*release_for_cancel;
+                let released = released.lock().expect("lock read release");
+                let _released = condvar
+                    .wait_while(released, |released| !*released)
+                    .expect("wait for read release");
                 Ok(1_i64)
             })
             .await
@@ -298,15 +308,13 @@ async fn cancelled_anyhow_read_keeps_permit_until_checkin() {
     started_rx.await.expect("blocking read started");
     handle.abort();
     assert!(handle.await.expect_err("cancelled").is_cancelled());
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            adb.run_read_anyhow(|_db| Ok(2_i64)),
-        )
-        .await
-        .is_err()
-    );
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    let permit_lifetime = tokio::time::timeout(
+        Duration::from_millis(100),
+        adb.run_read_anyhow(|_db| Ok(2_i64)),
+    )
+    .await;
+    release_readers(&release);
+    assert!(permit_lifetime.is_err());
     assert_eq!(
         adb.run_read_anyhow(|_db| Ok(3_i64))
             .await

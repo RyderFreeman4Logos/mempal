@@ -14187,6 +14187,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_mcp_scoped_wait_holder_does_not_suppress_scoped_processing() {
+        let _worker_lifecycle_lock = global_ingest_worker_lifecycle_test_lock()
+            .lock_owned()
+            .await;
         let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (_tempdir, db_path, server) = setup_server();
         let scoped_wait_lease = Database::open(&db_path)
