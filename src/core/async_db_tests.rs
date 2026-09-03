@@ -268,15 +268,13 @@ async fn cancelled_db_error_read_keeps_permit_until_checkin() {
     started_rx.await.expect("blocking read started");
     handle.abort();
     assert!(handle.await.expect_err("cancelled").is_cancelled());
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            adb.run_read(|_db| Ok::<_, DbError>(2_i64)),
-        )
-        .await
-        .is_err()
-    );
+    let permit_lifetime = tokio::time::timeout(
+        Duration::from_millis(100),
+        adb.run_read(|_db| Ok::<_, DbError>(2_i64)),
+    )
+    .await;
     release_readers(&release);
+    assert!(permit_lifetime.is_err());
     assert_eq!(
         adb.run_read(|_db| Ok::<_, DbError>(3_i64))
             .await
@@ -310,15 +308,13 @@ async fn cancelled_anyhow_read_keeps_permit_until_checkin() {
     started_rx.await.expect("blocking read started");
     handle.abort();
     assert!(handle.await.expect_err("cancelled").is_cancelled());
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            adb.run_read_anyhow(|_db| Ok(2_i64)),
-        )
-        .await
-        .is_err()
-    );
+    let permit_lifetime = tokio::time::timeout(
+        Duration::from_millis(100),
+        adb.run_read_anyhow(|_db| Ok(2_i64)),
+    )
+    .await;
     release_readers(&release);
+    assert!(permit_lifetime.is_err());
     assert_eq!(
         adb.run_read_anyhow(|_db| Ok(3_i64))
             .await
