@@ -1,6 +1,9 @@
 use super::local_gate_child::{RecordedProcessIdentity, capture_recorded_process};
 use super::*;
 
+#[path = "rest_gate_worker_process_isolation.rs"]
+mod rest_gate_worker_process_isolation;
+
 pub(super) fn recorded_process_identity(record: &str) -> RecordedProcessIdentity {
     let mut fields = record.split_ascii_whitespace();
     let pid = fields
