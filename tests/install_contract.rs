@@ -4,12 +4,22 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     process::{Command, Output, Stdio},
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
 
 const FIXTURE_SUBPROCESS_DEADLINE: Duration = Duration::from_secs(30);
 const CLEANUP_DEADLINE: Duration = Duration::from_millis(250);
+
+// ponytail: one process-local install-contract class lock; split by fixture family if throughput matters.
+static INSTALL_CONTRACT_CLASS_LOCK: Mutex<()> = Mutex::new(());
+
+fn install_contract_class_lock() -> std::sync::MutexGuard<'static, ()> {
+    INSTALL_CONTRACT_CLASS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn repo_file(path: &str) -> String {
     fs::read_to_string(format!("{}/{}", env!("CARGO_MANIFEST_DIR"), path))
@@ -187,6 +197,7 @@ exit 1
 
 #[test]
 fn live_install_contract_keeps_rest_and_recycles_daemon() {
+    let _class_lock = install_contract_class_lock();
     let justfile = repo_file("justfile");
     let source_installer = repo_file("scripts/install-from-source.sh");
 
@@ -214,6 +225,7 @@ fn live_install_contract_keeps_rest_and_recycles_daemon() {
 
 #[test]
 fn active_systemd_install_contract_recycles_without_cli_restart() {
+    let _class_lock = install_contract_class_lock();
     let events = run_post_merge_fixture(
         "active",
         &[
@@ -230,6 +242,7 @@ fn active_systemd_install_contract_recycles_without_cli_restart() {
 
 #[test]
 fn inactive_systemd_install_contract_uses_unmanaged_cli_restart() {
+    let _class_lock = install_contract_class_lock();
     let events = run_post_merge_fixture(
         "inactive",
         &[
@@ -246,6 +259,7 @@ fn inactive_systemd_install_contract_uses_unmanaged_cli_restart() {
 
 #[test]
 fn probe_error_install_contract_aborts_recycle_without_cli_or_systemd_restart() {
+    let _class_lock = install_contract_class_lock();
     let events = run_post_merge_fixture(
         "error",
         &[
@@ -267,6 +281,7 @@ fn probe_error_install_contract_aborts_recycle_without_cli_or_systemd_restart() 
 
 #[test]
 fn install_contract_timeout_cleanup_is_bounded() {
+    let _class_lock = install_contract_class_lock();
     let mut command = Command::new("python3");
     command
         .args([
