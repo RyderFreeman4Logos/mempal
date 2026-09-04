@@ -24,6 +24,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- Test-only suite-load isolation for install-contract event counts, database admission, write-reserve, scoped-wait, priming, MCP ingest, database-admission crash, and historical rejudge fixtures (#947, #1064, #1065, #1066, #1067, #1068, #1069, #1070).
 - Daemon SQLite writer-lease waits out a live maintenance holder past capped `remaining_secs` instead of exit 75; a live incompatible `mcp-ingest-worker` holder is still refused without takeover (#916, #849).
 - Ingress: fsync before ACK; lease-fenced replay; REST bind/systemd READY precede daemon-ready (#945). Persist/spool before model and on SQLite/breaker-open; stall keeps REST (#986, #1000, #987).
 - Cited-recall latest-decision walks the full successor chain, filters context the same way, and requires a live correction/continuation citation (#898).
