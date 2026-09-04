@@ -26621,6 +26621,14 @@ mod ingest_wait_timeout_error_tests {
 mod historical_rejudge_tests {
     use super::*;
 
+    // ponytail: one process-local historical-rejudge class lock; split by fixture family if throughput matters.
+    static HISTORICAL_REJUDGE_CLASS_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
+    async fn historical_rejudge_class_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        HISTORICAL_REJUDGE_CLASS_LOCK.lock().await
+    }
+
     fn test_config() -> Config {
         Config::parse("[gating]\nenabled = true\n").expect("parse config")
     }
@@ -31066,6 +31074,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_all_execute_llm_timeout_retries_until_recovered() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut server = mockito::Server::new_async().await;
         let timeout_mock = server
             .mock("POST", "/v1/chat/completions")
@@ -31141,6 +31150,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_two_stage_keeps_when_proposal_keeps_without_confirming() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31198,6 +31208,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_two_stage_confirms_proposal_candidate_immediately() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31262,6 +31273,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_two_stage_keeps_when_confirm_rejects_proposal() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31327,6 +31339,7 @@ threshold = 0.7
     #[tokio::test]
     async fn historical_rejudge_two_stage_drains_confirm_after_recovery_without_rerunning_proposal()
     {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31424,6 +31437,7 @@ threshold = 0.7
     #[tokio::test]
     async fn historical_rejudge_paired_spark_exhausted_persists_confirm_backlog_and_continues_qwen()
     {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31516,6 +31530,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_paired_resume_drains_confirm_pending_without_rerunning_qwen() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31614,6 +31629,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_paired_spark_exhausted_retries_do_not_advance_unconfirmed() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31718,6 +31734,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_paired_partial_spark_failure_keeps_remaining_pending() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31817,6 +31834,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_proposal_only_persists_confirm_backlog_without_mutation() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31917,6 +31935,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_proposal_only_backlog_is_sqlite_backed_across_pages() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -32008,6 +32027,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_proposal_only_persists_tier1_backlog_without_mutation() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -32104,6 +32124,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_confirm_pending_only_reuses_persisted_proposal_without_qwen() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
