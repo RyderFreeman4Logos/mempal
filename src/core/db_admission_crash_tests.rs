@@ -55,9 +55,7 @@ fn admission_crash_fixture() {
 
 #[test]
 fn crash_after_lease_creation_before_state_publish_reclaims_orphan() {
-    let _fixture_guard = super::db::db_open_busy_fixture_lock()
-        .lock()
-        .expect("serialize database busy fixtures");
+    let _fixture_guard = super::db::db_open_busy_fixture_lock().blocking_lock();
     let temp = tempfile::tempdir().expect("temp dir");
     let database = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&database).expect("admission paths");
@@ -75,9 +73,7 @@ fn crash_after_lease_creation_before_state_publish_reclaims_orphan() {
 
 #[test]
 fn crash_after_state_temp_sync_before_rename_reclaims_only_the_staged_state() {
-    let _fixture_guard = super::db::db_open_busy_fixture_lock()
-        .lock()
-        .expect("serialize database busy fixtures");
+    let _fixture_guard = super::db::db_open_busy_fixture_lock().blocking_lock();
     let temp = tempfile::tempdir().expect("temp dir");
     let database = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&database).expect("admission paths");
@@ -105,9 +101,7 @@ fn crash_after_state_temp_sync_before_rename_reclaims_only_the_staged_state() {
 
 #[test]
 fn crash_after_release_state_save_before_lease_unlink_reclaims_orphan() {
-    let _fixture_guard = super::db::db_open_busy_fixture_lock()
-        .lock()
-        .expect("serialize database busy fixtures");
+    let _fixture_guard = super::db::db_open_busy_fixture_lock().blocking_lock();
     let temp = tempfile::tempdir().expect("temp dir");
     let database = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&database).expect("admission paths");
@@ -135,9 +129,7 @@ fn crash_after_release_state_save_before_lease_unlink_reclaims_orphan() {
 
 #[test]
 fn crash_after_reap_state_save_before_orphan_sweep_reclaims_lease_next_pass() {
-    let _fixture_guard = super::db::db_open_busy_fixture_lock()
-        .lock()
-        .expect("serialize database busy fixtures");
+    let _fixture_guard = super::db::db_open_busy_fixture_lock().blocking_lock();
     let temp = tempfile::tempdir().expect("temp dir");
     let database = temp.path().join("palace.db");
     let paths = AdmissionPaths::new(&database).expect("admission paths");
