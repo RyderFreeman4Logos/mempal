@@ -438,6 +438,7 @@ async fn test_mcp_scoped_finite_lease_timeout_releases_late_acquisition() {
 
 #[tokio::test]
 async fn test_mcp_scoped_smoke_wait_bounds_lease_check_to_remaining_budget() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
     let async_db = QueryOnlyAsyncDb::open(&db_path, 4)
         .expect("open query-only async db")
