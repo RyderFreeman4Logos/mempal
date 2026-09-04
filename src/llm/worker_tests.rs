@@ -12,6 +12,16 @@ use tokio::sync::Notify;
 #[path = "worker_contention_tests.rs"]
 mod contention_tests;
 
+fn shared_llm_client_runtime_with_worker_test_lock(
+    config: &LlmConfig,
+    worker_test_lock: tokio::sync::OwnedMutexGuard<()>,
+) -> SharedLlmClientRuntime {
+    SharedLlmClientRuntime {
+        inner: Arc::new(std::sync::Mutex::new(LlmClientRuntime::new(config))),
+        _worker_test_lock: Arc::new(worker_test_lock),
+    }
+}
+
 fn spawn_runtime_ticker() -> (Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
     let ticks = Arc::new(AtomicU64::new(0));
     let ticks_bg = Arc::clone(&ticks);
@@ -410,6 +420,7 @@ fn with_isolated_llm_worker_runtime(test: impl std::future::Future<Output = ()>)
 #[test]
 fn test_worker_observes_client_preparation_release_lock() {
     with_isolated_llm_worker_runtime(async {
+        let worker_test_lock = crate::llm::acquire_llm_worker_test_lock();
         let _guard = crate::core::config::global_config_test_lock()
             .lock_owned()
             .await;
@@ -435,7 +446,10 @@ fn test_worker_observes_client_preparation_release_lock() {
         let async_store =
             AsyncPendingMessageStore::from_store(store).with_release_lock_failures_for_test(1);
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
-        let client_runtime = SharedLlmClientRuntime::new(&ConfigHandle::current().llm);
+        let client_runtime = shared_llm_client_runtime_with_worker_test_lock(
+            &ConfigHandle::current().llm,
+            worker_test_lock,
+        );
         let test_lease = db
             .runtime_writer_lease_acquire("sqlite-writer", "test", "llm-worker-test", 300, None)
             .expect("acquire test lease")
@@ -473,6 +487,7 @@ fn test_worker_observes_client_preparation_release_lock() {
 #[test]
 fn test_worker_survives_confirm_lock_contention() {
     with_isolated_llm_worker_runtime(async {
+        let worker_test_lock = crate::llm::acquire_llm_worker_test_lock();
         let _guard = crate::core::config::global_config_test_lock()
             .lock_owned()
             .await;
@@ -505,7 +520,10 @@ fn test_worker_survives_confirm_lock_contention() {
         let async_store = AsyncPendingMessageStore::from_store(store.clone())
             .with_complete_lock_failures_for_test(1);
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
-        let client_runtime = SharedLlmClientRuntime::new(&ConfigHandle::current().llm);
+        let client_runtime = shared_llm_client_runtime_with_worker_test_lock(
+            &ConfigHandle::current().llm,
+            worker_test_lock,
+        );
         let test_lease = db
             .runtime_writer_lease_acquire("sqlite-writer", "test", "llm-worker-test", 300, None)
             .expect("acquire test lease")
@@ -539,6 +557,7 @@ fn test_worker_survives_confirm_lock_contention() {
 #[test]
 fn test_worker_uses_reloaded_client_when_generation_changes_before_claim_returns() {
     with_isolated_llm_worker_runtime(async {
+        let worker_test_lock = crate::llm::acquire_llm_worker_test_lock();
         let _guard = crate::core::config::global_config_test_lock()
             .lock_owned()
             .await;
@@ -582,7 +601,10 @@ fn test_worker_uses_reloaded_client_when_generation_changes_before_claim_returns
         let async_store = AsyncPendingMessageStore::from_store(store)
             .with_blocking_delay(Duration::from_millis(500));
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
-        let client_runtime = SharedLlmClientRuntime::new(&ConfigHandle::current().llm);
+        let client_runtime = shared_llm_client_runtime_with_worker_test_lock(
+            &ConfigHandle::current().llm,
+            worker_test_lock,
+        );
         let test_lease = db
             .runtime_writer_lease_acquire("sqlite-writer", "test", "llm-worker-test", 300, None)
             .expect("acquire test lease")
