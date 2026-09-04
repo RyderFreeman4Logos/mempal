@@ -17081,6 +17081,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_async_ingest_completion_retries_transient_sqlite_lock() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let request = IngestRequest {
@@ -17255,6 +17256,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_scoped_finite_completion_lock_respects_budget() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let request = IngestRequest {
@@ -17328,6 +17330,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_scoped_finite_completion_real_sqlite_lock_respects_budget() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
         let operation_id = queue
@@ -17397,6 +17400,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_async_ingest_uses_admission_supersedes_target_after_queue_wait() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let seed_id = "async-supersedes-old";
         insert_drawer_with_project(&db_path, seed_id, "mcp", Some("runtime"), None);
@@ -23023,15 +23027,6 @@ enabled = false
     }
 
     mod smoke;
-
-    // =========================================================================
-    // mempal_cowork_push MCP handler tests (P8 task 7, Codex review round-2 #2)
-    // =========================================================================
-    //
-    // These tests exercise the HANDLER itself — caller identity inference,
-    // target auto-inference, self-push rejection, and InboxError → ErrorData
-    // mapping. They complement the integration tests in tests/cowork_inbox.rs,
-    // which only cover the CLI and inbox layers.
 
     use super::super::tools::CoworkPushRequest;
     use tokio::sync::Mutex as TokioMutex;
