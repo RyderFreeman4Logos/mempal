@@ -14,8 +14,9 @@ run_phase() {
 # Reuse #1052's process split for the default `just test` invocation. REST
 # phases pass arguments after `test` and keep their existing process layout.
 if (( $# > 0 )) && [[ "${!#}" == "test" ]]; then
-    run_phase "$@" -- --skip test_worker_
+    run_phase "$@" -- --skip test_worker_ --skip historical_rejudge
     run_phase "$@" test_worker_
+    run_phase "$@" historical_rejudge
 else
     exec python3 "${timeout_wrapper}" "$@"
 fi
