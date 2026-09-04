@@ -106,7 +106,7 @@ pub(super) fn drawers_source_type_check_is_current(table_sql: &str) -> bool {
 }
 
 #[cfg(test)]
-fn db_open_busy_fixture_lock() -> &'static std::sync::Mutex<()> {
+pub(super) fn db_open_busy_fixture_lock() -> &'static std::sync::Mutex<()> {
     // ponytail: one process-global fixture lock; split by contention domain if throughput matters.
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(std::sync::Mutex::default)
