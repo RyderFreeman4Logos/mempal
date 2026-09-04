@@ -498,6 +498,21 @@ impl HookLlmGateRuntime {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_worker_test_lock(
+        config: &crate::core::config::LlmConfig,
+        worker_test_lock: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Self {
+        Self {
+            client_runtime:
+                crate::llm::worker::tests::shared_llm_client_runtime_with_worker_test_lock(
+                    config,
+                    worker_test_lock,
+                ),
+            status: Arc::new(crate::llm::LlmStatus::new(10)),
+        }
+    }
+
     async fn judge(
         &self,
         config: &crate::core::config::Config,
@@ -5644,6 +5659,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_reject_after_unavailable_model_retains_raw_payload() {
+        let worker_test_lock = crate::llm::acquire_llm_worker_test_lock();
         let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
@@ -5770,7 +5786,8 @@ mod tests {
         config.llm.base_url = Some(format!("{}/v1", llm_server.url()));
         config.llm.model = Some("test-llm".to_string());
         config.llm.enabled_for = vec!["gating".to_string()];
-        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+        let llm_gate =
+            super::HookLlmGateRuntime::new_with_worker_test_lock(&config.llm, worker_test_lock);
         let mut retry_message = message.clone();
         retry_message.retry_count = 1;
         process_claimed_message_with_embedder(
@@ -5863,6 +5880,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_default_score_keep_precedes_durable_insert() {
+        let worker_test_lock = crate::llm::acquire_llm_worker_test_lock();
         let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut llm_server = mockito::Server::new_async().await;
@@ -5921,7 +5939,8 @@ mod tests {
             enabled: true,
             ..LlmJudgeConfig::default()
         });
-        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+        let llm_gate =
+            super::HookLlmGateRuntime::new_with_worker_test_lock(&config.llm, worker_test_lock);
         let classifier_embedder = StaticEmbedder;
         let classifier =
             compile_classifier_from_embedder(&classifier_embedder, &config.ingest_gating)
@@ -6015,6 +6034,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_prototype_hard_reject_bypasses_llm_gate() {
+        let worker_test_lock = crate::llm::acquire_llm_worker_test_lock();
         let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
@@ -6063,7 +6083,8 @@ mod tests {
             enabled: true,
             ..LlmJudgeConfig::default()
         });
-        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+        let llm_gate =
+            super::HookLlmGateRuntime::new_with_worker_test_lock(&config.llm, worker_test_lock);
         let classifier_embedder = StaticEmbedder;
         let classifier =
             compile_classifier_from_embedder(&classifier_embedder, &config.ingest_gating)
@@ -6127,6 +6148,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_soft_prototype_reject_persists_before_llm_retry() {
+        let worker_test_lock = crate::llm::acquire_llm_worker_test_lock();
         let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
@@ -6173,7 +6195,8 @@ mod tests {
             enabled: true,
             ..LlmJudgeConfig::default()
         });
-        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+        let llm_gate =
+            super::HookLlmGateRuntime::new_with_worker_test_lock(&config.llm, worker_test_lock);
         let classifier = compile_classifier_from_embedder(&StaticEmbedder, &config.ingest_gating)
             .await
             .expect("compile classifier")
@@ -6240,6 +6263,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_llm_gate_preserves_classifier_audit() {
+        let worker_test_lock = crate::llm::acquire_llm_worker_test_lock();
         let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut llm_server = mockito::Server::new_async().await;
@@ -6297,7 +6321,8 @@ mod tests {
             enabled: true,
             ..LlmJudgeConfig::default()
         });
-        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+        let llm_gate =
+            super::HookLlmGateRuntime::new_with_worker_test_lock(&config.llm, worker_test_lock);
         let classifier_embedder = StaticEmbedder;
         let classifier =
             compile_classifier_from_embedder(&classifier_embedder, &config.ingest_gating)
@@ -6373,6 +6398,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_malformed_llm_gate_persists_before_retry() {
+        let worker_test_lock = crate::llm::acquire_llm_worker_test_lock();
         let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut llm_server = mockito::Server::new_async().await;
@@ -6427,7 +6453,8 @@ mod tests {
             enabled: true,
             ..LlmJudgeConfig::default()
         });
-        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+        let llm_gate =
+            super::HookLlmGateRuntime::new_with_worker_test_lock(&config.llm, worker_test_lock);
 
         super::process_hook_worker_message(
             HookWorkerState {
@@ -6488,6 +6515,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_llm_reject_retains_payload_for_pruner() {
+        let worker_test_lock = crate::llm::acquire_llm_worker_test_lock();
         let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut llm_server = mockito::Server::new_async().await;
@@ -6542,7 +6570,8 @@ mod tests {
             enabled: true,
             ..LlmJudgeConfig::default()
         });
-        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+        let llm_gate =
+            super::HookLlmGateRuntime::new_with_worker_test_lock(&config.llm, worker_test_lock);
 
         let drawer_id = process_claimed_message_with_embedder(
             &async_db,
@@ -6608,6 +6637,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automatic_hook_truncated_reject_preserves_untrusted_payload_path() {
+        let worker_test_lock = crate::llm::acquire_llm_worker_test_lock();
         let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut llm_server = mockito::Server::new_async().await;
@@ -6657,7 +6687,8 @@ mod tests {
             enabled: true,
             ..LlmJudgeConfig::default()
         });
-        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+        let llm_gate =
+            super::HookLlmGateRuntime::new_with_worker_test_lock(&config.llm, worker_test_lock);
 
         let drawer_id = process_claimed_message_with_embedder(
             &async_db,

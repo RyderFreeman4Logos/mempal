@@ -117,7 +117,7 @@ impl SharedLlmClientRuntime {
         Self {
             inner: Arc::new(Mutex::new(LlmClientRuntime::new(config))),
             #[cfg(test)]
-            // ponytail: process-wide worker-lifetime lock; split by worker fixture if throughput matters.
+            // ponytail: global lock; per-fixture locks if throughput matters.
             _worker_test_lock: Arc::new(super::acquire_llm_worker_test_lock()),
         }
     }
@@ -915,6 +915,6 @@ fn parse_gating_verdict(content: &str) -> (String, f64) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     include!("worker_tests.rs");
 }

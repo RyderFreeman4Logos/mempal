@@ -141,6 +141,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_rejection_does_not_discard_another_messages_completed_drawer() {
+        let worker_test_lock = crate::llm::acquire_llm_worker_test_lock();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -223,7 +224,7 @@ mod tests {
         config.llm.base_url = Some(format!("{}/v1", llm_server.url()));
         config.llm.model = Some("test-llm".to_string());
         config.llm.enabled_for = vec!["gating".to_string()];
-        let llm_gate = HookLlmGateRuntime::new(&config.llm);
+        let llm_gate = HookLlmGateRuntime::new_with_worker_test_lock(&config.llm, worker_test_lock);
 
         let rejected_drawer_id = process_claimed_message_with_embedder(
             &async_db,
@@ -267,6 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_rejection_does_not_discard_completed_drawer_owned_by_stale_admission() {
+        let worker_test_lock = crate::llm::acquire_llm_worker_test_lock();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -360,7 +362,10 @@ mod tests {
         unavailable_config.llm.base_url = Some(format!("{}/v1", llm_server.url()));
         unavailable_config.llm.model = Some("test-llm".to_string());
         unavailable_config.llm.enabled_for = vec!["gating".to_string()];
-        let llm_gate = HookLlmGateRuntime::new(&unavailable_config.llm);
+        let llm_gate = HookLlmGateRuntime::new_with_worker_test_lock(
+            &unavailable_config.llm,
+            worker_test_lock,
+        );
         let mut retry = failed_admission.clone();
         retry.retry_count = 1;
         process_claimed_message_with_embedder(

@@ -12,7 +12,7 @@ use tokio::sync::Notify;
 #[path = "worker_contention_tests.rs"]
 mod contention_tests;
 
-fn shared_llm_client_runtime_with_worker_test_lock(
+pub(crate) fn shared_llm_client_runtime_with_worker_test_lock(
     config: &LlmConfig,
     worker_test_lock: tokio::sync::OwnedMutexGuard<()>,
 ) -> SharedLlmClientRuntime {
