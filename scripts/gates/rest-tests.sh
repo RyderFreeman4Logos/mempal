@@ -152,8 +152,9 @@ echo "rest cargo build jobs: ${CARGO_BUILD_JOBS}"
 
 # #1052: rest-lib test_worker_* observer/contention tests get their own cargo
 # process instead of running inside the parallel --lib suite.
-run_cargo_test --workspace --features rest --lib --bins -- --skip test_worker_
+run_cargo_test --workspace --features rest --lib --bins -- --skip test_worker_ --skip recovery_publication_failure_returns_error_without_ready_or_child_leaks
 run_cargo_test --workspace --features rest --lib test_worker_
+run_cargo_test --workspace --features rest --lib recovery_publication_failure_returns_error_without_ready_or_child_leaks
 run_cargo_test --workspace --features rest --doc
 clean_mempal_artifacts
 
