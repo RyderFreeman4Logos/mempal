@@ -16,7 +16,8 @@ run_phase() {
 if (( $# > 0 )) && [[ "${!#}" == "test" ]]; then
     run_phase "$@" -- --skip test_worker_ --skip historical_rejudge
     run_phase "$@" test_worker_
-    run_phase "$@" historical_rejudge
+    run_phase "$@" historical_rejudge -- --skip historical_rejudge_paired_spark_exhausted_persists_confirm_backlog_and_continues_qwen
+    run_phase "$@" historical_rejudge_paired_spark_exhausted_persists_confirm_backlog_and_continues_qwen
 else
     exec python3 "${timeout_wrapper}" "$@"
 fi
