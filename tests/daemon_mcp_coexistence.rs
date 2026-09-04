@@ -549,6 +549,7 @@ async fn process_exit_check_never_signals_reused_pid() -> Result<()> {
 
 #[test]
 fn daemon_refuses_a_live_incompatible_writer_lease_without_takeover() -> Result<()> {
+    let _process_lock = local_gate_child::PROCESS_LIFECYCLE_TEST_LOCK.blocking_lock();
     let test_home = TestHome::new()?;
     let lease_db = Database::open(&test_home.db_path).context("open writer lease fixture")?;
     let lease = lease_db
