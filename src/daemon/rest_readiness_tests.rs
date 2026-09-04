@@ -60,7 +60,9 @@ impl NotifySocketEnv {
         Self::set_value_and_home(path.as_os_str().to_owned(), Some(home))
     }
     fn set_value_and_home(value: OsString, home: Option<&Path>) -> Self {
-        let lock = NOTIFY_ENV_LOCK.lock().expect("NOTIFY_SOCKET env lock");
+        let lock = NOTIFY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = std::env::var_os("NOTIFY_SOCKET");
         let previous_home = std::env::var_os("HOME");
         // SAFETY: the test lock serializes this process-global environment mutation.
