@@ -120,6 +120,7 @@ async fn writer_is_writable() {
 
 #[tokio::test]
 async fn deadline_write_does_not_dispatch_closure_after_expiry() {
+    let _deadline_write_lock = CANCELLED_READ_PERMIT_TEST_LOCK.lock().await;
     let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1)
         .expect("open async db")
@@ -420,6 +421,7 @@ async fn async_db_symlink_retarget_does_not_divert_admitted_identity() {
 
 #[tokio::test]
 async fn deadline_write_reports_committed_success_when_closure_returns_after_deadline() {
+    let _deadline_write_lock = CANCELLED_READ_PERMIT_TEST_LOCK.lock().await;
     let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1).expect("open async db");
     adb.run_write(|db| {
@@ -466,6 +468,7 @@ async fn deadline_write_reports_committed_success_when_closure_returns_after_dea
 
 #[tokio::test]
 async fn deadline_write_preserves_committed_success_after_real_lock_releases() {
+    let _deadline_write_lock = CANCELLED_READ_PERMIT_TEST_LOCK.lock().await;
     let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
     let adb = AsyncDb::open(&db_path, 1).expect("open async db");
@@ -537,6 +540,7 @@ async fn deadline_write_preserves_committed_success_after_real_lock_releases() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn deadline_write_self_heal_is_off_runtime_and_bounded() {
+    let _deadline_write_lock = CANCELLED_READ_PERMIT_TEST_LOCK.lock().await;
     let tmp = short_tempdir();
     let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1)
         .expect("open async db")
