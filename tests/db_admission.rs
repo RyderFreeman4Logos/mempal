@@ -547,6 +547,7 @@ fn status_remains_available_when_holder_budget_is_exhausted() {
 #[cfg(target_os = "linux")]
 #[test]
 fn pid_namespace_mcp_holder_is_reaped_after_forced_exit_when_supported() {
+    let _class_lock = db_admission_class_lock();
     let Ok(mut support_command) = SpawnSpec::resolve("unshare") else {
         eprintln!("skipping PID namespace integration probe: unshare is unavailable");
         return;
@@ -586,7 +587,6 @@ fn pid_namespace_mcp_holder_is_reaped_after_forced_exit_when_supported() {
         Err(error) => panic!("unshare capability probe failed: {error}"),
     }
 
-    let _class_lock = db_admission_class_lock();
     let tmp = tempfile::tempdir().expect("tempdir");
     let home = tmp.path().join("home");
     let mempal_home = home.join(".mempal");
