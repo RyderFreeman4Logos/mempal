@@ -752,8 +752,8 @@ async fn systemd_notify_fails_when_api_is_disabled() {
 #[tokio::test]
 async fn recovery_publication_failure_returns_error_without_ready_or_child_leaks() {
     let (_config_lock, _config_reset) = acquire_config_test_isolation().await;
-    let tempdir = tempfile::tempdir().expect("create recovery publication fixture");
     let _shutdown_lock = acquire_shutdown_test_lock().await;
+    let tempdir = tempfile::tempdir().expect("create recovery publication fixture");
     let api_addr = reserve_rest_address().await;
     let (db_path, config_path) = write_fixture(&tempdir, api_addr);
     let notify_path = tempdir.path().join("notify.sock");
