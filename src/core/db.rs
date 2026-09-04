@@ -544,6 +544,8 @@ fn validate_vector_metric(metric: &str) -> Result<&str, DbError> {
 
 #[path = "db_open.rs"]
 mod db_open;
+#[cfg(test)]
+pub(crate) use db_open::db_open_busy_fixture_lock;
 #[path = "db_write_reserve.rs"]
 mod db_write_reserve;
 pub(crate) use db_write_reserve::ensure_write_reserve_logged;
