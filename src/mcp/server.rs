@@ -15688,10 +15688,11 @@ quality_policy = "llm_required_for_keep"
 
     #[tokio::test]
     async fn test_mcp_ingest_enqueue_waits_for_transient_sqlite_lock() {
+        let _l = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         assert!(
             MCP_INGEST_QUEUE_LOCK_RETRY_DEADLINE >= Duration::from_secs(5),
-            "MCP ingest queue admission must preserve the previous SQLite busy-timeout budget"
+            "MCP queue admission preserves SQLite busy-timeout budget"
         );
         let lock = hold_sqlite_write_lock(db_path.clone(), Duration::from_millis(2_500));
 
@@ -15704,7 +15705,7 @@ quality_policy = "llm_required_for_keep"
                 ..IngestRequest::default()
             }))
             .await
-            .expect("ingest admission should retry through transient SQLite busy")
+            .expect("ingest admission retries SQLite busy")
             .0;
 
         lock.join().expect("lock thread");
@@ -15873,6 +15874,7 @@ quality_policy = "llm_required_for_keep"
 
     #[tokio::test]
     async fn test_mcp_ingest_enqueue_skips_wal_reset_under_existing_reader() {
+        let _l = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let reader = rusqlite::Connection::open(&db_path).expect("open existing MCP holder");
         reader
@@ -16639,6 +16641,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_ingest_replacement_target_uses_request_budget_for_admission() {
+        let _l = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         insert_drawer(
             &db_path,
