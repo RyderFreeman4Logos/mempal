@@ -1,12 +1,22 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mempal::core::db::Database;
 use mempal::core::types::{Drawer, SourceType};
 use serde_json::Value;
 use tempfile::TempDir;
+
+// ponytail: one process-local priming class lock; split by fixture family if throughput matters.
+static DB_ADMISSION_CLASS_LOCK: Mutex<()> = Mutex::new(());
+
+fn db_admission_class_lock() -> std::sync::MutexGuard<'static, ()> {
+    DB_ADMISSION_CLASS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn mempal_bin() -> String {
     env!("CARGO_BIN_EXE_mempal").to_string()
@@ -28,6 +38,7 @@ struct PrimeEnv {
 
 impl PrimeEnv {
     fn new() -> Self {
+        let _class_lock = db_admission_class_lock();
         let tmp = TempDir::new_in("/tmp").expect("external tempdir");
         let home = tmp.path().join("home");
         let mempal_home = home.join(".mempal");
@@ -99,6 +110,7 @@ struct DrawerSeed {
 }
 
 fn insert_drawer(db_path: &Path, seed: DrawerSeed) {
+    let _class_lock = db_admission_class_lock();
     let db = Database::open(db_path).expect("open db");
     db.insert_drawer_with_project(
         &Drawer {
