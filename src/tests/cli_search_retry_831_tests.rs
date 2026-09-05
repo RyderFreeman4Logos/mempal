@@ -18,7 +18,7 @@ async fn search_command_deadline_covers_embedder_initialization() {
             session: None,
             filters: SearchFilters::default(),
             top_k: 0,
-            project: None,
+            project: Some("deadline-test"),
             include_global: false,
             all_projects: true,
             json: true,
@@ -42,6 +42,7 @@ async fn search_command_deadline_covers_embedder_initialization() {
     tokio::pin!(search);
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         tokio::select! {
+            biased;
             started = &mut initialization_started_rx => {
                 started.expect("embedder initialization should report its start");
             }
