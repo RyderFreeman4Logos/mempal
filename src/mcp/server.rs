@@ -14116,7 +14116,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_background_ingest_starts_local_worker_when_daemon_lease_probe_fails() {
-        let _l = acquire_ingest_worker_lifecycle_lock().await;
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, _db_path, server) = setup_server();
         let server =
             server.with_daemon_writer_lease_check_error_for_test("forced daemon lease probe error");
@@ -14137,7 +14137,7 @@ mod tests {
                 },
             )
             .await
-            .expect("receipt")
+            .expect("durable receipt")
             .0;
 
         assert_eq!(response.state, Some(IngestOperationState::Queued));
@@ -14147,8 +14147,8 @@ mod tests {
             server.wait_for_operation_completion(operation_id),
         )
         .await
-        .expect("complete")
-        .expect("complete");
+        .expect("worker timeout")
+        .expect("worker error");
 
         assert_eq!(completed.state, Some(IngestOperationState::Completed));
         assert!(!completed.created_drawer_ids.is_empty());
