@@ -1,10 +1,8 @@
 use std::fs;
-use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
-use std::sync::atomic::Ordering;
+use std::process::{Command, Output};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use std::sync::Arc;
 
@@ -21,8 +19,13 @@ use mempal::mcp::MempalMcpServer;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+#[path = "common/harness/cli_deadline.rs"]
+mod cli_deadline;
 #[path = "support/openai_embedding_stub.rs"]
 mod openai_embedding_stub;
+
+const _: fn() = cli_deadline::reference_shared_cli_deadline_api;
+
 struct StubEmbedderFactory;
 
 #[async_trait]
@@ -311,39 +314,39 @@ fn run_context(home: &Path, args: Vec<String>) -> Output {
         .expect("run context")
 }
 fn run_context_json(home: &Path, query: &str, extra: &[&str]) -> Value {
-    let (endpoint, stop, handle) = openai_embedding_stub::start(query, vector());
-    write_cli_api_config(home, &endpoint);
+    let stub = openai_embedding_stub::start(query, vector());
+    write_cli_api_config(home, stub.endpoint());
 
     let mut args = vec!["context".to_string(), query.to_string()];
     args.extend(extra.iter().map(|arg| (*arg).to_string()));
     args.extend(["--format".to_string(), "json".to_string()]);
 
     let output = run_context(home, args);
-    stop.store(true, Ordering::Relaxed);
+    let outcome = stub.stop_and_join();
     assert!(
         output.status.success(),
         "context command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    handle.join().expect("join embedding stub");
+    assert_eq!(outcome, openai_embedding_stub::StubOutcome::Served);
     serde_json::from_slice(&output.stdout).expect("parse context json")
 }
 
 fn run_context_plain(home: &Path, query: &str, extra: &[&str]) -> String {
-    let (endpoint, stop, handle) = openai_embedding_stub::start(query, vector());
-    write_cli_api_config(home, &endpoint);
+    let stub = openai_embedding_stub::start(query, vector());
+    write_cli_api_config(home, stub.endpoint());
 
     let mut args = vec!["context".to_string(), query.to_string()];
     args.extend(extra.iter().map(|arg| (*arg).to_string()));
 
     let output = run_context(home, args);
-    stop.store(true, Ordering::Relaxed);
+    let outcome = stub.stop_and_join();
     assert!(
         output.status.success(),
         "context command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    handle.join().expect("join embedding stub");
+    assert_eq!(outcome, openai_embedding_stub::StubOutcome::Served);
     String::from_utf8(output.stdout).expect("context stdout utf8")
 }
 
@@ -1138,49 +1141,45 @@ fn test_context_empty_result_exits_successfully() {
 fn test_context_delayed_client_is_served_after_former_stub_accept_budget() {
     let (tmp, _db) = setup_cli_home();
     let query = "no such topic";
-    let (endpoint, stop, handle) = openai_embedding_stub::start(query, vector());
-    write_cli_api_config(tmp.path(), &endpoint);
+    let stub = openai_embedding_stub::start(query, vector());
+    write_cli_api_config(tmp.path(), stub.endpoint());
     thread::sleep(Duration::from_millis(5500));
-    let mut child = Command::new(mempal_bin())
-        .args(["context", query, "--format", "json"])
-        .env_clear()
-        .env("HOME", tmp.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn delayed context client");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let status = loop {
-        match child.try_wait().expect("poll delayed context client") {
-            Some(status) => break status,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                stop.store(true, Ordering::Relaxed);
-                let _ = handle.join();
-                panic!("delayed context client still running after 20s");
-            }
-            None => thread::sleep(Duration::from_millis(50)),
-        }
-    };
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        pipe.read_to_end(&mut stdout).expect("read delayed stdout");
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        pipe.read_to_end(&mut stderr).expect("read delayed stderr");
-    }
-    stop.store(true, Ordering::Relaxed);
-    handle.join().expect("join embedding stub");
-    assert!(
-        status.success(),
-        "delayed context client failed: {}",
-        String::from_utf8_lossy(&stderr)
+    let output = cli_deadline::run_cli_output(
+        "delayed context client",
+        |spec| {
+            cli_deadline::with_home(spec, tmp.path());
+            cli_deadline::push_args(spec, ["context", query, "--format", "json"]);
+        },
+        Duration::from_secs(20),
     );
-    let value: Value = serde_json::from_slice(&stdout).expect("parse delayed context json");
+    let outcome = stub.stop_and_join();
+    assert!(
+        output.status.success(),
+        "delayed context client failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(outcome, openai_embedding_stub::StubOutcome::Served);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("parse delayed context json");
     assert_eq!(value["query"], query);
     assert_eq!(value["sections"].as_array().expect("sections").len(), 0);
+}
+
+#[test]
+fn test_context_nonzero_exit_stops_stub_without_false_served() {
+    let (tmp, _db) = setup_cli_home();
+    let stub = openai_embedding_stub::start("debug", vector());
+    write_cli_api_config(tmp.path(), stub.endpoint());
+    let output = cli_deadline::run_cli_output(
+        "invalid max-items context",
+        |spec| {
+            cli_deadline::with_home(spec, tmp.path());
+            cli_deadline::push_args(spec, ["context", "debug", "--max-items", "0"]);
+        },
+        Duration::from_secs(20),
+    );
+    let outcome = stub.stop_and_join();
+    assert!(!output.status.success());
+    assert_eq!(outcome, openai_embedding_stub::StubOutcome::Stopped);
 }
 
 #[test]
