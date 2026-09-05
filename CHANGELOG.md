@@ -31,7 +31,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - MCP search shares a deadline and releases reads before responding (#881).
 - Typed/redacted MCP admission and audit-write diagnostics (#879).
 - Daemon pidfile validates identity; scoped ingest release honors remaining retry budget (#885/#895).
-- Profile-lock retries keep byte-budget rejection; suite-load isolation; Busy retry waits non-budget (#893/#947/#1064–#1075, #934/#1077).
+- Profile locks retain byte-budget rejection and suite-load isolation; Busy waits stay non-budget (#893/#947/#1064–#1075, #934/#1077/#1078).
 - Diagnostic readonly queue stats no longer inherit SQLite's default 5s busy wait: a `queue_stats_readonly` read under a held writer lock now returns a bounded lock diagnostic instead of stalling (#911).
 
 - **Daemon readiness CLI tests**: shared Linux supervisor for bounded redacted lifecycle handling (#892).
