@@ -87,6 +87,7 @@ fn spawn_spec_api_methods(spec: &mut SpawnSpec) -> io::Result<()> {
     let _ = spec.arg(std::ffi::OsString::new());
     let _ = spec.args(Vec::<std::ffi::OsString>::new());
     let _ = spec.env(std::ffi::OsString::new(), std::ffi::OsString::new());
+    let _ = spec.env_clear();
     let _ = spec.current_dir(std::path::PathBuf::from("/"))?;
     let _ = spec.stdio(StdioMode::Capture);
     Ok(())

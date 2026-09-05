@@ -499,22 +499,32 @@ async fn deadline_write_preserves_committed_success_after_real_lock_releases() {
         .expect("SQLite lock holder ready");
 
     let deadline = Instant::now() + Duration::from_secs(1);
-    let result = tokio::time::timeout(
-        Duration::from_secs(3),
-        adb.run_write_until(deadline, move |db| {
-            db.conn().execute(
-                "INSERT INTO deadline_lock_boundary_success (value) VALUES (1)",
-                [],
-            )?;
-            // Wait from the actual mutation, not fixture setup, so suite load
-            // cannot make this committed closure return before its deadline.
-            std::thread::sleep(
-                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(50),
-            );
-            Ok::<(), DbError>(())
-        }),
-    )
-    .await;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let write = adb.run_write_until(deadline, move |db| {
+        db.conn().execute(
+            "INSERT INTO deadline_lock_boundary_success (value) VALUES (1)",
+            [],
+        )?;
+        // Bound the outer wait from the started mutation, not dispatch.
+        let _ = started_tx.send(());
+        // Wait from the actual mutation, not fixture setup, so suite load
+        // cannot make this committed closure return before its deadline.
+        std::thread::sleep(
+            deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(50),
+        );
+        Ok::<(), DbError>(())
+    });
+    tokio::pin!(write);
+    let result = tokio::select! {
+        biased;
+        result = &mut write => Ok(result),
+        started = tokio::time::timeout(Duration::from_secs(3), started_rx) => {
+            started
+                .expect("started mutation signal must arrive")
+                .expect("started mutation sender dropped");
+            tokio::time::timeout(Duration::from_secs(3), write).await
+        }
+    };
     holder.join().expect("join SQLite lock holder");
 
     result

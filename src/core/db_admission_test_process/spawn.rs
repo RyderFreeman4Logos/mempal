@@ -87,6 +87,11 @@ impl SpawnSpec {
         self
     }
 
+    pub fn env_clear(&mut self) -> &mut Self {
+        self.environment.clear();
+        self
+    }
+
     pub fn current_dir(&mut self, directory: impl Into<PathBuf>) -> io::Result<&mut Self> {
         let directory = directory.into();
         if !directory.is_absolute() {
