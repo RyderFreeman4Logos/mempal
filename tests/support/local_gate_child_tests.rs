@@ -199,6 +199,7 @@ mod tests {
     fn assert_capture_failure_reaps_direct_child(
         capture: impl FnOnce(&Child) -> io::Result<ProcessHandle>,
     ) {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let child = spawn_sleeping_direct_child();
         let identity = capture_owned_child(child.child())
             .expect("capture direct child identity before injected failure")
@@ -212,13 +213,11 @@ mod tests {
         assert!(!error.to_string().is_empty(), "failure must retain diagnostics");
         assert_process_identity_gone_within(identity, Duration::from_secs(1));
     }
-
     #[test]
     fn procfs_exit_errors_are_treated_as_absent_processes() {
         assert!(process_is_gone(&io::Error::from(io::ErrorKind::NotFound)));
         assert!(process_is_gone(&io::Error::from_raw_os_error(libc::ESRCH)));
     }
-
     #[test]
     fn process_identity_mismatch_is_refused_before_signaling() {
         let expected = ProcessIdentity {
@@ -239,7 +238,6 @@ mod tests {
             "a reused PID must not be accepted as the tracked process"
         );
     }
-
     #[test]
     fn reaped_child_identity_is_not_retracked_when_its_pid_is_reused() {
         let direct_child = ProcessIdentity {
@@ -260,7 +258,6 @@ mod tests {
             "the original child identity must never adopt a later process with the same PID"
         );
     }
-
     #[test]
     fn procfs_capture_failure_reaps_direct_child() {
         assert_capture_failure_reaps_direct_child(|_| {
@@ -270,23 +267,21 @@ mod tests {
             ))
         });
     }
-
     #[test]
     fn pidfd_capture_failure_reaps_direct_child() {
         assert_capture_failure_reaps_direct_child(|_| {
             Err(io::Error::other("injected pidfd_open failure"))
         });
     }
-
     #[test]
     fn fd_exhaustion_during_capture_reaps_direct_child() {
         assert_capture_failure_reaps_direct_child(|_| {
             Err(io::Error::from_raw_os_error(libc::EMFILE))
         });
     }
-
     #[test]
     fn panic_during_capture_reaps_direct_child() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let child = spawn_sleeping_direct_child();
         let identity = capture_owned_child(child.child())
             .expect("capture direct child identity before injected panic")
@@ -301,9 +296,9 @@ mod tests {
         assert!(panic.is_err(), "injected setup panic must unwind");
         assert_process_identity_gone_within(identity, Duration::from_secs(1));
     }
-
     #[test]
     fn gate_child_success_reaps_the_direct_child() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let mut command = Command::new("/bin/true");
         command
             .stdin(Stdio::null())
@@ -322,9 +317,9 @@ mod tests {
         assert!(output.status.success());
         assert_process_identity_gone_within(identity, Duration::from_secs(1));
     }
-
     #[test]
     fn gate_child_timeout_reaps_the_direct_child() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let child = spawn_sleeping_direct_child();
         let identity = capture_owned_child(child.child())
             .expect("capture timeout child identity")
@@ -338,9 +333,9 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_process_identity_gone_within(identity, Duration::from_secs(1));
     }
-
     #[test]
     fn gate_child_drop_reaps_the_direct_child() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let child = spawn_sleeping_direct_child();
         let identity = capture_owned_child(child.child())
             .expect("capture drop child identity")
@@ -370,6 +365,7 @@ mod tests {
 
     #[test]
     fn pipe_reader_sibling_is_never_tracked_or_signaled_as_a_writer() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let fixture = tempfile::tempdir().expect("create pipe-endpoint fixture");
         let sibling_ready = fixture.path().join("sibling-ready");
         let term_file = fixture.path().join("sibling-term");
@@ -505,6 +501,7 @@ mod tests {
     }
     #[test]
     fn discovers_children_created_by_non_leader_threads() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let parent_pid = i32::try_from(std::process::id()).expect("test process PID fits i32");
         let parent = ProcessHandle::capture(parent_pid)
             .expect("capture test process")
@@ -553,6 +550,7 @@ mod tests {
 
     #[test]
     fn unrelated_non_utf8_comm_does_not_abort_pipe_cleanup() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let fixture = tempfile::tempdir().expect("create non-UTF-8 comm fixture");
         let unrelated_ready = fixture.path().join("unrelated-ready");
         let unrelated = spawn_non_utf8_comm_process(&unrelated_ready);
@@ -580,6 +578,7 @@ mod tests {
     }
     #[test]
     fn gate_child_wait_timeout_reaps_descendants_that_hold_pipes() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let fixture = tempfile::tempdir().expect("create pipe-holder fixture");
         let ready_file = fixture.path().join("ready");
         let pid_file = fixture.path().join("pid");
@@ -601,6 +600,7 @@ mod tests {
     }
     #[test]
     fn gate_child_drop_reaps_descendants_that_hold_pipes() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let fixture = tempfile::tempdir().expect("create drop pipe-holder fixture");
         let ready_file = fixture.path().join("ready");
         let pid_file = fixture.path().join("pid");

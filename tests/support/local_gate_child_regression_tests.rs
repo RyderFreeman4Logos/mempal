@@ -354,6 +354,7 @@ mod regression_tests {
 
     #[test]
     fn gate_child_timeout_bounds_proc_discovery_with_fd_heavy_sibling() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let fixture = tempfile::tempdir().expect("create FD-heavy discovery fixture");
         let ready_file = fixture.path().join("fd-heavy-ready");
         let sibling = spawn_fd_heavy_sibling(&ready_file);
@@ -387,6 +388,7 @@ mod regression_tests {
 
     #[test]
     fn reaped_gate_leader_does_not_signal_a_reused_process_group() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
         let mut leader_command = Command::new("/bin/sleep");
         leader_command
             .arg("0.01")
