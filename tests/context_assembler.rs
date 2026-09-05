@@ -1,9 +1,10 @@
 use std::fs;
-use std::io::Write;
-use std::net::TcpListener;
+use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::Ordering;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use std::sync::Arc;
 
@@ -20,8 +21,8 @@ use mempal::mcp::MempalMcpServer;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-#[path = "support/bounded_http_request.rs"]
-mod bounded_http_request;
+#[path = "support/openai_embedding_stub.rs"]
+mod openai_embedding_stub;
 struct StubEmbedderFactory;
 
 #[async_trait]
@@ -268,61 +269,6 @@ fn insert_project_fixture(db: &Database, drawer: &Drawer, project_id: &str) {
         .expect("insert project vector");
 }
 
-fn start_openai_embedding_stub(
-    expected_query: &str,
-    vector: Vec<f32>,
-) -> (String, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding stub");
-    listener
-        .set_nonblocking(true)
-        .expect("set embedding stub nonblocking");
-    let address = listener.local_addr().expect("local addr");
-    let expected_query = expected_query.to_string();
-
-    let handle = thread::spawn(move || {
-        let (mut stream, _) = (0..50)
-            .find_map(|_| match listener.accept() {
-                Ok(connection) => Some(connection),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(std::time::Duration::from_millis(100));
-                    None
-                }
-                Err(error) => panic!("accept request: {error}"),
-            })
-            .expect("embedding stub timed out waiting for request");
-        let request = bounded_http_request::read_tcp(&mut stream, bounded_http_request::MAX_BYTES)
-            .expect("read embedding request");
-        let (headers, body) = request
-            .split_once("\r\n\r\n")
-            .expect("request should contain HTTP headers and JSON body");
-        let request_line = headers.lines().next().expect("request line");
-        assert_eq!(request_line, "POST /v1/embeddings HTTP/1.1");
-
-        let payload: Value = serde_json::from_str(body).expect("parse embedding request body");
-        assert_eq!(payload["model"], "test-model");
-        let input = payload["input"]
-            .as_array()
-            .expect("input should be an array");
-        assert_eq!(input.len(), 1, "expected a single embedding query");
-        assert_eq!(input[0], expected_query);
-
-        let body = serde_json::to_string(&json!({
-            "data": [{ "embedding": vector }]
-        }))
-        .expect("serialize response body");
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write embedding response");
-    });
-
-    (format!("http://{address}/v1"), handle)
-}
-
 fn write_cli_api_config(home: &Path, endpoint: &str) {
     let config_path = home.join(".mempal").join("config.toml");
     let existing = fs::read_to_string(&config_path).unwrap_or_default();
@@ -365,7 +311,7 @@ fn run_context(home: &Path, args: Vec<String>) -> Output {
         .expect("run context")
 }
 fn run_context_json(home: &Path, query: &str, extra: &[&str]) -> Value {
-    let (endpoint, handle) = start_openai_embedding_stub(query, vector());
+    let (endpoint, stop, handle) = openai_embedding_stub::start(query, vector());
     write_cli_api_config(home, &endpoint);
 
     let mut args = vec!["context".to_string(), query.to_string()];
@@ -373,6 +319,7 @@ fn run_context_json(home: &Path, query: &str, extra: &[&str]) -> Value {
     args.extend(["--format".to_string(), "json".to_string()]);
 
     let output = run_context(home, args);
+    stop.store(true, Ordering::Relaxed);
     assert!(
         output.status.success(),
         "context command failed: {}",
@@ -383,13 +330,14 @@ fn run_context_json(home: &Path, query: &str, extra: &[&str]) -> Value {
 }
 
 fn run_context_plain(home: &Path, query: &str, extra: &[&str]) -> String {
-    let (endpoint, handle) = start_openai_embedding_stub(query, vector());
+    let (endpoint, stop, handle) = openai_embedding_stub::start(query, vector());
     write_cli_api_config(home, &endpoint);
 
     let mut args = vec!["context".to_string(), query.to_string()];
     args.extend(extra.iter().map(|arg| (*arg).to_string()));
 
     let output = run_context(home, args);
+    stop.store(true, Ordering::Relaxed);
     assert!(
         output.status.success(),
         "context command failed: {}",
@@ -1183,6 +1131,55 @@ async fn test_field_taxonomy_does_not_restrict_custom_context_field() {
 fn test_context_empty_result_exits_successfully() {
     let (tmp, _db) = setup_cli_home();
     let value = run_context_json(tmp.path(), "no such topic", &[]);
+    assert_eq!(value["sections"].as_array().expect("sections").len(), 0);
+}
+
+#[test]
+fn test_context_delayed_client_is_served_after_former_stub_accept_budget() {
+    let (tmp, _db) = setup_cli_home();
+    let query = "no such topic";
+    let (endpoint, stop, handle) = openai_embedding_stub::start(query, vector());
+    write_cli_api_config(tmp.path(), &endpoint);
+    thread::sleep(Duration::from_millis(5500));
+    let mut child = Command::new(mempal_bin())
+        .args(["context", query, "--format", "json"])
+        .env_clear()
+        .env("HOME", tmp.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn delayed context client");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        match child.try_wait().expect("poll delayed context client") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                stop.store(true, Ordering::Relaxed);
+                let _ = handle.join();
+                panic!("delayed context client still running after 20s");
+            }
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_end(&mut stdout).expect("read delayed stdout");
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_end(&mut stderr).expect("read delayed stderr");
+    }
+    stop.store(true, Ordering::Relaxed);
+    handle.join().expect("join embedding stub");
+    assert!(
+        status.success(),
+        "delayed context client failed: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let value: Value = serde_json::from_slice(&stdout).expect("parse delayed context json");
+    assert_eq!(value["query"], query);
     assert_eq!(value["sections"].as_array().expect("sections").len(), 0);
 }
 
