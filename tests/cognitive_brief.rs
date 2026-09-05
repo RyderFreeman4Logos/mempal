@@ -1,8 +1,9 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::TcpListener;
 use std::process::{Command, Output, Stdio};
-use std::sync::{OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,8 +14,15 @@ use mempal::core::types::{
     KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, Provenance, RuntimeAdoptionFilter,
     SourceType,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use tempfile::TempDir;
+
+#[path = "common/harness/cli_deadline.rs"]
+mod cli_deadline;
+#[path = "support/openai_embedding_stub.rs"]
+mod openai_embedding_stub;
+
+const _: fn() = cli_deadline::reference_shared_cli_deadline_api;
 
 fn mempal_bin() -> String {
     env!("CARGO_BIN_EXE_mempal").to_string()
@@ -30,15 +38,12 @@ fn setup_cli_home() -> (TempDir, Database) {
 
 static LOAD_DOTENV: OnceLock<()> = OnceLock::new();
 
-/// Inject hermetic embed environment into a child Command.
-///
-/// Forwards `MEMPAL_EMBED_*` vars from the test-process env (populated from
-/// `.env` via dotenvy on first call).  If `MEMPAL_EMBED_BACKEND` is absent,
-/// defaults to `stub` so no model download or network call occurs in CI.
-fn inject_embed_env(cmd: &mut Command) {
+/// Hermetic embed env: dotenv-forwarded `MEMPAL_EMBED_*`, then `extra` overlays.
+fn embed_env_pairs(extra: &[(String, String)]) -> Vec<(String, String)> {
     LOAD_DOTENV.get_or_init(|| {
         dotenvy::dotenv().ok();
     });
+    let mut pairs = Vec::new();
     for key in [
         "MEMPAL_EMBED_BACKEND",
         "MEMPAL_EMBED_BASE_URL",
@@ -46,39 +51,53 @@ fn inject_embed_env(cmd: &mut Command) {
         "MEMPAL_EMBED_DIM",
     ] {
         if let Ok(val) = std::env::var(key) {
-            cmd.env(key, val);
+            pairs.push((key.to_string(), val));
         }
     }
     if std::env::var("MEMPAL_EMBED_BACKEND").is_err() {
-        cmd.env("MEMPAL_EMBED_BACKEND", "stub");
+        pairs.push(("MEMPAL_EMBED_BACKEND".to_string(), "stub".to_string()));
     }
+    for (key, value) in extra {
+        pairs.push((key.clone(), value.clone()));
+    }
+    pairs
 }
 
-fn run_mempal(home: &TempDir, args: &[&str]) -> std::process::Output {
-    let mut cmd = Command::new(mempal_bin());
-    cmd.args(args).env("HOME", home.path());
-    inject_embed_env(&mut cmd);
-    cmd.output().expect("run mempal")
+fn openai_compat_env(base_url: &str, dim: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "MEMPAL_EMBED_BACKEND".to_string(),
+            "openai_compat".to_string(),
+        ),
+        ("MEMPAL_EMBED_BASE_URL".to_string(), base_url.to_string()),
+        ("MEMPAL_EMBED_MODEL".to_string(), "test-model".to_string()),
+        ("MEMPAL_EMBED_DIM".to_string(), dim.to_string()),
+    ]
 }
 
-fn run_mempal_with_env(
-    home: &TempDir,
-    args: &[&str],
-    envs: &[(&str, String)],
-) -> std::process::Output {
-    let mut cmd = Command::new(mempal_bin());
-    cmd.args(args).env("HOME", home.path());
-    inject_embed_env(&mut cmd);
-    for (key, value) in envs {
-        cmd.env(key, value);
-    }
-    cmd.output().expect("run mempal")
+fn run_mempal(home: &TempDir, args: &[&str]) -> Output {
+    run_mempal_with_env(home, args, &[])
+}
+
+fn run_mempal_with_env(home: &TempDir, args: &[&str], extra: &[(String, String)]) -> Output {
+    let env_pairs = embed_env_pairs(extra);
+    cli_deadline::run_cli_output(
+        "brief cli",
+        |spec| {
+            cli_deadline::with_home(spec, home.path());
+            cli_deadline::push_args(spec, args.iter().copied());
+            for (key, value) in &env_pairs {
+                spec.env(key, value);
+            }
+        },
+        cli_deadline::CLI_HELPER_DEADLINE,
+    )
 }
 
 fn run_mempal_with_env_timeout(
     home: &TempDir,
     args: &[&str],
-    envs: &[(&str, String)],
+    extra: &[(String, String)],
     ready: mpsc::Receiver<()>,
     timeout: Duration,
 ) -> Output {
@@ -87,8 +106,7 @@ fn run_mempal_with_env_timeout(
         .env("HOME", home.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    inject_embed_env(&mut cmd);
-    for (key, value) in envs {
+    for (key, value) in embed_env_pairs(extra) {
         cmd.env(key, value);
     }
     let mut child = cmd.spawn().expect("spawn mempal");
@@ -227,64 +245,35 @@ fn insert_card_with_link(db: &Database, card_id: &str, evidence_id: &str) {
     .expect("insert card link");
 }
 
-fn start_openai_embedding_stub(
-    expected_query: &str,
-    request_count: usize,
-) -> (String, thread::JoinHandle<()>) {
-    start_openai_embedding_stub_with_vector(expected_query, request_count, vector())
+struct StalledEmbeddingStub {
+    endpoint: String,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
 }
 
-fn start_openai_embedding_stub_with_vector(
-    expected_query: &str,
-    request_count: usize,
-    response_vector: Vec<f32>,
-) -> (String, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding stub");
-    listener
-        .set_nonblocking(true)
-        .expect("set embedding stub nonblocking");
-    let address = listener.local_addr().expect("local addr");
-    let expected_query = expected_query.to_string();
-    let handle = thread::spawn(move || {
-        for _ in 0..request_count {
-            let (mut stream, _) = (0..50)
-                .find_map(|_| match listener.accept() {
-                    Ok(connection) => Some(connection),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(std::time::Duration::from_millis(100));
-                        None
-                    }
-                    Err(error) => panic!("accept request: {error}"),
-                })
-                .expect("embedding stub timed out waiting for request");
-            let mut request = [0_u8; 4096];
-            let bytes_read = stream.read(&mut request).expect("read embedding request");
-            let request = String::from_utf8_lossy(&request[..bytes_read]);
-            let (_, body) = request
-                .split_once("\r\n\r\n")
-                .expect("request should contain JSON body");
-            let payload: Value = serde_json::from_str(body).expect("parse embedding request");
-            assert_eq!(payload["input"][0], expected_query);
-            let body = serde_json::to_string(&json!({
-                "data": [{ "embedding": response_vector.clone() }]
-            }))
-            .expect("serialize embedding response");
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write embedding response");
+impl StalledEmbeddingStub {
+    fn join(mut self) {
+        self.handle
+            .take()
+            .expect("stalled embedding stub already joined")
+            .join()
+            .expect("stalled embedding stub");
+    }
+}
+
+impl Drop for StalledEmbeddingStub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
-    });
-    (format!("http://{address}/v1/embeddings"), handle)
+    }
 }
 
 fn start_stalled_openai_embedding_stub(
     expected_query: &str,
-) -> (String, mpsc::Receiver<()>, thread::JoinHandle<()>) {
+) -> (StalledEmbeddingStub, mpsc::Receiver<()>) {
+    let stop = Arc::new(AtomicBool::new(false));
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled embedding stub");
     listener
         .set_nonblocking(true)
@@ -292,17 +281,20 @@ fn start_stalled_openai_embedding_stub(
     let address = listener.local_addr().expect("local addr");
     let expected_query = expected_query.to_string();
     let (request_started_tx, request_started_rx) = mpsc::channel();
+    let stop_for_thread = Arc::clone(&stop);
     let handle = thread::spawn(move || {
-        let (mut stream, _) = (0..50)
-            .find_map(|_| match listener.accept() {
-                Ok(connection) => Some(connection),
+        let (mut stream, _) = loop {
+            if stop_for_thread.load(Ordering::Relaxed) {
+                return;
+            }
+            match listener.accept() {
+                Ok(connection) => break connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(std::time::Duration::from_millis(100));
-                    None
+                    thread::sleep(Duration::from_millis(100));
                 }
                 Err(error) => panic!("accept stalled request: {error}"),
-            })
-            .expect("stalled embedding stub timed out waiting for request");
+            }
+        };
         let mut request = [0_u8; 4096];
         let bytes_read = stream.read(&mut request).expect("read embedding request");
         let request = String::from_utf8_lossy(&request[..bytes_read]);
@@ -326,9 +318,12 @@ fn start_stalled_openai_embedding_stub(
         }
     });
     (
-        format!("http://{address}/v1/embeddings"),
+        StalledEmbeddingStub {
+            endpoint: format!("http://{address}/v1"),
+            stop,
+            handle: Some(handle),
+        },
         request_started_rx,
-        handle,
     )
 }
 
@@ -356,30 +351,54 @@ fn seed_brief_fixture(db: &Database) {
 }
 
 #[test]
+fn test_cli_brief_delayed_client_is_served_after_former_stub_accept_budget() {
+    let (home, db) = setup_cli_home();
+    seed_brief_fixture(&db);
+    let query = "Alice pricing";
+    let stub = openai_embedding_stub::start(query, vector());
+    thread::sleep(Duration::from_millis(5500));
+    let output = run_mempal_with_env(
+        &home,
+        &["brief", query, "--format", "json"],
+        &openai_compat_env(stub.endpoint(), "384"),
+    );
+    let outcome = stub.stop_and_join();
+    assert!(
+        output.status.success(),
+        "delayed brief client failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(outcome, openai_embedding_stub::StubOutcome::Served);
+    let brief: Value = serde_json::from_slice(&output.stdout).expect("brief json");
+    assert_eq!(brief["query"], query);
+    assert_eq!(
+        brief["key_facts"][0]["citation"]["drawer_id"],
+        "brief_knowledge_alice"
+    );
+    assert_eq!(
+        brief["key_facts"][0]["citation"]["source_file"],
+        "knowledge://project/brief/brief_knowledge_alice"
+    );
+}
 
+#[test]
 fn test_cli_brief_json_includes_citations_uncertainty_and_actions() {
     let (home, db) = setup_cli_home();
     seed_brief_fixture(&db);
     let query = "Alice pricing";
-    let (endpoint, handle) = start_openai_embedding_stub(query, 1);
-    let base_url = endpoint.trim_end_matches("/embeddings").to_string();
-
+    let stub = openai_embedding_stub::start(query, vector());
     let output = run_mempal_with_env(
         &home,
         &["brief", query, "--format", "json"],
-        &[
-            ("MEMPAL_EMBED_BACKEND", "openai_compat".to_string()),
-            ("MEMPAL_EMBED_BASE_URL", base_url),
-            ("MEMPAL_EMBED_MODEL", "test-model".to_string()),
-            ("MEMPAL_EMBED_DIM", "384".to_string()),
-        ],
+        &openai_compat_env(stub.endpoint(), "384"),
     );
+    let outcome = stub.stop_and_join();
     assert!(
         output.status.success(),
         "brief failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    handle.join().expect("embedding stub");
+    assert_eq!(outcome, openai_embedding_stub::StubOutcome::Served);
     let brief: Value = serde_json::from_slice(&output.stdout).expect("brief json");
     assert_eq!(brief["query"], query);
     assert!(
@@ -413,30 +432,23 @@ fn test_cli_brief_json_includes_citations_uncertainty_and_actions() {
 }
 
 #[test]
-
 fn test_cli_brief_plain_lists_sections_and_citations() {
     let (home, db) = setup_cli_home();
     seed_brief_fixture(&db);
     let query = "Alice pricing";
-    let (endpoint, handle) = start_openai_embedding_stub(query, 1);
-    let base_url = endpoint.trim_end_matches("/embeddings").to_string();
-
+    let stub = openai_embedding_stub::start(query, vector());
     let output = run_mempal_with_env(
         &home,
         &["brief", query],
-        &[
-            ("MEMPAL_EMBED_BACKEND", "openai_compat".to_string()),
-            ("MEMPAL_EMBED_BASE_URL", base_url),
-            ("MEMPAL_EMBED_MODEL", "test-model".to_string()),
-            ("MEMPAL_EMBED_DIM", "384".to_string()),
-        ],
+        &openai_compat_env(stub.endpoint(), "384"),
     );
+    let outcome = stub.stop_and_join();
     assert!(
         output.status.success(),
         "brief failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    handle.join().expect("embedding stub");
+    assert_eq!(outcome, openai_embedding_stub::StubOutcome::Served);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("## Summary"));
     assert!(stdout.contains("## Key Facts"));
@@ -448,29 +460,22 @@ fn test_cli_brief_plain_lists_sections_and_citations() {
 }
 
 #[test]
-
 fn test_cli_brief_no_evidence_reports_uncertainty() {
     let (home, _db) = setup_cli_home();
     let query = "Unknown account";
-    let (endpoint, handle) = start_openai_embedding_stub(query, 1);
-    let base_url = endpoint.trim_end_matches("/embeddings").to_string();
-
+    let stub = openai_embedding_stub::start(query, vector());
     let output = run_mempal_with_env(
         &home,
         &["brief", query, "--format", "json"],
-        &[
-            ("MEMPAL_EMBED_BACKEND", "openai_compat".to_string()),
-            ("MEMPAL_EMBED_BASE_URL", base_url),
-            ("MEMPAL_EMBED_MODEL", "test-model".to_string()),
-            ("MEMPAL_EMBED_DIM", "384".to_string()),
-        ],
+        &openai_compat_env(stub.endpoint(), "384"),
     );
+    let outcome = stub.stop_and_join();
     assert!(
         output.status.success(),
         "brief failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    handle.join().expect("embedding stub");
+    assert_eq!(outcome, openai_embedding_stub::StubOutcome::Served);
     let brief: Value = serde_json::from_slice(&output.stdout).expect("brief json");
     assert_eq!(brief["evidence"].as_array().unwrap().len(), 0);
     assert!(
@@ -499,18 +504,11 @@ fn test_cli_brief_embedding_deadline_falls_back_to_bm25_json() {
     );
     db.insert_drawer(&drawer).expect("insert drawer");
     let query = "Synthetic deadline query";
-    let (endpoint, request_started, handle) = start_stalled_openai_embedding_stub(query);
-    let base_url = endpoint.trim_end_matches("/embeddings").to_string();
-
+    let (stub, request_started) = start_stalled_openai_embedding_stub(query);
     let output = run_mempal_with_env_timeout(
         &home,
         &["brief", query, "--format", "json"],
-        &[
-            ("MEMPAL_EMBED_BACKEND", "openai_compat".to_string()),
-            ("MEMPAL_EMBED_BASE_URL", base_url),
-            ("MEMPAL_EMBED_MODEL", "test-model".to_string()),
-            ("MEMPAL_EMBED_DIM", "384".to_string()),
-        ],
+        &openai_compat_env(&stub.endpoint, "384"),
         request_started,
         Duration::from_secs(5),
     );
@@ -536,7 +534,7 @@ fn test_cli_brief_embedding_deadline_falls_back_to_bm25_json() {
         brief["evidence"][0]["citation"]["drawer_id"],
         "brief_evidence_deadline"
     );
-    handle.join().expect("stalled embedding stub");
+    stub.join();
 }
 
 #[test]
@@ -551,25 +549,19 @@ fn test_cli_brief_embedding_dimension_mismatch_falls_back_to_bm25_json() {
     db.insert_vector(&drawer.id, &[0.8, 0.2])
         .expect("insert 2d vector");
     let query = "Synthetic dimension query";
-    let (endpoint, handle) = start_openai_embedding_stub_with_vector(query, 1, vec![0.1, 0.2, 0.3]);
-    let base_url = endpoint.trim_end_matches("/embeddings").to_string();
-
+    let stub = openai_embedding_stub::start(query, vec![0.1, 0.2, 0.3]);
     let output = run_mempal_with_env(
         &home,
         &["brief", query, "--format", "json"],
-        &[
-            ("MEMPAL_EMBED_BACKEND", "openai_compat".to_string()),
-            ("MEMPAL_EMBED_BASE_URL", base_url),
-            ("MEMPAL_EMBED_MODEL", "test-model".to_string()),
-            ("MEMPAL_EMBED_DIM", "3".to_string()),
-        ],
+        &openai_compat_env(stub.endpoint(), "3"),
     );
+    let outcome = stub.stop_and_join();
     assert!(
         output.status.success(),
         "brief fallback should exit 0: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    handle.join().expect("embedding stub");
+    assert_eq!(outcome, openai_embedding_stub::StubOutcome::Served);
     assert!(!output.stdout.is_empty());
     let brief: Value = serde_json::from_slice(&output.stdout).expect("brief json");
     assert_eq!(brief["search_mode"], "bm25_only");
