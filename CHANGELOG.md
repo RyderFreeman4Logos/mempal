@@ -104,13 +104,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - MCP ingest-worker tests: wait for I/O-burst telemetry before assertions; integration-visible `reset_io_burst_for_tests` isolates process-global observability (#808/#861).
 - **Path-sensitive tests**: create daemon IPC, SQLite admission, and symlink
   identity fixtures below a bounded `/tmp` root (#810).
-- **CLI integration tests**: route `ingest`/`delete` helpers through one
-  Linux-only deadline-aware subprocess supervisor (spawn, bounded capture,
-  pipe drain, TERM→KILL escalation, identity-safe reaping) so a hung CLI or
-  pipe-holding descendant cannot stall `cargo test`/local gates indefinitely
-  (#795). Stdin-write timeout paths now clean up the supervised child before
-  panicking (no active-child Drop / `_exit(125)`), and timeout diagnostics
-  measure wall time from before the helper call.
+- **CLI integration tests**: Linux-only deadline supervisor for `ingest`/`delete` (spawn, bounded capture, pipe drain, TERM→KILL, identity-safe reap) so hung CLI/descendants cannot stall `cargo test`/gates (#795); stdin-write timeouts clean the child before panic (no Drop/`_exit(125)`), wall-time from before the helper; ordinary hermetic context CLI helpers use that bound (#1085); started-write fixture timing starts after the mutation signals started (#1088).
 - **MCP admission**: reserve service holder seats for daemon/MCP, report
   reaped/reserved budget diagnostics, and fail closed on `wait=true`
   `mempal_ingest` when the MCP async pool cannot be admitted instead of
