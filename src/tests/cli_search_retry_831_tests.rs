@@ -4,11 +4,11 @@ use super::*;
 async fn search_command_deadline_covers_embedder_initialization() {
     let (_tmp, db) = new_temp_db();
     let config = Config::default();
-    let initialization_started = Arc::new(AtomicUsize::new(0));
-    let initialization_started_for_factory = Arc::clone(&initialization_started);
+    let (initialization_started_tx, mut initialization_started_rx) =
+        tokio::sync::oneshot::channel();
     let started_at = std::time::Instant::now();
 
-    let error = search_command_with_embedder_initializer(
+    let search = search_command_with_embedder_initializer(
         &db,
         &config,
         SearchCommandOptions {
@@ -18,7 +18,7 @@ async fn search_command_deadline_covers_embedder_initialization() {
             session: None,
             filters: SearchFilters::default(),
             top_k: 0,
-            project: None,
+            project: Some("deadline-test"),
             include_global: false,
             all_projects: true,
             json: true,
@@ -28,7 +28,9 @@ async fn search_command_deadline_covers_embedder_initialization() {
         },
         std::time::Duration::from_millis(20),
         move || async move {
-            initialization_started_for_factory.store(1, Ordering::SeqCst);
+            initialization_started_tx
+                .send(())
+                .expect("report that embedder initialization started");
             tokio::task::spawn_blocking(|| {
                 std::thread::sleep(std::time::Duration::from_millis(250));
             })
@@ -36,11 +38,25 @@ async fn search_command_deadline_covers_embedder_initialization() {
             .expect("blocking embedder initialization task should not panic");
             Ok::<Box<dyn Embedder>, anyhow::Error>(Box::new(RecordingEmbedder::default()))
         },
-    )
+    );
+    tokio::pin!(search);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::select! {
+            biased;
+            started = &mut initialization_started_rx => {
+                started.expect("embedder initialization should report its start");
+            }
+            result = &mut search => {
+                panic!("search command finished before embedder initialization started: {result:?}");
+            }
+        }
+    })
     .await
-    .expect_err("the command-level deadline must cancel embedder initialization");
+    .expect("embedder initialization should start before the command deadline");
+    let error = search
+        .await
+        .expect_err("the command-level deadline must cancel embedder initialization");
 
-    assert_eq!(initialization_started.load(Ordering::SeqCst), 1);
     assert!(format!("{error:#}").contains("CLI search total deadline exceeded"));
     assert!(
         started_at.elapsed() < std::time::Duration::from_secs(1),

@@ -14116,6 +14116,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_background_ingest_starts_local_worker_when_daemon_lease_probe_fails() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, _db_path, server) = setup_server();
         let server =
             server.with_daemon_writer_lease_check_error_for_test("forced daemon lease probe error");
@@ -14136,7 +14137,7 @@ mod tests {
                 },
             )
             .await
-            .expect("ingest should return a durable receipt")
+            .expect("durable receipt")
             .0;
 
         assert_eq!(response.state, Some(IngestOperationState::Queued));
@@ -14146,8 +14147,8 @@ mod tests {
             server.wait_for_operation_completion(operation_id),
         )
         .await
-        .expect("local background worker should complete the operation")
-        .expect("operation should complete");
+        .expect("worker timeout")
+        .expect("worker error");
 
         assert_eq!(completed.state, Some(IngestOperationState::Completed));
         assert!(!completed.created_drawer_ids.is_empty());
@@ -22799,6 +22800,7 @@ enabled = true
 
     #[tokio::test]
     async fn test_mcp_operation_status_returns_queue_result_with_slow_warning_snapshot() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (_tempdir, db_path, server) = setup_server();
         let operation_id = PendingMessageStore::new_without_reclaim(&db_path)

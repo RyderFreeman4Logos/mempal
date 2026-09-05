@@ -170,9 +170,18 @@ if ((${#integration_tests[@]} == 0)); then
     exit 0
 fi
 
+# #934: the hostile-child lifecycle selector gets its own cargo process;
+# its existing process-lifecycle lock cannot fence unrelated test binaries.
+mcp_lifecycle_target="daemon_mcp_coexistence"
+mcp_lifecycle_selector="mcp_lifecycle_timeouts_reap_hostile_children"
+mcp_lifecycle_target_present=0
 batch=()
 batch_index=1
 for target in "${integration_tests[@]}"; do
+    if [[ "${target}" == "${mcp_lifecycle_target}" ]]; then
+        mcp_lifecycle_target_present=1
+        continue
+    fi
     batch+=("${target}")
     if ((${#batch[@]} == REST_TEST_TARGETS_PER_BATCH)); then
         run_integration_batch "${batch_index}" "${batch[@]}"
@@ -183,4 +192,13 @@ done
 
 if ((${#batch[@]} > 0)); then
     run_integration_batch "${batch_index}" "${batch[@]}"
+fi
+
+if ((mcp_lifecycle_target_present)); then
+    run_cargo_test --workspace --features rest --test "${mcp_lifecycle_target}" -- \
+        --skip "${mcp_lifecycle_selector}"
+    clean_mempal_artifacts
+    run_cargo_test --workspace --features rest --test "${mcp_lifecycle_target}" \
+        "${mcp_lifecycle_selector}"
+    clean_mempal_artifacts
 fi

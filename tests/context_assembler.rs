@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 use std::thread;
 
 use std::sync::Arc;
@@ -356,19 +356,23 @@ fn write_strict_search_config(home: &Path) {
     .expect("write strict search config");
 }
 
-fn run_context_json(home: &Path, query: &str, extra_args: &[&str]) -> Value {
+fn run_context(home: &Path, args: Vec<String>) -> Output {
+    Command::new(mempal_bin())
+        .args(args)
+        .env_clear()
+        .env("HOME", home)
+        .output()
+        .expect("run context")
+}
+fn run_context_json(home: &Path, query: &str, extra: &[&str]) -> Value {
     let (endpoint, handle) = start_openai_embedding_stub(query, vector());
     write_cli_api_config(home, &endpoint);
 
     let mut args = vec!["context".to_string(), query.to_string()];
-    args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
+    args.extend(extra.iter().map(|arg| (*arg).to_string()));
     args.extend(["--format".to_string(), "json".to_string()]);
 
-    let output = Command::new(mempal_bin())
-        .args(args)
-        .env("HOME", home)
-        .output()
-        .expect("run mempal context");
+    let output = run_context(home, args);
     assert!(
         output.status.success(),
         "context command failed: {}",
@@ -378,18 +382,14 @@ fn run_context_json(home: &Path, query: &str, extra_args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).expect("parse context json")
 }
 
-fn run_context_plain(home: &Path, query: &str, extra_args: &[&str]) -> String {
+fn run_context_plain(home: &Path, query: &str, extra: &[&str]) -> String {
     let (endpoint, handle) = start_openai_embedding_stub(query, vector());
     write_cli_api_config(home, &endpoint);
 
     let mut args = vec!["context".to_string(), query.to_string()];
-    args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
+    args.extend(extra.iter().map(|arg| (*arg).to_string()));
 
-    let output = Command::new(mempal_bin())
-        .args(args)
-        .env("HOME", home)
-        .output()
-        .expect("run mempal context");
+    let output = run_context(home, args);
     assert!(
         output.status.success(),
         "context command failed: {}",

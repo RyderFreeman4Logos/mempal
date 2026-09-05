@@ -24,14 +24,15 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
-- Daemon SQLite writer-lease waits out a live maintenance holder past capped `remaining_secs` instead of exit 75; a live incompatible `mcp-ingest-worker` holder is still refused without takeover (#916, #849).
+- Context fixtures isolate embed env (#1080).
+- Daemon SQLite writer lease waits past capped maintenance `remaining_secs` rather than exit 75; incompatible `mcp-ingest-worker` holders remain refused (#916, #849).
 - Ingress: fsync before ACK; lease-fenced replay; REST bind/systemd READY precede daemon-ready (#945). Persist/spool before model and on SQLite/breaker-open; stall keeps REST (#986, #1000, #987).
 - Cited-recall latest-decision walks the full successor chain, filters context the same way, and requires a live correction/continuation citation (#898).
 - Codex snapshots atomically remove superseded turns/vectors and fail closed on ambiguity (#896).
 - MCP search shares a deadline and releases reads before responding (#881).
 - Typed/redacted MCP admission and audit-write diagnostics (#879).
 - Daemon pidfile validates identity; scoped ingest release honors remaining retry budget (#885/#895).
-- Profile-lock retries keep byte-budget rejection; suite-load isolation; Busy retry waits non-budget (#893/#947/#1064–#1075).
+- Profile locks retain byte-budget rejection and suite-load isolation; Busy waits stay non-budget (#893/#947/#1064–#1075, #934/#1077/#1078).
 - Diagnostic readonly queue stats no longer inherit SQLite's default 5s busy wait: a `queue_stats_readonly` read under a held writer lock now returns a bounded lock diagnostic instead of stalling (#911).
 
 - **Daemon readiness CLI tests**: shared Linux supervisor for bounded redacted lifecycle handling (#892).
@@ -67,7 +68,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   REST are unavailable, retaining an operation receipt for reconciliation (#834).
 - **CLI search**: reserve BM25 fallback budget so hybrid search cannot consume
   the full CLI deadline (#833).
-- **CLI writes/search**: retry pin, unpin, and delete SQLite locks for 10 seconds; enforce a 120-second search deadline, including embedder initialization and bounded runtime teardown (#831).
+- **CLI writes/search**: retry pin, unpin, and delete SQLite locks for 10 seconds; enforce a 120-second search deadline, including embedder initialization and bounded runtime teardown (#831, #1079).
 - **MCP full smoke**: follow accepted ingest wait-timeout operation receipts to
   recover cleanup-safe drawer IDs before classifying create or update as missing
   IDs (#829).
