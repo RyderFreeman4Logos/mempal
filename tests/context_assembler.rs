@@ -311,7 +311,7 @@ fn run_context(home: &Path, args: Vec<String>) -> Output {
     cli_deadline::run_cli_output(
         "context fixture",
         |spec| {
-            cli_deadline::with_home(spec, home);
+            cli_deadline::with_home(spec.env_clear(), home);
             cli_deadline::push_args(spec, &args);
         },
         cli_deadline::CLI_HELPER_DEADLINE,

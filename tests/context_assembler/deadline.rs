@@ -10,6 +10,9 @@ use super::cli_deadline::{
 };
 use std::time::{Duration, Instant};
 
+#[path = "env_isolation.rs"]
+mod env_isolation;
+
 /// Floor proving helpers start `Instant::now()` *before* the supervisor call.
 const MIN_OBSERVED_DEADLINE_WAIT: Duration = Duration::from_millis(250);
 
