@@ -24,7 +24,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
-- Context fixtures isolate embed env (#1080).
+- Context isolate embed env HTTP CL (#1080,#1082).
 - Daemon SQLite writer lease waits past capped maintenance `remaining_secs` rather than exit 75; incompatible `mcp-ingest-worker` holders remain refused (#916, #849).
 - Ingress: fsync before ACK; lease-fenced replay; REST bind/systemd READY precede daemon-ready (#945). Persist/spool before model and on SQLite/breaker-open; stall keeps REST (#986, #1000, #987).
 - Cited-recall latest-decision walks the full successor chain, filters context the same way, and requires a live correction/continuation citation (#898).

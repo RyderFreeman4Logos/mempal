@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -20,6 +20,8 @@ use mempal::mcp::MempalMcpServer;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+#[path = "support/bounded_http_request.rs"]
+mod bounded_http_request;
 struct StubEmbedderFactory;
 
 #[async_trait]
@@ -288,10 +290,8 @@ fn start_openai_embedding_stub(
                 Err(error) => panic!("accept request: {error}"),
             })
             .expect("embedding stub timed out waiting for request");
-        let mut request = [0_u8; 4096];
-        let bytes_read = stream.read(&mut request).expect("read embedding request");
-        assert!(bytes_read > 0, "expected non-empty HTTP request");
-        let request = String::from_utf8_lossy(&request[..bytes_read]);
+        let request = bounded_http_request::read_tcp(&mut stream, bounded_http_request::MAX_BYTES)
+            .expect("read embedding request");
         let (headers, body) = request
             .split_once("\r\n\r\n")
             .expect("request should contain HTTP headers and JSON body");
