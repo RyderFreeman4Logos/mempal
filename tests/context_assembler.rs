@@ -21,6 +21,8 @@ use tempfile::TempDir;
 
 #[path = "common/harness/cli_deadline.rs"]
 mod cli_deadline;
+#[path = "context_assembler/deadline.rs"]
+mod deadline;
 #[path = "support/openai_embedding_stub.rs"]
 mod openai_embedding_stub;
 
@@ -306,12 +308,14 @@ fn write_strict_search_config(home: &Path) {
 }
 
 fn run_context(home: &Path, args: Vec<String>) -> Output {
-    Command::new(mempal_bin())
-        .args(args)
-        .env_clear()
-        .env("HOME", home)
-        .output()
-        .expect("run context")
+    cli_deadline::run_cli_output(
+        "context fixture",
+        |spec| {
+            cli_deadline::with_home(spec, home);
+            cli_deadline::push_args(spec, &args);
+        },
+        cli_deadline::CLI_HELPER_DEADLINE,
+    )
 }
 fn run_context_json(home: &Path, query: &str, extra: &[&str]) -> Value {
     let stub = openai_embedding_stub::start(query, vector());
