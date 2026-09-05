@@ -26618,7 +26618,12 @@ mod ingest_wait_timeout_error_tests {
 }
 
 #[cfg(test)]
+#[path = "historical_rejudge_test_support.rs"]
+mod historical_rejudge_test_support;
+
+#[cfg(test)]
 mod historical_rejudge_tests {
+    use super::historical_rejudge_test_support::historical_rejudge_class_lock;
     use super::*;
 
     fn test_config() -> Config {
@@ -27249,7 +27254,10 @@ threshold = 0.3
         .expect("parse llm rejudge config")
     }
 
-    fn two_stage_llm_rejudge_config(proposal_base_url: &str, confirm_base_url: &str) -> Config {
+    pub(crate) fn two_stage_llm_rejudge_config(
+        proposal_base_url: &str,
+        confirm_base_url: &str,
+    ) -> Config {
         Config::parse(&format!(
             r#"
 [llm]
@@ -27279,7 +27287,7 @@ threshold = 0.3
         .expect("parse two-stage llm rejudge config")
     }
 
-    fn llm_chat_response(model: &str, score: f64, reason: &str) -> String {
+    pub(crate) fn llm_chat_response(model: &str, score: f64, reason: &str) -> String {
         serde_json::json!({
             "model": model,
             "choices": [{
@@ -27294,7 +27302,11 @@ threshold = 0.3
         .to_string()
     }
 
-    fn insert_low_signal_rejudge_drawers(db: &Database, prefix: &str, count: usize) -> Vec<i64> {
+    pub(crate) fn insert_low_signal_rejudge_drawers(
+        db: &Database,
+        prefix: &str,
+        count: usize,
+    ) -> Vec<i64> {
         (0..count)
             .map(|index| {
                 let drawer_id = format!("{prefix}-{index}");
@@ -27312,7 +27324,7 @@ threshold = 0.3
             .collect()
     }
 
-    fn historical_rejudge_confirm_pending_count_for_rows(
+    pub(crate) fn historical_rejudge_confirm_pending_count_for_rows(
         db: &Database,
         run_id: &str,
         rowids: &[i64],
@@ -27611,7 +27623,7 @@ threshold = 0.7
         );
     }
 
-    fn backup_dir(tmp: &tempfile::TempDir) -> PathBuf {
+    pub(crate) fn backup_dir(tmp: &tempfile::TempDir) -> PathBuf {
         tmp.path().join("rejudge-backups")
     }
 
@@ -27699,7 +27711,7 @@ threshold = 0.7
         );
     }
 
-    fn audit_count(db: &Database) -> i64 {
+    pub(crate) fn audit_count(db: &Database) -> i64 {
         db.conn()
             .query_row("SELECT COUNT(*) FROM gating_audit", [], |row| row.get(0))
             .expect("count gating audit")
@@ -27841,7 +27853,7 @@ threshold = 0.7
         sync_historical_rejudge_backup_storage(path).expect("sync legacy backup rewrite");
     }
 
-    fn full_rejudge_options<'a>(
+    pub(crate) fn full_rejudge_options<'a>(
         execute: bool,
         backup_dir: Option<&'a Path>,
         page_size: usize,
@@ -31066,6 +31078,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_all_execute_llm_timeout_retries_until_recovered() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut server = mockito::Server::new_async().await;
         let timeout_mock = server
             .mock("POST", "/v1/chat/completions")
@@ -31141,6 +31154,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_two_stage_keeps_when_proposal_keeps_without_confirming() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31198,6 +31212,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_two_stage_confirms_proposal_candidate_immediately() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31262,6 +31277,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_two_stage_keeps_when_confirm_rejects_proposal() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31327,6 +31343,7 @@ threshold = 0.7
     #[tokio::test]
     async fn historical_rejudge_two_stage_drains_confirm_after_recovery_without_rerunning_proposal()
     {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31422,100 +31439,8 @@ threshold = 0.7
     }
 
     #[tokio::test]
-    async fn historical_rejudge_paired_spark_exhausted_persists_confirm_backlog_and_continues_qwen()
-    {
-        let mut proposal_server = mockito::Server::new_async().await;
-        let mut confirm_server = mockito::Server::new_async().await;
-        let proposal_mock = proposal_server
-            .mock("POST", "/v1/chat/completions")
-            .with_status(200)
-            .with_body(llm_chat_response(
-                "qwen3.6-27b-decensor-by-aeon",
-                0.05,
-                "proposal_delete_secret_reason",
-            ))
-            .expect(6)
-            .create_async()
-            .await;
-        let exhausted_confirm_mock = confirm_server
-            .mock("POST", "/v1/chat/completions")
-            .with_status(429)
-            .with_header("Retry-After", "0")
-            .with_body("spark quota exhausted raw body")
-            .expect(6)
-            .create_async()
-            .await;
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
-        let rowids = insert_low_signal_rejudge_drawers(&db, "paired-spark-exhausted", 6);
-        let backups = backup_dir(&tmp);
-        let progress_file = tmp.path().join("paired-spark-exhausted-progress.jsonl");
-        let config = two_stage_llm_rejudge_config(&proposal_server.url(), &confirm_server.url());
-
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            maintenance_rejudge_command_with_runtime(
-                &db,
-                &config,
-                HistoricalRejudgeOptions {
-                    progress_file: Some(&progress_file),
-                    proposal_llm_endpoint: Some("qwen"),
-                    confirm_llm_endpoint: Some("spark"),
-                    ..full_rejudge_options(true, Some(&backups), 6)
-                },
-                HistoricalRejudgeRuntimeOptions {
-                    llm_concurrency: 6,
-                    ..HistoricalRejudgeRuntimeOptions::default()
-                },
-            ),
-        )
-        .await
-        .expect("Spark quota exhaustion must not keep paired rejudge sleeping forever")
-        .expect("paired rejudge should preserve Qwen proposals as confirmation backlog");
-
-        proposal_mock.assert_async().await;
-        exhausted_confirm_mock.assert_async().await;
-        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
-        assert_eq!(
-            audit_count(&db),
-            0,
-            "unconfirmed proposals must not audit a final mutation"
-        );
-        let checkpoint = load_historical_rejudge_checkpoint(&db)
-            .expect("load checkpoint")
-            .expect("checkpoint");
-        assert_eq!(checkpoint.status, "confirm_pending");
-        assert_eq!(checkpoint.mutated_count, 0);
-        let backlog = historical_rejudge_backlog_counts(&db, &checkpoint.run_id)
-            .expect("load backlog counts");
-        assert_eq!(backlog.no_stage_pending_count, 0);
-        assert_eq!(backlog.confirm_pending_count, 6);
-        assert_eq!(
-            historical_rejudge_confirm_pending_count_for_rows(&db, &checkpoint.run_id, &rowids),
-            6
-        );
-
-        let raw_progress = std::fs::read_to_string(&progress_file).expect("read progress");
-        assert!(
-            !raw_progress.contains("Low-signal transient output"),
-            "{raw_progress}"
-        );
-        assert!(
-            !raw_progress.contains("paired-spark-exhausted"),
-            "{raw_progress}"
-        );
-        assert!(
-            !raw_progress.contains("proposal_delete_secret_reason"),
-            "{raw_progress}"
-        );
-        assert!(
-            !raw_progress.contains("spark quota exhausted raw body"),
-            "{raw_progress}"
-        );
-    }
-
-    #[tokio::test]
     async fn historical_rejudge_paired_resume_drains_confirm_pending_without_rerunning_qwen() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31614,6 +31539,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_paired_spark_exhausted_retries_do_not_advance_unconfirmed() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31718,6 +31644,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_paired_partial_spark_failure_keeps_remaining_pending() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31817,6 +31744,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_proposal_only_persists_confirm_backlog_without_mutation() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -31917,6 +31845,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_proposal_only_backlog_is_sqlite_backed_across_pages() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -32008,6 +31937,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_proposal_only_persists_tier1_backlog_without_mutation() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -32104,6 +32034,7 @@ threshold = 0.7
 
     #[tokio::test]
     async fn historical_rejudge_confirm_pending_only_reuses_persisted_proposal_without_qwen() {
+        let _class_lock = historical_rejudge_class_lock().await;
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server

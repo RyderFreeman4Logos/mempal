@@ -400,6 +400,7 @@ mod tests {
 
     #[test]
     fn write_reserve_is_consumed_and_db_write_retries_after_sqlite_full() {
+        let _fixture_guard = super::super::db_open::db_open_busy_fixture_lock().blocking_lock();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -439,6 +440,7 @@ mod tests {
 
     #[test]
     fn concurrent_open_does_not_refill_reserve_before_retry() {
+        let _fixture_guard = super::super::db_open::db_open_busy_fixture_lock().blocking_lock();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -521,6 +523,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_reserve_lock_contention_is_bounded() {
+        let _fixture_guard = super::super::db_open::db_open_busy_fixture_lock().blocking_lock();
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::OpenOptionsExt;
         use std::time::Duration;
@@ -569,6 +572,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reserve_namespace_transitions_sync_parent_after_publication() {
+        let _fixture_guard = super::super::db_open::db_open_busy_fixture_lock().blocking_lock();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("palace.db");
         let reserve_path = write_reserve_path(&db_path);

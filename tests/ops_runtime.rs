@@ -15,11 +15,11 @@ fn mempal_bin() -> String {
 
 static LOAD_DOTENV: OnceLock<()> = OnceLock::new();
 const CLI_TIMEOUT: Duration = Duration::from_secs(10);
-// ponytail: one process-local class lock; split by fixture family only if throughput matters.
-static QUEUE_FAILURE_CLASS_LOCK: Mutex<()> = Mutex::new(());
+// ponytail: one process-local process-lifecycle lock; split by fixture family only if throughput matters.
+static OPS_RUNTIME_PROCESS_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
 
-fn acquire_queue_failure_class_lock() -> std::sync::MutexGuard<'static, ()> {
-    QUEUE_FAILURE_CLASS_LOCK
+fn acquire_ops_runtime_process_lifecycle_lock() -> std::sync::MutexGuard<'static, ()> {
+    OPS_RUNTIME_PROCESS_LIFECYCLE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -171,6 +171,7 @@ fn install_fake_path_mempal(home: &TempDir) -> String {
 #[test]
 
 fn test_cli_doctor_json_reports_schema_and_path() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
     let db = Database::open(&palace_db_path(&home)).expect("open db");
@@ -206,6 +207,7 @@ fn test_cli_doctor_json_reports_schema_and_path() {
 
 #[test]
 fn test_cli_doctor_and_status_report_daemon_outage_queue_high_severity() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
     let db_path = palace_db_path(&home);
@@ -248,6 +250,7 @@ fn test_cli_doctor_and_status_report_daemon_outage_queue_high_severity() {
 
 #[test]
 fn test_cli_doctor_reports_unavailable_when_config_is_invalid() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     let mempal_home = home.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
@@ -267,6 +270,7 @@ fn test_cli_doctor_reports_unavailable_when_config_is_invalid() {
 
 #[test]
 fn test_cli_status_emits_typed_availability_when_config_is_invalid() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     let mempal_home = home.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
@@ -304,6 +308,7 @@ fn test_cli_status_emits_typed_availability_when_config_is_invalid() {
 
 #[test]
 fn test_cli_status_emits_typed_availability_when_database_is_unavailable() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     let mempal_home = home.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
@@ -341,6 +346,7 @@ fn test_cli_status_emits_typed_availability_when_database_is_unavailable() {
 
 #[test]
 fn test_cli_status_emits_typed_availability_when_database_schema_is_newer() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     let mempal_home = home.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
@@ -374,6 +380,7 @@ fn test_cli_status_emits_typed_availability_when_database_schema_is_newer() {
 
 #[test]
 fn test_cli_status_emits_typed_availability_when_queue_stats_are_unavailable() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     let mempal_home = home.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
@@ -410,6 +417,7 @@ fn test_cli_status_emits_typed_availability_when_queue_stats_are_unavailable() {
 
 #[test]
 fn test_cli_doctor_reports_unavailable_when_queue_stats_fail() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
     fs::write(palace_db_path(&home), "not a sqlite database").expect("write invalid db");
@@ -428,6 +436,7 @@ fn test_cli_doctor_reports_unavailable_when_queue_stats_fail() {
 #[cfg(target_os = "linux")]
 #[test]
 fn test_cli_doctor_rejects_unrelated_live_pid_as_daemon_identity() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
     Database::open(&palace_db_path(&home)).expect("open db");
@@ -463,7 +472,7 @@ fn test_cli_doctor_rejects_unrelated_live_pid_as_daemon_identity() {
 #[test]
 
 fn test_cli_doctor_reports_queue_failure_classes() {
-    let _class_lock = acquire_queue_failure_class_lock();
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
     fs::write(
@@ -548,7 +557,7 @@ fn test_cli_doctor_reports_queue_failure_classes() {
 
 #[test]
 fn test_cli_daemon_status_reports_queue_failure_classes() {
-    let _class_lock = acquire_queue_failure_class_lock();
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new_in("/tmp").expect("home");
     let mempal_home = home.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
@@ -623,6 +632,7 @@ fn test_cli_daemon_status_reports_queue_failure_classes() {
 #[test]
 
 fn test_cli_doctor_plain_no_db_is_read_only() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     let output = run_mempal(&home, &["doctor", "--format", "plain"]);
     assert_success(&output);
@@ -634,6 +644,7 @@ fn test_cli_doctor_plain_no_db_is_read_only() {
 #[test]
 
 fn test_cli_doctor_rejects_invalid_format() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     let output = run_mempal(&home, &["doctor", "--format", "yaml"]);
     assert!(!output.status.success());
@@ -644,6 +655,7 @@ fn test_cli_doctor_rejects_invalid_format() {
 #[test]
 
 fn test_cli_maintenance_guided_run_json() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
     Database::open(&palace_db_path(&home)).expect("open db");
@@ -667,6 +679,7 @@ fn test_cli_maintenance_guided_run_json() {
 #[test]
 
 fn test_cli_maintenance_guided_run_plain() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
     Database::open(&palace_db_path(&home)).expect("open db");
@@ -682,6 +695,7 @@ fn test_cli_maintenance_guided_run_plain() {
 #[test]
 
 fn test_cli_maintenance_guided_run_rejects_invalid_format() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
     Database::open(&palace_db_path(&home)).expect("open db");
@@ -694,6 +708,7 @@ fn test_cli_maintenance_guided_run_rejects_invalid_format() {
 #[test]
 
 fn test_cli_release_readiness_json() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     let mut cmd = Command::new(mempal_bin());
     cmd.args(["release-readiness", "--format", "json"])
@@ -730,6 +745,7 @@ fn test_cli_release_readiness_json() {
 #[test]
 
 fn test_cli_release_readiness_plain() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     let mut cmd = Command::new(mempal_bin());
     cmd.args(["release-readiness", "--format", "plain"])
@@ -747,6 +763,7 @@ fn test_cli_release_readiness_plain() {
 #[test]
 
 fn test_cli_release_readiness_rejects_invalid_format() {
+    let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
     let home = TempDir::new().expect("home");
     let mut cmd = Command::new(mempal_bin());
     cmd.args(["release-readiness", "--format", "yaml"])

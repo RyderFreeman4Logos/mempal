@@ -14155,6 +14155,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_scoped_unbounded_wait_processes_locally_when_daemon_lease_probe_fails() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, _db_path, server) = setup_server();
         let server =
             server.with_daemon_writer_lease_check_error_for_test("forced daemon lease probe error");
@@ -15502,6 +15503,7 @@ quality_policy = "llm_required_for_keep"
 
     #[tokio::test]
     async fn test_unbounded_scoped_wait_keeps_polling_after_writer_lease_conflict() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let daemon_lease = hold_daemon_writer_lease(&db_path);
         let operation_id = enqueue_prepared_test_ingest_operation(
@@ -15547,6 +15549,7 @@ quality_policy = "llm_required_for_keep"
 
     #[tokio::test]
     async fn test_unbounded_scoped_wait_retries_transient_claim_sqlite_lock() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (_tempdir, db_path, server) = setup_server();
         let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
@@ -15582,6 +15585,7 @@ quality_policy = "llm_required_for_keep"
 
     #[tokio::test]
     async fn test_scoped_operation_wait_retries_transient_write_lock_without_failed_receipt() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let server = server.with_sync_db_open_lock_failures_for_test(1);
         let operation_id = enqueue_prepared_test_ingest_operation(
@@ -15646,6 +15650,7 @@ quality_policy = "llm_required_for_keep"
 
     #[tokio::test]
     async fn test_mcp_ingest_scoped_finite_wait_processes_local_queue() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
 
         let response = server
@@ -15683,10 +15688,11 @@ quality_policy = "llm_required_for_keep"
 
     #[tokio::test]
     async fn test_mcp_ingest_enqueue_waits_for_transient_sqlite_lock() {
+        let _l = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         assert!(
             MCP_INGEST_QUEUE_LOCK_RETRY_DEADLINE >= Duration::from_secs(5),
-            "MCP ingest queue admission must preserve the previous SQLite busy-timeout budget"
+            "MCP queue admission preserves SQLite busy-timeout budget"
         );
         let lock = hold_sqlite_write_lock(db_path.clone(), Duration::from_millis(2_500));
 
@@ -15699,7 +15705,7 @@ quality_policy = "llm_required_for_keep"
                 ..IngestRequest::default()
             }))
             .await
-            .expect("ingest admission should retry through transient SQLite busy")
+            .expect("ingest admission retries SQLite busy")
             .0;
 
         lock.join().expect("lock thread");
@@ -15868,6 +15874,7 @@ quality_policy = "llm_required_for_keep"
 
     #[tokio::test]
     async fn test_mcp_ingest_enqueue_skips_wal_reset_under_existing_reader() {
+        let _l = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let reader = rusqlite::Connection::open(&db_path).expect("open existing MCP holder");
         reader
@@ -16634,6 +16641,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_ingest_replacement_target_uses_request_budget_for_admission() {
+        let _l = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         insert_drawer(
             &db_path,
@@ -16798,6 +16806,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_ingest_scoped_zero_wait_skips_status_refresh_after_budget() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, _db_path, server) = setup_server();
         let server = server.with_operation_status_probe_delay_for_test(Duration::from_millis(500));
 
@@ -16853,6 +16862,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_ingest_scoped_short_budget_skips_claim_before_timeout_receipt() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
 
         let response = tokio::time::timeout(
@@ -16897,6 +16907,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_ingest_scoped_short_budget_ignores_release_lock_failures() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
             .with_release_lock_failures_for_test(100);
@@ -17070,6 +17081,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_async_ingest_completion_retries_transient_sqlite_lock() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let request = IngestRequest {
@@ -17244,6 +17256,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_scoped_finite_completion_lock_respects_budget() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let request = IngestRequest {
@@ -17317,6 +17330,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_scoped_finite_completion_real_sqlite_lock_respects_budget() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
         let operation_id = queue
@@ -17386,6 +17400,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_async_ingest_uses_admission_supersedes_target_after_queue_wait() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let seed_id = "async-supersedes-old";
         insert_drawer_with_project(&db_path, seed_id, "mcp", Some("runtime"), None);
@@ -20925,6 +20940,7 @@ prototypes = ["keep"]
 
     #[tokio::test]
     async fn test_mcp_queued_duplicate_completion_does_not_create_cleanup_ids() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
 
         let first = ingest_manual(&server, "queued duplicate cleanup fact", None, None, None).await;
@@ -21596,6 +21612,7 @@ prototypes = ["keep"]
 
     #[tokio::test]
     async fn test_scoped_ingest_worker_respects_existing_writer_lease() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let db = Database::open(&db_path).expect("open db");
         let _daemon_lease = db
@@ -21634,6 +21651,7 @@ prototypes = ["keep"]
 
     #[tokio::test]
     async fn test_scoped_ingest_worker_respects_expired_live_daemon_writer_lease() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let db = Database::open(&db_path).expect("open db");
         let daemon_lease = db
@@ -22278,6 +22296,7 @@ prototypes = ["keep"]
 
     #[tokio::test]
     async fn test_mcp_ingest_wait_succeeds_when_async_db_diagnostic_reports_current_lock() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("palace.db");
         Database::open(&db_path).expect("open db");
@@ -23008,15 +23027,6 @@ enabled = false
     }
 
     mod smoke;
-
-    // =========================================================================
-    // mempal_cowork_push MCP handler tests (P8 task 7, Codex review round-2 #2)
-    // =========================================================================
-    //
-    // These tests exercise the HANDLER itself — caller identity inference,
-    // target auto-inference, self-push rejection, and InboxError → ErrorData
-    // mapping. They complement the integration tests in tests/cowork_inbox.rs,
-    // which only cover the CLI and inbox layers.
 
     use super::super::tools::CoworkPushRequest;
     use tokio::sync::Mutex as TokioMutex;

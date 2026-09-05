@@ -106,10 +106,10 @@ pub(super) fn drawers_source_type_check_is_current(table_sql: &str) -> bool {
 }
 
 #[cfg(test)]
-fn db_open_busy_fixture_lock() -> &'static std::sync::Mutex<()> {
+pub(crate) fn db_open_busy_fixture_lock() -> &'static tokio::sync::Mutex<()> {
     // ponytail: one process-global fixture lock; split by contention domain if throughput matters.
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(std::sync::Mutex::default)
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::const_new(()))
 }
 
 #[cfg(test)]
@@ -472,9 +472,7 @@ mod tests {
 
     #[test]
     fn current_schema_db_open_repairs_all_legacy_structural_invariants() {
-        let _fixture_guard = super::db_open_busy_fixture_lock()
-            .lock()
-            .expect("serialize database busy fixtures");
+        let _fixture_guard = super::db_open_busy_fixture_lock().blocking_lock();
         let mut columns = V5_DRAWER_COLUMN_MIGRATIONS
             .iter()
             .map(|column| ("V5", "drawers", column.name))

@@ -4,9 +4,7 @@ use std::time::Duration;
 
 #[test]
 fn repair_required_current_schema_open_fails_bounded_then_repairs_after_writer_release() {
-    let _fixture_guard = super::db_open_busy_fixture_lock()
-        .lock()
-        .expect("serialize database busy fixtures");
+    let _fixture_guard = super::db_open_busy_fixture_lock().blocking_lock();
     let tempdir = tempfile::TempDir::new_in("/tmp").expect("short tempdir");
     let db_path = tempdir.path().join("palace.db");
     drop(Database::open(&db_path).expect("initialize current database"));
