@@ -367,8 +367,9 @@ fn test_codex_brief_transport_failure_fails_open() {
 #[test]
 fn test_codex_install_registers_brief_hook_without_replacing_drain() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
+    let root = tmp.path().canonicalize().expect("canonical fixture root");
+    let cwd = root.join("repo");
+    let home = root.join("home");
     fs::create_dir_all(&cwd).expect("create cwd");
     fs::create_dir_all(home.join(".codex")).expect("create .codex");
     fs::write(
