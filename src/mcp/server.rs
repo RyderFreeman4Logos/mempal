@@ -1329,7 +1329,7 @@ impl MempalMcpServer {
         let runtime_writer_lease = external_writer_lease
             .or_else(|| writer_lease.as_ref().map(|lease| lease.lease().clone()));
         let outcome = match self
-            .run_queued_write_off_runtime(queued, runtime_writer_lease)
+            .run_queued_write_off_runtime(queued, runtime_writer_lease, Some(claim.id.clone()))
             .await
         {
             Ok(Ok(response)) => Ok(response),
@@ -1524,7 +1524,7 @@ impl MempalMcpServer {
         let runtime_writer_lease = external_writer_lease
             .or_else(|| writer_lease.as_ref().map(|lease| lease.lease().clone()));
         let outcome = match self
-            .run_queued_write_off_runtime(queued, runtime_writer_lease)
+            .run_queued_write_off_runtime(queued, runtime_writer_lease, Some(claim.id.clone()))
             .await
         {
             Ok(Ok(response)) => Ok(response),
@@ -1796,7 +1796,7 @@ impl MempalMcpServer {
         };
         let outcome = match tokio::time::timeout(
             remaining,
-            self.run_queued_write_inline(queued, runtime_writer_lease.as_ref()),
+            self.run_queued_write_inline(queued, runtime_writer_lease.as_ref(), Some(&claim.id)),
         )
         .await
         {
@@ -2265,6 +2265,7 @@ impl MempalMcpServer {
         &self,
         operation: QueuedWriteOperation,
         runtime_writer_lease: Option<RuntimeWriterLease>,
+        creation_operation_id: Option<String>,
     ) -> anyhow::Result<std::result::Result<IngestResponse, McpQueuedIngestError>> {
         let queued = match operation {
             QueuedWriteOperation::Ingest(queued) => queued,
@@ -2293,6 +2294,7 @@ impl MempalMcpServer {
                         queued.request,
                         queued.controls,
                         runtime_writer_lease.as_ref(),
+                        creation_operation_id.as_deref(),
                         queued.superseded_drawer_id,
                     ))
                     .map(|response| response.0))
@@ -2306,6 +2308,7 @@ impl MempalMcpServer {
         &self,
         operation: QueuedWriteOperation,
         runtime_writer_lease: Option<&RuntimeWriterLease>,
+        creation_operation_id: Option<&str>,
     ) -> std::result::Result<IngestResponse, McpQueuedIngestError> {
         match operation {
             QueuedWriteOperation::Ingest(queued) => self
@@ -2313,6 +2316,7 @@ impl MempalMcpServer {
                     queued.request,
                     queued.controls,
                     runtime_writer_lease,
+                    creation_operation_id,
                     queued.superseded_drawer_id,
                 )
                 .await
@@ -3720,6 +3724,7 @@ impl MempalMcpServer {
         confidence: f64,
         inserted_drawer_ids: &mut Vec<String>,
         newly_created_drawer_ids: &mut Vec<String>,
+        creation_operation_id: Option<&str>,
         runtime_writer_lease: Option<&RuntimeWriterLease>,
     ) -> std::result::Result<(), ErrorData> {
         let metadata = validate_ingest_request(request, &source_type)?;
@@ -3794,12 +3799,13 @@ impl MempalMcpServer {
                 runtime_writer_lease,
                 "insert MCP ingest fallback drawer",
                 || {
-                    db.insert_drawer_with_project_validity(
+                    db.insert_drawer_with_project_validity_and_operation(
                         &drawer,
                         project_id,
                         None,
                         request.valid_from.as_deref(),
                         request.valid_until.as_deref(),
+                        creation_operation_id,
                     )
                 },
             )?;
@@ -7290,10 +7296,7 @@ impl MempalMcpServer {
         let wait = request.wait.unwrap_or(false);
         let wait_timeout_secs = request.wait_timeout_secs.unwrap_or(30);
         let request_deadline = ingest_request_deadline(request_started_at, wait, wait_timeout_secs);
-        // Snapshot the request-wide warnings once so every early-return path reports a
-        // consistent set from a single `sqlite_master` read. A mid-request embed transition
-        // to degraded is not lost: the degraded-write guards above reject before any
-        // success response that would carry this snapshot is built.
+        // One sqlite_master snapshot for every early-return; degraded writes reject first.
         let request_system_warnings = if worker_mode != IngestWaitWorkerMode::Background {
             current_system_warnings()
         } else {
@@ -7333,6 +7336,7 @@ impl MempalMcpServer {
                 self.ingest_admission_deadline,
                 self.run_queued_write_off_runtime(
                     QueuedWriteOperation::ingest(request, controls, None),
+                    None,
                     None,
                 ),
             )
@@ -8081,6 +8085,7 @@ impl MempalMcpServer {
             controls,
             runtime_writer_lease,
             None,
+            None,
         )
         .await
         .map_err(|error| match error {
@@ -8130,6 +8135,7 @@ impl MempalMcpServer {
         request: IngestRequest,
         controls: IngestControls,
         runtime_writer_lease: Option<&RuntimeWriterLease>,
+        creation_operation_id: Option<&str>,
         pre_resolved_superseded_drawer_id: Option<String>,
     ) -> std::result::Result<Json<IngestResponse>, McpQueuedIngestError> {
         let dry_run = request.dry_run.unwrap_or(false);
@@ -8166,10 +8172,7 @@ impl MempalMcpServer {
             .into());
         }
         let db = self.open_sync_ingest_db_with_admission_retry().await?;
-        // Snapshot the request-wide warnings once so every early-return path reports a
-        // consistent set from a single `sqlite_master` read. A mid-request embed transition
-        // to degraded is not lost: the degraded-write guard above rejects before any
-        // success response that would carry this snapshot is built.
+        // One sqlite_master snapshot for every early-return; degraded writes reject first.
         let mut request_system_warnings = system_warnings_with_stale_index(&db);
         let no_gate = controls.no_gate;
         let bypass_novelty = controls.bypass_novelty;
@@ -8246,10 +8249,8 @@ impl MempalMcpServer {
         let superseded_drawer_id_ref = superseded_drawer_id.as_deref();
         let mut superseded_response_id: Option<String> = None;
 
-        // Trusted local CLI callers bypass novelty because the legacy stdin path
-        // treats an exact request-wide content match as a no-op before chunking.
-        // Preserve that behavior for queue-first waits, including when the
-        // pre-existing drawer was written by the direct stdin path.
+        // CLI bypass_novelty matches stdin exact-content no-op, including queue-first
+        // waits after a direct stdin write of the same drawer.
         let direct_exact_duplicate = if bypass_novelty {
             exact_content_duplicate_drawer_id(
                 &db,
@@ -8361,9 +8362,16 @@ impl MempalMcpServer {
                 .await
                 .map_err(db_error)?;
             }
+            let created_drawer_ids = match creation_operation_id {
+                Some(operation_id) => db
+                    .drawer_ids_created_by_operation(operation_id, &all_ids)
+                    .map_err(db_error)?,
+                None => Vec::new(),
+            };
             return Ok(Json(IngestResponse {
                 drawer_id,
                 drawer_ids: all_ids,
+                created_drawer_ids,
                 chunk_count: chunks.len(),
                 dropped: false,
                 gating_decision: None,
@@ -8724,8 +8732,6 @@ impl MempalMcpServer {
                     .zip(chunks.iter().zip(vectors.iter()))
                 {
                     if *chunk_exists {
-                        // Dedup-resolved pre-lock: include in response but NOT in
-                        // newly_created_drawer_ids so LLM reject cannot delete it.
                         if metadata.is_pinned {
                             db.pin_drawer_fenced(runtime_writer_lease, chunk_did, None)
                                 .map_err(|error| {
@@ -8758,8 +8764,6 @@ impl MempalMcpServer {
                     };
                     let exists_after_lock = db.drawer_exists(chunk_did).map_err(db_error)?;
                     if exists_after_lock {
-                        // Dedup-resolved post-lock: include in response but NOT in
-                        // newly_created_drawer_ids so LLM reject cannot delete it.
                         if metadata.is_pinned {
                             db.pin_drawer_fenced(runtime_writer_lease, chunk_did, None)
                                 .map_err(|error| {
@@ -8793,12 +8797,13 @@ impl MempalMcpServer {
                         runtime_writer_lease,
                         "insert MCP ingest drawer",
                         || {
-                            db.insert_drawer_with_project_validity(
+                            db.insert_drawer_with_project_validity_and_operation(
                                 &drawer,
                                 project_id.as_deref(),
                                 None,
                                 request.valid_from.as_deref(),
                                 request.valid_until.as_deref(),
+                                creation_operation_id,
                             )
                         },
                     )?;
@@ -8888,6 +8893,7 @@ impl MempalMcpServer {
                         confidence,
                         &mut inserted_drawer_ids,
                         &mut newly_created_drawer_ids,
+                        creation_operation_id,
                         runtime_writer_lease,
                     )?;
                     novelty_action = Some(NoveltyAction::Insert);
@@ -8951,6 +8957,7 @@ impl MempalMcpServer {
                                     confidence,
                                     &mut inserted_drawer_ids,
                                     &mut newly_created_drawer_ids,
+                                    creation_operation_id,
                                     runtime_writer_lease,
                                 )?;
                                 novelty_action = Some(NoveltyAction::Insert);
@@ -8980,6 +8987,7 @@ impl MempalMcpServer {
                                 confidence,
                                 &mut inserted_drawer_ids,
                                 &mut newly_created_drawer_ids,
+                                creation_operation_id,
                                 runtime_writer_lease,
                             )?;
                             novelty_action = Some(NoveltyAction::Insert);
@@ -9065,11 +9073,8 @@ impl MempalMcpServer {
             .map_err(db_error)?;
         }
 
-        // Tier 3 LLM judge (P12) — fire-and-forget after drawer is stored.
-        // Only runs when Tier 2 returned "prototype_below_threshold" and LLM judge is active.
-        // Guard: only enqueue for NEWLY CREATED drawers. Dedup-resolved IDs (pre-existing drawers
-        // found by hash) are excluded from newly_created_drawer_ids so a subsequent LLM reject
-        // cannot soft-delete a drawer that predated this ingest request.
+        // Tier 3 LLM judge after store; enqueue only newly created IDs so reject
+        // cannot delete a pre-existing hash-dedup drawer.
         if should_enqueue_llm_task && !newly_created_drawer_ids.is_empty() {
             let system_prompt = config
                 .ingest_gating
@@ -9181,10 +9186,16 @@ impl MempalMcpServer {
             )?;
         }
 
+        let created_drawer_ids = match creation_operation_id {
+            Some(operation_id) => db
+                .drawer_ids_created_by_operation(operation_id, &inserted_drawer_ids)
+                .map_err(db_error)?,
+            None => newly_created_drawer_ids,
+        };
         Ok(Json(IngestResponse {
             drawer_id: response_drawer_id,
             drawer_ids: inserted_drawer_ids,
-            created_drawer_ids: newly_created_drawer_ids,
+            created_drawer_ids,
             chunk_count: chunks.len(),
             dropped: false,
             gating_decision,
@@ -13608,6 +13619,7 @@ mod tests {
     mod delete_receipt_921_tests;
     mod ingest_receipt_tests;
     mod mcp_roots_936_tests;
+    mod operation_creation_receipt_tests;
     mod read_tests;
     #[derive(Clone)]
     struct StubEmbedderFactory {

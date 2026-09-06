@@ -74,7 +74,9 @@ async fn wait_for_rest_server(addr: SocketAddr) -> Result<()> {
         .timeout(Duration::from_millis(250))
         .build()
         .context("failed to build REST readiness client")?;
-    let url = format!("http://{addr}/api/status");
+    // ponytail: any HTTP response proves Axum is polling; keep the probe off
+    // DB-backed handlers unless readiness gains its own response contract.
+    let url = format!("http://{addr}/api/_serve_ready");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if client.get(&url).send().await.is_ok() {
@@ -113,4 +115,36 @@ pub(super) fn server_for_rest(
         .with_external_ingest_writer_lease(writer_lease.lease().clone())
         .with_daemon_write_observer(write_observer),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rest_readiness_does_not_wait_for_status_diagnostics() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind REST readiness fixture");
+        let addr = listener.local_addr().expect("read REST readiness address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/api/status",
+                    axum::routing::get(|| async { std::future::pending::<()>().await }),
+                ),
+            )
+            .await
+        });
+
+        let readiness =
+            tokio::time::timeout(Duration::from_millis(500), wait_for_rest_server(addr)).await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            matches!(readiness, Ok(Ok(()))),
+            "REST serve-loop readiness must not depend on status diagnostics: {readiness:?}"
+        );
+    }
 }

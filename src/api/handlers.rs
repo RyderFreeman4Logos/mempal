@@ -973,8 +973,8 @@ async fn process_ingest_request(
         return Ok(IngestResponse {
             drawer_id: primary_drawer_id,
             drawer_ids,
-            created_drawer_ids: Vec::new(),
             cleanup_drawer_ids: Vec::new(),
+            created_drawer_ids: Vec::new(),
             chunk_count: accepted_chunks.len(),
             dropped: false,
             superseded_drawer_id: superseded_response_id,

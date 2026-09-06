@@ -20,6 +20,7 @@ mod db_admission_release;
 mod db_admission_sidecar_tests;
 mod db_admission_state;
 pub(crate) mod db_connection;
+mod db_operation_creation;
 pub(crate) mod deadline;
 pub use async_db::{AsyncDb, QueryOnlyAsyncDb};
 pub mod decay;

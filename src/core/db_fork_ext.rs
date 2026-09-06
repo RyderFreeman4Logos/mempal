@@ -8,8 +8,9 @@ use v26::{apply_v24, apply_v25, apply_v26};
 mod v27;
 use v27::apply_v27;
 
-/// Hook injected into the migration runner between `up()` and `COMMIT`.
-/// Returning Err triggers a ROLLBACK, leaving `fork_ext_version` unchanged.
+#[path = "db_fork_ext_v28.rs"]
+mod v28;
+/// Runs between `up()` and `COMMIT`; an error rolls back without advancing the version.
 /// // harness-point: PR0
 pub trait MigrationHook: Send + Sync {
     fn pre_commit(&self) -> anyhow::Result<()>;
@@ -22,13 +23,10 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 27;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 28;
 
-// Partial indexes on the most expensive GROUP BY + COUNT(*) paths used by `mempal status`.
-// idx_drawers_project_id_active is a partial replacement for the non-partial
-// idx_drawers_project_id (added in fork_ext v5), cutting project_breakdown() from ~8s to
-// sub-second on 500K+ row databases. idx_drawers_wing_room_active does the same for
-// scope_counts() (GROUP BY wing, room WHERE deleted_at IS NULL).
+// Partial indexes accelerate the GROUP BY + COUNT(*) paths used by `mempal status`.
+// `idx_drawers_project_id_active` cuts 500K-row `project_breakdown()` from ~8s to sub-second; the wing/room index does the same for `scope_counts()`.
 pub const FORK_EXT_V16_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS conversation_turns (
     id              TEXT PRIMARY KEY,
@@ -513,6 +511,7 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 27,
             up: apply_v27,
         },
+        Migration { version: 28, up: v28::apply_v28 },
     ]
 }
 
