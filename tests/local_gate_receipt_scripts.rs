@@ -434,11 +434,8 @@ fn fixture(aggregate: &str) -> GateFixture {
         .expect("read local gate receipt script");
     let script = script_dir.join("local-gate-receipt.sh");
     write_executable(&script, &fixture_script(&source, aggregate));
-    fs::write(
-        root.join("justfile"),
-        "fmt-check:\n    true\n\nquality-gates:\n    true\n\ntest-rest:\n    true\n\nrelease-gate:\n    true\n",
-    )
-    .expect("write fixture justfile");
+    fs::write(root.join("justfile"), failure_modes::fixture_justfile())
+        .expect("write fixture justfile");
     fs::write(root.join("lefthook.yml"), "pre-push:\n  commands: {}\n")
         .expect("write fixture lefthook config");
     fs::write(root.join(".gitignore"), "/target\n/.fixture-git-hooks\n")
