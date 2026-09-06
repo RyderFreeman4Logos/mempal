@@ -7139,7 +7139,9 @@ fn cleanup_drawer_ids_for_stdin_output_from_created<'a>(
     stats: &IngestStats,
     created_drawer_ids: &'a [String],
 ) -> &'a [String] {
-    if dry_run || stats.chunks == 0 || stats.skipped > 0 || stats.dropped_by_gate > 0 {
+    if !created_drawer_ids.is_empty() {
+        created_drawer_ids
+    } else if dry_run || stats.chunks == 0 || stats.skipped > 0 || stats.dropped_by_gate > 0 {
         &[]
     } else {
         created_drawer_ids
@@ -26583,6 +26585,27 @@ mod ingest_wait_timeout_error_tests {
         let error = anyhow::anyhow!("other error");
 
         assert!(!is_ingest_wait_timed_out(&error));
+    }
+
+    #[test]
+    fn stdin_wait_json_keeps_created_ids_when_chunk_count_omitted() {
+        let response = IngestResponse {
+            state: Some(IngestOperationState::Completed),
+            created_drawer_ids: vec!["drawer-update".to_string()],
+            drawer_ids: vec!["drawer-update".to_string()],
+            superseded_drawer_id: Some("drawer-create".to_string()),
+            ..IngestResponse::default()
+        };
+        let stats = ingest_stdin_wait_stats_from_response(&response);
+        let cleanup = cleanup_drawer_ids_for_stdin_output_from_created(
+            false,
+            &stats,
+            &response.created_drawer_ids,
+        );
+
+        assert_eq!(cleanup, ["drawer-update"]);
+        assert_eq!(stats.skipped, 0);
+        assert_eq!(stats.dropped_by_gate, 0);
     }
 
     #[test]

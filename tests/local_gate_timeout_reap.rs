@@ -329,12 +329,11 @@ fn cargo_test_wrapper_timeout_reaps_a_term_ignoring_descendant() {
     command.env("MEMPAL_CARGO_TEST_TIMEOUT_SECS", "1");
     command.env("MEMPAL_CARGO_TEST_KILL_GRACE_SECS", "1");
     let mut wrapper = command.spawn().expect("spawn timeout wrapper");
-    wait_for_file(
+    let identity_record = local_gate_pid_safety::wait_for_recorded_process_identity(
         &identity_file,
         Duration::from_secs(2),
         "term-ignoring descendant identity",
     );
-    let identity_record = fs::read_to_string(&identity_file).expect("read descendant identity");
 
     let deadline = Instant::now() + Duration::from_secs(4);
     let status = loop {
@@ -394,12 +393,11 @@ fn cargo_test_wrapper_timeout_reaps_nested_setsid_descendant_and_drains_pipes() 
     "#;
     let (mut wrapper, stdout_done, stderr_done) =
         spawn_piped_wrapper(&script, command, "1", &identity_file);
-    wait_for_file(
+    let identity_record = local_gate_pid_safety::wait_for_recorded_process_identity(
         &identity_file,
         Duration::from_secs(2),
         "nested-session descendant identity",
     );
-    let identity_record = fs::read_to_string(&identity_file).expect("read nested identity");
 
     let status = wait_for_wrapper(
         &mut wrapper,
@@ -451,12 +449,11 @@ fn cargo_test_wrapper_reaps_descendant_after_leader_exits_and_drains_pipes() {
     "#;
     let (mut wrapper, stdout_done, stderr_done) =
         spawn_piped_wrapper(&script, command, "10", &identity_file);
-    wait_for_file(
+    let identity_record = local_gate_pid_safety::wait_for_recorded_process_identity(
         &identity_file,
         Duration::from_secs(2),
         "early-exit descendant identity",
     );
-    let identity_record = fs::read_to_string(&identity_file).expect("read early-exit identity");
 
     let status = wait_for_wrapper(
         &mut wrapper,
@@ -514,12 +511,11 @@ while True:
     "#;
     let (mut wrapper, _stdout_done, _stderr_done) =
         spawn_piped_wrapper(&script, command, "10", &identity_file);
-    wait_for_file(
+    let identity_record = local_gate_pid_safety::wait_for_recorded_process_identity(
         &identity_file,
         Duration::from_secs(2),
         "non-UTF-8 task-name descendant identity",
     );
-    let identity_record = fs::read_to_string(&identity_file).expect("read non-UTF-8 identity");
 
     let status = wait_for_wrapper(
         &mut wrapper,

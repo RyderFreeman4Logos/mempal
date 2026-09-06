@@ -15,7 +15,7 @@ mod db_admission_test_process;
 
 const _: fn() = db_admission_test_process::reference_shared_test_api;
 
-use db_admission_test_process::{DeadlineChild, SpawnSpec};
+use db_admission_test_process::{DeadlineChild, SpawnSpec, SupervisionError};
 
 const FIXTURE_CASE_ENV: &str = "MEMPAL_DB_ADMISSION_FIXTURE_CASE";
 const FIXTURE_DATABASE_ENV: &str = "MEMPAL_DB_ADMISSION_FIXTURE_DATABASE";
@@ -210,8 +210,15 @@ fn assert_crashes_at(database: &Path, point: CrashPoint) {
         .env(FIXTURE_DATABASE_ENV, database.as_os_str())
         .env(FIXTURE_CASE_ENV, fixture_case(point));
 
-    let output =
-        DeadlineChild::output(spec, Duration::from_secs(10)).expect("run admission crash fixture");
+    // Match tests/db_admission.rs: collection bound returns on child exit;
+    // CleanupIncomplete gets a separate reap retry, not a larger product timeout.
+    let output = match DeadlineChild::output(spec, Duration::from_secs(30)) {
+        Ok(output) => output,
+        Err(SupervisionError::CleanupIncomplete(incomplete)) => incomplete
+            .finish_output(Duration::from_secs(5))
+            .expect("run admission crash fixture"),
+        Err(error) => panic!("run admission crash fixture: {error:?}"),
+    };
     assert_eq!(
         output.status.code(),
         Some(point.exit_code()),
