@@ -1989,7 +1989,7 @@ def mcp_crud() -> list[str]:
                 reason=_ur(update_recovery),
                 cleanup_id_count=len(cleanup_ids),
                 **recovery_fields(update_recovery),
-                product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/1096',
+                product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/1101',
             )
             return cleanup_ids
         created_ids.extend(authoritative_update_ids)

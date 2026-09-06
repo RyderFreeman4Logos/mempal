@@ -26,8 +26,8 @@ use crate::core::{
         SourceType, TaxonomyEntry, default_confidence,
     },
     utils::{
-        build_bootstrap_evidence_drawer_id, iso_timestamp, link_superseded_drawer,
-        source_file_or_synthetic,
+        build_bootstrap_evidence_drawer_id, created_ids_owned_by_supersede_retry, iso_timestamp,
+        link_superseded_drawer, source_file_or_synthetic,
     },
 };
 use crate::embed::global_embed_status;
@@ -970,11 +970,21 @@ async fn process_ingest_request(
             superseded_response_id = Some(old_id.to_string());
         }
         let primary_drawer_id = drawer_ids.first().cloned().unwrap_or_default();
+        let created_drawer_ids = created_ids_owned_by_supersede_retry(
+            &drawer_ids,
+            superseded_drawer_id.as_deref(),
+            |id| {
+                db.get_drawer(id)
+                    .ok()
+                    .flatten()
+                    .and_then(|drawer| drawer.supersedes)
+            },
+        );
         return Ok(IngestResponse {
             drawer_id: primary_drawer_id,
             drawer_ids,
-            created_drawer_ids: Vec::new(),
-            cleanup_drawer_ids: Vec::new(),
+            cleanup_drawer_ids: created_drawer_ids.clone(),
+            created_drawer_ids,
             chunk_count: accepted_chunks.len(),
             dropped: false,
             superseded_drawer_id: superseded_response_id,

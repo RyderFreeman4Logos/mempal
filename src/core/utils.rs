@@ -174,6 +174,26 @@ pub fn link_superseded_drawer(drawer: &mut Drawer, old_id: &str) {
     }
 }
 
+/// Cleanup IDs for an already-persisted replacement owned by this supersede.
+///
+/// Same-operation retry may find the replacement via content identity after the
+/// first attempt inserted it. Cross-operation exact matches must not gain
+/// `created_drawer_ids`. Ownership is `drawer.supersedes == this target`.
+pub fn created_ids_owned_by_supersede_retry(
+    existing_ids: &[String],
+    superseded_drawer_id: Option<&str>,
+    drawer_supersedes: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let Some(old_id) = superseded_drawer_id else {
+        return Vec::new();
+    };
+    existing_ids
+        .iter()
+        .filter(|id| drawer_supersedes(id).as_deref() == Some(old_id))
+        .cloned()
+        .collect()
+}
+
 pub fn build_triple_id(subject: &str, predicate: &str, object: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(subject.as_bytes());
@@ -522,5 +542,31 @@ mod tests {
             Some("2026-04-25T12:00:00Z".to_string())
         );
         assert_eq!(normalize_rfc3339_timestamp("not-a-date"), None);
+    }
+
+    #[test]
+    fn supersede_retry_keeps_owned_replacement_as_created() {
+        let existing = vec!["drawer-new".to_string(), "drawer-other".to_string()];
+        let created =
+            created_ids_owned_by_supersede_retry(&existing, Some("drawer-old"), |id| match id {
+                "drawer-new" => Some("drawer-old".to_string()),
+                _ => None,
+            });
+        assert_eq!(created, ["drawer-new"]);
+    }
+
+    #[test]
+    fn supersede_retry_does_not_grant_unrelated_existing_ids() {
+        let existing = vec!["drawer-new".to_string()];
+        let created = created_ids_owned_by_supersede_retry(&existing, Some("drawer-old"), |_| {
+            Some("drawer-elsewhere".to_string())
+        });
+        assert!(created.is_empty());
+        assert!(
+            created_ids_owned_by_supersede_retry(&existing, None, |_| {
+                Some("drawer-old".to_string())
+            })
+            .is_empty()
+        );
     }
 }

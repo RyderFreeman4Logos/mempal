@@ -50,8 +50,9 @@ use crate::core::{
         RuntimeWriterLease, SearchResult, SourceType, TriggerHints, Triple, default_confidence,
     },
     utils::{
-        build_bootstrap_drawer_id_from_parts, build_triple_id, current_timestamp, expand_home,
-        iso_timestamp, knowledge_source_file, link_superseded_drawer, normalize_rfc3339_timestamp,
+        build_bootstrap_drawer_id_from_parts, build_triple_id,
+        created_ids_owned_by_supersede_retry, current_timestamp, expand_home, iso_timestamp,
+        knowledge_source_file, link_superseded_drawer, normalize_rfc3339_timestamp,
         source_file_or_synthetic,
     },
 };
@@ -7290,10 +7291,7 @@ impl MempalMcpServer {
         let wait = request.wait.unwrap_or(false);
         let wait_timeout_secs = request.wait_timeout_secs.unwrap_or(30);
         let request_deadline = ingest_request_deadline(request_started_at, wait, wait_timeout_secs);
-        // Snapshot the request-wide warnings once so every early-return path reports a
-        // consistent set from a single `sqlite_master` read. A mid-request embed transition
-        // to degraded is not lost: the degraded-write guards above reject before any
-        // success response that would carry this snapshot is built.
+        // One sqlite_master snapshot for every early-return; degraded writes reject first.
         let request_system_warnings = if worker_mode != IngestWaitWorkerMode::Background {
             current_system_warnings()
         } else {
@@ -8166,10 +8164,7 @@ impl MempalMcpServer {
             .into());
         }
         let db = self.open_sync_ingest_db_with_admission_retry().await?;
-        // Snapshot the request-wide warnings once so every early-return path reports a
-        // consistent set from a single `sqlite_master` read. A mid-request embed transition
-        // to degraded is not lost: the degraded-write guard above rejects before any
-        // success response that would carry this snapshot is built.
+        // One sqlite_master snapshot for every early-return; degraded writes reject first.
         let mut request_system_warnings = system_warnings_with_stale_index(&db);
         let no_gate = controls.no_gate;
         let bypass_novelty = controls.bypass_novelty;
@@ -8246,10 +8241,8 @@ impl MempalMcpServer {
         let superseded_drawer_id_ref = superseded_drawer_id.as_deref();
         let mut superseded_response_id: Option<String> = None;
 
-        // Trusted local CLI callers bypass novelty because the legacy stdin path
-        // treats an exact request-wide content match as a no-op before chunking.
-        // Preserve that behavior for queue-first waits, including when the
-        // pre-existing drawer was written by the direct stdin path.
+        // CLI bypass_novelty matches stdin exact-content no-op, including queue-first
+        // waits after a direct stdin write of the same drawer.
         let direct_exact_duplicate = if bypass_novelty {
             exact_content_duplicate_drawer_id(
                 &db,
@@ -8361,9 +8354,15 @@ impl MempalMcpServer {
                 .await
                 .map_err(db_error)?;
             }
+            let created_drawer_ids = created_ids_owned_by_supersede_retry(
+                &all_ids,
+                superseded_drawer_id.as_deref(),
+                |id| db.get_drawer(id).ok().flatten().and_then(|d| d.supersedes),
+            );
             return Ok(Json(IngestResponse {
                 drawer_id,
                 drawer_ids: all_ids,
+                created_drawer_ids,
                 chunk_count: chunks.len(),
                 dropped: false,
                 gating_decision: None,
@@ -9065,11 +9064,8 @@ impl MempalMcpServer {
             .map_err(db_error)?;
         }
 
-        // Tier 3 LLM judge (P12) — fire-and-forget after drawer is stored.
-        // Only runs when Tier 2 returned "prototype_below_threshold" and LLM judge is active.
-        // Guard: only enqueue for NEWLY CREATED drawers. Dedup-resolved IDs (pre-existing drawers
-        // found by hash) are excluded from newly_created_drawer_ids so a subsequent LLM reject
-        // cannot soft-delete a drawer that predated this ingest request.
+        // Tier 3 LLM judge after store; enqueue only newly created IDs so reject
+        // cannot delete a pre-existing hash-dedup drawer.
         if should_enqueue_llm_task && !newly_created_drawer_ids.is_empty() {
             let system_prompt = config
                 .ingest_gating

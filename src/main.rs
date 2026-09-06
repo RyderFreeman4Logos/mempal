@@ -66,8 +66,8 @@ use mempal::core::{
         TunnelEndpoint, default_confidence,
     },
     utils::{
-        build_bootstrap_evidence_drawer_id, build_triple_id, current_timestamp,
-        format_tunnel_endpoint, iso_timestamp, link_superseded_drawer,
+        build_bootstrap_evidence_drawer_id, build_triple_id, created_ids_owned_by_supersede_retry,
+        current_timestamp, format_tunnel_endpoint, iso_timestamp, link_superseded_drawer,
         normalize_added_at as normalize_added_at_value, normalize_rfc3339_timestamp,
         source_file_or_synthetic,
     },
@@ -6288,16 +6288,27 @@ fn finalize_exact_duplicate_stdin_ingest(ctx: ExactDuplicateStdinIngest<'_>) -> 
         db.pin_drawer(drawer_id, None)
             .with_context(|| format!("failed to pin duplicate drawer {drawer_id}"))?;
     }
-    stats.skipped = 1;
     stats.drawer_ids = vec![drawer_id.to_string()];
     if let Some(old_id) = superseded_drawer_id {
         db.supersede_drawer(old_id, &format!("replaced by {drawer_id}"))
             .with_context(|| format!("failed to supersede drawer {old_id}"))?;
         stats.superseded_drawer_id = Some(old_id.to_string());
     }
+    let created_drawer_ids =
+        created_ids_owned_by_supersede_retry(&stats.drawer_ids, superseded_drawer_id, |id| {
+            db.get_drawer(id)
+                .ok()
+                .flatten()
+                .and_then(|drawer| drawer.supersedes)
+        });
+    if created_drawer_ids.is_empty() {
+        stats.skipped = 1;
+    } else {
+        stats.chunks = 1;
+    }
     append_ingest_stdin_audit_log(db, wing, false, record, stats)
         .context("failed to append ingest audit log")?;
-    print_stdin_ingest_output(json, false, stats)?;
+    print_stdin_ingest_output_with_created_ids(json, false, stats, &created_drawer_ids)?;
     Ok(())
 }
 
