@@ -7867,20 +7867,7 @@ impl MempalMcpServer {
             crate::hook_ipc::HookIpcClientOutcome::Accepted => {
                 let operation_id =
                     PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &idempotency_key);
-                if self
-                    .daemon_admitted_operation_is_visible(&operation_id, request_deadline)
-                    .await?
-                {
-                    Ok(DaemonIngestEnqueue::Accepted { operation_id })
-                } else {
-                    tracing::warn!(
-                        operation_id,
-                        "daemon ingest enqueue ACK did not expose a queryable operation row; falling back to local idempotent admission"
-                    );
-                    Ok(DaemonIngestEnqueue::Fallback {
-                        may_have_reached_daemon: true,
-                    })
-                }
+                Ok(DaemonIngestEnqueue::Accepted { operation_id })
             }
             crate::hook_ipc::HookIpcClientOutcome::Fallback(reason) => {
                 let may_have_reached_daemon = reason.may_have_reached_daemon();
@@ -14917,7 +14904,7 @@ quality_policy = "llm_required_for_keep"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_mcp_ingest_completes_local_fallback_when_daemon_ack_lacks_queryable_operation() {
+    async fn test_mcp_ingest_keeps_receipt_when_daemon_ack_precedes_visibility() {
         let (tempdir, db_path, server) = setup_server();
         let (listener, _socket_guard) =
             crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
@@ -14938,12 +14925,11 @@ quality_policy = "llm_required_for_keep"
         let response = server
             .mempal_ingest_with_controls(
                 IngestRequest {
-                    content: "daemon ACK without durable operation must complete local fallback"
-                        .to_string(),
+                    content: "daemon ACK precedes queue visibility".to_string(),
                     wing: "mcp".to_string(),
                     room: Some("receipt".to_string()),
                     wait: Some(true),
-                    wait_timeout_secs: Some(10),
+                    wait_timeout_secs: Some(1),
                     ..IngestRequest::default()
                 },
                 IngestControls {
@@ -14952,27 +14938,25 @@ quality_policy = "llm_required_for_keep"
                 },
             )
             .await
-            .expect("ingest admission should complete through local idempotent fallback")
+            .expect("durable ACK should return a followable receipt")
             .0;
 
         let request = daemon.await.expect("daemon IPC task");
-        assert_eq!(response.state, Some(IngestOperationState::Completed));
-        assert!(!response.timed_out);
-        assert!(
-            !response.created_drawer_ids.is_empty(),
-            "local fallback completion must expose cleanup-safe created ids"
-        );
         let operation_id = response.operation_id.as_deref().expect("operation id");
         assert_eq!(
             operation_id,
             PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &request.idempotency_key)
         );
-        let record = PendingMessageStore::new_without_reclaim(&db_path)
-            .operation_status(operation_id)
-            .expect("query operation")
-            .expect("returned operation id must be completed");
-        assert_eq!(record.id, operation_id);
-        assert_eq!(record.op_state, IngestOperationState::Completed.as_str());
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(response.timed_out);
+        assert!(response.created_drawer_ids.is_empty());
+        assert!(
+            PendingMessageStore::new_without_reclaim(&db_path)
+                .operation_status(operation_id)
+                .expect("query operation")
+                .is_none(),
+            "receipt handling must not create a local fallback duplicate"
+        );
     }
 
     #[cfg(unix)]

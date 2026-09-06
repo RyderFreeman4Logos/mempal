@@ -171,3 +171,122 @@ async fn test_cli_style_operation_wait_follows_live_daemon_receipt_to_created_id
     );
     release_test_ingest_writer_lease(&db_path, &daemon_lease);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_fsynced_daemon_ack_returns_receipt_before_queue_visibility() {
+    let (tempdir, db_path, server) = setup_server();
+    let request = IngestRequest {
+        content: "fsynced daemon receipt survives blocked queue visibility".into(),
+        wing: "mcp".into(),
+        room: Some("receipt".into()),
+        ..IngestRequest::default()
+    };
+    let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+    let project_id = server
+        .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+        .await
+        .expect("resolve project");
+    let prepared = server
+        .prepare_async_ingest_operation(
+            &request,
+            side_effect_controls(),
+            config.as_ref(),
+            compiled_privacy.as_ref(),
+            project_id,
+        )
+        .await
+        .expect("prepare queued ingest");
+    let payload = serde_json::to_string(&prepared).expect("serialize queued ingest");
+    let idempotency_key = mcp_ingest_idempotency_key(&payload);
+
+    let (listener, _socket_guard) =
+        crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
+    let spool = Arc::new(crate::ingress_spool::IngressSpool::new(tempdir.path()));
+    let daemon_spool = Arc::clone(&spool);
+    let daemon = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept daemon IPC");
+        let request = crate::hook_ipc::read_enqueue_request(&mut stream)
+            .await
+            .expect("read daemon IPC request");
+        daemon_spool.append(&request).expect("fsync ingress spool");
+        crate::hook_ipc::write_enqueue_response(
+            &mut stream,
+            &crate::hook_ipc::HookIpcEnqueueResponse::Accepted,
+        )
+        .await
+        .expect("write durable ACK");
+        request
+    });
+    let lock = rusqlite::Connection::open(&db_path).expect("open lock connection");
+    lock.execute_batch("BEGIN IMMEDIATE")
+        .expect("block queue visibility");
+
+    let outcome = server
+        .try_enqueue_ingest_operation_via_daemon(
+            payload,
+            idempotency_key,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("durable ACK must return a receipt");
+    let request = daemon.await.expect("daemon IPC task");
+    let expected_operation_id =
+        PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &request.idempotency_key);
+    assert_eq!(
+        outcome,
+        DaemonIngestEnqueue::Accepted {
+            operation_id: expected_operation_id.clone(),
+        }
+    );
+    assert!(
+        PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(&expected_operation_id)
+            .expect("query hidden operation")
+            .is_none(),
+        "ACK must precede SQLite visibility"
+    );
+
+    lock.execute_batch("ROLLBACK").expect("release queue lock");
+    let queue = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+    assert_eq!(spool.drain_once(&queue).await.expect("replay spool"), 1);
+    assert_eq!(spool.drain_once(&queue).await.expect("dedupe replay"), 0);
+    let claim = queue
+        .claim_by_id_and_kind_with_lock_retry_deadline(
+            "receipt-worker".into(),
+            INGEST_CLAIM_TTL_SECS,
+            expected_operation_id.clone(),
+            INGEST_ASYNC_KIND.into(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("claim replayed operation")
+        .expect("replayed operation exists");
+    server
+        .process_ingest_claim(&queue, "receipt-worker", claim)
+        .await
+        .expect("complete replayed operation");
+
+    let completed = server
+        .operation_status_json_for_test(&expected_operation_id)
+        .await
+        .expect("load completion receipt");
+    assert_eq!(completed.state, Some(IngestOperationState::Completed));
+    assert_eq!(completed.created_drawer_ids.len(), 1);
+    let conn = rusqlite::Connection::open(&db_path).expect("open verification connection");
+    let completion_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_message_completions WHERE message_id = ?1",
+            [&expected_operation_id],
+            |row| row.get(0),
+        )
+        .expect("count completions");
+    let created_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM drawers WHERE creation_operation_id = ?1",
+            [&expected_operation_id],
+            |row| row.get(0),
+        )
+        .expect("count created drawers");
+    assert_eq!((completion_count, created_count), (1, 1));
+}
