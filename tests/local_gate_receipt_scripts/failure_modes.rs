@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
+pub(super) fn fixture_justfile() -> &'static str {
+    "fmt-check:\n    true\n\nquality-gates:\n    true\n\ntest-rest:\n    true\n\ntest-rest-feature-contract:\n    true\n\nrelease-gate:\n    true\n"
+}
+
 const FAULT_KIND_ENV: &str = "LOCAL_GATE_RECEIPT_FAULT_KIND";
 const FAULT_LOG_ENV: &str = "LOCAL_GATE_RECEIPT_FAULT_LOG";
 const FAULT_ARM_ENV: &str = "LOCAL_GATE_RECEIPT_FAULT_ARM";
@@ -380,5 +384,68 @@ fn push_reviewed_has_a_fixed_main_base_without_parameters() {
     assert!(
         String::from_utf8_lossy(&dry_run).contains("gh pr create --base main --fill"),
         "push-reviewed dry run lost canonical main base"
+    );
+}
+
+#[test]
+fn local_gate_aggregate_invokes_rest_feature_contract() {
+    let source = fs::read_to_string(repo_root().join("scripts/gates/local-gate-receipt.sh"))
+        .expect("read local gate receipt script");
+    let start = source
+        .find("# fixture-aggregate-start")
+        .expect("fixture start marker exists");
+    let end = source[start..]
+        .find("# fixture-aggregate-end")
+        .map(|offset| start + offset)
+        .expect("fixture end marker exists");
+    let aggregate = &source[start + "# fixture-aggregate-start".len()..end];
+    let test_rest = aggregate
+        .find("just test-rest\n")
+        .expect("aggregate runs test-rest");
+    let rest_contract = aggregate
+        .find("just test-rest-feature-contract\n")
+        .expect("aggregate runs test-rest-feature-contract");
+    let release = aggregate
+        .find("just release-gate\n")
+        .expect("aggregate runs release-gate");
+    assert!(
+        test_rest < rest_contract && rest_contract < release,
+        "rest feature contract must run after test-rest and before release-gate"
+    );
+
+    let justfile = fs::read_to_string(repo_root().join("justfile")).expect("read justfile");
+    let recipe_start = justfile
+        .find("test-rest-feature-contract:")
+        .expect("just recipe exists");
+    let recipe = &justfile[recipe_start..]
+        .split_once("\n\n")
+        .expect("recipe ends before next recipe")
+        .0;
+    assert!(
+        recipe.contains("run_contract 1")
+            && recipe.contains("run_contract 0 --no-default-features")
+            && recipe.contains("--ignored")
+            && recipe.contains("--exact")
+            && recipe.contains(
+                "rest_feature_contract_tests::rest_feature_matches_invocation_expectation",
+            )
+            && recipe.contains("running 1 test")
+            && recipe.contains("1 passed")
+            && recipe.contains("MEMPAL_EXPECT_REST must be 0 or 1"),
+        "rest feature contract recipe lost dual-mode assertions"
+    );
+
+    let fixture = fixture(aggregate);
+    let output = run_fixture(&fixture, "produce");
+    assert!(
+        output.status.success(),
+        "literal aggregate recipes failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        receipt_files(&fixture).expect("list receipts").len(),
+        1,
+        "literal aggregate must still publish exactly one PASS receipt"
     );
 }

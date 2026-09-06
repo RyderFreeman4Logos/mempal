@@ -120,7 +120,7 @@ time.sleep(60)
                 del kwargs
                 if command[:2] == ["mempal", "delete"]:
                     return {
-                        "returncode": 0 if command[2] == "drawer-a" else 1,
+                        "returncode": 0 if "drawer-a" in command else 1,
                         "stdout": b"",
                         "stderr": b"",
                     }

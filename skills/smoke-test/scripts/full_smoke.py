@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Aggregate-only mempal smoke runner for repo-local skills/smoke-test.
 
-Exercises CLI and MCP CRUD without printing drawer content or raw command output.
+Exercises CLI/MCP CRUD without printing drawer content or raw output.
 """
 from __future__ import annotations
 
@@ -1189,7 +1189,7 @@ def delete_exact_ids_cli(drawer_ids: list[str], label: str, room: str | None = N
 
     def delete(drawer_id: str) -> bool:
         nonlocal stdout_bytes, stderr_bytes
-        proc = run_child_process(['mempal', 'delete', drawer_id], timeout=60, io_category='cli_child_processes')
+        proc = run_child_process(['mempal', 'delete', '--all-projects', drawer_id], timeout=60, io_category='cli_child_processes')
         stdout_bytes += len(proc['stdout'])
         stderr_bytes += len(proc['stderr'])
         return proc['returncode'] == 0

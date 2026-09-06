@@ -79,6 +79,9 @@ fn writer_lease_renew_retries_sqlite_busy_until_live_holder_releases() {
     let temp = tempfile::tempdir().expect("tempdir");
     let db_path = temp.path().join("palace.db");
     let db = Database::open(&db_path).expect("database");
+    // Lease-control opens use SQLITE_OPEN_NOFOLLOW. tempfile under a symlink
+    // TMPDIR is lexical; admitted Database::path() is the canonical identity.
+    let db_path = db.path().to_path_buf();
     let lease = db
         .runtime_writer_lease_acquire("sqlite-writer", "daemon", "daemon", 120, None)
         .expect("acquire daemon lease")

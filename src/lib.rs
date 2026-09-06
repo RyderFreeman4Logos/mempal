@@ -70,3 +70,17 @@ pub mod supersede;
 pub mod system_memory;
 pub mod wiki;
 pub mod xurl;
+
+#[cfg(test)]
+mod rest_feature_contract_tests {
+    #[test]
+    #[ignore = "invoked by just test-rest-feature-contract with MEMPAL_EXPECT_REST"]
+    fn rest_feature_matches_invocation_expectation() {
+        let expected = match std::env::var("MEMPAL_EXPECT_REST").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            other => panic!("MEMPAL_EXPECT_REST must be 0 or 1, got {other:?}"),
+        };
+        assert_eq!(cfg!(feature = "rest"), expected);
+    }
+}

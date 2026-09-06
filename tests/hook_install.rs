@@ -22,13 +22,21 @@ fn expected_hook_command(name: &str) -> String {
     format!("{} hook {name}", binary.display())
 }
 
-#[test]
-fn test_hook_install_writes_claude_code_settings() {
-    let tmp = TempDir::new().expect("tempdir");
+fn canonical_fixture_roots(tmp: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
     let cwd = tmp.path().join("repo");
     let home = tmp.path().join("home");
     fs::create_dir_all(&cwd).expect("create cwd");
     fs::create_dir_all(&home).expect("create home");
+    (
+        fs::canonicalize(&cwd).expect("canonical fixture cwd"),
+        fs::canonicalize(&home).expect("canonical fixture home"),
+    )
+}
+
+#[test]
+fn test_hook_install_writes_claude_code_settings() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
 
     let outcome = install_claude_code(&cwd, &home, false, false).expect("install");
     let parsed = parse_json(&outcome.write_path);
@@ -50,10 +58,8 @@ fn test_hook_install_writes_claude_code_settings() {
 #[test]
 fn test_hook_install_respects_project_local_settings() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
     fs::create_dir_all(cwd.join(".claude")).expect("create local .claude");
-    fs::create_dir_all(&home).expect("create home");
     fs::write(cwd.join(".claude/settings.json"), r#"{ "theme": "dark" }"#)
         .expect("write local settings");
 
@@ -76,10 +82,8 @@ fn test_hook_install_respects_project_local_settings() {
 #[test]
 fn test_hook_install_merges_existing_settings() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
     fs::create_dir_all(cwd.join(".claude")).expect("create local .claude");
-    fs::create_dir_all(&home).expect("create home");
     fs::write(
         cwd.join(".claude/settings.json"),
         r#"{
@@ -115,11 +119,9 @@ fn test_hook_install_merges_existing_settings() {
 #[test]
 fn test_hook_install_follows_symlink_target() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
     let target_dir = cwd.join("shared");
     fs::create_dir_all(cwd.join(".claude")).expect("create local .claude");
-    fs::create_dir_all(&home).expect("create home");
     fs::create_dir_all(target_dir.join(".claude")).expect("create target dir");
 
     let real_target = target_dir.join(".claude/settings.json");
@@ -148,10 +150,8 @@ fn test_hook_install_follows_symlink_target() {
 #[test]
 fn test_hook_install_coexists_with_upstream_cowork_entry() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
     fs::create_dir_all(cwd.join(".claude")).expect("create local .claude");
-    fs::create_dir_all(&home).expect("create home");
     fs::write(
         cwd.join(".claude/settings.json"),
         r#"{
@@ -211,10 +211,7 @@ fn test_hook_install_coexists_with_upstream_cowork_entry() {
 #[test]
 fn test_hook_install_dry_run_does_not_write() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
-    fs::create_dir_all(&cwd).expect("create cwd");
-    fs::create_dir_all(&home).expect("create home");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
 
     let outcome = install_claude_code(&cwd, &home, true, false).expect("dry-run install");
     assert!(
@@ -232,11 +229,9 @@ fn test_hook_install_dry_run_does_not_write() {
 #[test]
 fn test_hook_install_refuses_agent_instruction_targets() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
     let forbidden = tmp.path().join("AGENTS.md");
     fs::create_dir_all(cwd.join(".claude")).expect("create local .claude");
-    fs::create_dir_all(&home).expect("create home");
     fs::write(&forbidden, "instructions").expect("write forbidden target");
 
     let local_link = cwd.join(".claude/settings.json");
@@ -253,10 +248,7 @@ fn test_hook_install_refuses_agent_instruction_targets() {
 #[test]
 fn test_hook_install_absolute_path_binary() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
-    fs::create_dir_all(&cwd).expect("create cwd");
-    fs::create_dir_all(&home).expect("create home");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
 
     let outcome = install_claude_code(&cwd, &home, false, false).expect("install");
     let parsed = parse_json(&outcome.write_path);
@@ -289,10 +281,7 @@ fn test_hook_install_absolute_path_binary() {
 #[test]
 fn test_hook_install_public_wrapper_uses_home_env() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
-    fs::create_dir_all(&cwd).expect("create cwd");
-    fs::create_dir_all(&home).expect("create home");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
 
     let output = Command::new(mempal_bin())
         .args(["hook", "install", "--target", "claude-code"])
@@ -483,10 +472,7 @@ fn test_install_user_mcp_uninstall_removes_empty_file() {
 #[test]
 fn test_hook_install_skip_mcp_does_not_touch_user_mcp() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
-    fs::create_dir_all(&cwd).expect("create cwd");
-    fs::create_dir_all(&home).expect("create home");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
 
     let output = Command::new(mempal_bin())
         .args(["hook", "install", "--target", "claude-code", "--skip-mcp"])
@@ -513,10 +499,7 @@ fn test_hook_install_skip_mcp_does_not_touch_user_mcp() {
 #[test]
 fn test_hook_install_writes_codex_hooks() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
-    fs::create_dir_all(&cwd).expect("create cwd");
-    fs::create_dir_all(&home).expect("create home");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
 
     let outcome = install_codex(&cwd, &home, false, false).expect("install codex");
     let parsed = parse_json(&outcome.write_path);
@@ -536,8 +519,7 @@ fn test_hook_install_writes_codex_hooks() {
 #[test]
 fn test_hook_install_codex_merges_existing() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
     fs::create_dir_all(home.join(".codex")).expect("create .codex");
     fs::write(
         home.join(".codex/hooks.json"),
@@ -577,10 +559,7 @@ fn test_hook_install_codex_merges_existing() {
 #[test]
 fn test_hook_install_all_target() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
-    fs::create_dir_all(&cwd).expect("create cwd");
-    fs::create_dir_all(&home).expect("create home");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
 
     let output = Command::new(mempal_bin())
         .args(["hook", "install", "--target", "all"])
@@ -598,10 +577,7 @@ fn test_hook_install_all_target() {
 #[test]
 fn test_hook_install_codex_warns_on_missing_feature_flag() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
-    fs::create_dir_all(&cwd).expect("create cwd");
-    fs::create_dir_all(&home).expect("create home");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
 
     let output = Command::new(mempal_bin())
         .args(["hook", "install", "--target", "codex"])
@@ -618,9 +594,7 @@ fn test_hook_install_codex_warns_on_missing_feature_flag() {
 #[test]
 fn test_hook_install_codex_no_warning_when_feature_enabled() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
-    fs::create_dir_all(&cwd).expect("create cwd");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
     fs::create_dir_all(home.join(".codex")).expect("create .codex");
     fs::write(home.join(".codex/config.toml"), "codex_hooks = true").expect("enable hooks");
 
@@ -638,10 +612,8 @@ fn test_hook_install_codex_no_warning_when_feature_enabled() {
 #[test]
 fn test_hook_install_removes_legacy_aliases() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
     fs::create_dir_all(cwd.join(".claude")).expect("create local .claude");
-    fs::create_dir_all(&home).expect("create home");
 
     // Seed with a legacy hook command
     let legacy_cmd = "/usr/local/bin/mempal hook hook_post_tool";
@@ -676,9 +648,7 @@ fn test_hook_install_removes_legacy_aliases() {
 #[test]
 fn test_hook_install_codex_no_warning_when_feature_enabled_in_section() {
     let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("repo");
-    let home = tmp.path().join("home");
-    fs::create_dir_all(&cwd).expect("create cwd");
+    let (cwd, home) = canonical_fixture_roots(&tmp);
     fs::create_dir_all(home.join(".codex")).expect("create .codex");
     fs::write(
         home.join(".codex/config.toml"),
