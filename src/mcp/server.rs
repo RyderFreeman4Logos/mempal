@@ -50,9 +50,8 @@ use crate::core::{
         RuntimeWriterLease, SearchResult, SourceType, TriggerHints, Triple, default_confidence,
     },
     utils::{
-        build_bootstrap_drawer_id_from_parts, build_triple_id,
-        created_ids_owned_by_supersede_retry, current_timestamp, expand_home, iso_timestamp,
-        knowledge_source_file, link_superseded_drawer, normalize_rfc3339_timestamp,
+        build_bootstrap_drawer_id_from_parts, build_triple_id, current_timestamp, expand_home,
+        iso_timestamp, knowledge_source_file, link_superseded_drawer, normalize_rfc3339_timestamp,
         source_file_or_synthetic,
     },
 };
@@ -8354,15 +8353,9 @@ impl MempalMcpServer {
                 .await
                 .map_err(db_error)?;
             }
-            let created_drawer_ids = created_ids_owned_by_supersede_retry(
-                &all_ids,
-                superseded_drawer_id.as_deref(),
-                |id| db.get_drawer(id).ok().flatten().and_then(|d| d.supersedes),
-            );
             return Ok(Json(IngestResponse {
                 drawer_id,
                 drawer_ids: all_ids,
-                created_drawer_ids,
                 chunk_count: chunks.len(),
                 dropped: false,
                 gating_decision: None,

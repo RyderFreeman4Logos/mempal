@@ -639,11 +639,10 @@ async fn test_mcp_smoke_ingest_wait_update_and_status_return_created_ids() {
 }
 
 #[tokio::test]
-async fn test_mcp_smoke_update_retry_keeps_owned_created_ids() {
+async fn test_mcp_smoke_distinct_update_does_not_claim_existing_replacement() {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
     let old_id = "smoke-retry-old";
-    let replacement_id = "smoke-retry-new";
     let update_content = "cleanup-authoritative MCP smoke retry write two";
     insert_drawer(
         &db_path,
@@ -654,67 +653,48 @@ async fn test_mcp_smoke_update_retry_keeps_owned_created_ids() {
         "/tmp/smoke-retry-old.md",
         0,
     );
-    insert_drawer(
-        &db_path,
-        replacement_id,
-        update_content,
-        "smoke",
-        Some("mcp"),
-        "/tmp/smoke-retry-new.md",
-        0,
-    );
-    let db = Database::open(&db_path).expect("open db");
-    db.conn()
+    let request = || IngestRequest {
+        content: update_content.to_string(),
+        wing: "smoke".to_string(),
+        room: Some("mcp".to_string()),
+        source_type: Some("agent_inference".to_string()),
+        memory_kind: Some("evidence".to_string()),
+        domain: Some("project".to_string()),
+        field: Some("smoke".to_string()),
+        supersedes: Some(old_id.to_string()),
+        smoke: Some(true),
+        wait: Some(true),
+        wait_timeout_secs: Some(5),
+        ..IngestRequest::default()
+    };
+
+    let first = server
+        .mempal_ingest(Parameters(request()))
+        .await
+        .expect("first smoke update should complete")
+        .0;
+    assert_eq!(first.created_drawer_ids.len(), 1);
+    let replacement_id = first.created_drawer_ids[0].clone();
+
+    Database::open(&db_path)
+        .expect("open db")
+        .conn()
         .execute(
-            "UPDATE drawers SET supersedes = ?1 WHERE id = ?2",
-            [old_id, replacement_id],
+            "UPDATE drawers SET deleted_at = NULL WHERE id = ?1",
+            [old_id],
         )
-        .expect("persist replacement ownership");
-
-    let retried = server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: update_content.to_string(),
-            wing: "smoke".to_string(),
-            room: Some("mcp".to_string()),
-            source_type: Some("agent_inference".to_string()),
-            memory_kind: Some("evidence".to_string()),
-            domain: Some("project".to_string()),
-            field: Some("smoke".to_string()),
-            supersedes: Some(old_id.to_string()),
-            smoke: Some(true),
-            wait: Some(true),
-            wait_timeout_secs: Some(5),
-            ..IngestRequest::default()
-        }))
+        .expect("reactivate target for distinct operation");
+    let second = server
+        .mempal_ingest(Parameters(request()))
         .await
-        .expect("retry smoke update should complete")
+        .expect("second smoke update should complete")
         .0;
 
-    assert_eq!(retried.state, Some(IngestOperationState::Completed));
-    assert_eq!(retried.created_drawer_ids, [replacement_id.to_string()]);
-    assert_eq!(retried.drawer_ids, retried.created_drawer_ids);
-    assert_eq!(retried.superseded_drawer_id.as_deref(), Some(old_id));
-
-    let unrelated = server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: update_content.to_string(),
-            wing: "smoke".to_string(),
-            room: Some("mcp".to_string()),
-            source_type: Some("agent_inference".to_string()),
-            memory_kind: Some("evidence".to_string()),
-            domain: Some("project".to_string()),
-            field: Some("smoke".to_string()),
-            smoke: Some(true),
-            wait: Some(true),
-            wait_timeout_secs: Some(5),
-            ..IngestRequest::default()
-        }))
-        .await
-        .expect("unrelated exact match should complete")
-        .0;
-    assert_eq!(unrelated.drawer_id, replacement_id);
+    assert_ne!(first.operation_id, second.operation_id);
+    assert_eq!(second.drawer_ids, [replacement_id]);
+    assert_eq!(second.superseded_drawer_id.as_deref(), Some(old_id));
     assert!(
-        unrelated.created_drawer_ids.is_empty(),
-        "cross-operation exact match must not grant cleanup IDs"
+        second.created_drawer_ids.is_empty(),
+        "a distinct operation must not gain cleanup authority from supersede lineage"
     );
 }
