@@ -6,10 +6,12 @@ from typing import Any
 __all__ = [
     "classify_create_attempt",
     "cleanup_ids_from",
+    "followable_update_without_terminal_ids",
     "holder_budget_no_write_receipt",
     "operation_id_from",
     "operation_state_from",
     "receipt_dicts_from",
+    "update_missing_reason",
 ]
 
 _MAX_RUST_WIRE_INTEGER = (1 << 64) - 1
@@ -441,3 +443,17 @@ def classify_create_attempt(
             **cleanup_evidence,
         }
     return {"kind": "inconclusive", **cleanup_evidence}
+
+
+def followable_update_without_terminal_ids(info: dict[str, Any]) -> bool:
+    """True when a queued/running follow must not be labeled update-missing."""
+    if info.get("kind") != "queued" or not info.get("operation_id_present"):
+        return False
+    state = info.get("recovered_state") or info.get("operation_state")
+    return state in {"queued", "running"}
+
+
+def update_missing_reason(info: dict[str, Any]) -> str:
+    if followable_update_without_terminal_ids(info):
+        return "update_followable_not_terminal"
+    return "update_missing_created_drawer_ids"

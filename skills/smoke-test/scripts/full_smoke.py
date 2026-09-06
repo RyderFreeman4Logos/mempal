@@ -44,6 +44,7 @@ operation_id_from = _SMOKE_RECEIPTS.operation_id_from
 operation_state_from = _SMOKE_RECEIPTS.operation_state_from
 holder_budget_no_write_receipt = _SMOKE_RECEIPTS.holder_budget_no_write_receipt
 classify_create_attempt = _SMOKE_RECEIPTS.classify_create_attempt
+_fu, _ur = _SMOKE_RECEIPTS.followable_update_without_terminal_ids, _SMOKE_RECEIPTS.update_missing_reason
 
 try:
     import tomllib
@@ -1524,8 +1525,7 @@ def cli_crud() -> list[str]:
         else []
     )
 
-    # Fallback: retry update via REST if direct write failed (writer lease).
-    if not authoritative_update_ids and not update_receipt:
+    if not authoritative_update_ids and not update_receipt and not _fu(update_recovery):
         note(
             'cli_update', False, reason='update_not_authoritative',
             cleanup_id_count=len(update_cleanup_ids), **recovery_fields(update_recovery),
@@ -1548,7 +1548,7 @@ def cli_crud() -> list[str]:
         note('cli_update', True, created_id_count=len(authoritative_update_ids), **recovery_fields(update_recovery))
     if not authoritative_update_ids:
         delete_exact_ids_cli(cleanup_ids, 'cli_cleanup_after_update_failure', room='cli')
-        note('cli_crud', False, reason='update_missing_created_drawer_ids', cleanup_id_count=len(cleanup_ids), **recovery_fields(update_recovery))
+        note('cli_crud', False, reason=_ur(update_recovery), cleanup_id_count=len(cleanup_ids), **recovery_fields(update_recovery))
         return cleanup_ids
     created_ids.extend(authoritative_update_ids)
     SUMMARY['created_counts']['cli'] = len(created_ids)
@@ -1953,9 +1953,7 @@ def mcp_crud() -> list[str]:
                 )
             SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
-        # Fallback: if MCP update fails/hangs (writer lease), retry via REST so
-        # follow-on read/delete paths still have an updated drawer to exercise.
-        if not authoritative_update_ids and not update_receipt:
+        if not authoritative_update_ids and not update_receipt and not _fu(update_recovery):
             rest_upd_ids, rest_update_disposition = run_fallback_after_mcp_reaped(
                 client,
                 'update_rest',
@@ -1988,10 +1986,10 @@ def mcp_crud() -> list[str]:
             note(
                 'mcp_inconclusive_no_cleanup_id',
                 False,
-                reason='update_missing_created_drawer_ids',
+                reason=_ur(update_recovery),
                 cleanup_id_count=len(cleanup_ids),
                 **recovery_fields(update_recovery),
-                product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/834',
+                product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/1096',
             )
             return cleanup_ids
         created_ids.extend(authoritative_update_ids)
