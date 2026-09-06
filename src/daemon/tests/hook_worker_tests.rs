@@ -46,6 +46,9 @@ async fn test_bounded_hook_worker_continues_claiming_after_completed_batch() {
         "test runtime config must keep LLM disabled"
     );
     let idle_observer = Arc::new(Notify::new());
+    let idle = idle_observer.notified();
+    tokio::pin!(idle);
+    idle.as_mut().enable();
     let worker = tokio::spawn(run_hook_worker(
         HookWorkerState {
             async_db,
@@ -67,32 +70,29 @@ async fn test_bounded_hook_worker_continues_claiming_after_completed_batch() {
         Duration::from_millis(10),
     ));
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let completed: i64 = rusqlite::Connection::open(&db_path)
-                .expect("open sqlite")
-                .query_row(
-                    "SELECT COUNT(*) FROM pending_message_completions WHERE kind = ?1",
-                    [HookEvent::PostToolUse.queue_kind()],
-                    |row| row.get(0),
-                )
-                .expect("count completions");
-            if completed == 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("worker should continue claiming after first completion");
+    tokio::time::timeout(Duration::from_secs(5), idle)
+        .await
+        .expect("worker should enter idle after completing queued hooks");
 
     let stats = store.stats().expect("queue stats");
     assert_eq!(stats.pending, 0);
     assert_eq!(stats.claimed, 0);
+    let completed: i64 = rusqlite::Connection::open(&db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT COUNT(*) FROM pending_message_completions WHERE kind = ?1",
+            [HookEvent::PostToolUse.queue_kind()],
+            |row| row.get(0),
+        )
+        .expect("count completions");
+    assert_eq!(
+        completed, 2,
+        "worker should continue claiming after first completion"
+    );
 
+    let telemetry_db = Database::open(&db_path).expect("open telemetry db");
     let hook_row = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let telemetry_db = Database::open(&db_path).expect("open telemetry db");
             let telemetry = operation_telemetry_summary(
                 &telemetry_db,
                 OperationTelemetrySummaryOptions {
@@ -117,10 +117,6 @@ async fn test_bounded_hook_worker_continues_claiming_after_completed_batch() {
     assert_eq!(hook_row.operation_count, 2);
     assert_eq!(hook_row.success_count, 2);
     assert_eq!(hook_row.error_count, 0);
-
-    tokio::time::timeout(Duration::from_secs(5), idle_observer.notified())
-        .await
-        .expect("worker should enter idle after completing queued hooks");
 
     request_shutdown();
     tokio::time::timeout(Duration::from_secs(1), worker)
