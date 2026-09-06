@@ -74,6 +74,7 @@ pub mod xurl;
 #[cfg(test)]
 mod rest_feature_contract_tests {
     #[test]
+    #[ignore = "invoked by just test-rest-feature-contract with MEMPAL_EXPECT_REST"]
     fn rest_feature_matches_invocation_expectation() {
         let expected = match std::env::var("MEMPAL_EXPECT_REST").as_deref() {
             Ok("1") => true,

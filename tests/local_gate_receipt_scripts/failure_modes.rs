@@ -422,10 +422,16 @@ fn local_gate_aggregate_invokes_rest_feature_contract() {
         .expect("recipe ends before next recipe")
         .0;
     assert!(
-        recipe.contains("MEMPAL_EXPECT_REST=1")
-            && recipe.contains("MEMPAL_EXPECT_REST=0")
-            && recipe.contains("--no-default-features")
-            && recipe.contains("rest_feature_contract_tests"),
+        recipe.contains("run_contract 1")
+            && recipe.contains("run_contract 0 --no-default-features")
+            && recipe.contains("--ignored")
+            && recipe.contains("--exact")
+            && recipe.contains(
+                "rest_feature_contract_tests::rest_feature_matches_invocation_expectation",
+            )
+            && recipe.contains("running 1 test")
+            && recipe.contains("1 passed")
+            && recipe.contains("MEMPAL_EXPECT_REST must be 0 or 1"),
         "rest feature contract recipe lost dual-mode assertions"
     );
 

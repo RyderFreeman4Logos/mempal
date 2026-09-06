@@ -239,9 +239,41 @@ test-f pattern:
     {{cargo}} test {{pattern}}
 
 # Default REST vs --no-default-features contract (#1091).
+# Ignored lib test; ordinary suites skip it. Recipe fail-closes missing/invalid
+# expected and requires exactly one executed test.
 test-rest-feature-contract:
-    MEMPAL_EXPECT_REST=1 {{cargo}} test --lib rest_feature_contract_tests -- --nocapture
-    MEMPAL_EXPECT_REST=0 {{cargo}} test --no-default-features --lib rest_feature_contract_tests -- --nocapture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    run_contract() {
+        local expected="$1"
+        shift
+        case "${expected}" in
+            0|1) ;;
+            *)
+                echo "ERROR: MEMPAL_EXPECT_REST must be 0 or 1, got ${expected:-missing}" >&2
+                exit 1
+                ;;
+        esac
+        local log rc
+        log="$(mktemp)"
+        set +e
+        MEMPAL_EXPECT_REST="${expected}" {{cargo}} test "$@" --lib rest_feature_contract_tests::rest_feature_matches_invocation_expectation -- --ignored --exact --nocapture >"${log}" 2>&1
+        rc=$?
+        set -e
+        cat "${log}"
+        if [ "${rc}" -ne 0 ]; then
+            rm -f "${log}"
+            exit "${rc}"
+        fi
+        if ! grep -q 'running 1 test' "${log}" || ! grep -q '1 passed' "${log}"; then
+            echo "ERROR: rest feature contract must execute exactly 1 test" >&2
+            rm -f "${log}"
+            exit 1
+        fi
+        rm -f "${log}"
+    }
+    run_contract 1
+    run_contract 0 --no-default-features
 
 # Regression gate for the exact all-feature linker command from #698.
 test-onnx-link:
