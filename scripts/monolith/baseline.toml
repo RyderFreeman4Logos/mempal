@@ -114,14 +114,6 @@ issue = "876"
 rationale = "#876 separates cleanup authority from successful writes and rejects conflicting operation IDs across CLI/MCP/REST recovery; exact no-growth ratchet."
 
 [[files]]
-path = "skills/smoke-test/tests/test_smoke_runtime_lifecycle.py"
-kind = "test"
-baseline_tokens = 6472
-baseline_lines = 839
-issue = "1090"
-rationale = "#1090 verifies CLI cleanup uses global scope; exact no-growth ratchet."
-
-[[files]]
 path = "skills/smoke-test/tests/test_full_smoke_cli_crud_receipts.py"
 kind = "test"
 baseline_tokens = 7202

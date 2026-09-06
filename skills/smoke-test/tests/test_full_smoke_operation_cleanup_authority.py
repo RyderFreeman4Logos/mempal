@@ -314,6 +314,59 @@ class OperationCleanupAuthorityTests(unittest.TestCase):
             self.assertNotIn("private-raw-value", public)
             manifest.discard()
 
+    def test_exact_cli_cleanup_delete_uses_all_projects_like_view(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / "cleanup.json")
+            manifest.add_created_ids(["drawer-mcp"])
+            self.smoke.CLEANUP_MANIFEST = manifest
+            seen: list[list[str]] = []
+
+            def child_result(command: list[str], **kwargs: Any) -> dict[str, Any]:
+                del kwargs
+                seen.append(list(command))
+                if command[:2] == ["mempal", "delete"]:
+                    # Live #1090: unscoped delete fails; scoped delete succeeds.
+                    if "--all-projects" in command and "drawer-mcp" in command:
+                        return {"returncode": 0, "stdout": b"", "stderr": b""}
+                    return {
+                        "returncode": 1,
+                        "stdout": b"",
+                        "stderr": b"not in current project",
+                    }
+                if command[:2] == ["mempal", "view"]:
+                    return {
+                        "returncode": 1,
+                        "stdout": b"",
+                        "stderr": b"drawer drawer-mcp not found",
+                    }
+                return {"returncode": 0, "stdout": b"", "stderr": b""}
+
+            with mock.patch.object(
+                self.smoke,
+                "run_child_process",
+                side_effect=child_result,
+            ):
+                with mock.patch.object(
+                    self.smoke,
+                    "run_cli",
+                    return_value=(0, b"", b"", {"results": []}, {}),
+                ):
+                    result = self.smoke.delete_exact_ids_cli(
+                        ["drawer-mcp"],
+                        "unit_cleanup_scope",
+                        room="mcp",
+                    )
+
+            delete_cmds = [cmd for cmd in seen if cmd[:2] == ["mempal", "delete"]]
+            view_cmds = [cmd for cmd in seen if cmd[:2] == ["mempal", "view"]]
+            self.assertEqual(len(delete_cmds), 1)
+            self.assertIn("--all-projects", delete_cmds[0])
+            self.assertIn("drawer-mcp", delete_cmds[0])
+            self.assertTrue(view_cmds)
+            self.assertTrue(all("--all-projects" in cmd for cmd in view_cmds))
+            self.assertEqual(result["failed_count"], 0)
+            self.assertEqual(result["verified_absent_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
