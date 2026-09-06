@@ -9146,27 +9146,33 @@ impl MempalMcpServer {
                     config.embed.model.clone().unwrap_or_default()
                 }
             });
+            let pattern_plans = inserted_drawer_ids
+                .iter()
+                .zip(vectors.iter())
+                .map(|(drawer_id, vector)| {
+                    let args = crate::core::patterns::PatternDetectionArgs {
+                        new_drawer_id: drawer_id,
+                        session_id,
+                        embedding: vector,
+                        project_id: project_id.as_deref(),
+                        model_id: &model_id,
+                        similarity_threshold: config.patterns.similarity_threshold,
+                        min_sessions: config.patterns.min_sessions,
+                        min_exemplars: config.patterns.min_exemplars,
+                        promote_threshold: config.patterns.promote_threshold,
+                        top_tags: 5,
+                    };
+                    let plan = crate::core::patterns::plan_pattern_detection(db.conn(), &args);
+                    (args, plan)
+                })
+                .collect::<Vec<_>>();
             with_mcp_runtime_writer_lease_write(
                 &db,
                 runtime_writer_lease,
                 "record MCP ingest pattern signal",
                 || {
-                    for (drawer_id_p, vector_p) in inserted_drawer_ids.iter().zip(vectors.iter()) {
-                        crate::core::patterns::run_pattern_detection(
-                            db.conn(),
-                            &crate::core::patterns::PatternDetectionArgs {
-                                new_drawer_id: drawer_id_p.as_str(),
-                                session_id,
-                                embedding: vector_p.as_slice(),
-                                project_id: project_id.as_deref(),
-                                model_id: &model_id,
-                                similarity_threshold: config.patterns.similarity_threshold,
-                                min_sessions: config.patterns.min_sessions,
-                                min_exemplars: config.patterns.min_exemplars,
-                                promote_threshold: config.patterns.promote_threshold,
-                                top_tags: 5,
-                            },
-                        );
+                    for (args, plan) in pattern_plans {
+                        crate::core::patterns::apply_pattern_detection(db.conn(), &args, plan);
                     }
                     Ok(())
                 },
