@@ -1,5 +1,77 @@
 use super::*;
 
+async fn retry_partial_multi_chunk(
+    persisted_operation_id: &str,
+    retry_operation_id: &str,
+) -> (IngestResponse, String) {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
+    let (_tempdir, db_path, server) = setup_server();
+    let request = IngestRequest {
+        content: (0..2_000)
+            .map(|index| format!("partial receipt token-{index:04}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        wing: "mcp".into(),
+        room: Some("partial-receipt".into()),
+        ..IngestRequest::default()
+    };
+    let controls = IngestControls {
+        no_gate: true,
+        bypass_novelty: true,
+    };
+    let initial = server
+        .mempal_ingest_sync_with_superseded_override(
+            request.clone(),
+            controls,
+            None,
+            Some(persisted_operation_id),
+            None,
+        )
+        .await
+        .expect("seed multi-chunk operation")
+        .0;
+    assert!(initial.drawer_ids.len() > 1, "fixture must be multi-chunk");
+    let persisted_drawer_id = initial.drawer_ids[0].clone();
+    let removed_ids = initial.drawer_ids[1..].to_vec();
+    let db = Database::open(&db_path).expect("open partial-operation database");
+    assert_eq!(
+        db.soft_delete_drawers_by_ids(&removed_ids)
+            .expect("soft-delete uncommitted suffix"),
+        removed_ids.len()
+    );
+    assert_eq!(
+        db.purge_deleted(None).expect("purge uncommitted suffix"),
+        removed_ids.len() as u64
+    );
+
+    let retried = server
+        .mempal_ingest_sync_with_superseded_override(
+            request,
+            controls,
+            None,
+            Some(retry_operation_id),
+            None,
+        )
+        .await
+        .expect("retry partial multi-chunk operation")
+        .0;
+    assert_eq!(retried.drawer_ids, initial.drawer_ids);
+    (retried, persisted_drawer_id)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_partial_multi_chunk_same_operation_recovers_all_created_ids() {
+    let (retried, _) = retry_partial_multi_chunk("partial-same-op", "partial-same-op").await;
+    assert_eq!(retried.created_drawer_ids, retried.drawer_ids);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_partial_multi_chunk_distinct_operation_excludes_prior_created_id() {
+    let (retried, prior_id) = retry_partial_multi_chunk("partial-op-a", "partial-op-b").await;
+    assert!(!retried.created_drawer_ids.contains(&prior_id));
+    assert_eq!(retried.created_drawer_ids, retried.drawer_ids[1..]);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_same_operation_retry_recovers_created_ids_after_completion_failure() {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;

@@ -8732,8 +8732,6 @@ impl MempalMcpServer {
                     .zip(chunks.iter().zip(vectors.iter()))
                 {
                     if *chunk_exists {
-                        // Dedup-resolved pre-lock: include in response but NOT in
-                        // newly_created_drawer_ids so LLM reject cannot delete it.
                         if metadata.is_pinned {
                             db.pin_drawer_fenced(runtime_writer_lease, chunk_did, None)
                                 .map_err(|error| {
@@ -8766,8 +8764,6 @@ impl MempalMcpServer {
                     };
                     let exists_after_lock = db.drawer_exists(chunk_did).map_err(db_error)?;
                     if exists_after_lock {
-                        // Dedup-resolved post-lock: include in response but NOT in
-                        // newly_created_drawer_ids so LLM reject cannot delete it.
                         if metadata.is_pinned {
                             db.pin_drawer_fenced(runtime_writer_lease, chunk_did, None)
                                 .map_err(|error| {
@@ -9190,10 +9186,16 @@ impl MempalMcpServer {
             )?;
         }
 
+        let created_drawer_ids = match creation_operation_id {
+            Some(operation_id) => db
+                .drawer_ids_created_by_operation(operation_id, &inserted_drawer_ids)
+                .map_err(db_error)?,
+            None => newly_created_drawer_ids,
+        };
         Ok(Json(IngestResponse {
             drawer_id: response_drawer_id,
             drawer_ids: inserted_drawer_ids,
-            created_drawer_ids: newly_created_drawer_ids,
+            created_drawer_ids,
             chunk_count: chunks.len(),
             dropped: false,
             gating_decision,
