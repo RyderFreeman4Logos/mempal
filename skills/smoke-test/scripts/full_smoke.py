@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Aggregate-only mempal smoke runner for repo-local skills/smoke-test.
 
-Exercises CLI and MCP CRUD without printing drawer content or raw command output.
+Exercises CLI/MCP CRUD without printing drawer content or raw output.
 """
 from __future__ import annotations
 

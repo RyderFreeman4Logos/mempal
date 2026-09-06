@@ -30,7 +30,7 @@ name = "mempal"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["rest"]
 adk-rust = ["dep:adk-graph"]
 integration = []
 model2vec = ["dep:model2vec-rs"]

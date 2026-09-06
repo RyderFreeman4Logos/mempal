@@ -70,3 +70,15 @@ pub mod supersede;
 pub mod system_memory;
 pub mod wiki;
 pub mod xurl;
+
+/// Compile-time REST feature contract. Default builds include `rest`;
+/// `--no-default-features` keeps the no-REST arm distinct.
+pub const REST_FEATURE_ENABLED: bool = cfg!(feature = "rest");
+
+#[cfg(test)]
+mod rest_feature_contract_tests {
+    #[test]
+    fn rest_feature_flag_matches_cfg() {
+        assert_eq!(super::REST_FEATURE_ENABLED, cfg!(feature = "rest"));
+    }
+}

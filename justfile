@@ -238,6 +238,11 @@ test-all:
 test-f pattern:
     {{cargo}} test {{pattern}}
 
+# Default REST vs --no-default-features contract (#1091).
+test-rest-feature-contract:
+    {{cargo}} test --lib rest_feature_contract_tests -- --nocapture
+    {{cargo}} test --no-default-features --lib rest_feature_contract_tests -- --nocapture
+
 # Regression gate for the exact all-feature linker command from #698.
 test-onnx-link:
     {{cargo}} test --locked --all-features --no-run
@@ -253,8 +258,9 @@ build:
 # Release/package gate used by local-gates.
 release-gate:
     # Mirrors the former PR CI build coverage without GitHub-hosted runners.
+    # Default includes `rest`. Keep a distinct no-REST arm via --no-default-features.
+    {{cargo}} build --release --no-default-features
     {{cargo}} build --release
-    {{cargo}} build --release --features rest
     {{cargo}} package --locked
 
 # Install mempal binary to /usr/local/bin with REST enabled.
