@@ -89,6 +89,34 @@ async fn wait_for_rest_server(addr: SocketAddr) -> Result<()> {
     }
 }
 
+pub(super) fn server_for_rest(
+    local_addr: SocketAddr,
+    db_path: PathBuf,
+    config: Config,
+    async_db: AsyncDb,
+    writer_lease: &RuntimeWriterLeaseHandle,
+    write_observer: DaemonWriteObserver,
+) -> Result<Option<MempalMcpServer>> {
+    if !local_addr.ip().is_loopback() {
+        tracing::warn!(
+            "daemon MCP endpoint disabled because REST listener is not loopback: {local_addr}"
+        );
+        return Ok(None);
+    }
+    Ok(Some(
+        MempalMcpServer::new_with_factory_and_config(
+            db_path,
+            config.clone(),
+            Arc::new(crate::embed::ConfiguredEmbedderFactory::new_for_daemon(
+                config,
+            )),
+        )?
+        .with_daemon_owned_async_db(async_db)
+        .with_external_ingest_writer_lease(writer_lease.lease().clone())
+        .with_daemon_write_observer(write_observer),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,32 +147,4 @@ mod tests {
             "REST serve-loop readiness must not depend on status diagnostics: {readiness:?}"
         );
     }
-}
-
-pub(super) fn server_for_rest(
-    local_addr: SocketAddr,
-    db_path: PathBuf,
-    config: Config,
-    async_db: AsyncDb,
-    writer_lease: &RuntimeWriterLeaseHandle,
-    write_observer: DaemonWriteObserver,
-) -> Result<Option<MempalMcpServer>> {
-    if !local_addr.ip().is_loopback() {
-        tracing::warn!(
-            "daemon MCP endpoint disabled because REST listener is not loopback: {local_addr}"
-        );
-        return Ok(None);
-    }
-    Ok(Some(
-        MempalMcpServer::new_with_factory_and_config(
-            db_path,
-            config.clone(),
-            Arc::new(crate::embed::ConfiguredEmbedderFactory::new_for_daemon(
-                config,
-            )),
-        )?
-        .with_daemon_owned_async_db(async_db)
-        .with_external_ingest_writer_lease(writer_lease.lease().clone())
-        .with_daemon_write_observer(write_observer),
-    ))
 }
