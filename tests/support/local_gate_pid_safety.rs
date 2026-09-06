@@ -26,6 +26,64 @@ pub(super) fn recorded_process_identity(record: &str) -> RecordedProcessIdentity
     }
 }
 
+fn try_recorded_process_identity(record: &str) -> Option<RecordedProcessIdentity> {
+    let mut fields = record.split_ascii_whitespace();
+    let pid = fields.next()?.parse().ok()?;
+    let start_time_ticks = fields.next()?.parse().ok()?;
+    fields.next().is_none().then_some(RecordedProcessIdentity {
+        pid,
+        start_time_ticks,
+    })
+}
+
+pub(super) fn wait_for_recorded_process_identity(
+    path: &Path,
+    timeout: Duration,
+    description: &str,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(record) = fs::read_to_string(path) {
+            if try_recorded_process_identity(&record).is_some() {
+                return record;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{description} did not become ready"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn truncated_identity_file_is_not_a_recorded_process_pid() {
+    let fixture = tempfile::tempdir().expect("create truncated identity fixture");
+    let identity_file = fixture.path().join("identity");
+    fs::write(&identity_file, "").expect("write truncated identity");
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_recorded_process_identity(
+            &identity_file,
+            Duration::from_millis(50),
+            "truncated identity",
+        )
+    }));
+    let payload = panicked.expect_err("truncated identity must not count as published");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        message.contains("truncated identity did not become ready"),
+        "message={message}"
+    );
+    assert!(
+        !message.contains("recorded process PID"),
+        "a truncated identity file must not reach the PID parser"
+    );
+}
+
 fn process_start_time_ticks(pid: i32) -> Option<u64> {
     let stat = fs::read(format!("/proc/{pid}/stat")).ok()?;
     let fields = stat.rsplit(|byte| *byte == b')').next()?;
