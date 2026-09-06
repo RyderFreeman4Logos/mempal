@@ -30,7 +30,7 @@ cleanup only from that exact manifest; never reconstruct authority from search.
    - `mempal context <marker> --format json --max-items 3 --no-distill-suggestions`; summarize field names only.
    - `mempal pinned --json`; summarize type/count only.
 5. Update by replacement semantics with `mempal ingest ... --supersedes <created_id> ... --json`; require new `created_drawer_ids`.
-6. Pin/unpin exact smoke IDs, then `mempal delete <id>` for each created/update ID. Verify that exact ID is absent with `mempal view <id> --all-projects` before removing it from the manifest; suppress raw output.
+6. Pin/unpin exact smoke IDs, then `mempal delete --all-projects <id>` for each created/update ID. Verify that exact ID is absent with `mempal view <id> --all-projects` before removing it from the manifest; suppress raw output.
 7. Re-run marker search and require no active `smoke/cli` matches, or classify tombstone visibility if only include-deleted surfaces show them.
 
 ## Reversible MCP CRUD outline

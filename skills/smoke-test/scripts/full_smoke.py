@@ -1189,7 +1189,7 @@ def delete_exact_ids_cli(drawer_ids: list[str], label: str, room: str | None = N
 
     def delete(drawer_id: str) -> bool:
         nonlocal stdout_bytes, stderr_bytes
-        proc = run_child_process(['mempal', 'delete', drawer_id], timeout=60, io_category='cli_child_processes')
+        proc = run_child_process(['mempal', 'delete', '--all-projects', drawer_id], timeout=60, io_category='cli_child_processes')
         stdout_bytes += len(proc['stdout'])
         stderr_bytes += len(proc['stderr'])
         return proc['returncode'] == 0
