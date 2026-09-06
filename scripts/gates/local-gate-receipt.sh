@@ -98,6 +98,7 @@ run_literal_aggregate() {
     just fmt-check
     just quality-gates
     just test-rest
+    just test-rest-feature-contract
     just release-gate
     # fixture-aggregate-end
 }

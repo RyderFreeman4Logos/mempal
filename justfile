@@ -240,8 +240,8 @@ test-f pattern:
 
 # Default REST vs --no-default-features contract (#1091).
 test-rest-feature-contract:
-    {{cargo}} test --lib rest_feature_contract_tests -- --nocapture
-    {{cargo}} test --no-default-features --lib rest_feature_contract_tests -- --nocapture
+    MEMPAL_EXPECT_REST=1 {{cargo}} test --lib rest_feature_contract_tests -- --nocapture
+    MEMPAL_EXPECT_REST=0 {{cargo}} test --no-default-features --lib rest_feature_contract_tests -- --nocapture
 
 # Regression gate for the exact all-feature linker command from #698.
 test-onnx-link:

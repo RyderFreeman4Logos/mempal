@@ -71,14 +71,15 @@ pub mod system_memory;
 pub mod wiki;
 pub mod xurl;
 
-/// Compile-time REST feature contract. Default builds include `rest`;
-/// `--no-default-features` keeps the no-REST arm distinct.
-pub const REST_FEATURE_ENABLED: bool = cfg!(feature = "rest");
-
 #[cfg(test)]
 mod rest_feature_contract_tests {
     #[test]
-    fn rest_feature_flag_matches_cfg() {
-        assert_eq!(super::REST_FEATURE_ENABLED, cfg!(feature = "rest"));
+    fn rest_feature_matches_invocation_expectation() {
+        let expected = match std::env::var("MEMPAL_EXPECT_REST").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            other => panic!("MEMPAL_EXPECT_REST must be 0 or 1, got {other:?}"),
+        };
+        assert_eq!(cfg!(feature = "rest"), expected);
     }
 }
