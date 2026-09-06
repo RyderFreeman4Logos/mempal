@@ -576,24 +576,24 @@ impl Database {
         valid_from: Option<&str>,
         valid_until: Option<&str>,
     ) -> Result<(), DbError> {
-        self.with_write_reserve_retry("insert drawer", || {
-            self.insert_drawer_with_project_validity_once(
-                drawer,
-                project_id,
-                source_root,
-                valid_from,
-                valid_until,
-            )
-        })
+        self.insert_drawer_with_project_validity_and_operation(
+            drawer,
+            project_id,
+            source_root,
+            valid_from,
+            valid_until,
+            None,
+        )
     }
 
-    fn insert_drawer_with_project_validity_once(
+    pub(crate) fn insert_drawer_with_project_validity_once(
         &self,
         drawer: &Drawer,
         project_id: Option<&str>,
         source_root: Option<&str>,
         valid_from: Option<&str>,
         valid_until: Option<&str>,
+        creation_operation_id: Option<&str>,
     ) -> Result<(), DbError> {
         let content_hash = content_hash_hex(&drawer.content);
         anchor::validate_anchor_domain(&drawer.domain, &drawer.anchor_kind)
@@ -648,9 +648,10 @@ impl Database {
                 supersedes,
                 valid_from,
                 valid_until,
-                effective_importance
+                effective_importance,
+                creation_operation_id
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)
             "#,
             params![
                 drawer.id.as_str(),
@@ -689,6 +690,7 @@ impl Database {
                 valid_from.unwrap_or(drawer.added_at.as_str()),
                 valid_until,
                 seeded_effective_importance,
+                creation_operation_id,
             ],
         )?;
 

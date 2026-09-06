@@ -1329,7 +1329,7 @@ impl MempalMcpServer {
         let runtime_writer_lease = external_writer_lease
             .or_else(|| writer_lease.as_ref().map(|lease| lease.lease().clone()));
         let outcome = match self
-            .run_queued_write_off_runtime(queued, runtime_writer_lease)
+            .run_queued_write_off_runtime(queued, runtime_writer_lease, Some(claim.id.clone()))
             .await
         {
             Ok(Ok(response)) => Ok(response),
@@ -1524,7 +1524,7 @@ impl MempalMcpServer {
         let runtime_writer_lease = external_writer_lease
             .or_else(|| writer_lease.as_ref().map(|lease| lease.lease().clone()));
         let outcome = match self
-            .run_queued_write_off_runtime(queued, runtime_writer_lease)
+            .run_queued_write_off_runtime(queued, runtime_writer_lease, Some(claim.id.clone()))
             .await
         {
             Ok(Ok(response)) => Ok(response),
@@ -1796,7 +1796,7 @@ impl MempalMcpServer {
         };
         let outcome = match tokio::time::timeout(
             remaining,
-            self.run_queued_write_inline(queued, runtime_writer_lease.as_ref()),
+            self.run_queued_write_inline(queued, runtime_writer_lease.as_ref(), Some(&claim.id)),
         )
         .await
         {
@@ -2265,6 +2265,7 @@ impl MempalMcpServer {
         &self,
         operation: QueuedWriteOperation,
         runtime_writer_lease: Option<RuntimeWriterLease>,
+        creation_operation_id: Option<String>,
     ) -> anyhow::Result<std::result::Result<IngestResponse, McpQueuedIngestError>> {
         let queued = match operation {
             QueuedWriteOperation::Ingest(queued) => queued,
@@ -2293,6 +2294,7 @@ impl MempalMcpServer {
                         queued.request,
                         queued.controls,
                         runtime_writer_lease.as_ref(),
+                        creation_operation_id.as_deref(),
                         queued.superseded_drawer_id,
                     ))
                     .map(|response| response.0))
@@ -2306,6 +2308,7 @@ impl MempalMcpServer {
         &self,
         operation: QueuedWriteOperation,
         runtime_writer_lease: Option<&RuntimeWriterLease>,
+        creation_operation_id: Option<&str>,
     ) -> std::result::Result<IngestResponse, McpQueuedIngestError> {
         match operation {
             QueuedWriteOperation::Ingest(queued) => self
@@ -2313,6 +2316,7 @@ impl MempalMcpServer {
                     queued.request,
                     queued.controls,
                     runtime_writer_lease,
+                    creation_operation_id,
                     queued.superseded_drawer_id,
                 )
                 .await
@@ -3720,6 +3724,7 @@ impl MempalMcpServer {
         confidence: f64,
         inserted_drawer_ids: &mut Vec<String>,
         newly_created_drawer_ids: &mut Vec<String>,
+        creation_operation_id: Option<&str>,
         runtime_writer_lease: Option<&RuntimeWriterLease>,
     ) -> std::result::Result<(), ErrorData> {
         let metadata = validate_ingest_request(request, &source_type)?;
@@ -3794,12 +3799,13 @@ impl MempalMcpServer {
                 runtime_writer_lease,
                 "insert MCP ingest fallback drawer",
                 || {
-                    db.insert_drawer_with_project_validity(
+                    db.insert_drawer_with_project_validity_and_operation(
                         &drawer,
                         project_id,
                         None,
                         request.valid_from.as_deref(),
                         request.valid_until.as_deref(),
+                        creation_operation_id,
                     )
                 },
             )?;
@@ -7331,6 +7337,7 @@ impl MempalMcpServer {
                 self.run_queued_write_off_runtime(
                     QueuedWriteOperation::ingest(request, controls, None),
                     None,
+                    None,
                 ),
             )
             .await
@@ -8078,6 +8085,7 @@ impl MempalMcpServer {
             controls,
             runtime_writer_lease,
             None,
+            None,
         )
         .await
         .map_err(|error| match error {
@@ -8127,6 +8135,7 @@ impl MempalMcpServer {
         request: IngestRequest,
         controls: IngestControls,
         runtime_writer_lease: Option<&RuntimeWriterLease>,
+        creation_operation_id: Option<&str>,
         pre_resolved_superseded_drawer_id: Option<String>,
     ) -> std::result::Result<Json<IngestResponse>, McpQueuedIngestError> {
         let dry_run = request.dry_run.unwrap_or(false);
@@ -8353,9 +8362,16 @@ impl MempalMcpServer {
                 .await
                 .map_err(db_error)?;
             }
+            let created_drawer_ids = match creation_operation_id {
+                Some(operation_id) => db
+                    .drawer_ids_created_by_operation(operation_id, &all_ids)
+                    .map_err(db_error)?,
+                None => Vec::new(),
+            };
             return Ok(Json(IngestResponse {
                 drawer_id,
                 drawer_ids: all_ids,
+                created_drawer_ids,
                 chunk_count: chunks.len(),
                 dropped: false,
                 gating_decision: None,
@@ -8785,12 +8801,13 @@ impl MempalMcpServer {
                         runtime_writer_lease,
                         "insert MCP ingest drawer",
                         || {
-                            db.insert_drawer_with_project_validity(
+                            db.insert_drawer_with_project_validity_and_operation(
                                 &drawer,
                                 project_id.as_deref(),
                                 None,
                                 request.valid_from.as_deref(),
                                 request.valid_until.as_deref(),
+                                creation_operation_id,
                             )
                         },
                     )?;
@@ -8880,6 +8897,7 @@ impl MempalMcpServer {
                         confidence,
                         &mut inserted_drawer_ids,
                         &mut newly_created_drawer_ids,
+                        creation_operation_id,
                         runtime_writer_lease,
                     )?;
                     novelty_action = Some(NoveltyAction::Insert);
@@ -8943,6 +8961,7 @@ impl MempalMcpServer {
                                     confidence,
                                     &mut inserted_drawer_ids,
                                     &mut newly_created_drawer_ids,
+                                    creation_operation_id,
                                     runtime_writer_lease,
                                 )?;
                                 novelty_action = Some(NoveltyAction::Insert);
@@ -8972,6 +8991,7 @@ impl MempalMcpServer {
                                 confidence,
                                 &mut inserted_drawer_ids,
                                 &mut newly_created_drawer_ids,
+                                creation_operation_id,
                                 runtime_writer_lease,
                             )?;
                             novelty_action = Some(NoveltyAction::Insert);
@@ -13597,6 +13617,7 @@ mod tests {
     mod delete_receipt_921_tests;
     mod ingest_receipt_tests;
     mod mcp_roots_936_tests;
+    mod operation_creation_receipt_tests;
     mod read_tests;
     #[derive(Clone)]
     struct StubEmbedderFactory {

@@ -23268,7 +23268,7 @@ fn restore_soft_deleted_rejudge_drawer(
     let mut assignments = Vec::new();
     let mut values = Vec::new();
     for column in columns {
-        if column == "id" {
+        if matches!(column.as_str(), "id" | "creation_operation_id") {
             continue;
         }
         let quoted = quote_sql_identifier(&column);
@@ -23552,6 +23552,9 @@ fn insert_rejudge_raw_drawer_row(db: &Database, item: &HistoricalRejudgeBackupIt
     let mut placeholders = Vec::with_capacity(columns.len());
     let mut values = Vec::with_capacity(columns.len());
     for column in columns {
+        if column == "creation_operation_id" {
+            continue;
+        }
         let value = item
             .raw_drawer_row
             .get(&column)
