@@ -1,8 +1,5 @@
 //! Integration tests for P8 cowork inbox push.
 //!
-//! Run with:
-//!   cargo test --test cowork_inbox --no-default-features --features model2vec
-//!
 //! These tests exercise inbox behavior that must hold under real process
 //! boundaries (concurrent drain, CLI-level graceful degrade, stdin-json
 //! payload parsing). Unit coverage for push/drain/format lives inline in
@@ -23,7 +20,7 @@ fn mempal_bin() -> String {
 fn setup_repo(tmp: &TempDir, name: &str) -> PathBuf {
     let repo = tmp.path().join(name);
     fs::create_dir_all(repo.join(".git")).unwrap();
-    repo
+    repo.canonicalize().unwrap()
 }
 
 #[tokio::test]
