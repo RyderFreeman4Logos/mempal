@@ -13,6 +13,7 @@ impl PendingMessageStore {
             db_path: path.as_ref().to_path_buf(),
             config,
             connection_cache: ConnectionCache::new(),
+            lifecycle_writer_lease: None,
         }
     }
 }

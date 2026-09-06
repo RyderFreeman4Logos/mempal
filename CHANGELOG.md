@@ -26,7 +26,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - Context isolate embed env HTTP CL (#1080,#1082).
 - Daemon SQLite writer lease waits past capped maintenance `remaining_secs` rather than exit 75; incompatible `mcp-ingest-worker` holders remain refused (#916, #849).
-- Durable ACK/replay/readiness, persist-before-model spools, and pattern planning before fenced stale-safe apply (#945/#1103/#1105/#986/#1000/#987/#1106).
+- Durable ACK/replay, pre-model spools, fenced pattern apply, authoritative lease expiry, and daemon queue lifecycle fencing (#945/#1103/#1105/#986/#1000/#987/#1106/#1107).
 - Cited-recall latest-decision walks the full successor chain, filters context the same way, and requires a live correction/continuation citation (#898).
 - Codex snapshots atomically remove superseded turns/vectors and fail closed on ambiguity (#896).
 - MCP search shares a deadline and releases reads before responding (#881).

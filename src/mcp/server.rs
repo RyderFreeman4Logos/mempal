@@ -729,6 +729,7 @@ impl MempalMcpServer {
         session
     }
     pub fn with_external_ingest_writer_lease(mut self, lease: RuntimeWriterLease) -> Self {
+        self.async_queue = self.async_queue.with_lifecycle_writer_lease(lease.clone());
         self.external_ingest_writer_lease = Some(lease);
         self
     }
@@ -13608,6 +13609,7 @@ mod tests {
     };
 
     mod context_scope_schema_tests;
+    mod daemon_queue_lease_fence_tests;
     mod delete_busy_retry_836_tests;
     mod delete_receipt_921_tests;
     mod ingest_receipt_tests;

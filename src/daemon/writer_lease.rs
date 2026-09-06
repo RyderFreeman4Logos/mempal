@@ -237,6 +237,7 @@ fn spawn_runtime_writer_lease_heartbeat_with_renewal_checkpoints(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(DAEMON_WRITER_LEASE_RENEW_INTERVAL);
+        let mut last_confirmed = tokio::time::Instant::now();
         loop {
             interval.tick().await;
             let db_path = db_path.clone();
@@ -261,8 +262,11 @@ fn spawn_runtime_writer_lease_heartbeat_with_renewal_checkpoints(
                 };
                 let _ = renewal_finished.try_send(completion);
             }
-            match result {
-                Ok(Ok(true)) => {}
+            let renewal_unconfirmed = match result {
+                Ok(Ok(true)) => {
+                    last_confirmed = tokio::time::Instant::now();
+                    false
+                }
                 Ok(Ok(false)) => {
                     tracing::error!(
                         lease = %lease.name,
@@ -277,10 +281,26 @@ fn spawn_runtime_writer_lease_heartbeat_with_renewal_checkpoints(
                 }
                 Ok(Err(error)) => {
                     tracing::warn!(error = %error, "failed to renew daemon writer lease");
+                    true
                 }
                 Err(error) => {
                     tracing::warn!(error = %error, "writer lease heartbeat task failed");
+                    true
                 }
+            };
+            if renewal_unconfirmed
+                && last_confirmed.elapsed() >= Duration::from_secs(DAEMON_WRITER_LEASE_TTL_SECS)
+            {
+                tracing::error!(
+                    lease = %lease.name,
+                    owner = %lease.owner,
+                    "daemon writer lease was unobservable through its TTL; requesting shutdown"
+                );
+                recovery_faults
+                    .record_fault_once(crate::daemon_recovery::RecoveryFault::WriterLeaseLost);
+                #[cfg(unix)]
+                super::request_shutdown_and_notify();
+                break;
             }
         }
     })
@@ -716,5 +736,61 @@ mod tests {
 
         heartbeat.abort();
         let _ = heartbeat.await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn daemon_writer_lease_unobservable_for_ttl_requests_shutdown() {
+        let _shutdown_lock = super::super::global_shutdown_test_lock().lock_owned().await;
+        super::super::reset_shutdown_request();
+        let _shutdown_reset = ShutdownResetGuard;
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open database");
+        let lease = db
+            .runtime_writer_lease_acquire_for_daemon_start(
+                SQLITE_WRITER_LEASE_NAME,
+                DAEMON_WRITER_LEASE_TTL_SECS,
+                None,
+            )
+            .expect("acquire daemon writer lease")
+            .expect("daemon writer lease available");
+        let recovery = crate::daemon_recovery::DaemonRecovery::new(tempdir.path());
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(2);
+        let heartbeat = spawn_runtime_writer_lease_heartbeat_with_renewal_checkpoints(
+            tempdir.path().to_path_buf(),
+            lease,
+            crate::daemon_recovery::DaemonRecoveryFaultReporter::new(recovery.clone()),
+            None,
+            Some(finished_tx),
+        );
+
+        let first = tokio::task::spawn_blocking(move || {
+            wait_for_checkpoint(&finished_rx, Duration::from_secs(1), "first failed renewal")
+                .map(|result| (result, finished_rx))
+        })
+        .await
+        .expect("join first renewal wait")
+        .expect("first failed renewal arrives");
+        assert!(first.0.is_err());
+        assert!(!super::super::shutdown_requested());
+        assert!(!heartbeat.is_finished());
+
+        tokio::time::advance(Duration::from_secs(DAEMON_WRITER_LEASE_TTL_SECS)).await;
+        let second = tokio::task::spawn_blocking(move || {
+            wait_for_checkpoint(&first.1, Duration::from_secs(1), "TTL failed renewal")
+        })
+        .await
+        .expect("join TTL renewal wait")
+        .expect("TTL failed renewal arrives");
+        assert!(second.is_err());
+        tokio::task::yield_now().await;
+        assert!(super::super::shutdown_requested());
+        assert!(heartbeat.is_finished());
+        let snapshot = recovery.snapshot().expect("read recovery state");
+        assert_eq!(
+            snapshot.last_fault,
+            Some(crate::daemon_recovery::RecoveryFault::WriterLeaseLost)
+        );
     }
 }

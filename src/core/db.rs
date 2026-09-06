@@ -5494,7 +5494,8 @@ impl Database {
             let rows = self.conn.execute(
                 "UPDATE runtime_writer_leases \
                  SET expires_at = ?5, heartbeat_at = ?6 \
-                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4",
+                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4 \
+                   AND expires_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now')",
                 params![
                     name,
                     owner,
@@ -5534,6 +5535,7 @@ impl Database {
             "SELECT EXISTS(
                  SELECT 1 FROM runtime_writer_leases
                  WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4
+                   AND expires_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now')
              )",
             params![name, owner, session_id, generation as i64],
             |row| row.get::<_, i64>(0),
@@ -7898,7 +7900,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn runtime_writer_status_preserves_and_renews_expired_live_current_process_lease() {
+    fn runtime_writer_status_preserves_expired_live_holder_without_write_authority() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("test.db");
         let db = Database::open(&db_path).expect("open db");
@@ -7917,9 +7919,9 @@ mod tests {
             .expect("force lease expiry");
 
         assert!(
-            db.runtime_writer_lease_is_active(&lease)
-                .expect("check runtime writer lease active"),
-            "current live process must retain its runtime writer lease after delayed heartbeat"
+            !db.runtime_writer_lease_is_active(&lease)
+                .expect("check expired runtime writer lease authority"),
+            "an expired live holder must not retain write authority"
         );
         let expired_status = db
             .runtime_writer_lease_status(Some(&lease.name))
@@ -7927,15 +7929,10 @@ mod tests {
         assert_eq!(expired_status.len(), 1);
         assert_eq!(expired_status[0].remaining_secs, 0);
         assert!(
-            db.runtime_writer_lease_renew(&lease, 300)
-                .expect("renew delayed live runtime writer lease"),
-            "delayed live runtime writer lease must be renewable after expiry"
+            !db.runtime_writer_lease_renew(&lease, 300)
+                .expect("reject expired live runtime writer lease renewal"),
+            "an expired live holder must not resurrect its generation"
         );
-        let renewed_status = db
-            .runtime_writer_lease_status(Some(&lease.name))
-            .expect("load renewed runtime writer lease status");
-        assert_eq!(renewed_status.len(), 1);
-        assert!(renewed_status[0].remaining_secs > 0);
     }
 
     #[cfg(target_os = "linux")]

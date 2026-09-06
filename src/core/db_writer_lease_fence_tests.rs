@@ -74,6 +74,65 @@ fn takeover_after_preflight_rejects_stale_generation_mutation() {
     assert_eq!(count(), 1);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn expired_live_generation_cannot_renew_or_mutate() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("palace.db");
+    let db = Database::open(&db_path).expect("database");
+    db.conn()
+        .execute_batch("CREATE TABLE fence_probe (value TEXT NOT NULL)")
+        .expect("create fence probe");
+    let expired = db
+        .runtime_writer_lease_acquire_for_daemon_start("sqlite-writer", 120, None)
+        .expect("acquire daemon lease")
+        .expect("daemon lease available");
+    db.conn()
+        .execute(
+            "UPDATE runtime_writer_leases SET expires_at = '1970-01-01T00:00:00Z' \
+             WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4",
+            rusqlite::params![
+                &expired.name,
+                &expired.owner,
+                &expired.session_id,
+                expired.generation as i64
+            ],
+        )
+        .expect("force lease expiry");
+
+    assert!(
+        !db.runtime_writer_lease_renew(&expired, 120)
+            .expect("reject expired renewal"),
+        "an expired live-PID generation must not resurrect"
+    );
+    let error = db
+        .with_runtime_writer_lease_write(Some(&expired), "insert fenced probe", || {
+            db.conn()
+                .execute("INSERT INTO fence_probe (value) VALUES ('expired')", [])
+                .map(|_| ())
+                .map_err(DbError::from)
+        })
+        .expect_err("expired live-PID generation must not mutate");
+    assert!(matches!(
+        error,
+        DbError::RuntimeWriterLeaseLost { generation, .. } if generation == expired.generation
+    ));
+    assert_eq!(
+        db.conn()
+            .query_row("SELECT COUNT(*) FROM fence_probe", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count fence probe"),
+        0
+    );
+    assert_eq!(
+        db.runtime_writer_lease_status(Some(&expired.name))
+            .expect("preserved live holder status")
+            .len(),
+        1,
+        "expiry removes write authority, not live-holder takeover protection"
+    );
+}
+
 #[test]
 fn writer_lease_renew_retries_sqlite_busy_until_live_holder_releases() {
     let temp = tempfile::tempdir().expect("tempdir");

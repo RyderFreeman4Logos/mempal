@@ -384,6 +384,7 @@ impl Database {
             "SELECT EXISTS(
                  SELECT 1 FROM runtime_writer_leases
                  WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4
+                   AND expires_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now')
              )",
             params![
                 lease.name,
