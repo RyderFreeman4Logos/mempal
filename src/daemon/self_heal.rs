@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 #[cfg(all(test, unix))]
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use crate::core::queue::AsyncPendingMessageStore;
@@ -17,6 +17,7 @@ use crate::core::queue::QueueError;
 #[cfg(unix)]
 pub(super) const HOOK_IPC_HANDLER_DRAIN_BUDGET: Duration = Duration::from_secs(3);
 const DAEMON_CLAIM_LOCK_BACKOFF_MAX: Duration = Duration::from_secs(30);
+const CLAIM_CONTENTION_EVIDENCE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[cfg(unix)]
 pub(super) const HOOK_IPC_HANDLER_LIMIT: usize = 32;
@@ -25,11 +26,23 @@ pub(super) const HOOK_IPC_HANDLER_LIMIT: usize = 32;
 pub(super) struct ClaimBackoffState {
     pub(super) consecutive_sqlite_lock_errors: u64,
     pub(super) write_observer: Option<crate::daemon_bootstrap::DaemonWriteObserver>,
+    pub(super) last_contention_evidence_at: Option<Instant>,
 }
 
 impl ClaimBackoffState {
     pub(super) fn reset(&mut self) {
         self.consecutive_sqlite_lock_errors = 0;
+    }
+
+    pub(super) fn should_sample_contention_evidence(&mut self) -> bool {
+        let now = Instant::now();
+        if self.last_contention_evidence_at.is_some_and(|last| {
+            now.saturating_duration_since(last) < CLAIM_CONTENTION_EVIDENCE_INTERVAL
+        }) {
+            return false;
+        }
+        self.last_contention_evidence_at = Some(now);
+        true
     }
 
     pub(super) fn delay_after_error(&mut self, error: &QueueError) -> Duration {
