@@ -281,11 +281,13 @@ log_path = "{}"
         self.stderr_lines.lock().await.clone()
     }
 
-    async fn fence_process_group_and_reap(
+    pub(crate) async fn fence_process_group_and_reap(
         &mut self,
         deadline: Instant,
         graceful_exit_deadline: Option<Instant>,
     ) -> Result<()> {
+        // Timeout observation may be delayed past the caller's nominal cleanup reserve.
+        let deadline = deadline.max(Instant::now() + CLEANUP_RESERVE);
         if self.reaped {
             self.finish_stderr(deadline).await;
             return Ok(());
