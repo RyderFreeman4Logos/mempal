@@ -40,13 +40,7 @@ pub(crate) enum PatternDetectionPlan {
 
 pub(crate) struct PatternRevision {
     pattern_id: String,
-    signature: Vec<u8>,
     exemplar_ids: String,
-    exemplar_count: i64,
-    session_ids: String,
-    session_count: i64,
-    status: String,
-    updated_at: i64,
 }
 
 /// Run pattern detection for a newly ingested drawer.
@@ -259,10 +253,17 @@ fn try_apply_pattern_detection(
     match plan {
         PatternDetectionPlan::None => {}
         PatternDetectionPlan::Update(revision) => {
-            if pattern_revision_is_current(conn, &revision)? {
+            let pattern_id = if load_pattern_revision(conn, &revision.pattern_id)?.is_some() {
+                Some(revision.pattern_id)
+            } else {
+                let exemplar_ids =
+                    serde_json::from_str::<Vec<String>>(&revision.exemplar_ids).unwrap_or_default();
+                find_pattern_for_exemplars(conn, &exemplar_ids, args.project_id)?
+            };
+            if let Some(pattern_id) = pattern_id {
                 update_pattern_with_exemplar(
                     conn,
-                    &revision.pattern_id,
+                    &pattern_id,
                     args.new_drawer_id,
                     args.session_id,
                     args.embedding,
@@ -274,7 +275,18 @@ fn try_apply_pattern_detection(
             pattern,
             overlapping_exemplar_ids,
         } => {
-            if !pattern_overlap_exists(conn, &overlapping_exemplar_ids, args.project_id)? {
+            if let Some(pattern_id) =
+                find_pattern_for_exemplars(conn, &overlapping_exemplar_ids, args.project_id)?
+            {
+                update_pattern_with_exemplar(
+                    conn,
+                    &pattern_id,
+                    args.new_drawer_id,
+                    args.session_id,
+                    args.embedding,
+                    args.promote_threshold,
+                )?;
+            } else {
                 insert_pattern(conn, &pattern)?;
             }
         }
@@ -287,84 +299,17 @@ fn load_pattern_revision(
     pattern_id: &str,
 ) -> rusqlite::Result<Option<PatternRevision>> {
     conn.query_row(
-        "SELECT pattern_id, signature, exemplar_ids, exemplar_count, session_ids, \
-                session_count, status, updated_at \
+        "SELECT pattern_id, exemplar_ids \
          FROM patterns WHERE pattern_id = ?1 AND status IN ('candidate', 'active')",
         [pattern_id],
         |row| {
             Ok(PatternRevision {
                 pattern_id: row.get(0)?,
-                signature: row.get(1)?,
-                exemplar_ids: row.get(2)?,
-                exemplar_count: row.get(3)?,
-                session_ids: row.get(4)?,
-                session_count: row.get(5)?,
-                status: row.get(6)?,
-                updated_at: row.get(7)?,
+                exemplar_ids: row.get(1)?,
             })
         },
     )
     .optional()
-}
-
-fn pattern_revision_is_current(
-    conn: &Connection,
-    revision: &PatternRevision,
-) -> rusqlite::Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM patterns \
-         WHERE pattern_id = ?1 AND signature = ?2 AND exemplar_ids = ?3 \
-           AND exemplar_count = ?4 AND session_ids = ?5 AND session_count = ?6 \
-           AND status = ?7 AND updated_at = ?8)",
-        params![
-            revision.pattern_id,
-            revision.signature,
-            revision.exemplar_ids,
-            revision.exemplar_count,
-            revision.session_ids,
-            revision.session_count,
-            revision.status,
-            revision.updated_at,
-        ],
-        |row| row.get::<_, i64>(0).map(|current| current != 0),
-    )
-}
-
-fn pattern_overlap_exists(
-    conn: &Connection,
-    exemplar_ids: &[String],
-    project_id: Option<&str>,
-) -> rusqlite::Result<bool> {
-    if exemplar_ids.is_empty() {
-        return Ok(false);
-    }
-    let placeholders = (2..exemplar_ids.len() + 2)
-        .map(|index| format!("?{index}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT EXISTS( \
-             SELECT 1 FROM patterns p \
-             JOIN json_each(CASE WHEN json_valid(p.exemplar_ids) THEN p.exemplar_ids ELSE '[]' END) e \
-             WHERE p.status IN ('candidate', 'active') \
-               AND (?1 IS NULL OR p.project_id = ?1 OR p.project_id IS NULL) \
-               AND e.value IN ({placeholders}) \
-         )"
-    );
-    let mut values = Vec::with_capacity(exemplar_ids.len() + 1);
-    values.push(match project_id {
-        Some(project_id) => rusqlite::types::Value::Text(project_id.to_string()),
-        None => rusqlite::types::Value::Null,
-    });
-    values.extend(
-        exemplar_ids
-            .iter()
-            .cloned()
-            .map(rusqlite::types::Value::Text),
-    );
-    conn.query_row(&sql, rusqlite::params_from_iter(values.iter()), |row| {
-        row.get::<_, i64>(0).map(|exists| exists != 0)
-    })
 }
 
 fn fetch_drawer_contents(

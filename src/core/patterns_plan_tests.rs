@@ -44,9 +44,7 @@ fn stale_pattern_plans_do_not_overwrite_or_create_duplicates() {
         .expect("current pattern");
     update_pattern_with_exemplar(&conn, "current", "concurrent", "session-b", &[0.25; 8], 5)
         .expect("apply concurrent pattern update");
-    let concurrent = get_pattern(&conn, "current")
-        .expect("read concurrent pattern")
-        .expect("updated pattern");
+
     let embedding = [0.75; 8];
     let args = PatternDetectionArgs {
         new_drawer_id: "stale",
@@ -61,12 +59,26 @@ fn stale_pattern_plans_do_not_overwrite_or_create_duplicates() {
         top_tags: 5,
     };
     try_apply_pattern_detection(&conn, &args, PatternDetectionPlan::Update(stale_revision))
-        .expect("skip stale update plan");
+        .expect("rebase stale update plan");
     let after_stale_update = get_pattern(&conn, "current")
         .expect("read pattern after stale update")
         .expect("pattern remains");
-    assert_eq!(after_stale_update.exemplar_ids, concurrent.exemplar_ids);
-    assert_eq!(after_stale_update.signature, concurrent.signature);
+    assert_eq!(
+        after_stale_update.exemplar_ids,
+        vec![
+            "seed".to_string(),
+            "concurrent".to_string(),
+            "stale".to_string()
+        ]
+    );
+    assert_eq!(
+        after_stale_update.session_ids,
+        vec![
+            "session-a".to_string(),
+            "session-b".to_string(),
+            "session-c".to_string()
+        ]
+    );
 
     let conn = patterns_connection();
     insert_pattern(&conn, &pattern("winner", "seed")).expect("insert concurrent winner");
@@ -78,11 +90,16 @@ fn stale_pattern_plans_do_not_overwrite_or_create_duplicates() {
             overlapping_exemplar_ids: vec!["seed".to_string()],
         },
     )
-    .expect("skip stale insert plan");
+    .expect("rebase stale insert plan onto winner");
     let count = conn
         .query_row("SELECT COUNT(*) FROM patterns", [], |row| {
             row.get::<_, i64>(0)
         })
         .expect("count patterns");
     assert_eq!(count, 1, "stale insert must not duplicate the winner");
+    let winner = get_pattern(&conn, "winner")
+        .expect("read winner")
+        .expect("winner remains");
+    assert_eq!(winner.exemplar_ids, vec!["seed", "stale"]);
+    assert_eq!(winner.session_ids, vec!["session-a", "session-c"]);
 }
