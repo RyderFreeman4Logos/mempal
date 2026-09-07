@@ -265,7 +265,11 @@ spec.loader.exec_module(module)
 sccache = shutil.which("sccache")
 assert sccache is not None
 child = subprocess.Popen(["/bin/sleep", "10"], start_new_session=True)
-cache = subprocess.Popen(["/usr/bin/python3", "-c", "import time; time.sleep(10)"])
+cache = subprocess.Popen(
+    ["/usr/bin/python3", "-c", "import os; os.write(1,b'ready'); os.read(0,1)"],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+)
+assert cache.stdout and cache.stdout.read(5) == b"ready"
 supervisor = module.Supervisor(child, 1)
 original_readlink = module.os.readlink
 try:
