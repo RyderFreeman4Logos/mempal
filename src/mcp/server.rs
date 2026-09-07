@@ -118,6 +118,14 @@ use super::ingest_payload::{
     run_durable_delete,
 };
 use super::resource_usage;
+
+#[path = "server_operation_receipt.rs"]
+mod operation_receipt;
+use operation_receipt::{OperationLookup, spool_pending_operation_response};
+
+#[cfg(test)]
+#[path = "server_operation_receipt_tests.rs"]
+mod operation_receipt_tests;
 use super::smoke_vectors::deterministic_smoke_vectors;
 use super::timeline::{TimelineRequest, TimelineResponse};
 use super::tools::{
@@ -2919,13 +2927,12 @@ impl MempalMcpServer {
         if remaining_timeout.is_zero() {
             return Ok(None);
         }
-        match tokio::time::timeout(
-            remaining_timeout,
-            self.async_queue.operation_status(operation_id.to_string()),
-        )
-        .await
+        match self
+            .operation_lookup_within(operation_id, remaining_timeout)
+            .await?
         {
-            Ok(Ok(Some(record))) => {
+            Some(OperationLookup::Record(record)) => {
+                let record = *record;
                 let is_terminal = record
                     .op_state
                     .parse::<IngestOperationState>()
@@ -2946,15 +2953,15 @@ impl MempalMcpServer {
                 };
                 Ok(Some(operation_record_to_response(record, system_warnings)))
             }
-            Ok(Ok(None)) => Err(ErrorData::invalid_params(
+            Some(OperationLookup::SpoolPending) => Ok(Some(spool_pending_operation_response(
+                operation_id,
+                current_system_warnings(),
+            ))),
+            Some(OperationLookup::Missing) => Err(ErrorData::invalid_params(
                 format!("operation not found: {operation_id}"),
                 None,
             )),
-            Ok(Err(error)) => Err(ErrorData::internal_error(
-                format!("queue lookup failed: {error}"),
-                None,
-            )),
-            Err(_) => Ok(None),
+            None => Ok(None),
         }
     }
 
@@ -9213,55 +9220,17 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<OperationStatusRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
-        let started_at = Instant::now();
-        let record = match tokio::time::timeout(
-            self.operation_status_deadline,
-            self.async_queue
-                .operation_status(request.operation_id.clone()),
-        )
-        .await
+        match self
+            .operation_status_json_within(&request.operation_id, self.operation_status_deadline)
+            .await?
         {
-            Ok(Ok(record)) => record,
-            Ok(Err(error)) => {
-                return Err(ErrorData::internal_error(
-                    format!("queue lookup failed: {error}"),
-                    None,
-                ));
-            }
-            Err(_) => {
-                return Err(mcp_stage_timeout_error(
-                    "mempal_operation_status",
-                    "queue lookup",
-                    self.operation_status_deadline,
-                ));
-            }
-        };
-
-        let record = record.ok_or_else(|| {
-            ErrorData::invalid_params(
-                format!("operation not found: {}", request.operation_id),
-                None,
-            )
-        })?;
-        let warning_budget = self
-            .operation_status_deadline
-            .checked_sub(started_at.elapsed())
-            .unwrap_or_default();
-        let system_warnings = if warning_budget.is_zero() {
-            current_system_warnings()
-        } else {
-            match tokio::time::timeout(
-                warning_budget,
-                self.system_warnings_with_stale_index_bounded(warning_budget),
-            )
-            .await
-            {
-                Ok(warnings) => warnings?,
-                Err(_) => current_system_warnings(),
-            }
-        };
-
-        Ok(Json(operation_record_to_response(record, system_warnings)))
+            Some(response) => Ok(Json(response)),
+            None => Err(mcp_stage_timeout_error(
+                "mempal_operation_status",
+                "queue lookup",
+                self.operation_status_deadline,
+            )),
+        }
     }
 
     #[tool(
