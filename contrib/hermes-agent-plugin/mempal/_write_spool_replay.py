@@ -388,7 +388,11 @@ class WriteSpoolReplay:
         operation_id = operation.receipt_operation_id
         route = "/api/ingest/durable"
         try:
-            if replay_allowed is not None and not replay_allowed():
+            if (
+                replay_allowed is not None
+                and not replay_allowed()
+                and not operation_id
+            ):
                 self.release_claim(operation.operation_key, claim_token)
                 return ReplayOutcome(
                     operation,

@@ -104,6 +104,7 @@ def submit_conclusion(
     """Admit once and report success only after authoritative completion."""
     if not valid_control_token(operation_key):
         return ConcludeResult(False, _invalid_control_payload())
+    retrying = operation_key is not None
     key = operation_key or secrets.token_urlsafe(32)
     if spool is None:
         return ConcludeResult(False, _retry_payload(
@@ -133,7 +134,7 @@ def submit_conclusion(
             classify_write_error(exc),
         ))
 
-    if not transport_allowed:
+    if not transport_allowed and not retrying:
         return ConcludeResult(False, _retry_payload(
             "durable_admission_deferred",
             None,

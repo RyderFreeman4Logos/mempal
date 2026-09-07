@@ -302,9 +302,6 @@ class WriteSpoolClaims:
             "OR typeof(candidate.claim_expires_at) NOT IN ('real', 'integer') "
             "OR abs(candidate.claim_expires_at) > ?"
             ")",
-            "NOT EXISTS (SELECT 1 FROM write_operations AS earlier "
-            "WHERE earlier.sequence < candidate.sequence "
-            "AND earlier.settled_at IS NULL AND earlier.quarantined_at IS NULL)",
         ]
         params: list[object] = [now, _MAX_FINITE_BOUND]
         if not ignore_retry_delay:
@@ -318,7 +315,26 @@ class WriteSpoolClaims:
             )
             params.append(now)
             params.append(_MAX_FINITE_BOUND)
-        if operation_key is not None:
+        if operation_key is None:
+            where.append(
+                "NOT EXISTS (SELECT 1 FROM write_operations AS earlier "
+                "WHERE earlier.sequence < candidate.sequence "
+                "AND earlier.settled_at IS NULL AND earlier.quarantined_at IS NULL)"
+            )
+        else:
+            # Keyed replay: same-track rows stay ordered. Null-track
+            # replace/delete still wait on earlier null-track mutations.
+            where.append(
+                "NOT EXISTS (SELECT 1 FROM write_operations AS earlier "
+                "WHERE earlier.sequence < candidate.sequence "
+                "AND earlier.settled_at IS NULL AND earlier.quarantined_at IS NULL "
+                "AND ("
+                "(candidate.track_key IS NOT NULL "
+                "AND earlier.track_key = candidate.track_key) "
+                "OR (candidate.track_key IS NULL AND earlier.track_key IS NULL "
+                "AND candidate.action IN ('replace', 'delete'))"
+                "))"
+            )
             where.append("candidate.operation_key = ?")
             params.append(operation_key)
         query = (
@@ -427,6 +443,17 @@ class WriteSpoolClaims:
                     WHERE earlier.sequence < candidate.sequence
                       AND earlier.settled_at IS NULL
                       AND earlier.quarantined_at IS NULL
+                      AND (
+                        (
+                          candidate.track_key IS NOT NULL
+                          AND earlier.track_key = candidate.track_key
+                        )
+                        OR (
+                          candidate.track_key IS NULL
+                          AND earlier.track_key IS NULL
+                          AND candidate.action IN ('replace', 'delete')
+                        )
+                      )
                   )
                 """,
                 (operation_key,),

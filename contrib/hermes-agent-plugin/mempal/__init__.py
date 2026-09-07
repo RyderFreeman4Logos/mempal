@@ -329,8 +329,12 @@ class MempalMemoryProvider:
 
     def _replay_spooled_write(self) -> None:
         spool = self._write_spool
-        if spool is None or self._is_breaker_open():
+        if spool is None:
             return
+        if self._is_breaker_open():
+            head = spool.next_replayable_operation()
+            if head is None or not head.receipt_operation_id:
+                return
         try:
             outcome = spool.replay_one(
                 self._post,

@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -544,6 +545,102 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertEqual(provider._write_spool.count(), 1)
         self.assertEqual(provider.posts, [])
         self.assertNotIn("SECRET_REPLAY_CONCLUSION", json.dumps(second))
+
+    def test_keyed_conclude_settles_behind_unrelated_fifo_head(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
+        spool = provider._write_spool
+        assert spool is not None
+        head = spool.admit(
+            "ingest",
+            {
+                "content": "raw turn ahead",
+                "wing": provider._wing,
+                "room": "turns",
+            },
+            action="raw_turn",
+        )
+        before = provider._backoff._read_state()
+
+        stored = self._conclude(provider, "SECRET_KEYED_CONCLUSION")
+
+        self.assertEqual(stored.get("result"), "Fact stored.")
+        self.assertTrue(stored.get("drawer_id"))
+        self.assertTrue(stored.get("operation_key"))
+        after = provider._backoff._read_state()
+        self.assertEqual(after.failure_count, before.failure_count)
+        remaining = spool.get(head.operation_key)
+        self.assertIsNotNone(remaining)
+        assert remaining is not None
+        self.assertIsNone(remaining.settled_at)
+        durable_posts = [
+            body for path, body in provider.posts if path == "/api/ingest/durable"
+        ]
+        self.assertEqual(len(durable_posts), 1)
+        self.assertEqual(
+            durable_posts[0]["idempotency_key"], stored["operation_key"]
+        )
+        self.assertNotIn("SECRET_KEYED_CONCLUSION", json.dumps(stored))
+        provider.shutdown()
+
+    def test_keyed_retry_settles_existing_receipt_while_breaker_open(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
+        spool = provider._write_spool
+        assert spool is not None
+        spool.admit(
+            "ingest",
+            {
+                "content": "raw turn ahead",
+                "wing": provider._wing,
+                "room": "turns",
+            },
+            action="raw_turn",
+        )
+        first = self._conclude(provider, "SECRET_RECEIPT_CONCLUSION")
+        details = first["error_details"] if "error_details" in first else {}
+        operation_key = first.get("operation_key") or details.get("operation_key")
+        self.assertTrue(operation_key)
+        connection = sqlite3.connect(spool.path)
+        try:
+            connection.execute(
+                "UPDATE write_operations SET receipt_operation_id = ? "
+                "WHERE operation_key = ?",
+                ("op-existing-conclude", operation_key),
+            )
+            connection.execute(
+                "UPDATE write_operations SET settled_at = NULL, "
+                "result_drawer_id = NULL WHERE operation_key = ?",
+                (operation_key,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        provider.durable_status["op-existing-conclude"] = {
+            "operation_id": "op-existing-conclude",
+            "state": "completed",
+            "drawer_id": "drawer-existing-conclude",
+        }
+        provider.posts.clear()
+        for _ in range(5):
+            provider._backoff.record_failure()
+
+        stored = self._conclude(
+            provider,
+            "SECRET_RECEIPT_CONCLUSION",
+            operation_key=operation_key,
+        )
+
+        after = provider._backoff._read_state()
+        self.assertEqual(stored.get("result"), "Fact stored.")
+        self.assertEqual(stored.get("drawer_id"), "drawer-existing-conclude")
+        self.assertEqual(stored.get("operation_key"), operation_key)
+        self.assertEqual(after.failure_count, 0)
+        self.assertEqual(provider.posts, [])
+        self.assertNotIn("SECRET_RECEIPT_CONCLUSION", json.dumps(stored))
+        provider.shutdown()
 
     def test_open_breaker_returns_retryable_receipt_after_durable_spool(self) -> None:
         provider = RecordingProvider()

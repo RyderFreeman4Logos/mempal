@@ -340,7 +340,8 @@ def authoritative_memory_write(
         })
 
     key = operation.operation_key
-    if self._is_breaker_open():
+    retrying = retry_operation_key is not None
+    if self._is_breaker_open() and not retrying:
         try:
             self._wake_spool_worker()
         except Exception:
