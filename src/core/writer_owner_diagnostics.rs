@@ -2,8 +2,9 @@
 //!
 //! Label a connection as owner only after `BEGIN IMMEDIATE` succeeds. A thread
 //! still waiting on BEGIN is a waiter and must not invent a foreign owner PID.
-//! Contention against unlabeled foreign holders is `UnknownExternal`; this
-//! census does not claim external lock-owner coverage.
+//! Contention against unlabeled foreign holders is `UnknownExternal`. Absence
+//! means only `NoTrackedLocalOwner`, not that SQLite is currently lock-free;
+//! this census does not claim external lock-owner coverage.
 //! ponytail: process-local fence census only; add OS lock-owner probe if live
 //! unlabeled holders need a foreign PID.
 
@@ -12,6 +13,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::ops::Deref;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -23,6 +25,7 @@ macro_rules! writer_stall_event {
             queued_count = $diagnostic.queued_count,
             seconds_since_successful_write = $diagnostic.seconds_since_successful_write,
             last_error = %$diagnostic.last_error,
+            last_error_age_secs = $diagnostic.last_error_age_secs,
             uptime_secs = $diagnostic.uptime_secs,
             writer_evidence = ?$diagnostic.writer_evidence,
             $message
@@ -37,7 +40,7 @@ pub enum WriterLockClass {
     HeldWriter,
     BlockedWaiter,
     UnknownExternal,
-    Released,
+    NoTrackedLocalOwner,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,10 +54,11 @@ pub struct WriterLockEvidence {
 #[derive(Clone, Copy)]
 enum ThreadRole {
     Waiting,
-    Owning,
+    Owning(u64),
 }
 
 struct OwnerSlot {
+    generation: u64,
     pid: u32,
     operation: &'static str,
     started: Instant,
@@ -75,7 +79,6 @@ enum DatabaseIdentity {
 struct DatabaseState {
     owner: Option<OwnerSlot>,
     waiters: usize,
-    release_unverified: bool,
 }
 
 struct ProcessState {
@@ -139,13 +142,12 @@ fn writer_lock_evidence(database: DatabaseIdentity) -> WriterLockEvidence {
         return unknown_evidence();
     };
     let Some(state) = state.databases.get(&database) else {
-        return released_evidence();
+        return no_tracked_owner_evidence();
     };
-    if state.release_unverified {
-        return unknown_evidence();
-    }
     if let Some(owner) = state.owner.as_ref() {
-        let class = if matches!(role, Some(ThreadRole::Owning)) || state.waiters == 0 {
+        let class = if matches!(role, Some(ThreadRole::Owning(generation)) if generation == owner.generation)
+            || state.waiters == 0
+        {
             WriterLockClass::HeldWriter
         } else {
             WriterLockClass::BlockedWaiter
@@ -160,7 +162,7 @@ fn writer_lock_evidence(database: DatabaseIdentity) -> WriterLockEvidence {
     if matches!(role, Some(ThreadRole::Waiting)) || state.waiters > 0 {
         return unknown_evidence();
     }
-    released_evidence()
+    no_tracked_owner_evidence()
 }
 
 fn unknown_evidence() -> WriterLockEvidence {
@@ -172,9 +174,9 @@ fn unknown_evidence() -> WriterLockEvidence {
     }
 }
 
-fn released_evidence() -> WriterLockEvidence {
+fn no_tracked_owner_evidence() -> WriterLockEvidence {
     WriterLockEvidence {
-        class: WriterLockClass::Released,
+        class: WriterLockClass::NoTrackedLocalOwner,
         owner_pid: None,
         operation: None,
         elapsed: None,
@@ -209,33 +211,42 @@ impl WriterWaitGuard {
 
     pub fn into_owner(mut self, conn: &Connection) -> WriterOwnerGuard<'_> {
         self.active = false;
-        publish_owner(self.database, self.operation);
+        let generation = publish_owner(self.database, self.operation);
         WriterOwnerGuard {
             conn,
             database: self.database,
+            generation,
+            operation: self.operation,
             active: true,
         }
     }
 
-    fn into_transaction(mut self, transaction: Transaction<'_>) -> WriterOwnerTransaction<'_> {
+    fn into_transaction<'conn>(
+        mut self,
+        conn: &'conn Connection,
+        transaction: Transaction<'conn>,
+    ) -> WriterOwnerTransaction<'conn> {
         self.active = false;
-        publish_owner(self.database, self.operation);
+        let generation = publish_owner(self.database, self.operation);
         WriterOwnerTransaction {
             transaction: Some(transaction),
+            conn,
             database: self.database,
+            generation,
+            operation: self.operation,
         }
     }
 
     fn failed(mut self) {
         self.active = false;
-        finish_wait(self.database, true);
+        finish_wait(self.database);
     }
 }
 
 impl Drop for WriterWaitGuard {
     fn drop(&mut self) {
         if self.active {
-            finish_wait(self.database, false);
+            finish_wait(self.database);
         }
     }
 }
@@ -243,28 +254,32 @@ impl Drop for WriterWaitGuard {
 pub struct WriterOwnerGuard<'conn> {
     conn: &'conn Connection,
     database: DatabaseIdentity,
+    generation: u64,
+    operation: &'static str,
     active: bool,
 }
 
 impl<'conn> WriterOwnerGuard<'conn> {
     pub fn release(mut self) {
         self.active = false;
-        finish_owner(self.database, self.conn.is_autocommit());
+        finalize_owner(self.conn, self.database, self.generation, self.operation);
     }
 }
 
 impl Drop for WriterOwnerGuard<'_> {
     fn drop(&mut self) {
         if self.active {
-            let rollback = self.conn.execute_batch("ROLLBACK");
-            finish_owner(self.database, rollback.is_ok() || self.conn.is_autocommit());
+            finalize_owner(self.conn, self.database, self.generation, self.operation);
         }
     }
 }
 
 pub struct WriterOwnerTransaction<'conn> {
     transaction: Option<Transaction<'conn>>,
+    conn: &'conn Connection,
     database: DatabaseIdentity,
+    generation: u64,
+    operation: &'static str,
 }
 
 impl WriterOwnerTransaction<'_> {
@@ -274,7 +289,7 @@ impl WriterOwnerTransaction<'_> {
             .take()
             .expect("writer transaction must exist")
             .commit();
-        finish_owner(self.database, result.is_ok());
+        finalize_owner(self.conn, self.database, self.generation, self.operation);
         result
     }
 }
@@ -294,56 +309,100 @@ impl Drop for WriterOwnerTransaction<'_> {
         let Some(transaction) = self.transaction.take() else {
             return;
         };
-        let released = transaction.is_autocommit() || transaction.rollback().is_ok();
-        finish_owner(self.database, released);
+        drop(transaction);
+        finalize_owner(self.conn, self.database, self.generation, self.operation);
     }
 }
 
-fn publish_owner(database: DatabaseIdentity, operation: &'static str) {
+static NEXT_OWNER_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn publish_owner(database: DatabaseIdentity, operation: &'static str) -> u64 {
+    let generation = NEXT_OWNER_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("writer owner generation exhausted");
     THREAD_CONTEXT.with(|context| {
         context.set(Some(ThreadContext {
             database,
-            role: ThreadRole::Owning,
+            role: ThreadRole::Owning(generation),
         }));
     });
     if let Ok(mut state) = process_state().lock() {
         let state = state.databases.entry(database).or_default();
         state.waiters = state.waiters.saturating_sub(1);
-        state.release_unverified = false;
         state.owner = Some(OwnerSlot {
+            generation,
             pid: std::process::id(),
             operation,
             started: Instant::now(),
         });
     }
+    generation
 }
 
-fn finish_wait(database: DatabaseIdentity, unverified: bool) {
-    THREAD_CONTEXT.with(|context| context.set(None));
-    if let Ok(mut process) = process_state().lock() {
-        let database_state = process.databases.entry(database).or_default();
-        database_state.waiters = database_state.waiters.saturating_sub(1);
-        if unverified && database_state.owner.is_none() {
-            database_state.release_unverified = true;
+fn finish_wait(database: DatabaseIdentity) {
+    THREAD_CONTEXT.with(|context| {
+        if context.get().is_some_and(|current| {
+            current.database == database && matches!(current.role, ThreadRole::Waiting)
+        }) {
+            context.set(None);
         }
-        if database_state.waiters == 0
-            && database_state.owner.is_none()
-            && !database_state.release_unverified
-        {
+    });
+    if let Ok(mut process) = process_state().lock() {
+        let should_remove = if let Some(database_state) = process.databases.get_mut(&database) {
+            database_state.waiters = database_state.waiters.saturating_sub(1);
+            database_state.waiters == 0 && database_state.owner.is_none()
+        } else {
+            false
+        };
+        if should_remove {
             process.databases.remove(&database);
         }
     }
 }
 
-fn finish_owner(database: DatabaseIdentity, released: bool) {
-    THREAD_CONTEXT.with(|context| context.set(None));
+fn finish_owner(database: DatabaseIdentity, generation: u64) {
+    THREAD_CONTEXT.with(|context| {
+        if context.get().is_some_and(|current| {
+            current.database == database
+                && matches!(current.role, ThreadRole::Owning(current_generation) if current_generation == generation)
+        }) {
+            context.set(None);
+        }
+    });
     if let Ok(mut process) = process_state().lock() {
-        let database_state = process.databases.entry(database).or_default();
-        database_state.owner = None;
-        database_state.release_unverified = !released;
-        if database_state.waiters == 0 && released {
+        let should_remove = if let Some(database_state) = process.databases.get_mut(&database) {
+            if !database_state
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.generation == generation)
+            {
+                return;
+            }
+            database_state.owner = None;
+            database_state.waiters == 0
+        } else {
+            return;
+        };
+        if should_remove {
             process.databases.remove(&database);
         }
+    }
+}
+
+fn finalize_owner(
+    conn: &Connection,
+    database: DatabaseIdentity,
+    generation: u64,
+    operation: &'static str,
+) {
+    finish_owner(database, generation);
+    if !conn.is_autocommit() {
+        tracing::warn!(
+            operation,
+            "SQLite writer cleanup remains unverified; current owner tracking was removed"
+        );
     }
 }
 
@@ -365,9 +424,10 @@ pub(crate) fn transaction_immediate<'conn>(
     conn: &'conn mut Connection,
     operation: &'static str,
 ) -> rusqlite::Result<WriterOwnerTransaction<'conn>> {
+    let conn: &'conn Connection = conn;
     let wait = WriterWaitGuard::enter(conn, operation);
-    match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
-        Ok(transaction) => Ok(wait.into_transaction(transaction)),
+    match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
+        Ok(transaction) => Ok(wait.into_transaction(conn, transaction)),
         Err(error) => {
             wait.failed();
             Err(error)
@@ -376,19 +436,21 @@ pub(crate) fn transaction_immediate<'conn>(
 }
 
 #[cfg(test)]
+static EVIDENCE_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+fn lock_process_evidence() -> std::sync::MutexGuard<'static, ()> {
+    EVIDENCE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::Connection;
-    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::{Arc, Barrier, Mutex, MutexGuard, PoisonError, mpsc};
+    use std::sync::{Arc, Barrier, mpsc};
     use std::time::Duration;
-
-    static EVIDENCE_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock_process_evidence() -> MutexGuard<'static, ()> {
-        EVIDENCE_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
-    }
 
     fn assert_privacy(evidence: &WriterLockEvidence) {
         if let Some(operation) = evidence.operation {
@@ -417,7 +479,7 @@ mod tests {
         conn.execute_batch("COMMIT").expect("commit");
         drop(owner);
         let released = current_writer_lock_evidence(&conn);
-        assert_eq!(released.class, WriterLockClass::Released);
+        assert_eq!(released.class, WriterLockClass::NoTrackedLocalOwner);
         assert_eq!(released.owner_pid, None);
         assert_eq!(released.operation, None);
     }
@@ -438,68 +500,8 @@ mod tests {
         drop(owner);
         assert_eq!(
             current_writer_lock_evidence(&conn).class,
-            WriterLockClass::Released
+            WriterLockClass::NoTrackedLocalOwner
         );
-    }
-
-    #[test]
-    fn panic_drop_releases_held_writer() {
-        let _lock = lock_process_evidence();
-        let conn = Connection::open_in_memory().expect("memory db");
-        let panicked = catch_unwind(AssertUnwindSafe(|| {
-            let wait = WriterWaitGuard::enter(&conn, "claim queued message");
-            conn.execute_batch("BEGIN IMMEDIATE")
-                .expect("begin immediate");
-            let _owner = wait.into_owner(&conn);
-            assert_eq!(
-                current_writer_lock_evidence(&conn).class,
-                WriterLockClass::HeldWriter
-            );
-            panic!("force owner drop");
-        }));
-        assert!(panicked.is_err());
-        assert!(
-            conn.is_autocommit(),
-            "panic drop must roll back the transaction"
-        );
-        assert_eq!(
-            current_writer_lock_evidence(&conn).class,
-            WriterLockClass::Released
-        );
-    }
-
-    fn deny_transaction_end(context: AuthContext<'_>) -> Authorization {
-        match context.action {
-            AuthAction::Transaction { operation }
-                if !matches!(operation, TransactionOperation::Begin) =>
-            {
-                Authorization::Deny
-            }
-            _ => Authorization::Allow,
-        }
-    }
-
-    #[test]
-    fn panic_drop_with_failed_rollback_preserves_unverified_evidence() {
-        let _lock = lock_process_evidence();
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("panic-rollback.db");
-        let conn = Connection::open(&path).expect("open database");
-
-        let panicked = catch_unwind(AssertUnwindSafe(|| {
-            let _owner = begin_immediate(&conn, "panic failed cleanup").expect("begin");
-            conn.authorizer(Some(deny_transaction_end));
-            panic!("force failed owner drop");
-        }));
-        assert!(panicked.is_err());
-        assert!(!conn.is_autocommit(), "ROLLBACK must be denied");
-        let evidence = writer_lock_evidence_for_path(&path);
-        assert_eq!(evidence.class, WriterLockClass::UnknownExternal);
-        assert_eq!(evidence.owner_pid, None);
-        assert_eq!(evidence.operation, None);
-
-        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-        conn.execute_batch("ROLLBACK").expect("cleanup transaction");
     }
 
     #[test]
@@ -556,7 +558,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             current_writer_lock_evidence(&holder).class,
-            WriterLockClass::Released
+            WriterLockClass::NoTrackedLocalOwner
         );
     }
 
@@ -591,7 +593,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             current_writer_lock_evidence(&waiter).class,
-            WriterLockClass::Released
+            WriterLockClass::NoTrackedLocalOwner
         );
     }
 
@@ -609,7 +611,7 @@ mod tests {
         drop(owner);
         assert_eq!(
             current_writer_lock_evidence(&conn).class,
-            WriterLockClass::Released
+            WriterLockClass::NoTrackedLocalOwner
         );
     }
 
@@ -654,11 +656,15 @@ mod tests {
         second.join().expect("join second owner");
         assert_eq!(
             writer_lock_evidence_for_path(&first_path).class,
-            WriterLockClass::Released
+            WriterLockClass::NoTrackedLocalOwner
         );
         assert_eq!(
             writer_lock_evidence_for_path(&second_path).class,
-            WriterLockClass::Released
+            WriterLockClass::NoTrackedLocalOwner
         );
     }
 }
+
+#[cfg(test)]
+#[path = "writer_owner_diagnostics_lifecycle_tests.rs"]
+mod lifecycle_tests;

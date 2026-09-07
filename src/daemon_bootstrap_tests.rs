@@ -109,6 +109,35 @@ async fn stall_diagnostic_reports_the_target_database_writer() {
 }
 
 #[tokio::test]
+async fn historical_lock_error_age_is_separate_from_current_owner_tracking() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    sync_store
+        .enqueue("hook:user-prompt-submit", "{}")
+        .expect("enqueue pending message");
+    let store = AsyncPendingMessageStore::from_store(sync_store);
+    let observer = DaemonWriteObserver::new();
+    let now = unix_secs();
+    observer.force_last_successful_write_for_test(now.saturating_sub(DAEMON_STALL_SECONDS));
+    observer.record_claim_error(&sqlite_protocol_queue_error());
+    observer.force_last_error_observed_at_for_test(now.saturating_sub(37));
+
+    let diagnostic = observer
+        .stall_diagnostic(&store, now)
+        .await
+        .expect("stall diagnostic");
+
+    assert_eq!(diagnostic.last_error_age_secs, Some(37));
+    assert!(diagnostic.last_error_is_sqlite_lock);
+    assert_eq!(
+        diagnostic.writer_evidence.class,
+        crate::core::writer_owner_diagnostics::WriterLockClass::NoTrackedLocalOwner
+    );
+}
+
+#[tokio::test]
 async fn write_observer_requests_recovery_after_success_invalidates_lock_error() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
