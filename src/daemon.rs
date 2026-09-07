@@ -1205,6 +1205,12 @@ trait ClaimNextSource {
         worker_id: &'a str,
         claim_ttl_secs: i64,
     ) -> Pin<Box<dyn Future<Output = crate::core::queue::Result<Option<ClaimedMessage>>> + Send + 'a>>;
+
+    fn writer_lock_evidence(
+        &self,
+    ) -> Option<crate::core::writer_owner_diagnostics::WriterLockEvidence> {
+        None
+    }
 }
 
 impl ClaimNextSource for AsyncPendingMessageStore {
@@ -1215,6 +1221,12 @@ impl ClaimNextSource for AsyncPendingMessageStore {
     ) -> Pin<Box<dyn Future<Output = crate::core::queue::Result<Option<ClaimedMessage>>> + Send + 'a>>
     {
         Box::pin(async move { self.claim_next(worker_id.to_string(), claim_ttl_secs).await })
+    }
+
+    fn writer_lock_evidence(
+        &self,
+    ) -> Option<crate::core::writer_owner_diagnostics::WriterLockEvidence> {
+        Some(AsyncPendingMessageStore::writer_lock_evidence(self))
     }
 }
 
@@ -1275,12 +1287,16 @@ where
         Err(error) => {
             let is_sqlite_lock = error.is_sqlite_lock();
             let next_delay = backoff.delay_after_error(&error);
+            let writer_evidence = (is_sqlite_lock && backoff.should_sample_contention_evidence())
+                .then(|| store.writer_lock_evidence())
+                .flatten();
             tracing::warn!(
                 ?error,
                 worker_id,
                 is_sqlite_lock,
                 retry_count = backoff.consecutive_sqlite_lock_errors,
                 next_delay_ms = next_delay.as_millis() as u64,
+                writer_evidence = ?writer_evidence,
                 "claim_next failed"
             );
             sleep_on_error(next_delay).await;
