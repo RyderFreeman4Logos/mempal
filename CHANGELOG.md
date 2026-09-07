@@ -26,7 +26,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - Context isolate embed env HTTP CL (#1080,#1082).
 - Daemon SQLite writer lease waits past capped maintenance `remaining_secs` rather than exit 75; incompatible `mcp-ingest-worker` holders remain refused (#916, #849).
-- Spool receipt followability, pattern-signal rebase, lease/rejudge fixes, and hook/LLM queue fencing (#945/#1103/#1105/#986/#1000/#987/#1106/#1107).
+- Writer diagnostics delete finished generations without claiming release and preserve native cleanup semantics (#1105); spool/pattern/lease/hook fixes (#945/#1103/#986/#1000/#987/#1106/#1107).
 - Cited-recall latest-decision walks the full successor chain, filters context the same way, and requires a live correction/continuation citation (#898).
 - Codex snapshots atomically remove superseded turns/vectors and fail closed on ambiguity (#896).
 - MCP search shares a deadline and releases reads before responding (#881).
@@ -41,7 +41,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - **Daemon SQLite busy**: lease retries Busy/locked (#929); startup lock exits 75; systemd avoids extra-MCP churn (#931); REST install recycles daemon (#928, #940); default `rest` (#1091); Hermes writes authoritative; local conclusions avoid breaker retrips (#941).
 - **MCP search deadlines**: bounds embed/DB/route; no 240s hangs.
-- **Hermetic live-daemon tests**: isolate REST/MCP/ingest-wait/mark-failed/dashboard so exact-gates skip live `:3080`; timeout cleanup reaps owned trees, authenticates idle sccache by exe, and treats absent /proc as exit (#988, #989, #973, #991, #993, #1011, #1108).
+- **Hermetic daemon tests**: isolate REST/MCP/ingest-wait/mark-failed/dashboard from live `:3080`; timeout cleanup reaps trees, authenticates sccache executables, handshakes readiness, and treats absent /proc as exit (#988, #989, #973, #991, #993, #1011, #1108, #1110).
 - Lease #882/#889/#890,#944/#956,#958/#961/#962/#965/#971/#975/#976/#968,#1013,#1010,#1009,#1008,#1023/#1024,#1006/#1007,#1027,#1005,#1029,#1004,#1031,#980,#1003,#1002,#1001,#1035,#999,#998,#1037,#1038,#997,#996,#994,#1044,#990,#984,#1047,#970,#1049,#1050,#1051,#1040,#1054/#1059/#1060
 - **MCP delete retry**: force SQLite Busy before synchronized lock release (#886).
 

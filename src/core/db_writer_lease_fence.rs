@@ -338,11 +338,10 @@ impl Database {
             return write();
         }
 
-        crate::core::sqlite_retry::retry_content_mutation_sqlite_lock_until(
+        let owner = crate::core::sqlite_retry::retry_content_mutation_sqlite_lock_until(
             std::time::Instant::now() + super::RUNTIME_WRITER_LEASE_TRANSACTION_RETRY_DEADLINE,
             || {
-                self.conn
-                    .execute_batch("BEGIN IMMEDIATE")
+                crate::core::writer_owner_diagnostics::begin_immediate(&self.conn, operation)
                     .map_err(DbError::from)
             },
             super::db_error_is_sqlite_lock,
@@ -357,7 +356,7 @@ impl Database {
             }
             write()
         })();
-        match result {
+        let outcome = match result {
             Ok(value) => match self.conn.execute_batch("COMMIT") {
                 Ok(()) => Ok(value),
                 Err(commit_err) => {
@@ -372,7 +371,9 @@ impl Database {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(error)
             }
-        }
+        };
+        owner.release();
+        outcome
     }
 
     pub(super) fn require_runtime_writer_lease_tx(

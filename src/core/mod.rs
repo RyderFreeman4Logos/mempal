@@ -45,3 +45,4 @@ pub mod strata;
 pub mod timeline;
 pub mod types;
 pub mod utils;
+pub(crate) mod writer_owner_diagnostics;

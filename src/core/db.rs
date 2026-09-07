@@ -5116,25 +5116,26 @@ impl Database {
     where
         F: FnOnce() -> Result<T, DbError>,
     {
-        crate::core::sqlite_retry::retry_content_mutation_sqlite_lock_until(
+        let owner = crate::core::sqlite_retry::retry_content_mutation_sqlite_lock_until(
             Instant::now() + RUNTIME_WRITER_LEASE_TRANSACTION_RETRY_DEADLINE,
             || {
-                self.conn
-                    .execute_batch("BEGIN IMMEDIATE")
-                    .map_err(DbError::from)
+                crate::core::writer_owner_diagnostics::begin_immediate(
+                    &self.conn,
+                    "runtime writer lease control",
+                )
+                .map_err(DbError::from)
             },
             db_error_is_sqlite_lock,
         )?;
-        match work() {
-            Ok(value) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(value)
-            }
+        let outcome = match work() {
+            Ok(value) => self.conn.execute_batch("COMMIT").map(|()| value),
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
+                return Err(error);
             }
-        }
+        };
+        owner.release();
+        outcome.map_err(DbError::from)
     }
 
     // --- Lease coordination ---
