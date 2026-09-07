@@ -5,6 +5,7 @@ use crate::core::{
     config::{Config, ConfigHandle},
     db::Database,
     queue::{AsyncPendingMessageStore, QueueError},
+    writer_owner_diagnostics::WriterLockEvidence,
 };
 use crate::daemon_recovery::{
     DaemonRecovery, DaemonRecoveryFaultReporter, RESTART_COOLDOWN_SECS, RecoveryFault,
@@ -114,6 +115,7 @@ struct DaemonStallDiagnostic {
     last_error_is_sqlite_lock: bool,
     last_error_age_secs: Option<u64>,
     uptime_secs: u64,
+    writer_evidence: WriterLockEvidence,
 }
 
 pub struct DaemonContext {
@@ -242,21 +244,17 @@ impl DaemonWriteObserver {
                 .last_error_age_secs
                 .is_some_and(|age| age < DAEMON_SQLITE_CONTENTION_FRESHNESS_SECONDS)
         {
-            tracing::warn!(
-                queued_count = diagnostic.queued_count,
-                seconds_since_successful_write = diagnostic.seconds_since_successful_write,
-                last_error = %diagnostic.last_error,
-                uptime_secs = diagnostic.uptime_secs,
+            crate::core::writer_owner_diagnostics::writer_stall_event!(
+                tracing::warn,
+                diagnostic,
                 "daemon writes remain blocked by transient SQLite contention; keeping workers alive to retry"
             );
             return false;
         }
 
-        tracing::error!(
-            queued_count = diagnostic.queued_count,
-            seconds_since_successful_write = diagnostic.seconds_since_successful_write,
-            last_error = %diagnostic.last_error,
-            uptime_secs = diagnostic.uptime_secs,
+        crate::core::writer_owner_diagnostics::writer_stall_event!(
+            tracing::error,
+            diagnostic,
             "daemon write stall detected: queued messages exist but no successful write has completed for at least 5 minutes"
         );
         true
@@ -311,6 +309,7 @@ impl DaemonWriteObserver {
             last_error_is_sqlite_lock,
             last_error_age_secs,
             uptime_secs: self.inner.started_at.elapsed().as_secs(),
+            writer_evidence: store.writer_lock_evidence(),
         })
     }
 

@@ -60,6 +60,55 @@ async fn write_observer_reports_stall_when_queue_has_work_and_no_recent_writes()
 }
 
 #[tokio::test]
+async fn stall_diagnostic_reports_the_target_database_writer() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+    sync_store
+        .enqueue("hook:user-prompt-submit", "{}")
+        .expect("enqueue pending message");
+    let store = AsyncPendingMessageStore::from_store(sync_store);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder_path = db_path.clone();
+    let holder = std::thread::spawn(move || {
+        let mut conn = rusqlite::Connection::open(holder_path).expect("open writer");
+        let tx = crate::core::writer_owner_diagnostics::transaction_immediate(
+            &mut conn,
+            "claim queued message",
+        )
+        .expect("begin writer transaction");
+        ready_tx.send(()).expect("signal writer ready");
+        release_rx.recv().expect("wait for release");
+        drop(tx);
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("writer must be ready");
+
+    let observer = DaemonWriteObserver::new();
+    let now = unix_secs();
+    observer.force_last_successful_write_for_test(now.saturating_sub(DAEMON_STALL_SECONDS));
+    let diagnostic = observer
+        .stall_diagnostic(&store, now)
+        .await
+        .expect("stall diagnostic");
+    assert_eq!(
+        diagnostic.writer_evidence.class,
+        crate::core::writer_owner_diagnostics::WriterLockClass::HeldWriter
+    );
+    assert_eq!(
+        diagnostic.writer_evidence.operation,
+        Some("claim queued message")
+    );
+    assert!(observer.maybe_log_stall(&store).await);
+
+    release_tx.send(()).expect("release writer");
+    holder.join().expect("join writer");
+}
+
+#[tokio::test]
 async fn write_observer_requests_recovery_after_success_invalidates_lock_error() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");

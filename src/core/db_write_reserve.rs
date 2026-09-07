@@ -350,20 +350,17 @@ impl Database {
             return write();
         }
         with_write_reserve_retry(&self.path, operation, || {
-            let begin = crate::core::sqlite_retry::retry_content_mutation_sqlite_lock_until(
+            let owner = crate::core::sqlite_retry::retry_content_mutation_sqlite_lock_until(
                 Instant::now() + RUNTIME_WRITER_LEASE_TRANSACTION_RETRY_DEADLINE,
                 || {
-                    self.conn
-                        .execute_batch("BEGIN IMMEDIATE")
+                    crate::core::writer_owner_diagnostics::begin_immediate(&self.conn, operation)
                         .map_err(DbError::from)
                 },
                 db_error_is_sqlite_lock,
-            );
-            if let Err(error) = begin {
-                return Err(E::from(error));
-            }
+            )
+            .map_err(E::from)?;
 
-            match write() {
+            let outcome = match write() {
                 Ok(value) => match self.conn.execute_batch("COMMIT") {
                     Ok(()) => Ok(value),
                     Err(error) => {
@@ -375,7 +372,9 @@ impl Database {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     Err(error)
                 }
-            }
+            };
+            owner.release();
+            outcome
         })
     }
 }

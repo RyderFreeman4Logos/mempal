@@ -7,13 +7,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
 use super::config::scrub_sensitive_text;
 use super::db::{ensure_wal_journal_mode, rusqlite_error_is_lock};
 use super::queue_connection_admission as queue_admission;
+use super::writer_owner_diagnostics::{
+    WriterLockEvidence, transaction_immediate, writer_lock_evidence_for_path,
+};
 
 #[path = "queue_writer_lease_fence.rs"]
 mod queue_writer_lease_fence;
@@ -394,6 +397,10 @@ impl AsyncPendingMessageStore {
             #[cfg(any(test, feature = "db-test-seam"))]
             heartbeat_lock_failures: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub(crate) fn writer_lock_evidence(&self) -> WriterLockEvidence {
+        writer_lock_evidence_for_path(&self.inner.db_path)
     }
 
     pub(crate) fn fork_connection_cache(&self) -> Self {
@@ -963,7 +970,7 @@ impl PendingMessageStore {
     ) -> Result<String> {
         let payload_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
         self.with_connection_with_busy_timeout(busy_timeout, |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = transaction_immediate(conn, "enqueue async ingest message")?;
             if matches!(&identity, EnqueueIdentity::ExplicitKey(_))
                 && explicit_key_conflicts(&tx, &id, INGEST_ASYNC_KIND, &source_hash)?
             {
@@ -1033,7 +1040,7 @@ impl PendingMessageStore {
         claim_ttl_secs: i64,
     ) -> Result<Option<ClaimedMessage>> {
         self.with_claim_connection(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = transaction_immediate(conn, "claim queued message")?;
             reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
 
             let now = now_secs();
@@ -1117,7 +1124,7 @@ impl PendingMessageStore {
         kind_filter: &str,
     ) -> Result<Option<ClaimedMessage>> {
         self.with_claim_connection(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = transaction_immediate(conn, "claim queued message")?;
             self.require_lifecycle_writer_lease(&tx, "claim queued message")?;
             reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
 
@@ -1216,7 +1223,7 @@ impl PendingMessageStore {
         kind_filter: &str,
     ) -> Result<Option<ClaimedMessage>> {
         self.with_claim_connection(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = transaction_immediate(conn, "claim queued message by id")?;
             self.require_lifecycle_writer_lease(&tx, "claim queued message by id")?;
             reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
 
@@ -1286,7 +1293,7 @@ impl PendingMessageStore {
 
     pub fn confirm(&self, claim: &ClaimedMessage) -> Result<()> {
         self.with_connection(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = transaction_immediate(conn, "confirm queued message")?;
             self.require_lifecycle_writer_lease(&tx, "confirm queued message")?;
             confirm_in_tx(&tx, claim, "completed")?;
             tx.commit()?;
@@ -1323,7 +1330,7 @@ impl PendingMessageStore {
         busy_timeout: Option<Duration>,
     ) -> Result<()> {
         self.with_connection_with_busy_timeout(busy_timeout, |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = transaction_immediate(conn, "complete queued operation")?;
             self.require_lifecycle_writer_lease(&tx, "complete queued operation")?;
             let result_drawer_id = completion.result_drawer_id.as_deref();
             let rejected_reason = completion.rejected_reason.as_deref();
@@ -1379,7 +1386,7 @@ impl PendingMessageStore {
         disposition: QueueFailureDisposition,
     ) -> Result<()> {
         self.with_connection(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = transaction_immediate(conn, "requeue or fail queued message")?;
             self.require_lifecycle_writer_lease(&tx, "requeue or fail queued message")?;
             let redacted_error = sanitize_last_error(error);
             let current_retry = match tx
@@ -1485,7 +1492,7 @@ impl PendingMessageStore {
     ) -> Result<ModelTaskRequeueOutcome> {
         let now = now_secs();
         self.with_connection(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = transaction_immediate(conn, "requeue failed model tasks")?;
             let outcome = requeue_failed_model_tasks(
                 &tx,
                 now,
@@ -1559,7 +1566,7 @@ impl PendingMessageStore {
     /// they are intentionally left untouched.
     pub fn retry_failed_embed_messages(&self) -> Result<u64> {
         self.with_connection(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = transaction_immediate(conn, "retry failed embed messages")?;
             let retried = self.retry_failed_embed_messages_on_connection(&tx)?;
             tx.commit()?;
             Ok(retried)
@@ -1593,7 +1600,7 @@ impl PendingMessageStore {
             if let Some(timeout) = busy_timeout {
                 conn.busy_timeout(timeout)?;
             }
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = transaction_immediate(conn, "release queued message claim")?;
             self.require_lifecycle_writer_lease(&tx, "release queued message claim")?;
             let updated = tx.execute(
                 r#"
@@ -1635,7 +1642,7 @@ impl PendingMessageStore {
         let claim_prefix = format!("{worker_id}:");
         let now = now_secs();
         self.with_connection(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = transaction_immediate(conn, "refresh queued message heartbeat")?;
             self.require_lifecycle_writer_lease(&tx, "refresh queued message heartbeat")?;
             let updated = tx.execute(
                 r#"
@@ -1688,7 +1695,7 @@ impl PendingMessageStore {
         filter: QueueFailureFilter,
     ) -> Result<QueueFailureActionOutcome> {
         self.with_connection(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = transaction_immediate(conn, "retry failed queued messages")?;
             let outcome = self.retry_failed_messages_on_connection(&tx, filter)?;
             tx.commit()?;
             Ok(outcome)
@@ -1736,7 +1743,7 @@ impl PendingMessageStore {
         filter: QueueFailureFilter,
     ) -> Result<QueueFailureActionOutcome> {
         self.with_connection(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = transaction_immediate(conn, "archive failed queued messages")?;
             let outcome = self.archive_failed_messages_on_connection(&tx, filter)?;
             tx.commit()?;
             Ok(outcome)

@@ -3,6 +3,8 @@ use super::*;
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
 static RENEW_BUSY_SIGNAL: Mutex<Option<mpsc::Sender<()>>> = Mutex::new(None);
 
 fn signal_renew_busy(_: i32) -> bool {
@@ -218,4 +220,46 @@ fn writer_lease_renew_retries_sqlite_busy_until_live_holder_releases() {
         renewed,
         "live daemon lease must remain renewable after contention"
     );
+}
+
+fn deny_commit_and_rollback(context: AuthContext<'_>) -> Authorization {
+    match context.action {
+        AuthAction::Transaction { operation }
+            if !matches!(operation, TransactionOperation::Begin) =>
+        {
+            Authorization::Deny
+        }
+        _ => Authorization::Allow,
+    }
+}
+
+#[test]
+fn failed_commit_and_rollback_preserve_unverified_owner_evidence() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("palace.db");
+    let db = Database::open(&db_path).expect("database");
+
+    let result = db.with_runtime_writer_lease_transaction(
+        None,
+        "forced failed release",
+        || -> Result<(), DbError> {
+            db.conn().authorizer(Some(deny_commit_and_rollback));
+            Ok(())
+        },
+    );
+    assert!(result.is_err(), "COMMIT must be denied");
+    assert!(!db.conn().is_autocommit(), "ROLLBACK must also be denied");
+    let evidence = crate::core::writer_owner_diagnostics::writer_lock_evidence_for_path(&db_path);
+    assert_eq!(
+        evidence.class,
+        crate::core::writer_owner_diagnostics::WriterLockClass::UnknownExternal
+    );
+    assert_eq!(evidence.owner_pid, None);
+    assert_eq!(evidence.operation, None);
+
+    db.conn()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    db.conn()
+        .execute_batch("ROLLBACK")
+        .expect("cleanup transaction");
 }

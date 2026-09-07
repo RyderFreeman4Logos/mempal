@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, params};
 
 use super::{
     AsyncPendingMessageStore, INGEST_ASYNC_KIND, OVERSIZE_REJECTION_TOTAL_KEY, PendingMessageStore,
@@ -85,7 +85,7 @@ impl PendingMessageStore {
         let payload_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
         self.with_connection(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = crate::core::writer_owner_diagnostics::transaction_immediate(conn, operation)?;
             require_runtime_writer_lease(&tx, lease, operation)?;
 
             if kind == INGEST_ASYNC_KIND {
@@ -143,7 +143,7 @@ impl PendingMessageStore {
         let source_hash = hash_source(kind, payload);
         let id = idempotent_key_message_id(kind, idempotency_key);
         self.with_connection_with_busy_timeout(Some(Duration::ZERO), |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = crate::core::writer_owner_diagnostics::transaction_immediate(conn, operation)?;
             require_runtime_writer_lease(&tx, lease, operation)?;
             if explicit_key_conflicts(&tx, &id, kind, &source_hash)? {
                 return Err(QueueError::IdempotencyConflict);
