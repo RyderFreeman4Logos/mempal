@@ -118,6 +118,14 @@ use super::ingest_payload::{
     run_durable_delete,
 };
 use super::resource_usage;
+
+#[path = "server_operation_receipt.rs"]
+mod operation_receipt;
+use operation_receipt::{OperationLookup, spool_pending_operation_response};
+
+#[cfg(test)]
+#[path = "server_operation_receipt_tests.rs"]
+mod operation_receipt_tests;
 use super::smoke_vectors::deterministic_smoke_vectors;
 use super::timeline::{TimelineRequest, TimelineResponse};
 use super::tools::{
@@ -729,6 +737,7 @@ impl MempalMcpServer {
         session
     }
     pub fn with_external_ingest_writer_lease(mut self, lease: RuntimeWriterLease) -> Self {
+        self.async_queue = self.async_queue.with_lifecycle_writer_lease(lease.clone());
         self.external_ingest_writer_lease = Some(lease);
         self
     }
@@ -2918,13 +2927,12 @@ impl MempalMcpServer {
         if remaining_timeout.is_zero() {
             return Ok(None);
         }
-        match tokio::time::timeout(
-            remaining_timeout,
-            self.async_queue.operation_status(operation_id.to_string()),
-        )
-        .await
+        match self
+            .operation_lookup_within(operation_id, remaining_timeout)
+            .await?
         {
-            Ok(Ok(Some(record))) => {
+            Some(OperationLookup::Record(record)) => {
+                let record = *record;
                 let is_terminal = record
                     .op_state
                     .parse::<IngestOperationState>()
@@ -2945,15 +2953,15 @@ impl MempalMcpServer {
                 };
                 Ok(Some(operation_record_to_response(record, system_warnings)))
             }
-            Ok(Ok(None)) => Err(ErrorData::invalid_params(
+            Some(OperationLookup::SpoolPending) => Ok(Some(spool_pending_operation_response(
+                operation_id,
+                current_system_warnings(),
+            ))),
+            Some(OperationLookup::Missing) => Err(ErrorData::invalid_params(
                 format!("operation not found: {operation_id}"),
                 None,
             )),
-            Ok(Err(error)) => Err(ErrorData::internal_error(
-                format!("queue lookup failed: {error}"),
-                None,
-            )),
-            Err(_) => Ok(None),
+            None => Ok(None),
         }
     }
 
@@ -7867,20 +7875,7 @@ impl MempalMcpServer {
             crate::hook_ipc::HookIpcClientOutcome::Accepted => {
                 let operation_id =
                     PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &idempotency_key);
-                if self
-                    .daemon_admitted_operation_is_visible(&operation_id, request_deadline)
-                    .await?
-                {
-                    Ok(DaemonIngestEnqueue::Accepted { operation_id })
-                } else {
-                    tracing::warn!(
-                        operation_id,
-                        "daemon ingest enqueue ACK did not expose a queryable operation row; falling back to local idempotent admission"
-                    );
-                    Ok(DaemonIngestEnqueue::Fallback {
-                        may_have_reached_daemon: true,
-                    })
-                }
+                Ok(DaemonIngestEnqueue::Accepted { operation_id })
             }
             crate::hook_ipc::HookIpcClientOutcome::Fallback(reason) => {
                 let may_have_reached_daemon = reason.may_have_reached_daemon();
@@ -9159,27 +9154,33 @@ impl MempalMcpServer {
                     config.embed.model.clone().unwrap_or_default()
                 }
             });
+            let pattern_plans = inserted_drawer_ids
+                .iter()
+                .zip(vectors.iter())
+                .map(|(drawer_id, vector)| {
+                    let args = crate::core::patterns::PatternDetectionArgs {
+                        new_drawer_id: drawer_id,
+                        session_id,
+                        embedding: vector,
+                        project_id: project_id.as_deref(),
+                        model_id: &model_id,
+                        similarity_threshold: config.patterns.similarity_threshold,
+                        min_sessions: config.patterns.min_sessions,
+                        min_exemplars: config.patterns.min_exemplars,
+                        promote_threshold: config.patterns.promote_threshold,
+                        top_tags: 5,
+                    };
+                    let plan = crate::core::patterns::plan_pattern_detection(db.conn(), &args);
+                    (args, plan)
+                })
+                .collect::<Vec<_>>();
             with_mcp_runtime_writer_lease_write(
                 &db,
                 runtime_writer_lease,
                 "record MCP ingest pattern signal",
                 || {
-                    for (drawer_id_p, vector_p) in inserted_drawer_ids.iter().zip(vectors.iter()) {
-                        crate::core::patterns::run_pattern_detection(
-                            db.conn(),
-                            &crate::core::patterns::PatternDetectionArgs {
-                                new_drawer_id: drawer_id_p.as_str(),
-                                session_id,
-                                embedding: vector_p.as_slice(),
-                                project_id: project_id.as_deref(),
-                                model_id: &model_id,
-                                similarity_threshold: config.patterns.similarity_threshold,
-                                min_sessions: config.patterns.min_sessions,
-                                min_exemplars: config.patterns.min_exemplars,
-                                promote_threshold: config.patterns.promote_threshold,
-                                top_tags: 5,
-                            },
-                        );
+                    for (args, plan) in pattern_plans {
+                        crate::core::patterns::apply_pattern_detection(db.conn(), &args, plan);
                     }
                     Ok(())
                 },
@@ -9219,55 +9220,17 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<OperationStatusRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
-        let started_at = Instant::now();
-        let record = match tokio::time::timeout(
-            self.operation_status_deadline,
-            self.async_queue
-                .operation_status(request.operation_id.clone()),
-        )
-        .await
+        match self
+            .operation_status_json_within(&request.operation_id, self.operation_status_deadline)
+            .await?
         {
-            Ok(Ok(record)) => record,
-            Ok(Err(error)) => {
-                return Err(ErrorData::internal_error(
-                    format!("queue lookup failed: {error}"),
-                    None,
-                ));
-            }
-            Err(_) => {
-                return Err(mcp_stage_timeout_error(
-                    "mempal_operation_status",
-                    "queue lookup",
-                    self.operation_status_deadline,
-                ));
-            }
-        };
-
-        let record = record.ok_or_else(|| {
-            ErrorData::invalid_params(
-                format!("operation not found: {}", request.operation_id),
-                None,
-            )
-        })?;
-        let warning_budget = self
-            .operation_status_deadline
-            .checked_sub(started_at.elapsed())
-            .unwrap_or_default();
-        let system_warnings = if warning_budget.is_zero() {
-            current_system_warnings()
-        } else {
-            match tokio::time::timeout(
-                warning_budget,
-                self.system_warnings_with_stale_index_bounded(warning_budget),
-            )
-            .await
-            {
-                Ok(warnings) => warnings?,
-                Err(_) => current_system_warnings(),
-            }
-        };
-
-        Ok(Json(operation_record_to_response(record, system_warnings)))
+            Some(response) => Ok(Json(response)),
+            None => Err(mcp_stage_timeout_error(
+                "mempal_operation_status",
+                "queue lookup",
+                self.operation_status_deadline,
+            )),
+        }
     }
 
     #[tool(
@@ -13615,6 +13578,7 @@ mod tests {
     };
 
     mod context_scope_schema_tests;
+    mod daemon_queue_lease_fence_tests;
     mod delete_busy_retry_836_tests;
     mod delete_receipt_921_tests;
     mod ingest_receipt_tests;
@@ -14917,7 +14881,7 @@ quality_policy = "llm_required_for_keep"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_mcp_ingest_completes_local_fallback_when_daemon_ack_lacks_queryable_operation() {
+    async fn test_mcp_ingest_keeps_receipt_when_daemon_ack_precedes_visibility() {
         let (tempdir, db_path, server) = setup_server();
         let (listener, _socket_guard) =
             crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
@@ -14938,12 +14902,11 @@ quality_policy = "llm_required_for_keep"
         let response = server
             .mempal_ingest_with_controls(
                 IngestRequest {
-                    content: "daemon ACK without durable operation must complete local fallback"
-                        .to_string(),
+                    content: "daemon ACK precedes queue visibility".to_string(),
                     wing: "mcp".to_string(),
                     room: Some("receipt".to_string()),
                     wait: Some(true),
-                    wait_timeout_secs: Some(10),
+                    wait_timeout_secs: Some(1),
                     ..IngestRequest::default()
                 },
                 IngestControls {
@@ -14952,27 +14915,25 @@ quality_policy = "llm_required_for_keep"
                 },
             )
             .await
-            .expect("ingest admission should complete through local idempotent fallback")
+            .expect("durable ACK should return a followable receipt")
             .0;
 
         let request = daemon.await.expect("daemon IPC task");
-        assert_eq!(response.state, Some(IngestOperationState::Completed));
-        assert!(!response.timed_out);
-        assert!(
-            !response.created_drawer_ids.is_empty(),
-            "local fallback completion must expose cleanup-safe created ids"
-        );
         let operation_id = response.operation_id.as_deref().expect("operation id");
         assert_eq!(
             operation_id,
             PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &request.idempotency_key)
         );
-        let record = PendingMessageStore::new_without_reclaim(&db_path)
-            .operation_status(operation_id)
-            .expect("query operation")
-            .expect("returned operation id must be completed");
-        assert_eq!(record.id, operation_id);
-        assert_eq!(record.op_state, IngestOperationState::Completed.as_str());
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(response.timed_out);
+        assert!(response.created_drawer_ids.is_empty());
+        assert!(
+            PendingMessageStore::new_without_reclaim(&db_path)
+                .operation_status(operation_id)
+                .expect("query operation")
+                .is_none(),
+            "receipt handling must not create a local fallback duplicate"
+        );
     }
 
     #[cfg(unix)]

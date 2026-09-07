@@ -475,6 +475,9 @@ pub(crate) fn sync_directory(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+#[path = "ingress_spool_receipt.rs"]
+mod receipt;
+
 #[cfg(test)]
 mod tests {
     use super::*;

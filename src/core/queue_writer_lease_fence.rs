@@ -12,6 +12,12 @@ use super::{
 use crate::core::types::RuntimeWriterLease;
 
 impl AsyncPendingMessageStore {
+    /// Fence consumer lifecycle mutations without blocking durable producer enqueue.
+    pub fn with_lifecycle_writer_lease(mut self, lease: RuntimeWriterLease) -> Self {
+        self.inner.lifecycle_writer_lease = Some(lease);
+        self
+    }
+
     pub async fn enqueue_fenced(
         &self,
         lease: Option<RuntimeWriterLease>,
@@ -45,6 +51,23 @@ impl AsyncPendingMessageStore {
 }
 
 impl PendingMessageStore {
+    /// Fence consumer lifecycle mutations without blocking durable producer enqueue.
+    pub fn with_lifecycle_writer_lease(mut self, lease: RuntimeWriterLease) -> Self {
+        self.lifecycle_writer_lease = Some(lease);
+        self
+    }
+
+    pub(super) fn require_lifecycle_writer_lease(
+        &self,
+        conn: &Connection,
+        operation: &'static str,
+    ) -> Result<()> {
+        if let Some(lease) = &self.lifecycle_writer_lease {
+            require_runtime_writer_lease(conn, lease, operation)?;
+        }
+        Ok(())
+    }
+
     /// Enqueue under the same SQLite write lock that validates a runtime lease.
     pub fn enqueue_fenced(
         &self,
@@ -161,6 +184,7 @@ fn require_runtime_writer_lease(
         "SELECT EXISTS(
              SELECT 1 FROM runtime_writer_leases
              WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4
+               AND expires_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now')
          )",
         params![
             lease.name,
@@ -223,5 +247,113 @@ mod tests {
             .enqueue_fenced(Some(&current), "llm_task", "{}", "enqueue LLM task")
             .expect("current generation may enqueue");
         assert_eq!(store.stats().expect("queue stats").pending, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fenced_enqueue_rejects_expired_live_generation() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let store = PendingMessageStore::new(&db_path).expect("open queue");
+        let expired = db
+            .runtime_writer_lease_acquire_for_daemon_start("sqlite-writer", 120, None)
+            .expect("acquire daemon lease")
+            .expect("daemon lease available");
+        db.conn()
+            .execute(
+                "UPDATE runtime_writer_leases SET expires_at = '1970-01-01T00:00:00Z' \
+                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4",
+                params![
+                    &expired.name,
+                    &expired.owner,
+                    &expired.session_id,
+                    expired.generation as i64
+                ],
+            )
+            .expect("force lease expiry");
+
+        let error = store
+            .enqueue_fenced(Some(&expired), "llm_task", "{}", "enqueue LLM task")
+            .expect_err("expired live generation must not enqueue as lease owner");
+        assert!(matches!(
+            error,
+            QueueError::RuntimeWriterLeaseLost { generation, .. }
+                if generation == expired.generation
+        ));
+        assert_eq!(store.stats().expect("queue stats").pending, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queue_lifecycle_requires_current_unexpired_generation_and_recovers_claim() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let store = PendingMessageStore::new(&db_path).expect("open queue");
+        let message_id = store
+            .enqueue(INGEST_ASYNC_KIND, "{}")
+            .expect("durable enqueue is independent of lifecycle lease");
+        let stale = db
+            .runtime_writer_lease_acquire_for_daemon_start("sqlite-writer", 120, None)
+            .expect("acquire daemon lease")
+            .expect("daemon lease available");
+        let stale_store = store.clone().with_lifecycle_writer_lease(stale.clone());
+        let first_claim = stale_store
+            .claim_next_by_kind("old-worker", 60, INGEST_ASYNC_KIND)
+            .expect("valid generation may claim")
+            .expect("queued ingest");
+        assert_eq!(first_claim.id, message_id);
+        db.conn()
+            .execute(
+                "UPDATE runtime_writer_leases SET expires_at = '1970-01-01T00:00:00Z' \
+                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4",
+                params![
+                    &stale.name,
+                    &stale.owner,
+                    &stale.session_id,
+                    stale.generation as i64
+                ],
+            )
+            .expect("force lease expiry");
+
+        let rejected_lifecycle = [
+            stale_store.confirm(&first_claim),
+            stale_store.complete_operation(&first_claim, "completed", None, None, None, None),
+            stale_store.mark_failed(&first_claim, "retry"),
+            stale_store.release_claim(&first_claim),
+        ];
+        assert!(rejected_lifecycle.into_iter().all(|result| matches!(
+            result,
+            Err(QueueError::RuntimeWriterLeaseLost { generation, .. })
+                if generation == stale.generation
+        )));
+        let current = db
+            .runtime_writer_lease_acquire("sqlite-writer", "new", "daemon", 120, None)
+            .expect("explicit takeover")
+            .expect("expired generation is replaceable by explicit policy");
+        assert!(current.generation > stale.generation);
+        assert!(matches!(
+            stale_store.refresh_heartbeat(&first_claim.id, "old-worker"),
+            Err(QueueError::RuntimeWriterLeaseLost { generation, .. })
+                if generation == stale.generation
+        ));
+
+        db.conn()
+            .execute(
+                "UPDATE pending_messages SET heartbeat_at = 0 WHERE id = ?1",
+                [&message_id],
+            )
+            .expect("make abandoned claim reclaimable");
+        let current_store = store.with_lifecycle_writer_lease(current);
+        let recovered = current_store
+            .claim_next_by_kind("new-worker", 0, INGEST_ASYNC_KIND)
+            .expect("current generation may reclaim")
+            .expect("abandoned durable ingest is recovered");
+        assert_eq!(recovered.id, message_id);
+        current_store
+            .release_claim(&recovered)
+            .expect("current generation may release recovered claim");
+        assert_eq!(current_store.stats().expect("queue stats").pending, 1);
     }
 }

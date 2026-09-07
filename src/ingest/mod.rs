@@ -771,24 +771,28 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
                     }
                 });
                 let session_id = source_file.as_str();
+                let pattern_args = crate::core::patterns::PatternDetectionArgs {
+                    new_drawer_id: &drawer_id,
+                    session_id,
+                    embedding: &vector,
+                    project_id: options.project_id,
+                    model_id: &model_id,
+                    similarity_threshold: config_snap.patterns.similarity_threshold,
+                    min_sessions: config_snap.patterns.min_sessions,
+                    min_exemplars: config_snap.patterns.min_exemplars,
+                    promote_threshold: config_snap.patterns.promote_threshold,
+                    top_tags: 5,
+                };
+                let pattern_plan =
+                    crate::core::patterns::plan_pattern_detection(db.conn(), &pattern_args);
                 db.with_runtime_writer_lease_write(
                     runtime_writer_lease,
                     "record pattern signal",
                     || {
-                        crate::core::patterns::run_pattern_detection(
+                        crate::core::patterns::apply_pattern_detection(
                             db.conn(),
-                            &crate::core::patterns::PatternDetectionArgs {
-                                new_drawer_id: &drawer_id,
-                                session_id,
-                                embedding: &vector,
-                                project_id: options.project_id,
-                                model_id: &model_id,
-                                similarity_threshold: config_snap.patterns.similarity_threshold,
-                                min_sessions: config_snap.patterns.min_sessions,
-                                min_exemplars: config_snap.patterns.min_exemplars,
-                                promote_threshold: config_snap.patterns.promote_threshold,
-                                top_tags: 5,
-                            },
+                            &pattern_args,
+                            pattern_plan,
                         );
                         Ok(())
                     },

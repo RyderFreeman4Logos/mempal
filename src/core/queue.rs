@@ -326,6 +326,7 @@ pub struct PendingMessageStore {
     db_path: PathBuf,
     config: QueueConfig,
     connection_cache: ConnectionCache,
+    lifecycle_writer_lease: Option<super::types::RuntimeWriterLease>,
 }
 
 /// Bounded async facade for [`PendingMessageStore`].
@@ -783,6 +784,7 @@ impl PendingMessageStore {
             db_path: path.as_ref().to_path_buf(),
             config,
             connection_cache: ConnectionCache::new(),
+            lifecycle_writer_lease: None,
         };
         store.reclaim_stale(STARTUP_RECLAIM_STALE_SECS)?;
         Ok(store)
@@ -793,6 +795,7 @@ impl PendingMessageStore {
             db_path: self.db_path.clone(),
             config: self.config,
             connection_cache: ConnectionCache::new(),
+            lifecycle_writer_lease: self.lifecycle_writer_lease.clone(),
         }
     }
 
@@ -1115,6 +1118,7 @@ impl PendingMessageStore {
     ) -> Result<Option<ClaimedMessage>> {
         self.with_claim_connection(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            self.require_lifecycle_writer_lease(&tx, "claim queued message")?;
             reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
 
             let now = now_secs();
@@ -1213,6 +1217,7 @@ impl PendingMessageStore {
     ) -> Result<Option<ClaimedMessage>> {
         self.with_claim_connection(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            self.require_lifecycle_writer_lease(&tx, "claim queued message by id")?;
             reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
 
             let now = now_secs();
@@ -1282,6 +1287,7 @@ impl PendingMessageStore {
     pub fn confirm(&self, claim: &ClaimedMessage) -> Result<()> {
         self.with_connection(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            self.require_lifecycle_writer_lease(&tx, "confirm queued message")?;
             confirm_in_tx(&tx, claim, "completed")?;
             tx.commit()?;
             Ok(())
@@ -1318,6 +1324,7 @@ impl PendingMessageStore {
     ) -> Result<()> {
         self.with_connection_with_busy_timeout(busy_timeout, |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            self.require_lifecycle_writer_lease(&tx, "complete queued operation")?;
             let result_drawer_id = completion.result_drawer_id.as_deref();
             let rejected_reason = completion.rejected_reason.as_deref();
             let failure_detail = completion.failure_detail.as_deref();
@@ -1373,6 +1380,7 @@ impl PendingMessageStore {
     ) -> Result<()> {
         self.with_connection(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            self.require_lifecycle_writer_lease(&tx, "requeue or fail queued message")?;
             let redacted_error = sanitize_last_error(error);
             let current_retry = match tx
                 .query_row(
@@ -1586,6 +1594,7 @@ impl PendingMessageStore {
                 conn.busy_timeout(timeout)?;
             }
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            self.require_lifecycle_writer_lease(&tx, "release queued message claim")?;
             let updated = tx.execute(
                 r#"
                 UPDATE pending_messages
@@ -1626,7 +1635,9 @@ impl PendingMessageStore {
         let claim_prefix = format!("{worker_id}:");
         let now = now_secs();
         self.with_connection(|conn| {
-            let updated = conn.execute(
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            self.require_lifecycle_writer_lease(&tx, "refresh queued message heartbeat")?;
+            let updated = tx.execute(
                 r#"
                 UPDATE pending_messages
                 SET heartbeat_at = ?2
@@ -1639,6 +1650,7 @@ impl PendingMessageStore {
             if updated == 0 {
                 return Err(QueueError::MessageNotFound(id.to_string()));
             }
+            tx.commit()?;
             Ok(())
         })
     }

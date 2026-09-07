@@ -484,6 +484,30 @@ async fn mcp_lifecycle_timeouts_reap_hostile_children() -> Result<()> {
 }
 
 #[tokio::test]
+async fn mcp_cleanup_reserve_starts_when_cleanup_begins() -> Result<()> {
+    let _process_lock = local_gate_child::PROCESS_LIFECYCLE_TEST_LOCK.lock().await;
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command.args(["-c", "trap '' TERM; while IFS= read -r _; do :; done"]);
+    let mut client = McpStdio::spawn_command(&mut command)?;
+    let expired = tokio::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    let cleanup = client.fence_process_group_and_reap(expired, None).await;
+    if !client.is_reaped() {
+        client
+            .fence_process_group_and_reap(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                None,
+            )
+            .await
+            .context("recover child after failed cleanup-reserve assertion")?;
+    }
+    cleanup.context("cleanup must retain its reserve after timeout observation")?;
+    assert!(client.is_reaped(), "expired-deadline child was not reaped");
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_drop_fences_descendant_after_malformed_initialize() -> Result<()> {
     let _process_lock = local_gate_child::PROCESS_LIFECYCLE_TEST_LOCK.lock().await;
     let tempdir = TempDir::new_in("/tmp").context("create malformed MCP test directory")?;
