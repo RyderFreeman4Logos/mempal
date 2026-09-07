@@ -293,6 +293,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         });
     }
     let worker_id = writer_lease.lease().owner.clone();
+    let consumer_store = bind_daemon_consumer_store(&context.store, writer_lease.lease());
     let claim_ttl_secs = context.config.hooks.daemon_claim_ttl_secs as i64;
     let poll_interval = Duration::from_millis(context.config.hooks.daemon_poll_interval_ms);
     let stall_watchdog_handle = spawn_stall_watchdog(
@@ -319,7 +320,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         .then(|| HookLlmGateRuntime::new(&context.config.llm));
     let llm_worker_handles: Vec<tokio::task::JoinHandle<_>> = if let Some(llm_gate) = &llm_gate {
         let num_workers = context.config.llm.pool_capacity();
-        let llm_store = Arc::new(context.store.clone());
+        let llm_store = Arc::new(consumer_store.clone());
         let llm_client_runtime = llm_gate.client_runtime.clone();
         let llm_status = llm_gate.status.clone();
         let async_db = context.async_db.clone();
@@ -357,7 +358,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     let hook_worker_state = HookWorkerState {
         async_db: context.async_db.clone(),
         db_path: db_path.clone(),
-        store: context.store.clone(),
+        store: consumer_store,
         worker_id: worker_id.clone(),
         embedder: Arc::clone(&embedder),
         prototype_classifier: Arc::clone(&prototype_classifier),
@@ -482,6 +483,13 @@ struct HookWorkerState {
     runtime_writer_lease: Option<RuntimeWriterLease>,
     #[cfg(test)]
     idle_observer: Option<Arc<Notify>>,
+}
+
+fn bind_daemon_consumer_store(
+    store: &AsyncPendingMessageStore,
+    lease: &RuntimeWriterLease,
+) -> AsyncPendingMessageStore {
+    store.clone().with_lifecycle_writer_lease(lease.clone())
 }
 
 #[derive(Clone)]
@@ -3762,6 +3770,10 @@ mod mcp_ingest_tests;
 #[cfg(test)]
 #[path = "daemon_stall_watchdog_tests.rs"]
 mod daemon_stall_watchdog_tests;
+
+#[cfg(test)]
+#[path = "daemon_consumer_store_tests.rs"]
+mod daemon_consumer_store_tests;
 
 #[cfg(all(test, feature = "rest", unix))]
 mod rest_readiness_tests;
