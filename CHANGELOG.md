@@ -26,7 +26,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - Context isolate embed env HTTP CL (#1080,#1082).
 - Daemon SQLite writer lease waits past capped maintenance `remaining_secs` not exit 75; incompatible `mcp-ingest-worker` holders refused (#916,#849).
-- Writer diagnostics sample claim contention and retire owner generations (#1105); spool/pattern/lease/hook (#945/#1103/#986/#1000/#987/#1106/#1107).
+- Sample contention, retire owners, prune excess telemetry (#1105); spool/pattern/lease/hook (#945/#1103/#986/#1000/#987/#1106/#1107).
 - Cited-recall latest-decision walks the full successor chain, filters context the same way, and requires a live correction/continuation citation (#898).
 - Codex snapshots atomically remove superseded turns/vectors and fail closed on ambiguity (#896).
 - MCP search shares a deadline and releases reads before responding (#881).

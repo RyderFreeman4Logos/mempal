@@ -751,8 +751,8 @@ fn prune_operation_telemetry(conn: &Connection, now_unix_ms: i64) -> Result<()> 
         WHERE rowid IN (
             SELECT rowid
             FROM operation_telemetry
-            ORDER BY started_at_unix_ms DESC, rowid DESC
-            LIMIT -1 OFFSET ?1
+            ORDER BY started_at_unix_ms, rowid
+            LIMIT MAX(0,(SELECT COUNT(*) FROM operation_telemetry)-?1)
         )
         "#,
         params![OPERATION_TELEMETRY_MAX_ROWS],
