@@ -97,6 +97,41 @@ async fn test_llm_router_primary_5xx_falls_back_to_secondary_success() {
 }
 
 #[tokio::test]
+async fn test_llm_router_model_404_falls_back_to_secondary_success() {
+    let mut primary = Server::new_async().await;
+    let mut secondary = Server::new_async().await;
+    let primary_mock = primary
+        .mock("POST", "/v1/chat/completions")
+        .with_status(404)
+        .with_body("model not found")
+        .expect(1)
+        .create_async()
+        .await;
+    let secondary_mock = secondary
+        .mock("POST", "/v1/chat/completions")
+        .match_body(Matcher::PartialJson(serde_json::json!({
+            "model": "secondary-model"
+        })))
+        .with_status(200)
+        .with_body(success_body("secondary-model", "ok-after-model-miss"))
+        .expect(1)
+        .create_async()
+        .await;
+    let router =
+        LlmRouter::from_config(&endpoint_pool_config(&primary, &secondary)).expect("build router");
+
+    let response = router
+        .chat_completion(&request(), None)
+        .await
+        .expect("fallback response after endpoint-specific model miss");
+
+    primary_mock.assert_async().await;
+    secondary_mock.assert_async().await;
+    assert_eq!(response.endpoint_id, "secondary");
+    assert_eq!(response.endpoint_model, "secondary-model");
+}
+
+#[tokio::test]
 async fn test_llm_router_408_falls_back_to_secondary_success() {
     let mut primary = Server::new_async().await;
     let mut secondary = Server::new_async().await;

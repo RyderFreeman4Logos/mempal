@@ -181,7 +181,7 @@ fn should_try_next_endpoint(error: &LlmError) -> bool {
         LlmError::ClientError { status, .. } => {
             matches!(
                 *status,
-                StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
+                StatusCode::NOT_FOUND | StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
             )
         }
         LlmError::DecodeResponse(_)

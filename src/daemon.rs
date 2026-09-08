@@ -2490,13 +2490,31 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     }
     if !gating_audit_recorded && automatic_hook_llm_gate_required(context.daemon.config) {
         let classifier_decision = gating_decision.clone();
-        let llm_decision = judge_automatic_hook_llm_gate(
+        let llm_decision = match judge_automatic_hook_llm_gate(
             context,
             &drawer_id,
             &candidate.content,
             Some(&llm_heartbeat),
         )
-        .await?;
+        .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                if queue_failure_disposition(&error) == QueueFailureDisposition::Terminal {
+                    admission::soft_delete_model_rejected_admission(
+                        context.db,
+                        context.daemon.runtime_writer_lease,
+                        &drawer_id,
+                        admission_owner,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("failed to reconcile terminal hook admission after: {error:#}")
+                    })?;
+                }
+                return Err(error);
+            }
+        };
         let audit_decision = classifier_decision
             .as_ref()
             .map(|decision| audit_decision_with_llm_outcome(decision, &llm_decision))
@@ -3810,7 +3828,7 @@ mod tests {
 
     use crate::core::{
         AsyncDb,
-        config::{Config, LlmJudgeConfig, TurnStorageMode},
+        config::{Config, LlmEndpointConfig, LlmJudgeConfig, TurnStorageMode},
         db::Database,
         queue::{
             AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore, QueueError,
@@ -5907,10 +5925,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_automatic_hook_default_score_keep_precedes_durable_insert() {
+    async fn test_automatic_hook_model_404_fallback_records_one_default_keep_verdict() {
         let worker_test_lock = crate::llm::acquire_llm_worker_test_lock();
         let _shutdown_lock = super::global_shutdown_test_lock().lock_owned().await;
         let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut primary_server = mockito::Server::new_async().await;
+        let primary_mock = primary_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(404)
+            .with_body("primary model missing")
+            .expect(1)
+            .create_async()
+            .await;
         let mut llm_server = mockito::Server::new_async().await;
         let llm_mock = llm_server
             .mock("POST", "/v1/chat/completions")
@@ -5918,6 +5944,7 @@ mod tests {
             .with_body(
                 r#"{"model":"test-llm","choices":[{"message":{"role":"assistant","content":"{\"score\":0.95,\"reason\":\"important design note\"}"}}]}"#,
             )
+            .expect(1)
             .create_async()
             .await;
         let db_path = tmp.path().join("palace.db");
@@ -5956,8 +5983,20 @@ mod tests {
 
         let mut config = Config::default();
         config.llm.enabled = true;
-        config.llm.base_url = Some(format!("{}/v1", llm_server.url()));
-        config.llm.model = Some("test-llm".to_string());
+        config.llm.endpoints = vec![
+            LlmEndpointConfig {
+                id: Some("primary".to_string()),
+                base_url: Some(format!("{}/v1", primary_server.url())),
+                model: Some("missing-primary".to_string()),
+                ..LlmEndpointConfig::default()
+            },
+            LlmEndpointConfig {
+                id: Some("secondary".to_string()),
+                base_url: Some(format!("{}/v1", llm_server.url())),
+                model: Some("test-llm".to_string()),
+                ..LlmEndpointConfig::default()
+            },
+        ];
         config.llm.enabled_for = vec!["gating".to_string()];
         config.ingest_gating.enabled = true;
         config.ingest_gating.embedding_classifier.enabled = true;
@@ -5998,6 +6037,7 @@ mod tests {
         .await
         .expect("process hook envelope");
 
+        primary_mock.assert_async().await;
         llm_mock.assert_async().await;
         assert_eq!(embedder.embed_calls.load(Ordering::SeqCst), 1);
         assert!(
