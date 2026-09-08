@@ -16579,6 +16579,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_ingest_admission_warning_uses_request_budget_and_returns_receipt() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, _db_path, server) = setup_server();
         let server = server
             .with_ingest_warning_snapshot_delay_for_test(Duration::from_millis(150))
