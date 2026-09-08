@@ -25,23 +25,23 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ### Fixed
 
 - Context isolate embed env HTTP CL (#1080,#1082).
-- Daemon SQLite writer lease waits past capped maintenance `remaining_secs` rather than exit 75; incompatible `mcp-ingest-worker` holders remain refused (#916, #849).
-- Writer diagnostics sample immediate claim contention and retire finished owner generations safely (#1105); spool/pattern/lease/hook fixes (#945/#1103/#986/#1000/#987/#1106/#1107).
+- Daemon SQLite writer lease waits past capped maintenance `remaining_secs` not exit 75; incompatible `mcp-ingest-worker` holders refused (#916,#849).
+- Writer diagnostics sample claim contention and retire owner generations (#1105); spool/pattern/lease/hook (#945/#1103/#986/#1000/#987/#1106/#1107).
 - Cited-recall latest-decision walks the full successor chain, filters context the same way, and requires a live correction/continuation citation (#898).
 - Codex snapshots atomically remove superseded turns/vectors and fail closed on ambiguity (#896).
 - MCP search shares a deadline and releases reads before responding (#881).
 - Typed/redacted MCP admission and audit-write diagnostics (#879).
 - Daemon pidfile validates identity; scoped ingest release honors remaining retry budget (#885/#895).
-- Profile locks retain byte-budget rejection and suite-load isolation; Busy waits stay non-budget (#893/#947/#1064–#1075, #934/#1077/#1078).
-- Diagnostic readonly queue stats no longer inherit SQLite's default 5s busy wait: a `queue_stats_readonly` read under a held writer lock now returns a bounded lock diagnostic instead of stalling (#911).
+- Profile locks retain byte-budget rejection and suite-load isolation; Busy waits non-budget (#893,#947,#1064–#1075,#934/#1077/#1078).
+- Diagnostic readonly queue stats skip SQLite 5s busy wait: `queue_stats_readonly` under held writer lock returns a bounded lock diagnostic not stall (#911).
 
 - **Daemon readiness CLI tests**: shared Linux supervisor for bounded redacted lifecycle handling (#892).
 
-- **Hermes receipts**: scoped smoke ingest inline; live-daemon polls `created_drawer_ids`; `chunk_count` keeps IDs; same-op partial retry; smoke skips REST retry on followable update; soft-deleted `mempal_delete` succeeds; cleanup IDs survive CLI/MCP/REST decode; breaker-open conclude replay is pending success, not tool error; open REST/Hermes breakers admit typed/redacted `mempal_search`/`mempal_profile`; daemon down ≥100 pending → `doctor`/`status`/MCP doctor high-severity availability; unreadable config/queue stats/unverified PIDs → privacy-safe `unavailable`; recovery: drain, terminal failures, no DB edits; saturated MCP holder-budget no-write receipts and owner-bound smoke cleanup prevent false/cross-op cleanup IDs; MCP empty/invalid/failed roots → no project (#871,#876,#888,#918,#921,#923,#924,#927,#936,#1096,#1101).
+- **Hermes receipts**: scoped smoke ingest; live-daemon polls `created_drawer_ids`; `chunk_count` keeps IDs; same-op partial retry; smoke skips REST retry on followable update; soft-deleted `mempal_delete` succeeds; cleanup IDs survive CLI/MCP/REST; breaker-open conclude replay pending success not tool error; keyed FIFO; quarantine corrupt head (worker lives); GET exact receipt identity; GET-only no POST-breaker reset; open-breaker ≤1 probe; open REST/Hermes breakers admit typed/redacted `mempal_search`/`mempal_profile`; daemon down ≥100 pending → `doctor`/`status`/MCP high-severity; unreadable config/queue/PIDs → privacy-safe `unavailable`; drain/terminal failures, no DB edits; saturated MCP holder-budget no-write receipts and owner-bound smoke cleanup prevent false/cross-op IDs; MCP empty/invalid/failed roots → no project (#871,#876,#888,#918,#921,#923,#924,#927,#936,#1096,#1101,#1000).
 
 - **Daemon SQLite busy**: lease retries Busy/locked (#929); startup lock exits 75; systemd avoids extra-MCP churn (#931); REST install recycles daemon (#928, #940); default `rest` (#1091); Hermes writes authoritative; local conclusions avoid breaker retrips (#941).
 - **MCP search deadlines**: bounds embed/DB/route; no 240s hangs.
-- **Hermetic daemon tests**: isolate REST/MCP/ingest-wait/mark-failed/dashboard from live `:3080`; timeout cleanup reaps trees, authenticates sccache, readiness handshake, absent /proc as exit; ingest admission-warning fixture locks worker lifecycle before setup_server (#988,#989,#973,#991,#993,#1011,#1108,#1110,#1115).
+- **Hermetic daemon tests**: isolate REST/MCP/ingest-wait/mark-failed/dashboard from live `:3080`; timeout reaps trees, authenticates sccache, readiness handshake, absent /proc as exit; ingest admission-warning fixture locks worker before setup_server (#988,#989,#973,#991,#993,#1011,#1108,#1110,#1115).
 - Lease #882/#889/#890,#944/#956,#958/#961/#962/#965/#971/#975/#976/#968,#1013,#1010,#1009,#1008,#1023/#1024,#1006/#1007,#1027,#1005,#1029,#1004,#1031,#980,#1003,#1002,#1001,#1035,#999,#998,#1037,#1038,#997,#996,#994,#1044,#990,#984,#1047,#970,#1049,#1050,#1051,#1040,#1054/#1059/#1060
 - **MCP delete retry**: force SQLite Busy before synchronized lock release (#886).
 
