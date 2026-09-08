@@ -344,10 +344,10 @@ class MempalMemoryProvider:
             return
         if outcome is None:
             return
-        if outcome.completed and outcome.write_admitted:
+        if outcome.write_admitted:
             self._record_success()
             self._update_health(True)
-        elif outcome.error_class and classify_replay_error(
+        if outcome.error_class and classify_replay_error(
             outcome.error_class
         ).count_failure:
             self._record_failure()
@@ -1033,13 +1033,12 @@ class MempalMemoryProvider:
                     transport_allowed=not self._is_breaker_open(),
                     replay_allowed=lambda: not self._is_breaker_open(),
                 )
-                if result.stored:
-                    if result.write_admitted:
-                        try:
-                            self._record_success()
-                        except Exception:
-                            logger.warning("mempal conclude success bookkeeping failed")
-                else:
+                if result.write_admitted:
+                    try:
+                        self._record_success()
+                    except Exception:
+                        logger.warning("mempal conclude success bookkeeping failed")
+                if not result.stored:
                     conclude_side_effects(self, result.payload)
                 return json.dumps(result.payload)
             except Exception as exc:

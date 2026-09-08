@@ -357,12 +357,12 @@ def authoritative_memory_write(
         )
     except Exception:
         outcome = None
+    if outcome is not None and outcome.write_admitted:
+        try:
+            self._record_success()
+        except Exception:
+            logger.warning("mempal authoritative write success bookkeeping failed")
     if outcome is not None and outcome.completed and outcome.drawer_id:
-        if outcome.write_admitted:
-            try:
-                self._record_success()
-            except Exception:
-                logger.warning("mempal authoritative write success bookkeeping failed")
         return json.dumps({
             "success": True,
             "drawer_id": outcome.drawer_id,

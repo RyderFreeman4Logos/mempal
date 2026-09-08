@@ -45,6 +45,39 @@ def _admit_conclusion(
     _set_receipt(provider._write_spool, operation_key, operation_id)
 
 
+def _call_write(provider: RecordingProvider, caller: str, operation_key=None) -> str:
+    assert provider._write_spool is not None
+    if caller == "background":
+        if operation_key is None:
+            operation_key = provider._write_spool.admit(
+                "ingest",
+                {"content": "pending value"},
+                action="raw_turn",
+            ).operation_key
+        else:
+            with sqlite3.connect(provider._write_spool.path) as connection:
+                connection.execute(
+                    "UPDATE write_operations SET next_attempt_at = 0 "
+                    "WHERE operation_key = ?",
+                    (operation_key,),
+                )
+        provider._replay_spooled_write()
+        return operation_key
+    if caller == "conclude":
+        args = {"conclusion": "pending conclusion"}
+        if operation_key is not None:
+            args["operation_key"] = operation_key
+        result = json.loads(provider.handle_tool_call("mempal_conclude", args))
+        return str(
+            result.get("operation_key") or result["error_details"]["operation_key"]
+        )
+    args = {"action": "add", "target": "user", "content": "pending value"}
+    if operation_key is not None:
+        args["operation_key"] = operation_key
+    result = json.loads(provider.authoritative_memory_write(args))
+    return str(result["operation_key"])
+
+
 class ReplayReviewRegressionTests(unittest.TestCase):
     def test_breaker_open_corrupt_head_keeps_worker_alive_and_replays_next_row(
         self,
@@ -296,6 +329,114 @@ class ReplayReviewRegressionTests(unittest.TestCase):
                 )
                 self.assertNotIn("result", fresh)
                 self.assertEqual(provider.posts, [])
+                provider.shutdown()
+
+    def test_post_admission_resets_breaker_before_later_settlement_at_all_callers(
+        self,
+    ) -> None:
+        for caller in ("background", "conclude", "authoritative"):
+            for first_status in ("queued", "running", "get_error"):
+                with self.subTest(caller=caller, first_status=first_status):
+                    provider = RecordingProvider()
+                    provider.initialize("session-a", user_id="alice", profile="work")
+                    provider._start_write_worker = lambda: None
+                    provider._conclude_wait_timeout = 0.0
+                    assert provider._write_spool is not None
+                    original_post = provider._post
+                    original_get = provider._get
+                    allow_completion = [False]
+
+                    def post(
+                        path,
+                        body,
+                        original_post=original_post,
+                        provider=provider,
+                        first_status=first_status,
+                    ):
+                        receipt = original_post(path, body)
+                        operation_id = receipt["operation_id"]
+                        provider.durable_status[operation_id] = {
+                            "operation_id": operation_id,
+                            "state": (
+                                "queued"
+                                if first_status == "get_error"
+                                else first_status
+                            ),
+                        }
+                        return receipt
+
+                    def get(
+                        path,
+                        params=None,
+                        first_status=first_status,
+                        allow_completion=allow_completion,
+                        original_get=original_get,
+                    ):
+                        if (
+                            first_status == "get_error"
+                            and not allow_completion[0]
+                            and path.startswith("/api/operations/")
+                        ):
+                            raise TimeoutError("status unavailable")
+                        return original_get(path, params)
+
+                    provider._post = post
+                    provider._get = get
+                    for _ in range(4):
+                        provider._record_failure()
+
+                    operation_key = _call_write(provider, caller)
+                    expected_failures = 1 if first_status == "get_error" else 0
+                    self.assertEqual(
+                        provider._backoff._read_state().failure_count,
+                        expected_failures,
+                    )
+                    operation_id = f"operation_{operation_key}"
+                    provider.durable_status[operation_id] = {
+                        "operation_id": operation_id,
+                        "state": "completed",
+                        "drawer_id": f"drawer-{caller}-{first_status}",
+                    }
+                    allow_completion[0] = True
+                    _call_write(provider, caller, operation_key)
+                    settled = provider._write_spool.get(operation_key)
+                    self.assertIsNotNone(settled)
+                    assert settled is not None
+                    self.assertIsNotNone(settled.settled_at)
+                    self.assertEqual(len(provider.posts), 1)
+                    self.assertEqual(
+                        provider._backoff._read_state().failure_count,
+                        expected_failures,
+                    )
+                    provider._record_failure()
+                    self.assertEqual(
+                        provider._backoff._read_state().failure_count,
+                        expected_failures + 1,
+                    )
+                    self.assertFalse(provider._is_breaker_open())
+                    provider.shutdown()
+
+    def test_invalid_post_receipt_never_resets_breaker_at_any_caller(self) -> None:
+        for caller in ("background", "conclude", "authoritative"):
+            with self.subTest(caller=caller):
+                provider = RecordingProvider()
+                provider.initialize("session-a", user_id="alice", profile="work")
+                provider._start_write_worker = lambda: None
+                provider._conclude_wait_timeout = 0.0
+                assert provider._write_spool is not None
+
+                def invalid_post(path, body, provider=provider):
+                    provider.posts.append((path, dict(body)))
+                    return {}
+
+                provider._post = invalid_post
+                for _ in range(4):
+                    provider._record_failure()
+
+                _call_write(provider, caller)
+                self.assertEqual(provider._backoff._read_state().failure_count, 5)
+                self.assertTrue(provider._is_breaker_open())
+                self.assertEqual(len(provider.posts), 1)
                 provider.shutdown()
 
     def test_open_breaker_queued_and_running_receipts_poll_once_and_honor_backoff(

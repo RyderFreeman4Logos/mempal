@@ -148,6 +148,7 @@ def submit_conclusion(
     single_status_probe = retrying and not transport_allowed
     operation_id: Optional[str] = None
     state = "local_admitted"
+    write_admitted = False
     while True:
         outcome = spool.replay_operation_key(
             key,
@@ -162,7 +163,8 @@ def submit_conclusion(
                 operation_id,
                 key,
                 state,
-            ))
+            ), write_admitted=write_admitted)
+        write_admitted = write_admitted or outcome.write_admitted
         operation_id = outcome.operation_id or operation_id
         if outcome.error_class == "breaker_open":
             return ConcludeResult(False, _retry_payload(
@@ -171,14 +173,14 @@ def submit_conclusion(
                 key,
                 "local_admitted",
                 "breaker_open",
-            ))
+            ), write_admitted=write_admitted)
         if outcome.completed and outcome.drawer_id:
             return ConcludeResult(True, {
                 "result": "Fact stored.",
                 "operation_id": operation_id or "",
                 "operation_key": key,
                 "drawer_id": outcome.drawer_id,
-            }, write_admitted=outcome.write_admitted)
+            }, write_admitted=write_admitted)
         error_class = outcome.error_class
         if error_class and error_class.startswith("terminal_"):
             state = error_class.removeprefix("terminal_")
@@ -190,7 +192,7 @@ def submit_conclusion(
                 error_class,
                 outcome.error_details,
                 retry_safe=False,
-            ))
+            ), write_admitted=write_admitted)
         if error_class in {"operation_key_conflict", "malformed_spool_row"}:
             return ConcludeResult(False, _retry_payload(
                 error_class,
@@ -200,7 +202,7 @@ def submit_conclusion(
                 error_class,
                 outcome.error_details,
                 retry_safe=False,
-            ))
+            ), write_admitted=write_admitted)
         if error_class and error_class.startswith("status_"):
             state = error_class.removeprefix("status_")
             kind = (
@@ -230,7 +232,7 @@ def submit_conclusion(
                 error_class,
                 outcome.error_details,
                 retry_safe=retry_safe,
-            ))
+            ), write_admitted=write_admitted)
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 

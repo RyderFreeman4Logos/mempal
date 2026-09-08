@@ -418,12 +418,12 @@ class WriteSpoolReplay:
                         "request": request,
                     },
                 )
-                write_admitted = True
                 if not isinstance(receipt, dict):
                     raise RuntimeError("durable admission returned an invalid receipt")
                 operation_id = str(receipt.get("operation_id") or "")
                 if not operation_id:
                     raise RuntimeError("durable admission omitted operation_id")
+                write_admitted = True
                 self.record_receipt(operation.operation_key, operation_id, claim_token)
                 route = f"/api/operations/{operation_id}"
                 status = get(route)
@@ -491,6 +491,7 @@ class WriteSpoolReplay:
                 error_class=error_class,
                 operation_id=operation_id,
                 quarantined=quarantined,
+                write_admitted=write_admitted,
             )
         except ClaimLostError:
             return ReplayOutcome(
@@ -498,6 +499,7 @@ class WriteSpoolReplay:
                 completed=False,
                 error_class="claim_lost",
                 operation_id=operation_id,
+                write_admitted=write_admitted,
             )
         except Exception as exc:
             error_class = classify_write_error(exc)
@@ -520,6 +522,7 @@ class WriteSpoolReplay:
                     completed=False,
                     error_class="claim_lost",
                     operation_id=operation_id,
+                    write_admitted=write_admitted,
                 )
             return ReplayOutcome(
                 operation,
@@ -528,4 +531,5 @@ class WriteSpoolReplay:
                 operation_id=operation_id,
                 quarantined=quarantined,
                 error_details=error_details,
+                write_admitted=write_admitted,
             )
