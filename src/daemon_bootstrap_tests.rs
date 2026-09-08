@@ -406,7 +406,7 @@ fn daemon_storage_open_skips_queue_reclaim_while_writer_is_busy() {
 }
 
 #[test]
-fn sqlite_busy_start_failure_uses_temporary_refusal_status() {
+fn sqlite_busy_start_failure_does_not_use_temporary_refusal_status() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     drop(Database::open(&db_path).expect("initialize database"));
@@ -430,8 +430,8 @@ fn sqlite_busy_start_failure_uses_temporary_refusal_status() {
 
     assert_eq!(
         temporary_refusal_exit_status(&error),
-        Some(DAEMON_TEMPORARY_ADMISSION_REFUSAL_EXIT_STATUS),
-        "a persistent startup SQLite busy must fail closed instead of entering a restart loop"
+        None,
+        "raw startup SQLite BUSY must not map to temporary-refusal 75"
     );
 }
 
