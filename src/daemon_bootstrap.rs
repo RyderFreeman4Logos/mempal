@@ -74,13 +74,12 @@ impl std::fmt::Display for DaemonWriterLeaseHeld {
 }
 impl std::error::Error for DaemonWriterLeaseHeld {}
 /// Returns the stable temporary-refusal process exit status when `error` was
-/// caused by a temporary daemon admission refusal or startup SQLite contention.
+/// caused by a typed temporary daemon admission refusal.
 pub fn temporary_refusal_exit_status(error: &anyhow::Error) -> Option<i32> {
-    (is_sqlite_lock_error(error)
-        || error.chain().any(|cause| {
-            cause.is::<DaemonCooldownRequired>() || cause.is::<DaemonWriterLeaseHeld>()
-        }))
-    .then_some(DAEMON_TEMPORARY_ADMISSION_REFUSAL_EXIT_STATUS)
+    error
+        .chain()
+        .any(|cause| cause.is::<DaemonCooldownRequired>() || cause.is::<DaemonWriterLeaseHeld>())
+        .then_some(DAEMON_TEMPORARY_ADMISSION_REFUSAL_EXIT_STATUS)
 }
 
 #[cfg(not(test))]
