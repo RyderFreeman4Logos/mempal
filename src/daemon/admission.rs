@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_rejection_does_not_discard_completed_drawer_owned_by_stale_admission() {
+    async fn terminal_retry_does_not_discard_completed_successor_owned_by_stale_admission() {
         let worker_test_lock = crate::llm::acquire_llm_worker_test_lock();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
@@ -354,8 +354,8 @@ mod tests {
         let mut llm_server = mockito::Server::new_async().await;
         let llm_mock = llm_server
             .mock("POST", "/v1/chat/completions")
-            .with_status(200)
-            .with_body(r#"{"model":"test-llm","choices":[{"message":{"role":"assistant","content":"{\"verdict\":\"reject\",\"score\":0.05}"}}]}"#)
+            .with_status(404)
+            .with_body("model not found")
             .create_async()
             .await;
         unavailable_config.llm.enabled = true;
@@ -368,7 +368,7 @@ mod tests {
         );
         let mut retry = failed_admission.clone();
         retry.retry_count = 1;
-        process_claimed_message_with_embedder(
+        let error = process_claimed_message_with_embedder(
             &async_db,
             &async_store,
             "failed-admission-worker",
@@ -384,13 +384,14 @@ mod tests {
             },
         )
         .await
-        .expect("reject retry without stealing completed duplicate");
+        .expect_err("terminal retry must fail without stealing completed successor");
         llm_mock.assert_async().await;
+        assert!(format!("{error:#}").contains("404"));
 
         assert!(
             db.drawer_exists(&drawer_id)
-                .expect("completed duplicate drawer exists after stale retry rejection"),
-            "stale retry rejection must not delete another message's completed drawer"
+                .expect("completed successor exists after stale terminal retry"),
+            "stale terminal retry must not delete another message's completed successor"
         );
         let vector_count: i64 = db
             .conn()
