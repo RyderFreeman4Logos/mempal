@@ -637,7 +637,7 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertEqual(stored.get("result"), "Fact stored.")
         self.assertEqual(stored.get("drawer_id"), "drawer-existing-conclude")
         self.assertEqual(stored.get("operation_key"), operation_key)
-        self.assertEqual(after.failure_count, 0)
+        self.assertEqual(after.failure_count, 5)
         self.assertEqual(provider.posts, [])
         self.assertNotIn("SECRET_RECEIPT_CONCLUSION", json.dumps(stored))
         provider.shutdown()

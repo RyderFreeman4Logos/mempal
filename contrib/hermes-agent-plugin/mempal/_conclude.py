@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 class ConcludeResult:
     stored: bool
     payload: Dict[str, Any]
+    write_admitted: bool = False
 
 
 _TERMINAL_KINDS = {
@@ -144,6 +145,7 @@ def submit_conclusion(
         ))
 
     deadline = time.monotonic() + max(0.0, wait_timeout)
+    single_status_probe = retrying and not transport_allowed
     operation_id: Optional[str] = None
     state = "local_admitted"
     while True:
@@ -151,7 +153,7 @@ def submit_conclusion(
             key,
             post,
             get,
-            ignore_retry_delay=True,
+            ignore_retry_delay=not single_status_probe,
             replay_allowed=replay_allowed,
         )
         if outcome is None:
@@ -176,7 +178,7 @@ def submit_conclusion(
                 "operation_id": operation_id or "",
                 "operation_key": key,
                 "drawer_id": outcome.drawer_id,
-            })
+            }, write_admitted=outcome.write_admitted)
         error_class = outcome.error_class
         if error_class and error_class.startswith("terminal_"):
             state = error_class.removeprefix("terminal_")
@@ -215,7 +217,8 @@ def submit_conclusion(
             classification.retryable if classification is not None else True
         ) or kind == "durable_status_unavailable"
         if (
-            kind == "durable_admission_deferred"
+            single_status_probe
+            or kind == "durable_admission_deferred"
             or kind == "durable_status_invalid"
             or time.monotonic() >= deadline
         ):

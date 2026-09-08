@@ -331,10 +331,6 @@ class MempalMemoryProvider:
         spool = self._write_spool
         if spool is None:
             return
-        if self._is_breaker_open():
-            head = spool.next_replayable_operation()
-            if head is None or not head.receipt_operation_id:
-                return
         try:
             outcome = spool.replay_one(
                 self._post,
@@ -348,7 +344,7 @@ class MempalMemoryProvider:
             return
         if outcome is None:
             return
-        if outcome.completed:
+        if outcome.completed and outcome.write_admitted:
             self._record_success()
             self._update_health(True)
         elif outcome.error_class and classify_replay_error(
@@ -1038,10 +1034,11 @@ class MempalMemoryProvider:
                     replay_allowed=lambda: not self._is_breaker_open(),
                 )
                 if result.stored:
-                    try:
-                        self._record_success()
-                    except Exception:
-                        logger.warning("mempal conclude success bookkeeping failed")
+                    if result.write_admitted:
+                        try:
+                            self._record_success()
+                        except Exception:
+                            logger.warning("mempal conclude success bookkeeping failed")
                 else:
                     conclude_side_effects(self, result.payload)
                 return json.dumps(result.payload)

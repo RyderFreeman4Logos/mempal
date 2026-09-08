@@ -746,7 +746,7 @@ class AuthoritativeMemoryWriteTests(unittest.TestCase):
             spool = WriteSpool(hermes_home)
             other = WriteSpool(hermes_home)
             first = spool.admit("ingest", {"content": "one"}, track_key="one", action="add")
-            second = spool.admit("ingest", {"content": "two"}, track_key="two", action="add")
+            spool.admit("ingest", {"content": "two"}, track_key="two", action="add")
             entered = threading.Event()
             release = threading.Event()
             delivered = []
@@ -767,9 +767,9 @@ class AuthoritativeMemoryWriteTests(unittest.TestCase):
                     raise error
                 return {"operation_id": f"operation_{key}", "state": "completed"}
 
-            def get(_path):
-                return {"state": "completed", "drawer_id": "drawer"}
-
+            def get(path):
+                operation_id = path.rsplit("/", 1)[-1]
+                return {"operation_id": operation_id, "state": "completed", "drawer_id": "drawer"}
             results = []
             worker = threading.Thread(
                 target=lambda: results.append(spool.replay_one(post, get))

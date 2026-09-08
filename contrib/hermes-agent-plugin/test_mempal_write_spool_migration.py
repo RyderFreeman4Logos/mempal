@@ -6,7 +6,6 @@ from contextlib import closing
 from typing import Any, List
 
 from mempal._write_spool import WriteSpool, make_track_key
-import mempal._write_spool_claims as write_spool_claims_module  # noqa: E402
 
 
 class DeleteLineageTests(unittest.TestCase):
@@ -102,8 +101,11 @@ class DurableSpoolReplayMigrationTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            post = lambda _path, body: body
-            get = lambda _path: {}
+            def post(_path, body):
+                return body
+
+            def get(_path):
+                return {}
             quarantined = spool.replay_one(post, get)
             self.assertIsNotNone(quarantined)
             assert quarantined is not None
@@ -154,15 +156,16 @@ class DurableSpoolReplayMigrationTests(unittest.TestCase):
                     restarted = WriteSpool(hermes_home)
 
                     calls: List[Any] = []
-                    post = lambda _path, body: calls.append(body) or {
-                        "operation_id": "remote-tail",
-                        "state": "completed",
-                        "drawer_id": "drawer-tail",
-                    }
-                    get = lambda _path: {
-                        "state": "completed",
-                        "drawer_id": "drawer-tail",
-                    }
+                    def post(_path, body):
+                        calls.append(body)
+                        return {"operation_id": "remote-tail", "state": "completed"}
+
+                    def get(_path):
+                        return {
+                            "operation_id": "remote-tail",
+                            "state": "completed",
+                            "drawer_id": "drawer-tail",
+                        }
 
                     quarantined = restarted.replay_one(post, get)
                     self.assertIsNotNone(quarantined)
@@ -211,15 +214,16 @@ class DurableSpoolReplayMigrationTests(unittest.TestCase):
                     restarted = WriteSpool(hermes_home)
 
                     calls: List[Any] = []
-                    post = lambda _path, body: calls.append(body) or {
-                        "operation_id": "remote-tail",
-                        "state": "completed",
-                        "drawer_id": "drawer-tail",
-                    }
-                    get = lambda _path: {
-                        "state": "completed",
-                        "drawer_id": "drawer-tail",
-                    }
+                    def post(_path, body):
+                        calls.append(body)
+                        return {"operation_id": "remote-tail", "state": "completed"}
+
+                    def get(_path):
+                        return {
+                            "operation_id": "remote-tail",
+                            "state": "completed",
+                            "drawer_id": "drawer-tail",
+                        }
 
                     quarantined = restarted.replay_one(post, get)
                     self.assertIsNotNone(quarantined)

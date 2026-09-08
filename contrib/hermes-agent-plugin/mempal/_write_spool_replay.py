@@ -148,6 +148,7 @@ class ReplayOutcome:
     operation_id: Optional[str] = None
     quarantined: bool = False
     error_details: Optional[JsonObject] = None
+    write_admitted: bool = False
 
 
 class WriteSpoolReplay:
@@ -386,6 +387,7 @@ class WriteSpoolReplay:
                     "supersedes" if operation.action == "replace" else "drawer_id"
                 ] = target
         operation_id = operation.receipt_operation_id
+        write_admitted = False
         route = "/api/ingest/durable"
         try:
             if (
@@ -416,6 +418,7 @@ class WriteSpoolReplay:
                         "request": request,
                     },
                 )
+                write_admitted = True
                 if not isinstance(receipt, dict):
                     raise RuntimeError("durable admission returned an invalid receipt")
                 operation_id = str(receipt.get("operation_id") or "")
@@ -426,6 +429,25 @@ class WriteSpoolReplay:
                 status = get(route)
             if not isinstance(status, dict):
                 raise RuntimeError("durable status returned an invalid response")
+            # The POST receipt is token-fenced into the same durable row as
+            # operation_key/kind. The status response must echo that identity
+            # before it can mutate settlement or track state.
+            status_operation_id = status.get("operation_id")
+            if not isinstance(status_operation_id, str) or status_operation_id != operation_id:
+                quarantined = self.record_attempt(
+                    operation.operation_key,
+                    "status_operation_identity_mismatch",
+                    retryable=False,
+                    claim_token=claim_token,
+                )
+                return ReplayOutcome(
+                    operation,
+                    completed=False,
+                    error_class="status_operation_identity_mismatch",
+                    operation_id=operation_id,
+                    quarantined=quarantined,
+                    write_admitted=write_admitted,
+                )
             state = status.get("state")
             state = state if isinstance(state, str) else ""
             drawer_value = status.get("drawer_id")
@@ -443,6 +465,7 @@ class WriteSpoolReplay:
                     completed=True,
                     drawer_id=drawer_id,
                     operation_id=operation_id,
+                    write_admitted=write_admitted,
                 )
             if state == "completed":
                 error_class = "status_completed_missing_drawer"
