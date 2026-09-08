@@ -280,19 +280,23 @@ class MempalMemoryProvider:
             except queue.Empty:
                 self._replay_spooled_write()
                 continue
-            if item.get("op") == "spool_wake":
-                self._replay_spooled_write()
-            else:
-                self._process_write(item)
-            self._write_queue.task_done()
+            try:
+                if item.get("op") == "spool_wake":
+                    self._replay_spooled_write()
+                else:
+                    self._process_write(item)
+            finally:
+                self._write_queue.task_done()
             self._replay_spooled_write()
         while True:
             try:
                 item = self._write_queue.get_nowait()
             except queue.Empty:
                 break
-            self._process_write(item)
-            self._write_queue.task_done()
+            try:
+                self._process_write(item)
+            finally:
+                self._write_queue.task_done()
 
     def _track_key(self, target: str) -> str:
         return make_track_key(target, self._wing, self._project_id)
@@ -339,18 +343,27 @@ class MempalMemoryProvider:
             )
         except Exception:
             logger.error("mempal durable spool metadata update failed")
-            self._record_failure()
+            try:
+                self._record_failure()
+            except OSError:
+                logger.warning("mempal durable replay failure bookkeeping failed")
             self._update_health(False)
             return
         if outcome is None:
             return
         if outcome.write_admitted:
-            self._record_success()
+            try:
+                self._record_success()
+            except OSError:
+                logger.warning("mempal durable replay success bookkeeping failed")
             self._update_health(True)
         if outcome.error_class and classify_replay_error(
             outcome.error_class
         ).count_failure:
-            self._record_failure()
+            try:
+                self._record_failure()
+            except OSError:
+                logger.warning("mempal durable replay failure bookkeeping failed")
             self._update_health(False)
             logger.warning(
                 "mempal durable replay deferred operation=%s kind=%s error_class=%s",

@@ -137,6 +137,84 @@ class ReplayReviewRegressionTests(unittest.TestCase):
         finally:
             provider.shutdown()
 
+    def test_backoff_write_failure_keeps_real_worker_alive_and_queue_balanced(
+        self,
+    ) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        assert provider._write_spool is not None
+        spool = provider._write_spool
+        operation = spool.admit(
+            "ingest", {"content": "pending value"}, action="raw_turn"
+        )
+        original_post = provider._post
+        original_record_success = provider._backoff.record_success
+        bookkeeping_failed = threading.Event()
+
+        def queued_post(path, body):
+            receipt = original_post(path, body)
+            operation_id = receipt["operation_id"]
+            provider.durable_status[operation_id] = {
+                "operation_id": operation_id,
+                "state": "queued",
+            }
+            return receipt
+
+        def fail_success_once():
+            if not bookkeeping_failed.is_set():
+                bookkeeping_failed.set()
+                raise OSError("backoff persistence unavailable")
+            return original_record_success()
+
+        provider._post = queued_post
+        provider._backoff.record_success = fail_success_once
+
+        try:
+            provider._wake_spool_worker()
+            self.assertTrue(bookkeeping_failed.wait(timeout=2.0))
+            admitted = spool.get(operation.operation_key)
+            self.assertIsNotNone(admitted)
+            assert admitted is not None
+            self.assertIsNotNone(admitted.receipt_operation_id)
+            self.assertTrue(
+                provider._write_worker and provider._write_worker.is_alive()
+            )
+
+            operation_id = admitted.receipt_operation_id
+            assert operation_id is not None
+            provider.durable_status[operation_id] = {
+                "operation_id": operation_id,
+                "state": "completed",
+                "drawer_id": "drawer-recovered",
+            }
+            with sqlite3.connect(spool.path) as connection:
+                connection.execute(
+                    "UPDATE write_operations SET next_attempt_at = 0 "
+                    "WHERE operation_key = ?",
+                    (operation.operation_key,),
+                )
+            provider._wake_spool_worker()
+
+            settlement_deadline = time.monotonic() + 2.0
+            settled = spool.get(operation.operation_key)
+            while (
+                settled is None
+                or settled.settled_at is None
+                or provider._write_queue.unfinished_tasks
+            ) and time.monotonic() < settlement_deadline:
+                time.sleep(0.01)
+                settled = spool.get(operation.operation_key)
+            self.assertIsNotNone(settled)
+            assert settled is not None
+            self.assertIsNotNone(settled.settled_at)
+            self.assertEqual(provider._write_queue.unfinished_tasks, 0)
+            self.assertTrue(
+                provider._write_worker and provider._write_worker.is_alive()
+            )
+            self.assertEqual(len(provider.posts), 1)
+        finally:
+            provider.shutdown()
+
     def test_completed_status_requires_exact_bound_operation_identity_for_all_actions(
         self,
     ) -> None:
@@ -417,27 +495,40 @@ class ReplayReviewRegressionTests(unittest.TestCase):
                     provider.shutdown()
 
     def test_invalid_post_receipt_never_resets_breaker_at_any_caller(self) -> None:
+        invalid_receipts = (
+            ("integer", {"operation_id": 123}),
+            ("boolean", {"operation_id": True}),
+            ("list", {"operation_id": ["bad"]}),
+            ("object", {"operation_id": {"bad": "id"}}),
+            ("empty", {"operation_id": ""}),
+            ("missing", {}),
+        )
         for caller in ("background", "conclude", "authoritative"):
-            with self.subTest(caller=caller):
-                provider = RecordingProvider()
-                provider.initialize("session-a", user_id="alice", profile="work")
-                provider._start_write_worker = lambda: None
-                provider._conclude_wait_timeout = 0.0
-                assert provider._write_spool is not None
+            for receipt_kind, receipt in invalid_receipts:
+                with self.subTest(caller=caller, receipt_kind=receipt_kind):
+                    provider = RecordingProvider()
+                    provider.initialize("session-a", user_id="alice", profile="work")
+                    provider._start_write_worker = lambda: None
+                    provider._conclude_wait_timeout = 0.0
+                    assert provider._write_spool is not None
 
-                def invalid_post(path, body, provider=provider):
-                    provider.posts.append((path, dict(body)))
-                    return {}
+                    def invalid_post(path, body, provider=provider, receipt=receipt):
+                        provider.posts.append((path, dict(body)))
+                        return receipt
 
-                provider._post = invalid_post
-                for _ in range(4):
-                    provider._record_failure()
+                    provider._post = invalid_post
+                    for _ in range(4):
+                        provider._record_failure()
 
-                _call_write(provider, caller)
-                self.assertEqual(provider._backoff._read_state().failure_count, 5)
-                self.assertTrue(provider._is_breaker_open())
-                self.assertEqual(len(provider.posts), 1)
-                provider.shutdown()
+                    operation_key = _call_write(provider, caller)
+                    operation = provider._write_spool.get(operation_key)
+                    self.assertIsNotNone(operation)
+                    assert operation is not None
+                    self.assertIsNone(operation.receipt_operation_id)
+                    self.assertEqual(provider._backoff._read_state().failure_count, 5)
+                    self.assertTrue(provider._is_breaker_open())
+                    self.assertEqual(len(provider.posts), 1)
+                    provider.shutdown()
 
     def test_open_breaker_queued_and_running_receipts_poll_once_and_honor_backoff(
         self,

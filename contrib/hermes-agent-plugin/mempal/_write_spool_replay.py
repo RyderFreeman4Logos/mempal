@@ -420,9 +420,13 @@ class WriteSpoolReplay:
                 )
                 if not isinstance(receipt, dict):
                     raise RuntimeError("durable admission returned an invalid receipt")
-                operation_id = str(receipt.get("operation_id") or "")
+                operation_id = receipt.get("operation_id")
+                if not isinstance(operation_id, str):
+                    raise TypeError(
+                        "durable admission returned an invalid operation_id"
+                    )
                 if not operation_id:
-                    raise RuntimeError("durable admission omitted operation_id")
+                    raise ValueError("durable admission returned an empty operation_id")
                 write_admitted = True
                 self.record_receipt(operation.operation_key, operation_id, claim_token)
                 route = f"/api/operations/{operation_id}"
