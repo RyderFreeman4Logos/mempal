@@ -340,7 +340,8 @@ def authoritative_memory_write(
         })
 
     key = operation.operation_key
-    if self._is_breaker_open():
+    retrying = retry_operation_key is not None
+    if self._is_breaker_open() and not retrying:
         try:
             self._wake_spool_worker()
         except Exception:
@@ -356,11 +357,12 @@ def authoritative_memory_write(
         )
     except Exception:
         outcome = None
-    if outcome is not None and outcome.completed and outcome.drawer_id:
+    if outcome is not None and outcome.write_admitted:
         try:
             self._record_success()
         except Exception:
             logger.warning("mempal authoritative write success bookkeeping failed")
+    if outcome is not None and outcome.completed and outcome.drawer_id:
         return json.dumps({
             "success": True,
             "drawer_id": outcome.drawer_id,

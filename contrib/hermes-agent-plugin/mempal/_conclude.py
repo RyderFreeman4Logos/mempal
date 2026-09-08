@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 class ConcludeResult:
     stored: bool
     payload: Dict[str, Any]
+    write_admitted: bool = False
 
 
 _TERMINAL_KINDS = {
@@ -104,6 +105,7 @@ def submit_conclusion(
     """Admit once and report success only after authoritative completion."""
     if not valid_control_token(operation_key):
         return ConcludeResult(False, _invalid_control_payload())
+    retrying = operation_key is not None
     key = operation_key or secrets.token_urlsafe(32)
     if spool is None:
         return ConcludeResult(False, _retry_payload(
@@ -133,7 +135,7 @@ def submit_conclusion(
             classify_write_error(exc),
         ))
 
-    if not transport_allowed:
+    if not transport_allowed and not retrying:
         return ConcludeResult(False, _retry_payload(
             "durable_admission_deferred",
             None,
@@ -143,14 +145,16 @@ def submit_conclusion(
         ))
 
     deadline = time.monotonic() + max(0.0, wait_timeout)
+    single_status_probe = retrying and not transport_allowed
     operation_id: Optional[str] = None
     state = "local_admitted"
+    write_admitted = False
     while True:
         outcome = spool.replay_operation_key(
             key,
             post,
             get,
-            ignore_retry_delay=True,
+            ignore_retry_delay=not single_status_probe,
             replay_allowed=replay_allowed,
         )
         if outcome is None:
@@ -159,7 +163,8 @@ def submit_conclusion(
                 operation_id,
                 key,
                 state,
-            ))
+            ), write_admitted=write_admitted)
+        write_admitted = write_admitted or outcome.write_admitted
         operation_id = outcome.operation_id or operation_id
         if outcome.error_class == "breaker_open":
             return ConcludeResult(False, _retry_payload(
@@ -168,14 +173,14 @@ def submit_conclusion(
                 key,
                 "local_admitted",
                 "breaker_open",
-            ))
+            ), write_admitted=write_admitted)
         if outcome.completed and outcome.drawer_id:
             return ConcludeResult(True, {
                 "result": "Fact stored.",
                 "operation_id": operation_id or "",
                 "operation_key": key,
                 "drawer_id": outcome.drawer_id,
-            })
+            }, write_admitted=write_admitted)
         error_class = outcome.error_class
         if error_class and error_class.startswith("terminal_"):
             state = error_class.removeprefix("terminal_")
@@ -187,7 +192,7 @@ def submit_conclusion(
                 error_class,
                 outcome.error_details,
                 retry_safe=False,
-            ))
+            ), write_admitted=write_admitted)
         if error_class in {"operation_key_conflict", "malformed_spool_row"}:
             return ConcludeResult(False, _retry_payload(
                 error_class,
@@ -197,7 +202,7 @@ def submit_conclusion(
                 error_class,
                 outcome.error_details,
                 retry_safe=False,
-            ))
+            ), write_admitted=write_admitted)
         if error_class and error_class.startswith("status_"):
             state = error_class.removeprefix("status_")
             kind = (
@@ -214,7 +219,8 @@ def submit_conclusion(
             classification.retryable if classification is not None else True
         ) or kind == "durable_status_unavailable"
         if (
-            kind == "durable_admission_deferred"
+            single_status_probe
+            or kind == "durable_admission_deferred"
             or kind == "durable_status_invalid"
             or time.monotonic() >= deadline
         ):
@@ -226,7 +232,7 @@ def submit_conclusion(
                 error_class,
                 outcome.error_details,
                 retry_safe=retry_safe,
-            ))
+            ), write_admitted=write_admitted)
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
