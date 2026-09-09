@@ -1042,7 +1042,7 @@ impl PendingMessageStore {
         self.with_claim_connection(|conn| {
             let now = now_secs();
             let stale_cutoff = saturating_cutoff(now, claim_ttl_secs);
-            if !claim_work_available(conn, stale_cutoff, now, None, None, true)? {
+            if !claim_work_available(conn, stale_cutoff, now, None, true)? {
                 return Ok(None);
             }
             let tx = transaction_immediate(conn, "claim queued message")?;
@@ -1132,7 +1132,7 @@ impl PendingMessageStore {
             self.require_lifecycle_writer_lease(conn, "claim queued message")?;
             let now = now_secs();
             let stale_cutoff = saturating_cutoff(now, claim_ttl_secs);
-            if !claim_work_available(conn, stale_cutoff, now, None, Some(kind_filter), false)? {
+            if !claim_work_available(conn, stale_cutoff, now, Some(kind_filter), false)? {
                 return Ok(None);
             }
             let tx = transaction_immediate(conn, "claim queued message")?;
@@ -1237,14 +1237,7 @@ impl PendingMessageStore {
             self.require_lifecycle_writer_lease(conn, "claim queued message by id")?;
             let now = now_secs();
             let stale_cutoff = saturating_cutoff(now, claim_ttl_secs);
-            if !claim_work_available(
-                conn,
-                stale_cutoff,
-                now,
-                Some(id_filter),
-                Some(kind_filter),
-                false,
-            )? {
+            if !claim_by_id_work_available(conn, stale_cutoff, now, id_filter, kind_filter)? {
                 return Ok(None);
             }
             let tx = transaction_immediate(conn, "claim queued message by id")?;
@@ -2842,7 +2835,6 @@ fn claim_work_available(
     conn: &Connection,
     stale_cutoff: i64,
     now: i64,
-    id_filter: Option<&str>,
     kind_filter: Option<&str>,
     exclude_dedicated_kinds: bool,
 ) -> rusqlite::Result<bool> {
@@ -2856,19 +2848,47 @@ fn claim_work_available(
         ) OR EXISTS (
             SELECT 1 FROM pending_messages
             WHERE status = 'pending' AND next_attempt_at <= ?2
-              AND (?3 IS NULL OR id = ?3)
-              AND (?4 IS NULL OR kind = ?4)
-              AND (?5 = 0 OR kind NOT IN ('llm_task', 'ingest_async'))
+              AND (?3 IS NULL OR kind = ?3)
+              AND (?4 = 0 OR kind NOT IN ('llm_task', 'ingest_async'))
             LIMIT 1
         )
         "#,
         params![
             stale_cutoff,
             now,
-            id_filter,
             kind_filter,
             i64::from(exclude_dedicated_kinds)
         ],
+        |row| row.get::<_, i64>(0).map(|available| available != 0),
+    )
+}
+
+const CLAIM_BY_ID_WORK_AVAILABLE_SQL: &str = r#"
+    SELECT EXISTS (
+        SELECT 1 FROM pending_messages
+        WHERE status = 'claimed'
+          AND (heartbeat_at IS NULL OR heartbeat_at < ?1)
+        LIMIT 1
+    ) OR EXISTS (
+        SELECT 1 FROM pending_messages
+        WHERE id = ?3
+          AND status = 'pending'
+          AND next_attempt_at <= ?2
+          AND kind = ?4
+        LIMIT 1
+    )
+"#;
+
+fn claim_by_id_work_available(
+    conn: &Connection,
+    stale_cutoff: i64,
+    now: i64,
+    id_filter: &str,
+    kind_filter: &str,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        CLAIM_BY_ID_WORK_AVAILABLE_SQL,
+        params![stale_cutoff, now, id_filter, kind_filter],
         |row| row.get::<_, i64>(0).map(|available| available != 0),
     )
 }
