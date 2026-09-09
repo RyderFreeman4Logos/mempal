@@ -15,7 +15,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import resource
 import urllib.parse
 import urllib.request
 from urllib.error import HTTPError
@@ -37,7 +36,13 @@ def _load_sibling_module(name: str, filename: str) -> Any:
 _SMOKE_RUNTIME = _load_sibling_module('_mempal_smoke_runtime', 'smoke_runtime.py')
 _SMOKE_RECEIPTS = _load_sibling_module('_mempal_smoke_receipts', 'smoke_receipts.py')
 CleanupManifest = _SMOKE_RUNTIME.CleanupManifest
+child_io_blocks_delta = _SMOKE_RUNTIME.child_io_blocks_delta
+child_io_blocks_snapshot = _SMOKE_RUNTIME.child_io_blocks_snapshot
+io_delta = _SMOKE_RUNTIME.io_delta
+read_proc_io = _SMOKE_RUNTIME.read_proc_io
+read_tempfile_bytes = _SMOKE_RUNTIME.read_tempfile_bytes
 strict_json_loads = _SMOKE_RUNTIME.strict_json_loads
+wait_exited_without_reap = _SMOKE_RUNTIME.wait_exited_without_reap
 receipt_dicts_from = _SMOKE_RECEIPTS.receipt_dicts_from
 cleanup_ids_from = _SMOKE_RECEIPTS.cleanup_ids_from
 operation_id_from = _SMOKE_RECEIPTS.operation_id_from
@@ -434,33 +439,6 @@ def installed_binary_path() -> str | None:
     return shutil.which('mempal')
 
 
-def read_proc_io(pid: int | None) -> dict[str, int] | None:
-    if pid is None:
-        return None
-    try:
-        data = Path(f'/proc/{pid}/io').read_text()
-    except Exception:
-        return None
-    keys = {'read_bytes', 'write_bytes', 'cancelled_write_bytes', 'rchar', 'wchar'}
-    parsed: dict[str, int] = {}
-    for line in data.splitlines():
-        if ':' not in line:
-            continue
-        key, value = line.split(':', 1)
-        if key in keys:
-            try:
-                parsed[key] = int(value.strip())
-            except ValueError:
-                pass
-    return parsed
-
-
-def io_delta(before: dict[str, int] | None, after: dict[str, int] | None) -> dict[str, int] | None:
-    if before is None or after is None:
-        return None
-    return {key: after.get(key, 0) - before.get(key, 0) for key in sorted(set(before) | set(after))}
-
-
 def proc_io_aggregate() -> dict[str, Any]:
     return {
         'process_count': 0,
@@ -480,28 +458,6 @@ def record_proc_io_delta(
         SUMMARY['io'], _PROC_IO_RECEIPT_TARGETS, PROC_IO_KEYS,
         category, before, after, receipt_id,
     )
-
-
-def wait_exited_without_reap(pid: int, timeout: float) -> bool | None:
-    """Wait for a child process to exit without reaping it (leaves it for Popen.cleanup).
-
-    On Python 3.14+, ``os.waitid`` with ``WNOWAIT`` can deadlock when the
-    child uses tempfile redirection.  We instead poll ``/proc/<pid>`` which
-    reliably detects process exit without consuming the wait status.
-    """
-    deadline = time.monotonic() + timeout
-    while True:
-        if not Path(f'/proc/{pid}').exists():
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.05)
-
-
-def read_tempfile_bytes(handle: Any) -> bytes:
-    handle.flush()
-    handle.seek(0)
-    return handle.read()
 
 
 def run_child_process(
@@ -595,15 +551,6 @@ def run_child_process(
         'timed_out': timed_out,
         'killed': killed,
     }
-
-
-def child_io_blocks_snapshot() -> dict[str, int]:
-    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-    return {'ru_inblock': int(usage.ru_inblock), 'ru_oublock': int(usage.ru_oublock)}
-
-
-def child_io_blocks_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
-    return {key: after.get(key, 0) - before.get(key, 0) for key in sorted(set(before) | set(after))}
 
 
 def json_shape(value: Any) -> dict[str, Any]:
