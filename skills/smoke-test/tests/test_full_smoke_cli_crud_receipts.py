@@ -631,10 +631,9 @@ class CliCrudReceiptTests(unittest.TestCase):
                         [
                             "drawer-direct",
                             "drawer-rest",
-                            "update-rest",
                         ],
                     )
-                self.assertEqual(rest_fallback.call_count, 2)
+                self.assertEqual(rest_fallback.call_count, 1)
                 wait_operation.assert_called_once_with("op-A", "mcp_update_cli_wait")
                 self.assertNotIn("drawer-other", str((delete.call_args, manifest.path.read_text())))
                 self.assertFalse(smoke.SUMMARY["groups"]["mcp_create"]["ok"])

@@ -1266,6 +1266,7 @@ def recover_created_ids(value: Any, wait_label: str) -> tuple[list[str], dict[st
     if classified['kind'] != 'queued' or operation_id is None:
         return ids, info
 
+    _remember_pending_operation(wait_label, operation_id)
     waited = wait_operation(operation_id, wait_label)
     waited_classification = classify_create_attempt(
         waited, expected_operation_id=operation_id
@@ -1279,6 +1280,9 @@ def recover_created_ids(value: Any, wait_label: str) -> tuple[list[str], dict[st
         'created_drawer_ids', []
     )
     info['cleanup_drawer_ids'] = ids
+    if waited_classification['kind'] == 'created':
+        _remember_created_ids(ids)
+        _resolve_pending_operation(wait_label, operation_id)
     if waited_classification['kind'] == 'proven_no_write':
         info['receipt'] = waited_classification['receipt']
     info['recovered_via'] = wait_label
@@ -1615,6 +1619,16 @@ def _remember_created_ids(drawer_ids: list[str]) -> None:
         CLEANUP_MANIFEST.add_created_ids(drawer_ids)
 
 
+def _remember_pending_operation(role: str, operation_id: str | None) -> None:
+    if operation_id and CLEANUP_MANIFEST is not None:
+        CLEANUP_MANIFEST.add_pending_operation(role, operation_id)
+
+
+def _resolve_pending_operation(role: str, operation_id: str | None) -> None:
+    if operation_id and CLEANUP_MANIFEST is not None:
+        CLEANUP_MANIFEST.resolve_pending_operation(role, operation_id)
+
+
 def _mark_verified_cleaned(drawer_ids: list[str]) -> None:
     if drawer_ids and CLEANUP_MANIFEST is not None:
         CLEANUP_MANIFEST.mark_cleaned(drawer_ids)
@@ -1766,6 +1780,8 @@ def mcp_crud() -> list[str]:
         create_timeout_operation_id = (
             create_operation_id if create_classification.get('timed_out') is True else None
         )
+        if create_timeout_operation_id:
+            _remember_pending_operation('mcp_create_cli_wait', create_timeout_operation_id)
         create_recovery: dict[str, Any] = {
             'kind': create_classification['kind'],
             'operation_id_present': bool(create_operation_id),
@@ -1791,6 +1807,7 @@ def mcp_crud() -> list[str]:
             _remember_created_ids(status_ids)
             create_recovery['kind'] = status_classification['kind']
             if status_classification['kind'] == 'created':
+                _resolve_pending_operation('mcp_create_cli_wait', create_timeout_operation_id)
                 created_ids = status_classification.get('created_drawer_ids', [])
                 create_recovery.update({
                     'recovered_via': 'mcp_operation_status',
@@ -1830,6 +1847,7 @@ def mcp_crud() -> list[str]:
                 ),
             })
             if waited_classification['kind'] == 'created':
+                _resolve_pending_operation('mcp_create_cli_wait', create_timeout_operation_id)
                 created_ids = waited_classification.get('created_drawer_ids', [])
             SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
@@ -1921,6 +1939,8 @@ def mcp_crud() -> list[str]:
         update_timeout_operation_id = (
             update_operation_id if update_classification.get('timed_out') is True else None
         )
+        if update_timeout_operation_id:
+            _remember_pending_operation('mcp_update_cli_wait', update_timeout_operation_id)
         update_recovery: dict[str, Any] = {
             'kind': update_classification['kind'],
             'operation_id_present': bool(update_operation_id),
@@ -1948,12 +1968,13 @@ def mcp_crud() -> list[str]:
                 ),
             })
             if waited_classification['kind'] == 'created':
+                _resolve_pending_operation('mcp_update_cli_wait', update_timeout_operation_id)
                 authoritative_update_ids = waited_classification.get(
                     'created_drawer_ids', []
                 )
             SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
-        if not authoritative_update_ids and not update_receipt and not _fu(update_recovery):
+        if not authoritative_update_ids and not update_receipt and not _fu(update_recovery) and not update_timeout_operation_id:
             rest_upd_ids, rest_update_disposition = run_fallback_after_mcp_reaped(
                 client,
                 'update_rest',

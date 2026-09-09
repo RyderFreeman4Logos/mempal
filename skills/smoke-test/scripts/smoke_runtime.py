@@ -54,7 +54,7 @@ def strict_json_loads(data: str | bytes | bytearray) -> Any:
 
 
 class CleanupManifest:
-    """Persist only cleanup-authorized drawer IDs using atomic replacement."""
+    """Persist cleanup IDs and followable operation custody atomically."""
 
     def __init__(self, path: Path | None = None) -> None:
         if path is None:
@@ -62,17 +62,31 @@ class CleanupManifest:
             path = Path("/tmp") / name
         self.path = path
         self._pending: list[str] = []
+        self._pending_operations: list[dict[str, str]] = []
 
     @property
     def pending_count(self) -> int:
         return len(self._pending)
 
+    @property
+    def pending_operations(self) -> list[dict[str, str]]:
+        return [dict(operation) for operation in self._pending_operations]
+
+    @property
+    def pending_operation_count(self) -> int:
+        return len(self._pending_operations)
+
     def checkpoint(self) -> None:
         """Atomically persist the current cleanup receipt with mode 0600."""
-        self._checkpoint(self._pending)
+        self._checkpoint(self._pending, self._pending_operations)
 
-    def _checkpoint(self, pending: list[str]) -> None:
-        serialized = self._serialize(pending)
+    def _checkpoint(
+        self,
+        pending: list[str],
+        pending_operations: list[dict[str, str]] | None = None,
+    ) -> None:
+        operations = self._pending_operations if pending_operations is None else pending_operations
+        serialized = self._serialize(pending, operations)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path: Path | None = None
         try:
@@ -90,6 +104,7 @@ class CleanupManifest:
                 os.fsync(handle.fileno())
             os.replace(temporary_path, self.path)
             self._pending = list(pending)
+            self._pending_operations = [dict(operation) for operation in operations]
             self._fsync_parent()
         finally:
             if temporary_path is not None and temporary_path.exists():
@@ -114,10 +129,31 @@ class CleanupManifest:
                 )
         self._checkpoint(pending)
 
+    def add_pending_operation(self, role: str, operation_id: str) -> None:
+        if not isinstance(role, str) or not role:
+            raise ValueError("pending operation roles must be non-empty strings")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("pending operation IDs must be non-empty strings")
+        operations = self.pending_operations
+        operation = {"operation_id": operation_id, "role": role}
+        if operation not in operations:
+            operations.append(operation)
+        self._checkpoint(self._pending, operations)
+
+    def resolve_pending_operation(self, role: str, operation_id: str) -> None:
+        operation = {"operation_id": operation_id, "role": role}
+        operations = [item for item in self._pending_operations if item != operation]
+        if len(operations) == len(self._pending_operations):
+            return
+        if self._pending or operations:
+            self._checkpoint(self._pending, operations)
+        else:
+            self.discard()
+
     def mark_cleaned(self, drawer_ids: list[str]) -> None:
         cleaned = set(drawer_ids)
         pending = [drawer_id for drawer_id in self._pending if drawer_id not in cleaned]
-        if pending:
+        if pending or self._pending_operations:
             self._checkpoint(pending)
         else:
             self.discard()
@@ -127,8 +163,10 @@ class CleanupManifest:
             self.path.unlink()
         except FileNotFoundError:
             self._pending = []
+            self._pending_operations = []
             return
         self._pending = []
+        self._pending_operations = []
         self._fsync_parent()
 
     def _fsync_parent(self) -> None:
@@ -139,9 +177,14 @@ class CleanupManifest:
             os.close(directory_fd)
 
     @staticmethod
-    def _serialize(pending: list[str]) -> str:
+    def _serialize(
+        pending: list[str], pending_operations: list[dict[str, str]] | None = None
+    ) -> str:
+        payload: dict[str, Any] = {"cleanup_drawer_ids": pending}
+        if pending_operations:
+            payload["pending_operations"] = pending_operations
         serialized = json.dumps(
-            {"cleanup_drawer_ids": pending},
+            payload,
             sort_keys=True,
             separators=(",", ":"),
         ) + "\n"
@@ -161,14 +204,18 @@ def finalize_cleanup_manifest(
     """Expose a recovery receipt only while cleanup-authorized IDs remain."""
     summary.pop("cleanup_manifest_path", None)
     summary.pop("cleanup_pending_count", None)
+    summary.pop("pending_operation_count", None)
     if manifest is None:
         return
-    if manifest.pending_count > 0:
+    if manifest.pending_count > 0 or manifest.pending_operation_count > 0:
         if checkpoint:
             manifest.checkpoint()
         if manifest.path.exists():
             summary["cleanup_manifest_path"] = str(manifest.path)
-            summary["cleanup_pending_count"] = manifest.pending_count
+            if manifest.pending_count > 0:
+                summary["cleanup_pending_count"] = manifest.pending_count
+            if manifest.pending_operation_count > 0:
+                summary["pending_operation_count"] = manifest.pending_operation_count
     else:
         manifest.discard()
 

@@ -196,7 +196,11 @@ class OperationCleanupAuthorityTests(unittest.TestCase):
                     "cleanup_drawer_ids": [
                         "drawer-create-rest",
                         "drawer-update-rest",
-                    ]
+                    ],
+                    "pending_operations": [
+                        {"operation_id": "op-create", "role": "cli_create_wait"},
+                        {"operation_id": "op-update", "role": "cli_update_wait"},
+                    ],
                 },
             )
             public = json.dumps(self.smoke.SUMMARY)
@@ -307,18 +311,189 @@ class OperationCleanupAuthorityTests(unittest.TestCase):
             self.assertNotIn("drawer-other", delete_exact.call_args.args[1])
             self.assertEqual(
                 json.loads(manifest.path.read_text(encoding="utf-8")),
-                {"cleanup_drawer_ids": ["drawer-rest", "drawer-update"]},
+                {
+                    "cleanup_drawer_ids": ["drawer-rest", "drawer-update"],
+                    "pending_operations": [
+                        {"operation_id": "op-A", "role": "mcp_create_cli_wait"}
+                    ],
+                },
             )
             public = json.dumps(self.smoke.SUMMARY)
             self.assertNotIn("private_raw_key", public)
             self.assertNotIn("private-raw-value", public)
             manifest.discard()
 
+    def test_mcp_update_terminal_resume_avoids_rest_retry(self) -> None:
+        discover = mock.Mock()
+        discover.call.return_value = {
+            "result": {
+                "tools": [
+                    {"name": tool}
+                    for tool in (
+                        "mempal_ingest",
+                        "mempal_operation_status",
+                        "mempal_search",
+                        "mempal_read_drawer",
+                        "mempal_delete",
+                    )
+                ]
+            }
+        }
+        create_client = mock.Mock()
+        update_client = mock.Mock()
+        active_client = mock.Mock()
+        active_client.tool.return_value = ({}, {"ok": True})
+        create = {"created_drawer_ids": ["drawer-create"]}
+        create_info = {
+            "ok": True,
+            "_raw_mcp_response": {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"structuredContent": create},
+            },
+        }
+        queued_update = {
+            "ok": False,
+            "_raw_mcp_response": {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": {
+                    "code": -32603,
+                    "message": "queued",
+                    "data": {
+                        "operation_id": "op-update",
+                        "state": "queued",
+                        "timed_out": True,
+                    },
+                },
+            },
+        }
+        terminal_update = {
+            "operation_id": "op-update",
+            "state": "completed",
+            "created_drawer_ids": ["drawer-update"],
+            "cleanup_drawer_ids": ["drawer-update"],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / "cleanup.json")
+            setattr(self.smoke, "CLEANUP_MANIFEST", manifest)
+            with (
+                mock.patch.object(
+                    self.smoke,
+                    "mcp_start_initialized",
+                    side_effect=[discover, create_client, update_client, active_client],
+                ),
+                mock.patch.object(
+                    self.smoke,
+                    "mcp_call_isolated_labeled",
+                    return_value=(None, {"ok": True}),
+                ),
+                mock.patch.object(
+                    self.smoke,
+                    "_mcp_tool_with_hard_timeout",
+                    side_effect=[(create, create_info), (None, queued_update)],
+                ),
+                mock.patch.object(
+                    self.smoke, "wait_operation", return_value=terminal_update
+                ) as wait_operation,
+                mock.patch.object(
+                    self.smoke,
+                    "_rest_ingest_fallback",
+                    return_value=(
+                        ["drawer-rest"],
+                        {"kind": "created", "created_drawer_ids": ["drawer-rest"]},
+                    ),
+                ) as rest_fallback,
+                mock.patch.object(
+                    self.smoke,
+                    "delete_exact_ids_mcp",
+                    return_value={
+                        "deleted_count": 2,
+                        "failed_count": 0,
+                        "delete_failed_attempt_count": 0,
+                    },
+                ),
+            ):
+                self.assertEqual(
+                    self.smoke.mcp_crud(), ["drawer-create", "drawer-update"]
+                )
+
+            wait_operation.assert_called_once_with("op-update", "mcp_update_cli_wait")
+            rest_fallback.assert_not_called()
+            self.assertEqual(manifest.pending_operation_count, 0)
+            self.assertEqual(
+                json.loads(manifest.path.read_text(encoding="utf-8")),
+                {"cleanup_drawer_ids": ["drawer-create", "drawer-update"]},
+            )
+            public = json.dumps(self.smoke.SUMMARY)
+            self.assertNotIn("pending_operations", public)
+            manifest.discard()
+
+    def test_cli_wait_persists_terminal_ids_before_resolving_custody(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / "cleanup.json")
+            setattr(self.smoke, "CLEANUP_MANIFEST", manifest)
+            with mock.patch.object(
+                self.smoke,
+                "wait_operation",
+                return_value={
+                    "operation_id": "op-A",
+                    "state": "completed",
+                    "created_drawer_ids": ["drawer-A"],
+                    "cleanup_drawer_ids": ["drawer-A"],
+                },
+            ):
+                ids, info = self.smoke.recover_created_ids(
+                    {
+                        "operation_id": "op-A",
+                        "state": "queued",
+                        "timed_out": True,
+                    },
+                    "cli_create_wait",
+                )
+
+            self.assertEqual(ids, ["drawer-A"])
+            self.assertEqual(info["kind"], "created")
+            self.assertEqual(
+                json.loads(manifest.path.read_text(encoding="utf-8")),
+                {"cleanup_drawer_ids": ["drawer-A"]},
+            )
+            manifest.discard()
+
+    def test_pending_operation_ledger_survives_without_cleanup_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.smoke.CleanupManifest(Path(tmp) / "cleanup.json")
+            manifest.add_pending_operation("mcp_update_cli_wait", "op-A")
+
+            self.assertEqual(manifest.pending_operation_count, 1)
+            self.assertEqual(
+                manifest.pending_operations,
+                [{"operation_id": "op-A", "role": "mcp_update_cli_wait"}],
+            )
+            self.assertEqual(
+                json.loads(manifest.path.read_text(encoding="utf-8")),
+                {
+                    "cleanup_drawer_ids": [],
+                    "pending_operations": [
+                        {"operation_id": "op-A", "role": "mcp_update_cli_wait"}
+                    ],
+                },
+            )
+            self.assertEqual(manifest.path.stat().st_mode & 0o777, 0o600)
+
+            setattr(self.smoke, "CLEANUP_MANIFEST", manifest)
+            summary: dict[str, Any] = {}
+            self.smoke.finalize_cleanup_manifest(summary)
+            self.assertEqual(summary["cleanup_manifest_path"], str(manifest.path))
+            self.assertEqual(summary["pending_operation_count"], 1)
+            self.assertNotIn("pending_operations", json.dumps(summary))
+        manifest.discard()
+
     def test_exact_cli_cleanup_delete_uses_all_projects_like_view(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             manifest = self.smoke.CleanupManifest(Path(tmp) / "cleanup.json")
             manifest.add_created_ids(["drawer-mcp"])
-            self.smoke.CLEANUP_MANIFEST = manifest
+            setattr(self.smoke, "CLEANUP_MANIFEST", manifest)
             seen: list[list[str]] = []
 
             def child_result(command: list[str], **kwargs: Any) -> dict[str, Any]:
