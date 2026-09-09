@@ -1040,8 +1040,13 @@ impl PendingMessageStore {
         claim_ttl_secs: i64,
     ) -> Result<Option<ClaimedMessage>> {
         self.with_claim_connection(|conn| {
+            let now = now_secs();
+            let stale_cutoff = saturating_cutoff(now, claim_ttl_secs);
+            if !claim_work_available(conn, stale_cutoff, now, None, None, true)? {
+                return Ok(None);
+            }
             let tx = transaction_immediate(conn, "claim queued message")?;
-            reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
+            reclaim_stale_tx(&tx, stale_cutoff)?;
 
             let now = now_secs();
             let row = tx
@@ -1124,9 +1129,15 @@ impl PendingMessageStore {
         kind_filter: &str,
     ) -> Result<Option<ClaimedMessage>> {
         self.with_claim_connection(|conn| {
+            self.require_lifecycle_writer_lease(conn, "claim queued message")?;
+            let now = now_secs();
+            let stale_cutoff = saturating_cutoff(now, claim_ttl_secs);
+            if !claim_work_available(conn, stale_cutoff, now, None, Some(kind_filter), false)? {
+                return Ok(None);
+            }
             let tx = transaction_immediate(conn, "claim queued message")?;
             self.require_lifecycle_writer_lease(&tx, "claim queued message")?;
-            reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
+            reclaim_stale_tx(&tx, stale_cutoff)?;
 
             let now = now_secs();
             let row = tx
@@ -1223,9 +1234,22 @@ impl PendingMessageStore {
         kind_filter: &str,
     ) -> Result<Option<ClaimedMessage>> {
         self.with_claim_connection(|conn| {
+            self.require_lifecycle_writer_lease(conn, "claim queued message by id")?;
+            let now = now_secs();
+            let stale_cutoff = saturating_cutoff(now, claim_ttl_secs);
+            if !claim_work_available(
+                conn,
+                stale_cutoff,
+                now,
+                Some(id_filter),
+                Some(kind_filter),
+                false,
+            )? {
+                return Ok(None);
+            }
             let tx = transaction_immediate(conn, "claim queued message by id")?;
             self.require_lifecycle_writer_lease(&tx, "claim queued message by id")?;
-            reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
+            reclaim_stale_tx(&tx, stale_cutoff)?;
 
             let now = now_secs();
             let row = tx
@@ -2814,6 +2838,41 @@ fn min_optional_i64(left: Option<i64>, right: Option<i64>) -> Option<i64> {
     }
 }
 
+fn claim_work_available(
+    conn: &Connection,
+    stale_cutoff: i64,
+    now: i64,
+    id_filter: Option<&str>,
+    kind_filter: Option<&str>,
+    exclude_dedicated_kinds: bool,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM pending_messages
+            WHERE status = 'claimed'
+              AND (heartbeat_at IS NULL OR heartbeat_at < ?1)
+            LIMIT 1
+        ) OR EXISTS (
+            SELECT 1 FROM pending_messages
+            WHERE status = 'pending' AND next_attempt_at <= ?2
+              AND (?3 IS NULL OR id = ?3)
+              AND (?4 IS NULL OR kind = ?4)
+              AND (?5 = 0 OR kind NOT IN ('llm_task', 'ingest_async'))
+            LIMIT 1
+        )
+        "#,
+        params![
+            stale_cutoff,
+            now,
+            id_filter,
+            kind_filter,
+            i64::from(exclude_dedicated_kinds)
+        ],
+        |row| row.get::<_, i64>(0).map(|available| available != 0),
+    )
+}
+
 fn reclaim_stale_tx(conn: &rusqlite::Transaction<'_>, stale_cutoff: i64) -> rusqlite::Result<u64> {
     let updated = conn.execute(
         r#"
@@ -2992,5 +3051,6 @@ mod tests {
     use crate::core::db::Database;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    include!("queue_claim_contention_tests.rs");
     include!("queue_operation_key_tests.rs");
 }

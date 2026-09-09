@@ -26,7 +26,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - Context isolate embed env HTTP CL (#1080,#1082).
 - Daemon lease survives maintenance cap/no exit 75; rejects incompatible MCP-ingest holders (#916,#849).
-- Contention/owner/telemetry (#1105); spool/pattern/lease/hook (#945/#1103/#986/#1000/#987/#1106/#1107); LLM 404 fallback/owned admission cleanup (#1119).
+- #1105 contention telemetry/idle-poll elision; #945/#1103/#986/#1000/#987/#1106/#1107 spool/pattern/lease/hook; #1119 LLM 404/admission.
 - Cited-recall latest-decision walks the full successor chain, filters context the same way, and requires a live correction/continuation citation (#898).
 - Codex snapshots atomically remove superseded turns/vectors and fail closed on ambiguity (#896).
 - MCP search shares a deadline and releases reads before responding (#881).
