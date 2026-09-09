@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import resource
 import select
 import subprocess
 import tempfile
@@ -31,11 +32,17 @@ __all__ = [
     "MAX_MCP_RESPONSE_BYTES",
     "McpClient",
     "OwnedSubprocessRegistry",
+    "child_io_blocks_delta",
+    "child_io_blocks_snapshot",
     "cleanup_exact_ids",
     "finalize_cleanup_manifest",
+    "io_delta",
+    "read_proc_io",
+    "read_tempfile_bytes",
     "record_proc_io_delta",
     "strict_json_loads",
     "terminate_and_reap_owned_processes",
+    "wait_exited_without_reap",
 ]
 
 
@@ -54,7 +61,7 @@ def strict_json_loads(data: str | bytes | bytearray) -> Any:
 
 
 class CleanupManifest:
-    """Persist only cleanup-authorized drawer IDs using atomic replacement."""
+    """Persist cleanup IDs and followable operation custody atomically."""
 
     def __init__(self, path: Path | None = None) -> None:
         if path is None:
@@ -62,17 +69,31 @@ class CleanupManifest:
             path = Path("/tmp") / name
         self.path = path
         self._pending: list[str] = []
+        self._pending_operations: list[dict[str, str]] = []
 
     @property
     def pending_count(self) -> int:
         return len(self._pending)
 
+    @property
+    def pending_operations(self) -> list[dict[str, str]]:
+        return [dict(operation) for operation in self._pending_operations]
+
+    @property
+    def pending_operation_count(self) -> int:
+        return len(self._pending_operations)
+
     def checkpoint(self) -> None:
         """Atomically persist the current cleanup receipt with mode 0600."""
-        self._checkpoint(self._pending)
+        self._checkpoint(self._pending, self._pending_operations)
 
-    def _checkpoint(self, pending: list[str]) -> None:
-        serialized = self._serialize(pending)
+    def _checkpoint(
+        self,
+        pending: list[str],
+        pending_operations: list[dict[str, str]] | None = None,
+    ) -> None:
+        operations = self._pending_operations if pending_operations is None else pending_operations
+        serialized = self._serialize(pending, operations)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path: Path | None = None
         try:
@@ -90,6 +111,7 @@ class CleanupManifest:
                 os.fsync(handle.fileno())
             os.replace(temporary_path, self.path)
             self._pending = list(pending)
+            self._pending_operations = [dict(operation) for operation in operations]
             self._fsync_parent()
         finally:
             if temporary_path is not None and temporary_path.exists():
@@ -114,10 +136,31 @@ class CleanupManifest:
                 )
         self._checkpoint(pending)
 
+    def add_pending_operation(self, role: str, operation_id: str) -> None:
+        if not isinstance(role, str) or not role:
+            raise ValueError("pending operation roles must be non-empty strings")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("pending operation IDs must be non-empty strings")
+        operations = self.pending_operations
+        operation = {"operation_id": operation_id, "role": role}
+        if operation not in operations:
+            operations.append(operation)
+        self._checkpoint(self._pending, operations)
+
+    def resolve_pending_operation(self, role: str, operation_id: str) -> None:
+        operation = {"operation_id": operation_id, "role": role}
+        operations = [item for item in self._pending_operations if item != operation]
+        if len(operations) == len(self._pending_operations):
+            return
+        if self._pending or operations:
+            self._checkpoint(self._pending, operations)
+        else:
+            self.discard()
+
     def mark_cleaned(self, drawer_ids: list[str]) -> None:
         cleaned = set(drawer_ids)
         pending = [drawer_id for drawer_id in self._pending if drawer_id not in cleaned]
-        if pending:
+        if pending or self._pending_operations:
             self._checkpoint(pending)
         else:
             self.discard()
@@ -127,8 +170,10 @@ class CleanupManifest:
             self.path.unlink()
         except FileNotFoundError:
             self._pending = []
+            self._pending_operations = []
             return
         self._pending = []
+        self._pending_operations = []
         self._fsync_parent()
 
     def _fsync_parent(self) -> None:
@@ -139,9 +184,14 @@ class CleanupManifest:
             os.close(directory_fd)
 
     @staticmethod
-    def _serialize(pending: list[str]) -> str:
+    def _serialize(
+        pending: list[str], pending_operations: list[dict[str, str]] | None = None
+    ) -> str:
+        payload: dict[str, Any] = {"cleanup_drawer_ids": pending}
+        if pending_operations:
+            payload["pending_operations"] = pending_operations
         serialized = json.dumps(
-            {"cleanup_drawer_ids": pending},
+            payload,
             sort_keys=True,
             separators=(",", ":"),
         ) + "\n"
@@ -161,14 +211,18 @@ def finalize_cleanup_manifest(
     """Expose a recovery receipt only while cleanup-authorized IDs remain."""
     summary.pop("cleanup_manifest_path", None)
     summary.pop("cleanup_pending_count", None)
+    summary.pop("pending_operation_count", None)
     if manifest is None:
         return
-    if manifest.pending_count > 0:
+    if manifest.pending_count > 0 or manifest.pending_operation_count > 0:
         if checkpoint:
             manifest.checkpoint()
         if manifest.path.exists():
             summary["cleanup_manifest_path"] = str(manifest.path)
-            summary["cleanup_pending_count"] = manifest.pending_count
+            if manifest.pending_count > 0:
+                summary["cleanup_pending_count"] = manifest.pending_count
+            if manifest.pending_operation_count > 0:
+                summary["pending_operation_count"] = manifest.pending_operation_count
     else:
         manifest.discard()
 
@@ -263,6 +317,64 @@ def record_proc_io_delta(
     if receipt_key is not None:
         receipt_targets[receipt_key] = updated
         summary_io[category] = dict(updated)
+
+
+def read_proc_io(pid: int | None) -> dict[str, int] | None:
+    if pid is None:
+        return None
+    try:
+        data = Path(f'/proc/{pid}/io').read_text()
+    except Exception:
+        return None
+    keys = {'read_bytes', 'write_bytes', 'cancelled_write_bytes', 'rchar', 'wchar'}
+    parsed: dict[str, int] = {}
+    for line in data.splitlines():
+        if ':' not in line:
+            continue
+        key, value = line.split(':', 1)
+        if key in keys:
+            try:
+                parsed[key] = int(value.strip())
+            except ValueError:
+                pass
+    return parsed
+
+
+def io_delta(before: dict[str, int] | None, after: dict[str, int] | None) -> dict[str, int] | None:
+    if before is None or after is None:
+        return None
+    return {key: after.get(key, 0) - before.get(key, 0) for key in sorted(set(before) | set(after))}
+
+
+def wait_exited_without_reap(pid: int, timeout: float) -> bool | None:
+    """Wait for a child process to exit without reaping it (leaves it for Popen.cleanup).
+
+    On Python 3.14+, ``os.waitid`` with ``WNOWAIT`` can deadlock when the
+    child uses tempfile redirection.  We instead poll ``/proc/<pid>`` which
+    reliably detects process exit without consuming the wait status.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if not Path(f'/proc/{pid}').exists():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def read_tempfile_bytes(handle: Any) -> bytes:
+    handle.flush()
+    handle.seek(0)
+    return handle.read()
+
+
+def child_io_blocks_snapshot() -> dict[str, int]:
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return {'ru_inblock': int(usage.ru_inblock), 'ru_oublock': int(usage.ru_oublock)}
+
+
+def child_io_blocks_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+    return {key: after.get(key, 0) - before.get(key, 0) for key in sorted(set(before) | set(after))}
 
 
 class McpClient:

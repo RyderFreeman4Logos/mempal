@@ -15,7 +15,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import resource
 import urllib.parse
 import urllib.request
 from urllib.error import HTTPError
@@ -37,7 +36,13 @@ def _load_sibling_module(name: str, filename: str) -> Any:
 _SMOKE_RUNTIME = _load_sibling_module('_mempal_smoke_runtime', 'smoke_runtime.py')
 _SMOKE_RECEIPTS = _load_sibling_module('_mempal_smoke_receipts', 'smoke_receipts.py')
 CleanupManifest = _SMOKE_RUNTIME.CleanupManifest
+child_io_blocks_delta = _SMOKE_RUNTIME.child_io_blocks_delta
+child_io_blocks_snapshot = _SMOKE_RUNTIME.child_io_blocks_snapshot
+io_delta = _SMOKE_RUNTIME.io_delta
+read_proc_io = _SMOKE_RUNTIME.read_proc_io
+read_tempfile_bytes = _SMOKE_RUNTIME.read_tempfile_bytes
 strict_json_loads = _SMOKE_RUNTIME.strict_json_loads
+wait_exited_without_reap = _SMOKE_RUNTIME.wait_exited_without_reap
 receipt_dicts_from = _SMOKE_RECEIPTS.receipt_dicts_from
 cleanup_ids_from = _SMOKE_RECEIPTS.cleanup_ids_from
 operation_id_from = _SMOKE_RECEIPTS.operation_id_from
@@ -434,33 +439,6 @@ def installed_binary_path() -> str | None:
     return shutil.which('mempal')
 
 
-def read_proc_io(pid: int | None) -> dict[str, int] | None:
-    if pid is None:
-        return None
-    try:
-        data = Path(f'/proc/{pid}/io').read_text()
-    except Exception:
-        return None
-    keys = {'read_bytes', 'write_bytes', 'cancelled_write_bytes', 'rchar', 'wchar'}
-    parsed: dict[str, int] = {}
-    for line in data.splitlines():
-        if ':' not in line:
-            continue
-        key, value = line.split(':', 1)
-        if key in keys:
-            try:
-                parsed[key] = int(value.strip())
-            except ValueError:
-                pass
-    return parsed
-
-
-def io_delta(before: dict[str, int] | None, after: dict[str, int] | None) -> dict[str, int] | None:
-    if before is None or after is None:
-        return None
-    return {key: after.get(key, 0) - before.get(key, 0) for key in sorted(set(before) | set(after))}
-
-
 def proc_io_aggregate() -> dict[str, Any]:
     return {
         'process_count': 0,
@@ -480,28 +458,6 @@ def record_proc_io_delta(
         SUMMARY['io'], _PROC_IO_RECEIPT_TARGETS, PROC_IO_KEYS,
         category, before, after, receipt_id,
     )
-
-
-def wait_exited_without_reap(pid: int, timeout: float) -> bool | None:
-    """Wait for a child process to exit without reaping it (leaves it for Popen.cleanup).
-
-    On Python 3.14+, ``os.waitid`` with ``WNOWAIT`` can deadlock when the
-    child uses tempfile redirection.  We instead poll ``/proc/<pid>`` which
-    reliably detects process exit without consuming the wait status.
-    """
-    deadline = time.monotonic() + timeout
-    while True:
-        if not Path(f'/proc/{pid}').exists():
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.05)
-
-
-def read_tempfile_bytes(handle: Any) -> bytes:
-    handle.flush()
-    handle.seek(0)
-    return handle.read()
 
 
 def run_child_process(
@@ -595,15 +551,6 @@ def run_child_process(
         'timed_out': timed_out,
         'killed': killed,
     }
-
-
-def child_io_blocks_snapshot() -> dict[str, int]:
-    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-    return {'ru_inblock': int(usage.ru_inblock), 'ru_oublock': int(usage.ru_oublock)}
-
-
-def child_io_blocks_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
-    return {key: after.get(key, 0) - before.get(key, 0) for key in sorted(set(before) | set(after))}
 
 
 def json_shape(value: Any) -> dict[str, Any]:
@@ -1266,6 +1213,7 @@ def recover_created_ids(value: Any, wait_label: str) -> tuple[list[str], dict[st
     if classified['kind'] != 'queued' or operation_id is None:
         return ids, info
 
+    _remember_pending_operation(wait_label, operation_id)
     waited = wait_operation(operation_id, wait_label)
     waited_classification = classify_create_attempt(
         waited, expected_operation_id=operation_id
@@ -1279,6 +1227,9 @@ def recover_created_ids(value: Any, wait_label: str) -> tuple[list[str], dict[st
         'created_drawer_ids', []
     )
     info['cleanup_drawer_ids'] = ids
+    if waited_classification['kind'] == 'created':
+        _remember_created_ids(ids)
+        _resolve_pending_operation(wait_label, operation_id)
     if waited_classification['kind'] == 'proven_no_write':
         info['receipt'] = waited_classification['receipt']
     info['recovered_via'] = wait_label
@@ -1615,6 +1566,16 @@ def _remember_created_ids(drawer_ids: list[str]) -> None:
         CLEANUP_MANIFEST.add_created_ids(drawer_ids)
 
 
+def _remember_pending_operation(role: str, operation_id: str | None) -> None:
+    if operation_id and CLEANUP_MANIFEST is not None:
+        CLEANUP_MANIFEST.add_pending_operation(role, operation_id)
+
+
+def _resolve_pending_operation(role: str, operation_id: str | None) -> None:
+    if operation_id and CLEANUP_MANIFEST is not None:
+        CLEANUP_MANIFEST.resolve_pending_operation(role, operation_id)
+
+
 def _mark_verified_cleaned(drawer_ids: list[str]) -> None:
     if drawer_ids and CLEANUP_MANIFEST is not None:
         CLEANUP_MANIFEST.mark_cleaned(drawer_ids)
@@ -1766,6 +1727,8 @@ def mcp_crud() -> list[str]:
         create_timeout_operation_id = (
             create_operation_id if create_classification.get('timed_out') is True else None
         )
+        if create_timeout_operation_id:
+            _remember_pending_operation('mcp_create_cli_wait', create_timeout_operation_id)
         create_recovery: dict[str, Any] = {
             'kind': create_classification['kind'],
             'operation_id_present': bool(create_operation_id),
@@ -1791,6 +1754,7 @@ def mcp_crud() -> list[str]:
             _remember_created_ids(status_ids)
             create_recovery['kind'] = status_classification['kind']
             if status_classification['kind'] == 'created':
+                _resolve_pending_operation('mcp_create_cli_wait', create_timeout_operation_id)
                 created_ids = status_classification.get('created_drawer_ids', [])
                 create_recovery.update({
                     'recovered_via': 'mcp_operation_status',
@@ -1830,6 +1794,7 @@ def mcp_crud() -> list[str]:
                 ),
             })
             if waited_classification['kind'] == 'created':
+                _resolve_pending_operation('mcp_create_cli_wait', create_timeout_operation_id)
                 created_ids = waited_classification.get('created_drawer_ids', [])
             SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
@@ -1921,6 +1886,8 @@ def mcp_crud() -> list[str]:
         update_timeout_operation_id = (
             update_operation_id if update_classification.get('timed_out') is True else None
         )
+        if update_timeout_operation_id:
+            _remember_pending_operation('mcp_update_cli_wait', update_timeout_operation_id)
         update_recovery: dict[str, Any] = {
             'kind': update_classification['kind'],
             'operation_id_present': bool(update_operation_id),
@@ -1948,12 +1915,13 @@ def mcp_crud() -> list[str]:
                 ),
             })
             if waited_classification['kind'] == 'created':
+                _resolve_pending_operation('mcp_update_cli_wait', update_timeout_operation_id)
                 authoritative_update_ids = waited_classification.get(
                     'created_drawer_ids', []
                 )
             SUMMARY['mcp_ingest_fallback_to_cli'] += 1
 
-        if not authoritative_update_ids and not update_receipt and not _fu(update_recovery):
+        if not authoritative_update_ids and not update_receipt and not _fu(update_recovery) and not update_timeout_operation_id:
             rest_upd_ids, rest_update_disposition = run_fallback_after_mcp_reaped(
                 client,
                 'update_rest',
