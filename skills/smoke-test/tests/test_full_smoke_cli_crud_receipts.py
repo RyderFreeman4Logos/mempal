@@ -4,12 +4,13 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
-from pathlib import Path
 import tempfile
+from pathlib import Path
 from types import ModuleType
 from typing import Any
-import unittest
 from unittest import mock
+
+from smoke_test_support import FailClosedExternalCalls
 
 
 def load_full_smoke() -> ModuleType:
@@ -21,7 +22,7 @@ def load_full_smoke() -> ModuleType:
     return module
 
 
-class CliCrudReceiptTests(unittest.TestCase):
+class CliCrudReceiptTests(FailClosedExternalCalls):
     @staticmethod
     def mcp_holder_budget_receipt() -> dict[str, Any]:
         """Mirror the complete real 14-of-16 MCP async-pool refusal data."""
@@ -194,7 +195,7 @@ class CliCrudReceiptTests(unittest.TestCase):
 
         for name, (field, value) in cases.items():
             with self.subTest(name=name):
-                structured, info = self.mcp_error_tool_result(
+                _structured, info = self.mcp_error_tool_result(
                     smoke, {**self.mcp_holder_budget_receipt(), field: value}
                 )
                 attempt = smoke.create_attempt_from_mcp_info(info)
@@ -212,7 +213,7 @@ class CliCrudReceiptTests(unittest.TestCase):
 
         for name, contradiction in cases.items():
             with self.subTest(name=name):
-                structured, info = self.mcp_error_tool_result(
+                _structured, info = self.mcp_error_tool_result(
                     smoke, {**self.mcp_holder_budget_receipt(), **contradiction}
                 )
                 attempt = smoke.create_attempt_from_mcp_info(info)
@@ -537,8 +538,6 @@ class CliCrudReceiptTests(unittest.TestCase):
             create_client = mock.Mock()
             update_client = mock.Mock()
             update_client.tool.return_value = ({"results": []}, {"ok": True})
-            final_client = mock.Mock()
-            final_client.tool.return_value = ({"results": []}, {"ok": True})
             structured, info = self.mcp_error_tool_result(
                 smoke,
                 self.mcp_holder_budget_receipt(),
@@ -571,7 +570,7 @@ class CliCrudReceiptTests(unittest.TestCase):
                     mock.patch.object(
                         smoke,
                         "mcp_start_initialized",
-                        side_effect=[discover, create_client, update_client, final_client],
+                        side_effect=[discover, create_client, update_client],
                     ),
                     mock.patch.object(smoke, "mcp_call_isolated"),
                     mock.patch.object(
@@ -596,13 +595,10 @@ class CliCrudReceiptTests(unittest.TestCase):
                     ) as wait_operation,
                     mock.patch.object(
                         smoke,
-                        "delete_exact_ids_mcp",
-                        return_value={
-                            "deleted_count": 3,
-                            "failed_count": 0,
-                            "delete_failed_attempt_count": 0,
-                        },
-                    ) as delete,
+                        "run_exact_cli_cleanup_after_mcp",
+                        side_effect=lambda ids, _label: manifest.mark_cleaned(ids)
+                        or {"deleted_count": len(ids), "failed_count": 0},
+                    ) as cli_cleanup,
                     mock.patch.object(
                         smoke,
                         "_rest_ingest_fallback",
@@ -613,14 +609,6 @@ class CliCrudReceiptTests(unittest.TestCase):
                                     "kind": "created",
                                     "created_drawer_ids": ["drawer-rest"],
                                     "cleanup_drawer_ids": ["drawer-rest"],
-                                },
-                            ),
-                            (
-                                ["update-rest"],
-                                {
-                                    "kind": "created",
-                                    "created_drawer_ids": ["update-rest"],
-                                    "cleanup_drawer_ids": ["update-rest"],
                                 },
                             ),
                         ],
@@ -635,7 +623,12 @@ class CliCrudReceiptTests(unittest.TestCase):
                     )
                 self.assertEqual(rest_fallback.call_count, 1)
                 wait_operation.assert_called_once_with("op-A", "mcp_update_cli_wait")
-                self.assertNotIn("drawer-other", str((delete.call_args, manifest.path.read_text())))
+                cli_cleanup.assert_called_once_with(["drawer-direct", "drawer-rest"], "mcp_cleanup_after_update_failure")
+                self.assertEqual(
+                    manifest.pending_operations,
+                    [{"operation_id": "op-A", "role": "mcp_update_cli_wait"}],
+                )
+                self.assertNotIn("drawer-other", manifest.path.read_text())
                 self.assertFalse(smoke.SUMMARY["groups"]["mcp_create"]["ok"])
                 self.assertFalse(smoke.SUMMARY["groups"]["mcp_update"]["ok"])
             finally:
