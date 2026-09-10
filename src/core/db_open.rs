@@ -320,7 +320,10 @@ mod tests {
     use crate::ingress_spool::AppendOutcome;
 
     fn short_tempdir() -> tempfile::TempDir {
-        tempfile::TempDir::new().expect("short tempdir")
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temp root");
+        tempfile::TempDir::new_in(temp_root).expect("short tempdir")
     }
 
     #[test]

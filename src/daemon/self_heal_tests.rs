@@ -1,4 +1,8 @@
+#[cfg(target_os = "linux")]
+use std::fs::File;
 use std::io::{self, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -25,6 +29,17 @@ impl Drop for ShutdownResetGuard {
 
 fn short_tempdir() -> tempfile::TempDir {
     tempfile::TempDir::new().expect("short tempdir")
+}
+
+#[cfg(target_os = "linux")]
+fn short_mempal_home(tempdir: &tempfile::TempDir) -> (File, PathBuf) {
+    let directory = File::open(tempdir.path()).expect("open temporary directory");
+    let path = PathBuf::from(format!(
+        "/proc/{}/fd/{}/.mempal",
+        std::process::id(),
+        directory.as_raw_fd()
+    ));
+    (directory, path)
 }
 
 struct LogCapture {
@@ -463,6 +478,9 @@ async fn test_hook_ipc_listener_bounds_active_handlers() {
     super::reset_hook_ipc_handler_counters_for_test();
     let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
+    #[cfg(target_os = "linux")]
+    let (_tempdir_fd, mempal_home) = short_mempal_home(&tmp);
+    #[cfg(not(target_os = "linux"))]
     let mempal_home = tmp.path().join(".mempal");
     std::fs::create_dir_all(&mempal_home).expect("create mempal home");
     Database::open(&db_path).expect("open db");
@@ -539,7 +557,7 @@ async fn test_hook_ipc_listener_recovers_after_real_sqlite_contention() {
     super::reset_hook_ipc_handler_counters_for_test();
     let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
-    let mempal_home = tmp.path().join(".mempal");
+    let (_tempdir_fd, mempal_home) = short_mempal_home(&tmp);
     std::fs::create_dir_all(&mempal_home).expect("create mempal home");
     Database::open(&db_path).expect("open db");
     let (listener, _socket_guard) =
