@@ -515,10 +515,10 @@ rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-gro
 [[files]]
 path = "tests/hook_passive_capture.rs"
 kind = "test"
-baseline_tokens = 8636
-baseline_lines = 1098
+baseline_tokens = 8493
+baseline_lines = 1078
 issue = "695"
-rationale = "Compatibility tests use explicit REST state and a real status daemon; #695 tracks the split, with an exact no-growth ratchet."
+rationale = "Pre-existing tracked-text monolith debt calibrated for #695; no-growth ratchet."
 
 [[files]]
 path = "tests/ingest_cli_errors.rs"

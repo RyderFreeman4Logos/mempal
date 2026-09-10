@@ -1,6 +1,8 @@
 #![cfg(feature = "integration")]
 
 mod common;
+#[path = "hook_passive_capture/daemon_fixture.rs"]
+mod daemon_fixture;
 
 use std::collections::HashMap;
 use std::fs;
@@ -179,22 +181,6 @@ where
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("condition not satisfied within {timeout:?}");
-}
-
-async fn wait_for_daemon_stderr_line(daemon: &DaemonSupervisor, timeout: Duration, needle: &str) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        if daemon
-            .stderr_lines()
-            .await
-            .iter()
-            .any(|line| line.contains(needle))
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("daemon stderr did not contain {needle:?} within {timeout:?}");
 }
 
 fn drawer_count(db_path: &Path) -> i64 {
@@ -841,7 +827,7 @@ async fn test_daemon_sigterm_wakes_long_poll_hook_workers() {
         .wait_ready(Duration::from_secs(5))
         .await
         .expect("wait ready");
-    wait_for_daemon_stderr_line(
+    daemon_fixture::wait_for_stderr_line(
         &daemon,
         Duration::from_secs(5),
         "daemon hook workers started",
@@ -944,18 +930,7 @@ async fn test_daemon_status_reports_state_and_queue() {
     store
         .refresh_heartbeat(&claimed.id, "status-worker")
         .expect("refresh heartbeat");
-    let mut daemon = DaemonSupervisor::spawn(
-        HashMap::from([("HOME".to_string(), tmp.path().display().to_string())]),
-        vec!["--foreground".to_string()],
-    )
-    .await
-    .expect("spawn status daemon");
-    wait_for_daemon_stderr_line(
-        &daemon,
-        Duration::from_secs(5),
-        "hooks not enabled; daemon running configured background services only",
-    )
-    .await;
+    let mut daemon = daemon_fixture::spawn_status(tmp.path()).await;
 
     let mut status_cmd = Command::new(bin());
     status_cmd.arg("status").env("HOME", tmp.path());
@@ -998,12 +973,7 @@ async fn test_daemon_status_reports_state_and_queue() {
         "{daemon_stdout}"
     );
 
-    daemon.sigterm();
-    let status = tokio::time::timeout(Duration::from_secs(3), daemon.wait())
-        .await
-        .expect("status daemon did not stop within deadline")
-        .expect("wait status daemon");
-    assert!(status.success(), "status daemon exited with {status:?}");
+    daemon_fixture::stop_status(&mut daemon).await;
 }
 
 #[test]
