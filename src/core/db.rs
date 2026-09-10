@@ -6188,6 +6188,8 @@ fn ensure_v13_typed_pinned_schema(conn: &Connection, current_version: u32) -> Re
     let missing_pin_order = !existing_columns.contains("pin_order");
     let missing_supersedes = !existing_columns.contains("supersedes");
 
+    #[cfg(test)]
+    db_open::notify_schema_repair_begin_for_test(conn);
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     if let Err(error) = (|| -> Result<(), DbError> {
         if missing_is_pinned {

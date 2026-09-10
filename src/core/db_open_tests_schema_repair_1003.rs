@@ -11,28 +11,33 @@ fn repair_required_current_schema_open_fails_bounded_then_repairs_after_writer_r
 
     let blocker = Connection::open(&db_path).expect("open migration blocker");
     blocker
-        .execute_batch("DROP INDEX idx_drawers_supersedes; BEGIN IMMEDIATE;")
-        .expect("damage current schema and hold writer lock");
+        .execute_batch("DROP INDEX idx_drawers_supersedes;")
+        .expect("damage current schema");
     assert!(
         schema_repairs_required(&blocker).expect("inspect repair-required fixture"),
         "fixture must require structural repair"
     );
 
     let (opened_tx, opened_rx) = std::sync::mpsc::channel();
-    let (opener_started_tx, opener_started_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (repair_begin_rx, repair_resume_tx) =
+        super::install_schema_repair_begin_test_hook(&db_path);
     let open_path = db_path.clone();
     let opener = std::thread::spawn(move || {
-        opener_started_tx
-            .send(())
-            .expect("report repair opener readiness");
+        std::thread::sleep(Duration::from_millis(300));
         let _ = opened_tx.send(Database::open_with_busy_timeout(
             &open_path,
             Duration::from_millis(25),
         ));
     });
-    opener_started_rx
+    repair_begin_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("repair opener must reach the busy-window boundary");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold writer lock at the repair boundary");
+    repair_resume_tx
+        .send(())
+        .expect("release repair opener into the busy window");
     let opened = opened_rx.recv_timeout(Duration::from_millis(250));
     blocker
         .execute_batch("ROLLBACK;")
