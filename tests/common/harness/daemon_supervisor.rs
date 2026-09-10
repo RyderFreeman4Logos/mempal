@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 pub struct DaemonSupervisor {
     child: Child,
     pid: i32,
-    db_path: PathBuf,
+    home: PathBuf,
     stdout_lines: Arc<Mutex<Vec<String>>>,
     stderr_lines: Arc<Mutex<Vec<String>>>,
     stdout_task: Option<tokio::task::JoinHandle<()>>,
@@ -32,12 +32,12 @@ impl DaemonSupervisor {
                 runtime_root.display().to_string(),
             );
         }
-        let db_path = match env_vars
+        let home = match env_vars
             .get("HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
         {
-            Some(home) => home.join(".mempal").join("palace.db"),
+            Some(home) => home,
             None => bail!("daemon supervisor requires HOME for readiness"),
         };
         let mut command = Command::new(env!("CARGO_BIN_EXE_mempal"));
@@ -84,7 +84,7 @@ impl DaemonSupervisor {
         Ok(Self {
             child,
             pid,
-            db_path,
+            home,
             stdout_lines,
             stderr_lines,
             stdout_task: Some(stdout_task),
@@ -93,10 +93,33 @@ impl DaemonSupervisor {
     }
 
     pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
-        let db_path = self.db_path.clone();
-        let daemon_pid =
-            tokio::task::spawn_blocking(move || mempal::daemon_readiness::wait(&db_path, timeout))
-                .await??;
+        let timeout_secs = timeout.as_secs().saturating_add(1).to_string();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mempal"));
+        command
+            .args(["daemon", "wait", "--timeout-secs", &timeout_secs])
+            .env("HOME", &self.home)
+            .env(
+                mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
+                self.home.join(".mempal/runtime"),
+            )
+            .kill_on_drop(true);
+        let output = match tokio::time::timeout(timeout, command.output()).await {
+            Ok(output) => output?,
+            Err(_) => bail!("daemon readiness timed out after {timeout:?}"),
+        };
+        if !output.status.success() {
+            bail!(
+                "daemon readiness failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let daemon_pid = stdout
+            .trim()
+            .strip_prefix("daemon ready (pid ")
+            .and_then(|value| value.strip_suffix(')'))
+            .and_then(|value| value.parse::<i32>().ok())
+            .ok_or_else(|| anyhow::anyhow!("unexpected daemon readiness output: {stdout:?}"))?;
         if daemon_pid != self.pid {
             bail!("readiness probe identified a different daemon process");
         }
@@ -151,11 +174,10 @@ mod tests {
         let stdout_lines = Arc::new(Mutex::new(Vec::new()));
         let stderr_lines = Arc::new(Mutex::new(vec!["daemon log path: test".to_string()]));
         let temp = tempfile::tempdir()?;
-        let db_path = temp.path().join("palace.db");
         let mut supervisor = DaemonSupervisor {
             child,
             pid,
-            db_path,
+            home: temp.path().to_owned(),
             stdout_lines,
             stderr_lines,
             stdout_task: None,

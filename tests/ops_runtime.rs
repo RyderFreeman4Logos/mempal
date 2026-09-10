@@ -1,9 +1,12 @@
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use common::socket_temp_dir::SocketTempDir;
 use mempal::core::db::{CURRENT_SCHEMA_VERSION, Database};
 use mempal::core::queue::{PendingMessageStore, QueueFailureDisposition};
 use serde_json::Value;
@@ -66,13 +69,13 @@ fn run_mempal(home: &TempDir, args: &[&str]) -> std::process::Output {
     command_output_with_timeout(&mut cmd, CLI_TIMEOUT, "mempal")
 }
 
-fn run_daemon(home: &TempDir, args: &[&str]) -> std::process::Output {
+fn run_daemon(home: &Path, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(mempal_bin());
     cmd.args(args)
-        .env("HOME", home.path())
+        .env("HOME", home)
         .env(
             mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
-            home.path().join(".mempal/runtime"),
+            home.join(".mempal/runtime"),
         )
         .env_remove("MEMPAL_EMBED_BACKEND")
         .env_remove("MEMPAL_EMBED_BASE_URL")
@@ -558,10 +561,10 @@ fn test_cli_doctor_reports_queue_failure_classes() {
 #[test]
 fn test_cli_daemon_status_reports_queue_failure_classes() {
     let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
-    let home = TempDir::new().expect("home");
+    let home = SocketTempDir::new().expect("home");
     let mempal_home = home.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
-    let db_path = palace_db_path(&home);
+    let db_path = home.path().join(".mempal/palace.db");
     fs::write(
         mempal_home.join("config.toml"),
         format!(
@@ -614,10 +617,10 @@ fn test_cli_daemon_status_reports_queue_failure_classes() {
         .stderr(Stdio::null());
     let _daemon = OwnedTestChild(command.spawn().expect("start daemon"));
 
-    let ready = run_daemon(&home, &["daemon", "wait", "--timeout-secs", "10"]);
+    let ready = run_daemon(home.path(), &["daemon", "wait", "--timeout-secs", "10"]);
     assert_success(&ready);
 
-    let output = run_daemon(&home, &["daemon", "status"]);
+    let output = run_daemon(home.path(), &["daemon", "status"]);
     assert_success(&output);
     let out = stdout(&output);
     assert!(out.contains("queue.failed: 2"), "{out}");

@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use common::harness::{BootstrapObserver, DaemonSupervisor, FailMode, start as start_embed_mock};
+use common::socket_temp_dir::SocketTempDir as T;
 use mempal::bootstrap_events::BootstrapEvent;
 use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
@@ -18,11 +19,10 @@ use mempal::daemon_bootstrap::DaemonContext;
 use mempal::hook::{CapturedHookEnvelope, HookEvent};
 use mempal::session_review::split_hooks_raw_metadata;
 use rusqlite::Connection;
-use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-fn mempal_bin() -> String {
-    env!("CARGO_BIN_EXE_mempal").to_string()
+fn bin() -> &'static str {
+    env!("CARGO_BIN_EXE_mempal")
 }
 
 async fn test_guard() -> OwnedMutexGuard<()> {
@@ -34,8 +34,8 @@ async fn test_guard() -> OwnedMutexGuard<()> {
         .await
 }
 
-fn setup_home() -> (TempDir, PathBuf, PathBuf, PathBuf) {
-    let tmp = TempDir::new().expect("tempdir");
+fn setup_home() -> (T, PathBuf, PathBuf, PathBuf) {
+    let tmp = T::new().expect("tempdir");
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
     let db_path = mempal_home.join("palace.db");
@@ -113,7 +113,7 @@ fn command_output_with_timeout(command: &mut Command, timeout: Duration, label: 
 }
 
 fn run_hook(home: &Path, command: &str, payload: &[u8]) -> Output {
-    let mut child = Command::new(mempal_bin())
+    let mut child = Command::new(bin())
         .args(["hook", command])
         .env("HOME", home)
         .stdin(Stdio::piped())
@@ -338,7 +338,7 @@ fn test_daemon_exits_when_disabled() {
     let (tmp, _mempal_home, db_path, config_path) = setup_home();
     write_config(&config_path, &db_path, false, 50, 60, None);
 
-    let output = Command::new(mempal_bin())
+    let output = Command::new(bin())
         .args(["daemon", "--foreground"])
         .env("HOME", tmp.path())
         .stdin(Stdio::null())
@@ -566,7 +566,10 @@ async fn test_daemon_promotes_spooled_hook_payload_to_raw_mirror_and_cleans_spoo
         .wait_ready(Duration::from_secs(5))
         .await
         .expect("wait ready");
-    wait_for_condition(Duration::from_secs(10), || drawer_count(&db_path) > 0).await;
+    wait_for_condition(Duration::from_secs(10), || {
+        drawer_count(&db_path) > 0 && !spool_path.exists()
+    })
+    .await;
 
     let (wing, room, content, source_file) = latest_drawer_row(&db_path);
     assert_eq!(wing, "hooks-raw");
@@ -575,10 +578,6 @@ async fn test_daemon_promotes_spooled_hook_payload_to_raw_mirror_and_cleans_spoo
     assert_eq!(
         fs::read_to_string(&source_file).expect("read promoted raw mirror"),
         raw_payload
-    );
-    assert!(
-        !spool_path.exists(),
-        "successful daemon processing must remove temporary hook spool"
     );
     assert!(
         Path::new(&source_file).starts_with(mempal_home.join("hook-payloads")),
@@ -944,7 +943,7 @@ async fn test_daemon_status_reports_state_and_queue() {
     )
     .expect("write daemon pid");
 
-    let mut status_cmd = Command::new(mempal_bin());
+    let mut status_cmd = Command::new(bin());
     status_cmd.arg("status").env("HOME", tmp.path());
     let output = command_output_with_timeout(&mut status_cmd, Duration::from_secs(5), "status");
     assert!(output.status.success(), "status must succeed");
@@ -956,7 +955,7 @@ async fn test_daemon_status_reports_state_and_queue() {
     assert!(stdout.contains("claimed: 1"), "{stdout}");
     assert!(stdout.contains("last_heartbeat_unix_secs:"), "{stdout}");
 
-    let mut daemon_status_cmd = Command::new(mempal_bin());
+    let mut daemon_status_cmd = Command::new(bin());
     daemon_status_cmd
         .arg("daemon")
         .arg("status")

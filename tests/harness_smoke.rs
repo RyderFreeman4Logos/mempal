@@ -502,7 +502,7 @@ fn release_runtime_writer_lease(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn harness_integration_smoke() -> Result<()> {
-    let tmp = TempDir::new()?;
+    let tmp = SocketTempDir::new()?;
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home)?;
     let db_path = mempal_home.join("palace.db");
