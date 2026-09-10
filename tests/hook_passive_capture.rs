@@ -46,7 +46,8 @@ fn setup_home() -> (T, PathBuf, PathBuf, PathBuf) {
 fn write_config(
     config_path: &Path,
     db_path: &Path,
-    enabled: bool,
+    hooks_enabled: bool,
+    api_enabled: bool,
     poll_ms: u64,
     claim_ttl_secs: u64,
     base_url: Option<&str>,
@@ -75,10 +76,11 @@ backend = "stub"
         format!(
             r#"
 db_path = "{}"
+api.enabled={api_enabled}
 api.addr="127.0.0.1:0"
 {embed}
 [hooks]
-enabled = {enabled}
+enabled = {hooks_enabled}
 daemon_poll_interval_ms = {poll_ms}
 daemon_claim_ttl_secs = {claim_ttl_secs}
 
@@ -269,6 +271,7 @@ async fn test_daemon_crash_reclaim_stale() {
         &config_path,
         &db_path,
         true,
+        false,
         50,
         1,
         Some(&format!("http://{addr}/v1")),
@@ -336,16 +339,14 @@ async fn test_daemon_crash_reclaim_stale() {
 #[test]
 fn test_daemon_exits_when_disabled() {
     let (tmp, _mempal_home, db_path, config_path) = setup_home();
-    write_config(&config_path, &db_path, false, 50, 60, None);
+    write_config(&config_path, &db_path, false, false, 50, 60, None);
 
-    let output = Command::new(bin())
+    let mut command = Command::new(bin());
+    command
         .args(["daemon", "--foreground"])
         .env("HOME", tmp.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("run daemon");
+        .stdin(Stdio::null());
+    let output = command_output_with_timeout(&mut command, Duration::from_secs(5), "daemon");
 
     assert!(
         output.status.success(),
@@ -371,6 +372,7 @@ async fn test_daemon_handles_truncated_envelope_without_retry() {
         &config_path,
         &db_path,
         true,
+        false,
         50,
         60,
         Some(&format!("http://{addr}/v1")),
@@ -437,6 +439,7 @@ async fn test_daemon_processes_hook_post_tool_to_drawer() {
         &config_path,
         &db_path,
         true,
+        false,
         50,
         60,
         Some(&format!("http://{addr}/v1")),
@@ -511,6 +514,7 @@ async fn test_daemon_promotes_spooled_hook_payload_to_raw_mirror_and_cleans_spoo
         &config_path,
         &db_path,
         true,
+        false,
         50,
         60,
         Some(&format!("http://{addr}/v1")),
@@ -724,6 +728,7 @@ async fn test_daemon_slow_hook_does_not_block_later_hook() {
         &config_path,
         &db_path,
         true,
+        false,
         20,
         60,
         Some(&format!("http://{addr}/v1")),
@@ -820,6 +825,7 @@ async fn test_daemon_sigterm_wakes_long_poll_hook_workers() {
         &config_path,
         &db_path,
         true,
+        false,
         10_000,
         60,
         Some(&format!("http://{addr}/v1")),
@@ -861,6 +867,7 @@ async fn test_daemon_sigterm_graceful_shutdown() {
         &config_path,
         &db_path,
         true,
+        false,
         50,
         60,
         Some(&format!("http://{addr}/v1")),
@@ -920,8 +927,8 @@ async fn test_daemon_sigterm_graceful_shutdown() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_daemon_status_reports_state_and_queue() {
     let _guard = test_guard().await;
-    let (tmp, mempal_home, db_path, config_path) = setup_home();
-    write_config(&config_path, &db_path, true, 50, 60, None);
+    let (tmp, _mempal_home, db_path, config_path) = setup_home();
+    write_config(&config_path, &db_path, false, true, 50, 60, None);
 
     let store = queue_store(&db_path);
     store
@@ -937,11 +944,18 @@ async fn test_daemon_status_reports_state_and_queue() {
     store
         .refresh_heartbeat(&claimed.id, "status-worker")
         .expect("refresh heartbeat");
-    fs::write(
-        mempal_home.join("daemon.pid"),
-        std::process::id().to_string(),
+    let mut daemon = DaemonSupervisor::spawn(
+        HashMap::from([("HOME".to_string(), tmp.path().display().to_string())]),
+        vec!["--foreground".to_string()],
     )
-    .expect("write daemon pid");
+    .await
+    .expect("spawn status daemon");
+    wait_for_daemon_stderr_line(
+        &daemon,
+        Duration::from_secs(5),
+        "hooks not enabled; daemon running configured background services only",
+    )
+    .await;
 
     let mut status_cmd = Command::new(bin());
     status_cmd.arg("status").env("HOME", tmp.path());
@@ -983,12 +997,19 @@ async fn test_daemon_status_reports_state_and_queue() {
         daemon_stdout.contains("queue.failed_retryable_model: embedding=0 llm=0"),
         "{daemon_stdout}"
     );
+
+    daemon.sigterm();
+    let status = tokio::time::timeout(Duration::from_secs(3), daemon.wait())
+        .await
+        .expect("status daemon did not stop within deadline")
+        .expect("wait status daemon");
+    assert!(status.success(), "status daemon exited with {status:?}");
 }
 
 #[test]
 fn test_no_sqlite_before_daemonize() {
     let (_tmp, _mempal_home, db_path, config_path) = setup_home();
-    write_config(&config_path, &db_path, true, 50, 60, None);
+    write_config(&config_path, &db_path, true, false, 50, 60, None);
 
     let runtime = tokio::runtime::Runtime::new().expect("bootstrap runtime");
     let (tx, mut observer): (_, BootstrapObserver) = common::harness::channel();
@@ -1026,6 +1047,7 @@ async fn test_truncated_envelope_preview_is_scrubbed() {
         &config_path,
         &db_path,
         true,
+        false,
         50,
         60,
         Some(&format!("http://{addr}/v1")),
