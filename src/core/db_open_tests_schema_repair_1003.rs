@@ -6,8 +6,10 @@ use std::time::Duration;
 fn repair_required_current_schema_open_fails_bounded_then_repairs_after_writer_release() {
     let _fixture_guard = super::db_open_busy_fixture_lock().blocking_lock();
     let tempdir = tempfile::TempDir::new().expect("short tempdir");
-    let db_path = tempdir.path().join("palace.db");
-    drop(Database::open(&db_path).expect("initialize current database"));
+    let db_path = Database::open(&tempdir.path().join("palace.db"))
+        .expect("initialize current database")
+        .path()
+        .to_path_buf();
 
     let blocker = Connection::open(&db_path).expect("open migration blocker");
     blocker
