@@ -5116,26 +5116,12 @@ impl Database {
     where
         F: FnOnce() -> Result<T, DbError>,
     {
-        let owner = crate::core::sqlite_retry::retry_content_mutation_sqlite_lock_until(
+        self.with_runtime_writer_lease_transaction_until(
+            None,
+            "runtime writer lease control",
             Instant::now() + RUNTIME_WRITER_LEASE_TRANSACTION_RETRY_DEADLINE,
-            || {
-                crate::core::writer_owner_diagnostics::begin_immediate(
-                    &self.conn,
-                    "runtime writer lease control",
-                )
-                .map_err(DbError::from)
-            },
-            db_error_is_sqlite_lock,
-        )?;
-        let outcome = match work() {
-            Ok(value) => self.conn.execute_batch("COMMIT").map(|()| value),
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                return Err(error);
-            }
-        };
-        owner.release();
-        outcome.map_err(DbError::from)
+            work,
+        )
     }
 
     // --- Lease coordination ---
@@ -5563,14 +5549,13 @@ impl Database {
         session_id: &str,
         generation: u64,
     ) -> Result<bool, DbError> {
-        self.with_immediate_tx(|| {
-            let rows = self.conn.execute(
-                "DELETE FROM runtime_writer_leases \
-                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4",
-                params![name, owner, session_id, generation as i64],
-            )?;
-            Ok(rows > 0)
-        })
+        self.runtime_writer_lease_release_fenced_until(
+            name,
+            owner,
+            session_id,
+            generation,
+            Instant::now() + RUNTIME_WRITER_LEASE_TRANSACTION_RETRY_DEADLINE,
+        )
     }
 
     pub fn runtime_writer_lease_status(

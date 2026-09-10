@@ -12,6 +12,8 @@ use crate::core::{
 };
 use crate::daemon_bootstrap::{DaemonContext, DaemonWriterLeaseHeld, SharedDatabase};
 
+mod release;
+
 pub(super) const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
 const DAEMON_WRITER_LEASE_TTL_SECS: u64 = 120;
 const DAEMON_WRITER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
@@ -31,6 +33,7 @@ pub(super) struct RuntimeWriterLeaseHandle {
     db_path: PathBuf,
     lease: RuntimeWriterLease,
     heartbeat: tokio::task::JoinHandle<()>,
+    release_handed_off: bool,
 }
 
 impl RuntimeWriterLeaseHandle {
@@ -45,6 +48,7 @@ impl RuntimeWriterLeaseHandle {
             db_path,
             lease,
             heartbeat,
+            release_handed_off: false,
         }
     }
 
@@ -56,8 +60,10 @@ impl RuntimeWriterLeaseHandle {
 impl Drop for RuntimeWriterLeaseHandle {
     fn drop(&mut self) {
         self.heartbeat.abort();
-        if let Ok(db) = Database::open(&self.db_path) {
-            let _ = db.runtime_writer_lease_release(&self.lease);
+        if !self.release_handed_off {
+            if let Ok(db) = Database::open(&self.db_path) {
+                let _ = db.runtime_writer_lease_release(&self.lease);
+            }
         }
     }
 }

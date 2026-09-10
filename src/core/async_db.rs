@@ -363,6 +363,8 @@ impl AsyncDb {
             Arc::clone(&self._admission),
             delay,
             deadline,
+            #[cfg(test)]
+            None,
             f,
         )
         .await
@@ -603,6 +605,7 @@ async fn exec_with_deadline<F, R>(
     _admission: Arc<ProfileDbAdmission>,
     delay: Option<Duration>,
     deadline: Instant,
+    #[cfg(test)] owner_observed: Option<tokio::sync::oneshot::Sender<()>>,
     f: F,
 ) -> Result<R, DbError>
 where
@@ -650,6 +653,14 @@ where
             checkin_pool.checkin(conn);
             out
         })
+    });
+    let join = tokio::spawn(async move {
+        let result = await_write_join(join).await;
+        #[cfg(test)]
+        if let Some(owner_observed) = owner_observed {
+            let _ = owner_observed.send(());
+        }
+        result
     });
     let approval_tx =
         match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), ready_rx).await {

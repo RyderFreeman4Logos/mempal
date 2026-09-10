@@ -201,9 +201,24 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         .context("failed to start daemon async ingest worker")?;
 
     if !context.config.hooks.enabled {
-        recovery
+        if let Err(error) = recovery
             .record_recovered()
-            .context("failed to mark daemon recovery complete")?;
+            .context("failed to mark daemon recovery complete")
+        {
+            #[cfg(unix)]
+            request_shutdown_and_notify();
+            #[cfg(feature = "rest")]
+            drain_rest_server(rest_task).await;
+            ingest_drain_worker
+                .shutdown_and_drain_with_budget(Some(DAEMON_DRAIN_BUDGET))
+                .await;
+            sleep_scheduler::drain(sleep_scheduler_handle).await;
+            let _ = context.store.reclaim_stale(0).await;
+            if let Err(release_error) = writer_lease.release(&context.async_db).await {
+                tracing::error!(error = %release_error, "failed to release daemon writer lease after startup failure");
+            }
+            return Err(error);
+        }
         ensure_daemon_runtime_writer_lease_active(&*context.db.lock().await, writer_lease.lease())?;
         if let Err(error) = notify_systemd_ready() {
             #[cfg(unix)]
@@ -215,6 +230,9 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                 .await;
             sleep_scheduler::drain(sleep_scheduler_handle).await;
             let _ = context.store.reclaim_stale(0).await;
+            if let Err(release_error) = writer_lease.release(&context.async_db).await {
+                tracing::error!(error = %release_error, "failed to release daemon writer lease after readiness failure");
+            }
             return Err(error);
         }
         eprintln!("hooks not enabled; daemon running configured background services only");

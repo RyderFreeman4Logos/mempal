@@ -1,4 +1,6 @@
 mod common;
+#[path = "write_wait_cli/deadline.rs"]
+mod deadline;
 #[path = "write_wait_cli/ipc.rs"]
 mod ipc;
 use std::collections::BTreeSet;
@@ -15,6 +17,10 @@ use std::time::{Duration, Instant};
 
 use common::SocketTempDir as TempDir;
 use common::harness::embed_mock::start as start_embed_mock;
+use deadline::{
+    LeaderResourceState, StdioMode, cleanup_and_panic as panic_after_child_cleanup, spawn_cli,
+    wait_output as wait_child_output_timeout,
+};
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
 use mempal::core::db_admission::{DbAdmissionRequest, DbHolderClass, ProfileDbAdmission};
@@ -177,37 +183,6 @@ fn run_cli_with_stdin_bounded(
             panic!("bounded CLI probe did not exit within {timeout:?}");
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn spawn_cli(home: &Path, args: &[&str]) -> Child {
-    Command::new(mempal_bin())
-        .args(args)
-        .env("HOME", home)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn mempal")
-}
-
-fn wait_child_output_timeout(mut child: Child, timeout: Duration) -> Output {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if child.try_wait().expect("poll child").is_some() {
-            return child.wait_with_output().expect("collect child output");
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .expect("collect timed-out child output");
-            panic!(
-                "child did not exit within {timeout:?}; stdout={}, stderr={}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -1272,15 +1247,16 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
     let _config_path = write_config(home.path(), &format!("http://{addr}/v1"));
     let db_path = home.path().join(".mempal/palace.db");
     handle.pause();
-
     let payload = serde_json::json!({
         "content": "cli wait json timeout content",
         "wing": "cli-wing"
     })
     .to_string();
-
-    let mut child = Command::new(mempal_bin())
-        .args([
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(9);
+    let mut child = spawn_cli(
+        home.path(),
+        &[
             "ingest",
             "--stdin",
             "--project",
@@ -1292,36 +1268,41 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
             "--wait-timeout-secs",
             "6",
             "--json",
-        ])
-        .env("HOME", home.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn mempal");
+        ],
+        deadline,
+        StdioMode::CaptureWithInput,
+        "ingest wait receipt",
+    );
+    if child
+        .write_stdin(
+            payload.as_bytes(),
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .is_err()
     {
-        use std::io::Write as _;
-
-        let mut stdin = child.stdin.take().expect("child stdin");
-        stdin
-            .write_all(payload.as_bytes())
-            .expect("write stdin payload");
+        panic_after_child_cleanup(child, started, "ingest wait stdin");
     }
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    child.close_stdin();
     let operation_id = loop {
-        if let Some((operation_id, state)) = first_ingest_async_operation(&db_path) {
-            assert!(
-                matches!(state.as_str(), "queued" | "running"),
-                "finite wait may claim local work while the caller timeout is still open, got {state}"
-            );
-            break operation_id;
+        if handle.request_count() > 0 {
+            break first_ingest_async_operation(&db_path)
+                .expect("embed request follows enqueue")
+                .0;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "ingest wait worker did not enqueue operation"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        if child.exit_diagnostic().is_err() {
+            panic_after_child_cleanup(child, started, "ingest wait checkpoint");
+        }
+        if child.resources().leader != LeaderResourceState::Running {
+            let output =
+                wait_child_output_timeout(child, deadline, started, "ingest wait early exit");
+            panic!("early ingest exit {}", output.status);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            wait_child_output_timeout(child, deadline, started, "ingest wait checkpoint");
+            unreachable!("expired child collection must panic");
+        }
+        tokio::time::sleep(Duration::from_millis(25).min(remaining)).await;
     };
     let initial = PendingMessageStore::new_without_reclaim(&db_path)
         .operation_status(&operation_id)
@@ -1329,11 +1310,10 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
         .expect("operation record exists");
     assert!(
         matches!(initial.op_state.as_str(), "queued" | "running"),
-        "finite wait may claim local work while the caller timeout is still open, got {}",
+        "unexpected initial state: {}",
         initial.op_state
     );
-
-    let output = wait_child_output_timeout(child, Duration::from_secs(9));
+    let output = wait_child_output_timeout(child, deadline, started, "ingest wait receipt");
     assert!(
         !output.status.success(),
         "stdout={}, stderr={}",
@@ -1349,20 +1329,15 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
         !stdout
             .as_object()
             .expect("ingest receipt object")
-            .contains_key("drawer_ids"),
-        "timed-out receipt must not report drawer ids: {stdout}"
+            .contains_key("drawer_ids")
     );
-    assert!(
-        cleanup_ids_from_ingest_json(&stdout).is_empty(),
-        "timed-out receipt must not expose cleanup ids: {stdout}"
-    );
+    assert!(cleanup_ids_from_ingest_json(&stdout).is_empty());
     let queued = PendingMessageStore::new_without_reclaim(&db_path)
         .operation_status(&operation_id)
         .expect("load queued status")
         .expect("operation record exists");
     assert_eq!(queued.op_state, "queued");
     assert!(queued.claimed_at.is_none());
-
     handle.resume();
     let unbounded_timeout = u64::MAX.to_string();
     let recovery = run_cli(
@@ -1376,7 +1351,6 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
             "--json",
         ],
     );
-
     assert_success(&recovery);
     let (recovery_stdout, recovery_stderr) = print_lines(&recovery);
     let recovery_json: Value =
@@ -1386,7 +1360,7 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
     assert!(!recovery_json["timed_out"].as_bool().unwrap_or(false));
     assert!(
         !recovery_stdout.contains("cli wait json timeout content"),
-        "operation wait JSON must not expose raw content: {recovery_stdout}"
+        "recovery JSON exposed raw content: {recovery_stdout}"
     );
     assert!(
         recovery_stderr.contains("waiting for operation_id="),
@@ -1396,11 +1370,11 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
     assert_eq!(
         recovery_ids.len(),
         1,
-        "operation wait recovery must expose exact cleanup ids: {recovery_stdout}"
+        "expected one recovery id: {recovery_stdout}"
     );
     assert_eq!(
-        recovery_json["created_drawer_ids"], recovery_json["drawer_ids"],
-        "new operation completion should report the same affected and cleanup-safe IDs"
+        recovery_json["created_drawer_ids"],
+        recovery_json["drawer_ids"],
     );
     let completed = PendingMessageStore::new_without_reclaim(&db_path)
         .operation_status(&operation_id)
@@ -1412,32 +1386,25 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
         &["operation", "status", &operation_id, "--json"],
     );
     handle.shutdown().await;
-
     assert_success(&status);
     let status_json: Value =
         serde_json::from_slice(&status.stdout).expect("parse operation status JSON");
     assert_eq!(status_json["state"], "completed");
-    assert_eq!(
-        cleanup_ids_from_ingest_json(&status_json),
-        recovery_ids,
-        "operation status JSON must preserve cleanup-safe IDs after wait"
-    );
+    assert_eq!(cleanup_ids_from_ingest_json(&status_json), recovery_ids);
     assert!(
         !String::from_utf8_lossy(&status.stdout).contains("cli wait json timeout content"),
-        "operation status JSON must not expose raw content"
+        "status JSON exposed raw content"
     );
     let db = Database::open(&db_path).expect("open db");
     assert_eq!(db.drawer_count().expect("drawer count"), 1);
     drop(db);
-
     delete_cleanup_ids(home.path(), &recovery_ids, Some(project_id));
     let db = Database::open(&db_path).expect("reopen db");
     for drawer_id in &recovery_ids {
         assert!(
             db.get_drawer(drawer_id)
                 .expect("get deleted recovery drawer")
-                .is_none(),
-            "operation wait cleanup id must be deletable"
+                .is_none()
         );
     }
 }
@@ -1924,6 +1891,8 @@ async fn test_operation_wait_exits_zero_and_prints_progress() {
     let wait_timeout = "30".to_string();
 
     handle.pause();
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(35);
     let child = spawn_cli(
         home.path(),
         &[
@@ -1933,13 +1902,16 @@ async fn test_operation_wait_exits_zero_and_prints_progress() {
             "--timeout-secs",
             wait_timeout.as_str(),
         ],
+        deadline,
+        StdioMode::Capture,
+        "operation wait success",
     );
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     tokio::time::sleep(Duration::from_millis(150)).await;
     handle.resume();
 
-    let output = child.wait_with_output().expect("wait operation child");
+    let output = wait_child_output_timeout(child, deadline, started, "operation wait success");
     handle.shutdown().await;
 
     assert_success(&output);
@@ -1974,12 +1946,18 @@ async fn test_operation_wait_timeout_returns_receipt_and_leaves_finite_budget_qu
     );
 
     handle.pause();
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(9);
     let child = spawn_cli(
         home.path(),
         &["operation", "wait", &operation_id, "--timeout-secs", "6"],
+        deadline,
+        StdioMode::Capture,
+        "operation wait timeout receipt",
     );
 
-    let output = wait_child_output_timeout(child, Duration::from_secs(9));
+    let output =
+        wait_child_output_timeout(child, deadline, started, "operation wait timeout receipt");
     assert!(
         !output.status.success(),
         "stdout={}, stderr={}",

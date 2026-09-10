@@ -277,7 +277,7 @@ fn scoped_process_remaining(started: Instant, budget: Duration) -> Option<Durati
 }
 
 fn ingest_request_deadline(started: Instant, wait: bool, wait_timeout_secs: u64) -> Instant {
-    let budget = if wait {
+    let budget = if wait && wait_timeout_secs != 0 {
         clamp_wait_timeout(Duration::from_secs(wait_timeout_secs))
             .saturating_sub(MCP_INGEST_RESPONSE_RESERVE)
     } else {
@@ -22801,26 +22801,23 @@ enabled = true
         let operation_id = PendingMessageStore::new_without_reclaim(&db_path)
             .enqueue(INGEST_ASYNC_KIND, "{}")
             .expect("enqueue operation");
-        let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
-            .with_blocking_delay(Duration::from_millis(200));
+        let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path);
         let query_only_async_db = QueryOnlyAsyncDb::open(&db_path, 4)
             .expect("open query-only async db")
-            .with_read_delay(Duration::from_millis(200));
+            .with_read_delay(Duration::from_secs(1));
         let server = server
             .with_async_queue_for_test(async_queue)
             .with_query_only_async_db_for_test(query_only_async_db)
             .with_mcp_deadline_for_test(Duration::from_millis(300));
 
         let response = tokio::time::timeout(
-            Duration::from_millis(350),
+            Duration::from_millis(300),
             server.mempal_operation_status(Parameters(OperationStatusRequest { operation_id })),
         )
-        .await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let response = response
-            .expect("operation status must share its deadline with warning collection")
-            .expect("queued status should succeed")
-            .0;
+        .await
+        .expect("operation status must not wait for warning collection")
+        .expect("queued status should succeed")
+        .0;
 
         assert_eq!(response.state, Some(IngestOperationState::Queued));
     }

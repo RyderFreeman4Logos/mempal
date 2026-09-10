@@ -419,6 +419,75 @@ async fn async_db_symlink_retarget_does_not_divert_admitted_identity() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_approved_deadline_write_retains_result_owner() {
+    let tmp = short_tempdir();
+    let db_path = tmp.path().join("palace.db");
+    let adb = AsyncDb::open(&db_path, 1).expect("open async db");
+    adb.run_write(|db| {
+        db.conn().execute_batch(
+            "CREATE TABLE cancelled_approved_write (
+                value INTEGER NOT NULL
+            )",
+        )?;
+        Ok::<(), DbError>(())
+    })
+    .await
+    .expect("create fixture table");
+
+    let lock = rusqlite::Connection::open(&db_path).expect("open lock holder");
+    lock.execute_batch("BEGIN IMMEDIATE")
+        .expect("hold SQLite writer lock");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (observed_tx, mut observed_rx) = tokio::sync::oneshot::channel();
+    let write = tokio::spawn(exec_with_deadline(
+        Arc::clone(&adb.writer),
+        Arc::clone(&adb._admission),
+        None,
+        deadline,
+        Some(observed_tx),
+        move |db| {
+            let _ = started_tx.send(());
+            db.conn().execute(
+                "INSERT INTO cancelled_approved_write (value) VALUES (1)",
+                [],
+            )?;
+            Ok::<(), DbError>(())
+        },
+    ));
+    started_rx
+        .await
+        .expect("approved write reached SQLite operation");
+    write.abort();
+    assert!(write.await.expect_err("cancel write caller").is_cancelled());
+    assert!(
+        matches!(
+            observed_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the approved physical write must still be owned while SQLite is blocked"
+    );
+
+    lock.execute_batch("ROLLBACK")
+        .expect("release SQLite writer lock");
+    tokio::time::timeout(Duration::from_secs(1), observed_rx)
+        .await
+        .expect("result owner must finish within the write deadline")
+        .expect("result owner must observe the blocking task");
+    let count = adb
+        .run_read(|db| {
+            Ok(db
+                .conn()
+                .query_row("SELECT COUNT(*) FROM cancelled_approved_write", [], |row| {
+                    row.get::<_, i64>(0)
+                })?)
+        })
+        .await
+        .expect("read committed write");
+    assert_eq!(count, 1, "approved write must commit exactly once");
+}
+
 #[tokio::test]
 async fn deadline_write_reports_committed_success_when_closure_returns_after_deadline() {
     let _deadline_write_lock = CANCELLED_READ_PERMIT_TEST_LOCK.lock().await;
