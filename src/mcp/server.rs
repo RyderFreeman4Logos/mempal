@@ -20984,20 +20984,24 @@ prototypes = ["keep"]
 
     #[tokio::test]
     async fn test_mcp_wait_supersedes_returns_cleanup_ids_without_background_worker() {
+        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let (_tempdir, db_path, server) = setup_server();
         let old = ingest_manual(&server, "wait scoped supersedes old fact", None, None, None).await;
 
         server.ingest_worker_started.store(true, Ordering::SeqCst);
         let update = server
-            .mempal_ingest(Parameters(IngestRequest {
-                content: "wait scoped supersedes new fact".to_string(),
-                wing: "mempal".to_string(),
-                room: Some("replace".to_string()),
-                supersedes: Some(old.drawer_id.clone()),
-                wait: Some(true),
-                wait_timeout_secs: Some(u64::MAX),
-                ..IngestRequest::default()
-            }))
+            .mempal_ingest_with_controls_scoped_worker(
+                IngestRequest {
+                    content: "wait scoped supersedes new fact".to_string(),
+                    wing: "mempal".to_string(),
+                    room: Some("replace".to_string()),
+                    supersedes: Some(old.drawer_id.clone()),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(u64::MAX),
+                    ..IngestRequest::default()
+                },
+                IngestControls::default(),
+            )
             .await
             .expect("wait supersedes ingest")
             .0;
