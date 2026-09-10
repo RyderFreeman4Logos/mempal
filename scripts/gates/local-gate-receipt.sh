@@ -95,6 +95,7 @@ ensure_receipt_location_is_ignored() {
 
 run_literal_aggregate() {
     # fixture-aggregate-start
+    bash scripts/gates/check-test-temp-fixtures.sh
     just fmt-check
     just quality-gates
     just test-rest

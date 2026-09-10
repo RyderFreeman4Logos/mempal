@@ -13,6 +13,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use common::SocketTempDir as TempDir;
 use common::harness::embed_mock::start as start_embed_mock;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
@@ -22,9 +23,7 @@ use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType, Triple};
 use mempal::core::utils::build_triple_id;
 use mempal::mcp::{IngestDrainWorkerHandle, IngestOperationState, MempalMcpServer};
 use rusqlite::{Connection, OptionalExtension};
-use serde_json::Value;
-use serde_json::json;
-use tempfile::TempDir;
+use serde_json::{Value, json};
 
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
@@ -42,7 +41,7 @@ impl ConfigOverrideGuard {
 
 impl Drop for ConfigOverrideGuard {
     fn drop(&mut self) {
-        let tempdir = TempDir::new().expect("reset tempdir");
+        let tempdir = tempfile::tempdir().expect("reset tempdir");
         let path = tempdir.path().join("default.toml");
         fs::write(&path, "db_path = \"~/.mempal/palace.db\"\n").expect("write default config");
         ConfigHandle::harness_reload_from_path(&path);
@@ -54,7 +53,7 @@ fn mempal_bin() -> String {
 }
 
 fn setup_home_with_database() -> (TempDir, Database) {
-    let tmp = TempDir::new_in("/tmp").expect("short tempdir");
+    let tmp = TempDir::new().expect("short tempdir");
     fs::create_dir_all(tmp.path().join(".mempal")).expect("create mempal home");
     let db = Database::open(&tmp.path().join(".mempal/palace.db")).expect("open db");
     (tmp, db)
@@ -1145,7 +1144,7 @@ fn test_ingest_wait_duplicate_under_mcp_ingest_worker_lease_avoids_writer_confli
 #[cfg(unix)]
 #[test]
 fn test_ipc_readiness_connect_respects_deadline_when_accept_queue_is_full() {
-    let temp = tempfile::tempdir().expect("create IPC test directory");
+    let temp = TempDir::new().expect("create IPC test directory");
     let socket_path = temp.path().join("daemon-hook.sock");
     let listener = UnixListener::bind(&socket_path).expect("bind IPC listener");
     // SAFETY: listener owns a valid Unix-domain socket descriptor for this call.

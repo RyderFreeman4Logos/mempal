@@ -48,7 +48,7 @@ fn wait_output(mut child: Child) -> Output {
 
 #[test]
 fn operation_wait_follows_spool_receipt_until_queue_replay() {
-    let home = tempfile::TempDir::new_in("/tmp").expect("short tempdir");
+    let home = tempfile::TempDir::new().expect("short tempdir");
     let mempal_home = home.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
     let db_path = mempal_home.join("palace.db");

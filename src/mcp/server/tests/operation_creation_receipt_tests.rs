@@ -158,7 +158,7 @@ async fn test_same_operation_retry_recovers_created_ids_after_completion_failure
 
 #[test]
 fn test_rolled_back_drawer_write_has_no_creation_authority() {
-    let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+    let tempdir = TempDir::new().expect("short tempdir");
     let db_path = tempdir.path().join("palace.db");
     let db = Database::open(&db_path).expect("open database");
     db.conn()
@@ -199,7 +199,7 @@ fn test_rolled_back_drawer_write_has_no_creation_authority() {
 
 #[test]
 fn test_existing_drawer_creation_provenance_is_first_writer_wins() {
-    let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+    let tempdir = TempDir::new().expect("short tempdir");
     let db_path = tempdir.path().join("palace.db");
     let db = Database::open(&db_path).expect("open database");
     let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {

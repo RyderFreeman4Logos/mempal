@@ -8,7 +8,7 @@ use crate::hook::HookEvent;
 async fn test_hook_ipc_spools_before_ack_when_sqlite_locked() {
     let _test_guard = super::lock_hook_ipc_tests().await;
     super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
-    let tmp = tempfile::TempDir::new_in("/tmp").expect("short tempdir");
+    let tmp = tempfile::TempDir::new().expect("short tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
     let lock_conn = rusqlite::Connection::open(&db_path).expect("open lock connection");

@@ -140,7 +140,7 @@ async fn test_mcp_async_ingest_embed_failure_requeues_only_when_retryable() {
     let _worker_lifecycle_lock =
         crate::observability::test_support::acquire_ingest_worker_lifecycle_lock().await;
     for retryable in [true, false] {
-        let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+        let tempdir = TempDir::new().expect("short tempdir");
         let db_path = tempdir.path().join("palace.db");
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db fixture");
         let server = MempalMcpServer::new_with_factory(

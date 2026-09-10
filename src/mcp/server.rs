@@ -13695,7 +13695,7 @@ mod tests {
     }
 
     fn setup_server() -> (TempDir, PathBuf, MempalMcpServer) {
-        let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+        let tempdir = TempDir::new().expect("short tempdir");
         let db_path = tempdir.path().join("palace.db");
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db fixture");
         let server = MempalMcpServer::new_with_factory(
@@ -13710,7 +13710,7 @@ mod tests {
     }
 
     fn setup_server_with_api_addr(api_addr: &str) -> (TempDir, PathBuf, MempalMcpServer) {
-        let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+        let tempdir = TempDir::new().expect("short tempdir");
         let db_path = tempdir.path().join("palace.db");
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db fixture");
         let config = Config::parse(&format!("[api]\naddr = {api_addr:?}\n"))
@@ -16482,7 +16482,7 @@ pattern_boost = 0.2
             "[search]\nbm25_fallback = true\n\n[embed.retry]\nsearch_deadline_secs = 240\n",
         )
         .await;
-        let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+        let tempdir = TempDir::new().expect("short tempdir");
         let db_path = tempdir.path().join("palace.db");
         insert_drawer(
             &db_path,
@@ -22371,7 +22371,7 @@ prototypes = ["keep"]
 
     #[tokio::test]
     async fn test_mcp_ingest_wait_true_refuses_when_holder_budget_blocks_async_pool() {
-        let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+        let tempdir = TempDir::new().expect("short tempdir");
         let db_path = tempdir.path().join("palace.db");
         Database::open(&db_path).expect("open database");
         let server = MempalMcpServer::new_with_factory(
@@ -22445,7 +22445,7 @@ prototypes = ["keep"]
     #[tokio::test]
     async fn test_mcp_ingest_wait_true_admission_receipt_is_cleanup_safe_at_14_of_16_service_holders()
      {
-        let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+        let tempdir = TempDir::new().expect("short tempdir");
         let db_path = tempdir.path().join("palace.db");
         // Keep the warning preflight from consuming a separate MCP holder: this
         // fixture verifies the 14-holder snapshot produced by the real async-pool

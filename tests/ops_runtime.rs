@@ -558,7 +558,7 @@ fn test_cli_doctor_reports_queue_failure_classes() {
 #[test]
 fn test_cli_daemon_status_reports_queue_failure_classes() {
     let _process_lock = acquire_ops_runtime_process_lifecycle_lock();
-    let home = TempDir::new_in("/tmp").expect("home");
+    let home = TempDir::new().expect("home");
     let mempal_home = home.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
     let db_path = palace_db_path(&home);

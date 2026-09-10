@@ -6,7 +6,7 @@ use std::sync::{Condvar, Mutex};
 static CANCELLED_READ_PERMIT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn short_tempdir() -> tempfile::TempDir {
-    tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+    tempfile::TempDir::new().expect("short tempdir")
 }
 
 fn release_readers(release: &Arc<(Mutex<bool>, Condvar)>) {

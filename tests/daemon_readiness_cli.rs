@@ -2,6 +2,7 @@
 
 #[path = "common/harness/cli_deadline.rs"]
 mod cli_deadline;
+mod common;
 
 const _: fn() = cli_deadline::reference_shared_cli_deadline_api;
 
@@ -12,8 +13,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use cli_deadline::{push_args, run_cli_output, with_home};
+use common::socket_temp_dir::SocketTempDir;
 use mempal::core::db::Database;
-use tempfile::TempDir;
 
 // ponytail: one daemon-readiness test-binary lock; split by fixture family if throughput matters.
 static DAEMON_READINESS_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -37,8 +38,8 @@ fn run_daemon(home: &Path, args: &[&str], role: &'static str, timeout: Duration)
     )
 }
 
-fn setup_daemon_home() -> (TempDir, PathBuf) {
-    let tmp = TempDir::new_in("/tmp").expect("short tempdir");
+fn setup_daemon_home() -> (SocketTempDir, PathBuf) {
+    let tmp = SocketTempDir::new().expect("short tempdir");
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
     let db_path = mempal_home.join("palace.db");

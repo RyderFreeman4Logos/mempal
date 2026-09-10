@@ -24,7 +24,7 @@ impl Drop for ShutdownResetGuard {
 }
 
 fn short_tempdir() -> tempfile::TempDir {
-    tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+    tempfile::TempDir::new().expect("short tempdir")
 }
 
 struct LogCapture {

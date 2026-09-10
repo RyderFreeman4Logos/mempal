@@ -320,7 +320,7 @@ mod tests {
     use crate::ingress_spool::AppendOutcome;
 
     fn short_tempdir() -> tempfile::TempDir {
-        tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+        tempfile::TempDir::new().expect("short tempdir")
     }
 
     #[test]

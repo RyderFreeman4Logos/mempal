@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::harness::CapturedChild;
+use common::socket_temp_dir::SocketTempDir;
 use mempal::core::db::Database;
 
 fn spawn_daemon(home: &Path, log_path: &Path) -> CapturedChild {
@@ -111,7 +112,7 @@ fn stop_daemon(child: &mut CapturedChild) {
 #[cfg(unix)]
 #[test]
 fn daemon_runs_configured_sleep_cycle_when_hooks_are_disabled() {
-    let home = tempfile::TempDir::new_in("/tmp").expect("short temporary home");
+    let home = SocketTempDir::new().expect("short temporary home");
     let mempal_home = home.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
     let db_path = mempal_home.join("palace.db");
@@ -154,7 +155,7 @@ phases = ["salience"]
 #[cfg(unix)]
 #[test]
 fn daemon_sigterm_is_bounded_during_blocked_sleep_cycle() {
-    let home = tempfile::TempDir::new_in("/tmp").expect("short temporary home");
+    let home = SocketTempDir::new().expect("short temporary home");
     let mempal_home = home.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
     let db_path = mempal_home.join("palace.db");
@@ -206,7 +207,7 @@ phases = ["salience"]
 #[cfg(unix)]
 #[test]
 fn daemon_runs_configured_sleep_cycle_under_its_writer_lease() {
-    let home = tempfile::TempDir::new_in("/tmp").expect("short temporary home");
+    let home = SocketTempDir::new().expect("short temporary home");
     let mempal_home = home.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
     let db_path = mempal_home.join("palace.db");

@@ -206,7 +206,7 @@ impl TestEnv {
     }
 
     fn new_with_database(config_body: &str) -> (Self, Database) {
-        let tmp = TempDir::new_in("/tmp").expect("external tempdir");
+        let tmp = TempDir::new().expect("external tempdir");
         let home = tmp.path().to_path_buf();
         let mempal_home = home.join(".mempal");
         fs::create_dir_all(&mempal_home).expect("create mempal home");
