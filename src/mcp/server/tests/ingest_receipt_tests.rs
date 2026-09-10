@@ -1,6 +1,45 @@
 use super::*;
 
 #[tokio::test]
+async fn test_ingest_json_for_test_settles_repeated_operations() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
+    let (_tempdir, db_path, server) = setup_server();
+
+    for index in 0..10 {
+        let response = server
+            .ingest_json_for_test(serde_json::json!({
+                "content": format!("settled test ingest {index}"),
+                "wing": "mcp",
+                "room": "fixture-settlement"
+            }))
+            .await
+            .expect("test ingest reaches terminal state");
+        let operation_id = response.operation_id.expect("operation id");
+        let record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(&operation_id)
+            .expect("query operation")
+            .expect("operation row");
+        assert!(
+            record
+                .op_state
+                .parse::<IngestOperationState>()
+                .is_ok_and(IngestOperationState::is_terminal),
+            "operation {index} remained {}",
+            record.op_state
+        );
+    }
+
+    let stats = PendingMessageStore::new_without_reclaim(&db_path)
+        .stats()
+        .expect("queue stats");
+    assert_eq!((stats.pending, stats.claimed), (0, 0));
+    assert!(
+        !server.ingest_worker_started.load(Ordering::Acquire),
+        "test helper left its background ingest worker running after all operations were terminal"
+    );
+}
+
+#[tokio::test]
 async fn test_self_held_queue_lock_fails_before_returning_receipts() {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();

@@ -2875,11 +2875,28 @@ impl MempalMcpServer {
         let request = serde_json::from_value(value)
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         let response = self
-            .mempal_ingest(Parameters(request))
+            .mempal_ingest_with_controls_and_worker(
+                request,
+                IngestControls::default(),
+                IngestWaitWorkerMode::Scoped,
+            )
             .await
             .map(|response| response.0)?;
         match response.operation_id.as_deref() {
-            Some(operation_id) => self.wait_for_operation_completion(operation_id).await,
+            Some(operation_id) => match self
+                .wait_for_operation_status_with_scoped_worker_until_terminal(
+                    operation_id,
+                    Duration::from_secs(30),
+                    Duration::from_millis(150),
+                )
+                .await?
+            {
+                Some(response) => Ok(response),
+                None => Err(ErrorData::internal_error(
+                    format!("timed out waiting for ingest operation {operation_id}"),
+                    None,
+                )),
+            },
             None => Ok(response),
         }
     }
