@@ -1702,14 +1702,13 @@ impl Database {
             r#"
             WITH recent_drawers AS MATERIALIZED (
                 SELECT d.id
-                FROM drawer_vectors_rowids r
-                CROSS JOIN drawers d
-                WHERE d.id = r.id
-                  AND d.deleted_at IS NULL
+                FROM drawers d NOT INDEXED
+                WHERE d.deleted_at IS NULL
                   AND (?2 IS NULL OR d.wing = ?2)
                   AND (?3 IS NULL OR d.room = ?3)
                   AND (?4 IS NULL OR d.project_id = ?4)
-                ORDER BY r.rowid DESC
+                  AND EXISTS (SELECT 1 FROM drawer_vectors_rowids r WHERE r.id = d.id)
+                ORDER BY d.rowid DESC
                 LIMIT ?6
             )
             SELECT rd.id,
