@@ -1662,8 +1662,8 @@ impl Database {
             .query_row(
                 r#"
                 SELECT COUNT(*)
-                FROM drawer_vectors v
-                JOIN drawers d ON d.id = v.id
+                FROM drawers d
+                JOIN drawer_vectors_rowids r ON r.id = d.id
                 WHERE d.deleted_at IS NULL
                   AND (?1 IS NULL OR d.wing = ?1)
                   AND (?2 IS NULL OR d.room = ?2)
@@ -1700,15 +1700,16 @@ impl Database {
             .map_err(|_| DbError::InvalidSourceType("scan_limit".to_string()))?;
         let mut statement = self.conn.prepare(
             r#"
-            WITH recent_drawers AS (
+            WITH recent_drawers AS MATERIALIZED (
                 SELECT d.id
-                FROM drawers d
-                WHERE d.deleted_at IS NULL
+                FROM drawer_vectors_rowids r
+                CROSS JOIN drawers d
+                WHERE d.id = r.id
+                  AND d.deleted_at IS NULL
                   AND (?2 IS NULL OR d.wing = ?2)
                   AND (?3 IS NULL OR d.room = ?3)
                   AND (?4 IS NULL OR d.project_id = ?4)
-                  AND EXISTS (SELECT 1 FROM drawer_vectors v WHERE v.id = d.id)
-                ORDER BY d.rowid DESC
+                ORDER BY r.rowid DESC
                 LIMIT ?6
             )
             SELECT rd.id,
@@ -7830,6 +7831,10 @@ fn segment_cjk_query(query: &str) -> Vec<String> {
     }
     result
 }
+
+#[cfg(test)]
+#[path = "db_novelty_exact_plan_tests.rs"]
+mod db_novelty_exact_plan_tests;
 
 #[cfg(test)]
 mod tests {
