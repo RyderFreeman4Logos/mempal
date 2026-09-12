@@ -124,24 +124,6 @@ mod tests {
         spawn_in_own_session(&mut command).expect("spawn release-coordinated fixture")
     }
 
-    fn spawn_non_utf8_comm_process(ready_file: &Path) -> OwnedGateChild {
-        let mut command = Command::new("/bin/bash");
-        command
-            .args([
-                "-c",
-                r#"
-                    printf '\377' > /proc/self/comm
-                    : >"${READY_FILE:?}"
-                    while true; do /bin/sleep 60; done
-                "#,
-            ])
-            .env("READY_FILE", ready_file)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        spawn_in_own_session(&mut command).expect("spawn non-UTF-8 comm fixture")
-    }
-
     fn process_identity_from_pid_file(pid_file: &Path) -> ProcessIdentity {
         let pid_file = fs::read_to_string(pid_file).expect("read escaped process identity");
         let mut fields = pid_file.split_whitespace();
@@ -213,6 +195,7 @@ mod tests {
         assert!(!error.to_string().is_empty(), "failure must retain diagnostics");
         assert_process_identity_gone_within(identity, Duration::from_secs(1));
     }
+
     #[test]
     fn procfs_exit_errors_are_treated_as_absent_processes() {
         assert!(process_is_gone(&io::Error::from(io::ErrorKind::NotFound)));
@@ -550,31 +533,7 @@ mod tests {
 
     #[test]
     fn unrelated_non_utf8_comm_does_not_abort_pipe_cleanup() {
-        let _process_lock = process_lifecycle_test_lock_blocking();
-        let fixture = tempfile::tempdir().expect("create non-UTF-8 comm fixture");
-        let unrelated_ready = fixture.path().join("unrelated-ready");
-        let unrelated = spawn_non_utf8_comm_process(&unrelated_ready);
-        wait_for_file(
-            &unrelated_ready,
-            Duration::from_secs(2),
-            "non-UTF-8 comm process",
-        );
-
-        let mut writer_command = Command::new("/bin/sleep");
-        writer_command
-            .arg("60")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let writer = spawn_in_own_session(&mut writer_command).expect("spawn pipe writer");
-        let mut gate = GateChild::new(writer).expect("capture pipe writer identity");
-        let scan_result = gate.refresh_tracked_processes();
-        let cleanup_result = gate.terminate_and_collect_until(cleanup_deadline()).map(|_| ());
-        let unrelated_cleanup = reap_owned_child(unrelated);
-
-        scan_result.expect("unrelated non-UTF-8 comm must be skipped during global scan");
-        cleanup_result.expect("pipe cleanup must complete after scanning unrelated processes");
-        unrelated_cleanup.expect("clean up non-UTF-8 comm fixture");
+        super::regression_tests::assert_non_utf8_comm_does_not_abort_pipe_cleanup();
     }
     #[test]
     fn gate_child_wait_timeout_reaps_descendants_that_hold_pipes() {
