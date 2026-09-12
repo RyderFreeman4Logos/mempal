@@ -102,6 +102,7 @@ async fn test_same_operation_retry_recovers_created_ids_after_completion_failure
             config.as_ref(),
             compiled_privacy.as_ref(),
             project_id,
+            Instant::now() + MCP_INGEST_ADMISSION_DEADLINE,
         )
         .await
         .expect("prepare queued update");

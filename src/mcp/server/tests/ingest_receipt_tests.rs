@@ -233,6 +233,7 @@ async fn test_fsynced_daemon_ack_returns_receipt_before_queue_visibility() {
             config.as_ref(),
             compiled_privacy.as_ref(),
             project_id,
+            Instant::now() + MCP_INGEST_ADMISSION_DEADLINE,
         )
         .await
         .expect("prepare queued ingest");
@@ -328,4 +329,45 @@ async fn test_fsynced_daemon_ack_returns_receipt_before_queue_visibility() {
         )
         .expect("count created drawers");
     assert_eq!((completion_count, created_count), (1, 1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_mcp_ingest_replacement_target_uses_request_budget_for_admission() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
+    let (_tempdir, db_path, server) = setup_server();
+    insert_drawer(
+        &db_path,
+        "replacement-timeout-target",
+        "replacement target before timeout",
+        "mcp",
+        Some("deadline"),
+        "/tmp/replacement-timeout.md",
+        2,
+    );
+    let async_db = AsyncDb::open(&db_path, 4)
+        .expect("open async db")
+        .with_read_delay(Duration::from_secs(5));
+    let server = server
+        .with_async_db_for_test(async_db)
+        .with_mcp_deadline_for_test(Duration::from_millis(400));
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        server.mempal_ingest(Parameters(IngestRequest {
+            content: "replacement target should use request-wide admission budget".to_string(),
+            wing: "mcp".to_string(),
+            room: Some("deadline".to_string()),
+            replace_text: Some("replacement target before timeout".to_string()),
+            dry_run: Some(false),
+            wait: Some(false),
+            ..IngestRequest::default()
+        })),
+    )
+    .await
+    .expect("MCP ingest should return before client timeout")
+    .expect("slow replacement target resolution should use the request-wide budget")
+    .0;
+
+    assert_eq!(response.state, Some(IngestOperationState::Queued));
+    assert!(response.operation_id.is_some());
 }

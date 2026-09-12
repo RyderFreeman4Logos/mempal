@@ -68,6 +68,7 @@ async fn test_mcp_async_ingest_transient_write_lock_requeues_instead_of_failing(
             config.as_ref(),
             compiled_privacy.as_ref(),
             project_id,
+            Instant::now() + MCP_INGEST_ADMISSION_DEADLINE,
         )
         .await
         .expect("prepare async ingest");

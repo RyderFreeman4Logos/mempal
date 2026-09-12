@@ -282,16 +282,6 @@ fn scoped_process_remaining(started: Instant, budget: Duration) -> Option<Durati
     (!remaining.is_zero()).then_some(remaining)
 }
 
-fn ingest_request_deadline(started: Instant, wait: bool, wait_timeout_secs: u64) -> Instant {
-    let budget = if wait && wait_timeout_secs != 0 {
-        clamp_wait_timeout(Duration::from_secs(wait_timeout_secs))
-            .saturating_sub(MCP_INGEST_RESPONSE_RESERVE)
-    } else {
-        MCP_INGEST_ADMISSION_DEADLINE.saturating_sub(MCP_INGEST_RESPONSE_RESERVE)
-    };
-    started.checked_add(budget).unwrap_or(started)
-}
-
 fn ingest_retry_deadline(request_deadline: Option<Instant>, cap: Duration) -> Instant {
     let cap_deadline = Instant::now().checked_add(cap).unwrap_or_else(Instant::now);
     request_deadline
@@ -2545,6 +2535,16 @@ impl MempalMcpServer {
             return deadline;
         }
         Duration::from_secs(config.embed.retry.search_deadline_secs)
+    }
+
+    fn ingest_request_deadline(&self, started: Instant, wait: bool, timeout_secs: u64) -> Instant {
+        let budget = if wait && timeout_secs != 0 {
+            clamp_wait_timeout(Duration::from_secs(timeout_secs))
+        } else {
+            self.ingest_admission_deadline
+        }
+        .saturating_sub(MCP_INGEST_RESPONSE_RESERVE);
+        started.checked_add(budget).unwrap_or(started)
     }
 
     fn search_request_deadline(&self, config: &Config) -> Instant {
@@ -7336,7 +7336,8 @@ impl MempalMcpServer {
         let room = request.room.as_deref();
         let wait = request.wait.unwrap_or(false);
         let wait_timeout_secs = request.wait_timeout_secs.unwrap_or(30);
-        let request_deadline = ingest_request_deadline(request_started_at, wait, wait_timeout_secs);
+        let request_deadline =
+            self.ingest_request_deadline(request_started_at, wait, wait_timeout_secs);
         // One sqlite_master snapshot for every early-return; degraded writes reject first.
         let request_system_warnings = if worker_mode != IngestWaitWorkerMode::Background {
             current_system_warnings()
@@ -7419,6 +7420,7 @@ impl MempalMcpServer {
                 config.as_ref(),
                 compiled_privacy.as_ref(),
                 project_id,
+                request_deadline,
             ),
         )
         .await
@@ -7971,6 +7973,7 @@ impl MempalMcpServer {
         config: &crate::core::config::Config,
         compiled_privacy: &crate::core::config::CompiledPrivacyConfig,
         project_id: Option<String>,
+        request_deadline: Instant,
     ) -> std::result::Result<PreparedIngestOperation, ErrorData> {
         let controls = resolve_mcp_ingest_controls(request, controls)?;
         let scrubbed_content =
@@ -8011,6 +8014,7 @@ impl MempalMcpServer {
                 request.wing.clone(),
                 request.room.clone(),
                 project_id.clone(),
+                request_deadline,
             )
             .await?;
         let mut request = request.clone();
@@ -8040,23 +8044,24 @@ impl MempalMcpServer {
         wing: String,
         room: Option<String>,
         project_id: Option<String>,
+        request_deadline: Instant,
     ) -> std::result::Result<Option<DrawerSummary>, ErrorData> {
         if supersedes.is_none() && replace_text.is_none() {
             return Ok(None);
         }
 
-        let deadline = Instant::now() + self.ingest_admission_deadline;
+        let deadline = request_deadline.min(Instant::now() + self.ingest_admission_deadline);
+        let retry_delay = || {
+            MCP_INGEST_QUEUE_LOCK_RETRY_DELAY
+                .min(deadline.saturating_duration_since(Instant::now()))
+        };
         loop {
             let async_db = match self.async_db().await {
                 Ok(async_db) => async_db,
                 Err(error)
                     if anyhow_chain_contains_sqlite_lock(&error) && Instant::now() < deadline =>
                 {
-                    tokio::time::sleep(
-                        MCP_INGEST_QUEUE_LOCK_RETRY_DELAY
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    )
-                    .await;
+                    tokio::time::sleep(retry_delay()).await;
                     continue;
                 }
                 Err(error) => {
@@ -8074,7 +8079,7 @@ impl MempalMcpServer {
             let room = room.clone();
             let project_id = project_id.clone();
             match async_db
-                .run_read(move |db| {
+                .run_read_anyhow_until(deadline, move |db| {
                     db.resolve_replacement_target(
                         supersedes.as_deref(),
                         replace_text.as_deref(),
@@ -8082,21 +8087,22 @@ impl MempalMcpServer {
                         room.as_deref(),
                         project_id.as_deref(),
                     )
+                    .map_err(anyhow::Error::new)
                 })
                 .await
             {
                 Ok(target) => return Ok(target),
+                Err(error) if anyhow_error_is_read_deadline_exceeded(&error) => return Ok(None),
                 Err(error)
-                    if crate::core::db::db_error_is_sqlite_lock(&error)
-                        && Instant::now() < deadline =>
+                    if anyhow_chain_contains_sqlite_lock(&error) && Instant::now() < deadline =>
                 {
-                    tokio::time::sleep(
-                        MCP_INGEST_QUEUE_LOCK_RETRY_DELAY
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    )
-                    .await;
+                    tokio::time::sleep(retry_delay()).await;
                 }
-                Err(error) => return Err(replacement_db_error(error)),
+                Err(error) => {
+                    return Err(error
+                        .downcast::<crate::core::db::DbError>()
+                        .map_or_else(db_error, replacement_db_error));
+                }
             }
         }
     }
@@ -13967,6 +13973,7 @@ mod tests {
                 config.as_ref(),
                 compiled_privacy.as_ref(),
                 project_id,
+                Instant::now() + MCP_INGEST_ADMISSION_DEADLINE,
             )
             .await
             .expect("prepare async ingest");
@@ -16617,11 +16624,11 @@ pattern_boost = 0.2
         let (_tempdir, _db_path, server) = setup_server();
         let server = server
             .with_ingest_warning_snapshot_delay_for_test(Duration::from_millis(150))
-            .with_mcp_deadline_for_test(Duration::from_millis(20))
+            .with_mcp_deadline_for_test(Duration::from_millis(500))
             .with_daemon_writer_lease_check_error_for_test("skip unrelated lease probe");
 
         let result = tokio::time::timeout(
-            Duration::from_millis(500),
+            Duration::from_secs(1),
             server.mempal_ingest(Parameters(IngestRequest {
                 content: "bounded ingest admission".to_string(),
                 wing: "mcp".to_string(),
@@ -16644,51 +16651,6 @@ pattern_boost = 0.2
                     .message
                     .contains("stale vector index check exceeded")
         }));
-
-        tokio::time::sleep(Duration::from_millis(180)).await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_ingest_replacement_target_uses_request_budget_for_admission() {
-        let _l = acquire_ingest_worker_lifecycle_lock().await;
-        let (_tempdir, db_path, server) = setup_server();
-        insert_drawer(
-            &db_path,
-            "replacement-timeout-target",
-            "replacement target before timeout",
-            "mcp",
-            Some("deadline"),
-            "/tmp/replacement-timeout.md",
-            2,
-        );
-        let async_db = AsyncDb::open(&db_path, 4)
-            .expect("open async db")
-            .with_read_delay(Duration::from_millis(150));
-        let server = server
-            .with_async_db_for_test(async_db)
-            .with_mcp_deadline_for_test(Duration::from_millis(20));
-
-        let response = tokio::time::timeout(
-            Duration::from_millis(500),
-            server.mempal_ingest(Parameters(IngestRequest {
-                content: "replacement target should use request-wide admission budget".to_string(),
-                wing: "mcp".to_string(),
-                room: Some("deadline".to_string()),
-                replace_text: Some("replacement target before timeout".to_string()),
-                dry_run: Some(false),
-                wait: Some(false),
-                ..IngestRequest::default()
-            })),
-        )
-        .await
-        .expect("MCP ingest should return before client timeout")
-        .expect("slow replacement target resolution should use the request-wide budget")
-        .0;
-
-        assert_eq!(response.state, Some(IngestOperationState::Queued));
-        assert!(response.operation_id.is_some());
-
-        tokio::time::sleep(Duration::from_millis(180)).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -17058,6 +17020,7 @@ pattern_boost = 0.2
                 config.as_ref(),
                 compiled_privacy.as_ref(),
                 project_id,
+                Instant::now() + MCP_INGEST_ADMISSION_DEADLINE,
             )
             .await
             .expect("prepare async ingest");
@@ -17112,6 +17075,7 @@ pattern_boost = 0.2
                 config.as_ref(),
                 compiled_privacy.as_ref(),
                 project_id,
+                Instant::now() + MCP_INGEST_ADMISSION_DEADLINE,
             )
             .await
             .expect("prepare async ingest");
@@ -17287,6 +17251,7 @@ pattern_boost = 0.2
                 config.as_ref(),
                 compiled_privacy.as_ref(),
                 project_id,
+                Instant::now() + MCP_INGEST_ADMISSION_DEADLINE,
             )
             .await
             .expect("prepare async ingest");
@@ -17437,6 +17402,7 @@ pattern_boost = 0.2
                 config.as_ref(),
                 compiled_privacy.as_ref(),
                 project_id,
+                Instant::now() + MCP_INGEST_ADMISSION_DEADLINE,
             )
             .await
             .expect("prepare async supersedes ingest");
@@ -17508,6 +17474,7 @@ prototypes = ["keep"]
                 config.as_ref(),
                 compiled_privacy.as_ref(),
                 project_id,
+                Instant::now() + MCP_INGEST_ADMISSION_DEADLINE,
             )
             .await
             .expect("prepare async ingest");
@@ -17606,6 +17573,7 @@ prototypes = ["keep"]
                 config.as_ref(),
                 compiled_privacy.as_ref(),
                 project_id,
+                Instant::now() + MCP_INGEST_ADMISSION_DEADLINE,
             )
             .await
             .expect("prepare async ingest");
@@ -22668,6 +22636,7 @@ enabled = true
                 config.as_ref(),
                 compiled_privacy.as_ref(),
                 project_id,
+                Instant::now() + MCP_INGEST_ADMISSION_DEADLINE,
             )
             .await
             .expect("prepare async ingest");
@@ -22730,6 +22699,7 @@ enabled = true
                 config.as_ref(),
                 compiled_privacy.as_ref(),
                 project_id,
+                Instant::now() + MCP_INGEST_ADMISSION_DEADLINE,
             )
             .await
             .expect("prepare async ingest");
