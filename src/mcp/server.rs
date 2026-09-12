@@ -17165,6 +17165,7 @@ pattern_boost = 0.2
     }
 
     include!("server/tests/ingest_worker_idle_backoff_test.rs");
+    include!("server/tests/ingest_worker_approved_claim_shutdown_test.rs");
 
     #[test]
     fn test_mcp_async_ingest_transient_write_backoff_sequence_caps_at_30s() {

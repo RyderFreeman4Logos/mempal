@@ -356,6 +356,8 @@ pub struct AsyncPendingMessageStore {
     #[cfg(any(test, feature = "db-test-seam"))]
     claim_blocking_started: Option<Arc<tokio::sync::Notify>>,
     #[cfg(any(test, feature = "db-test-seam"))]
+    claim_approved: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(any(test, feature = "db-test-seam"))]
     release_lock_failures: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "db-test-seam"))]
     complete_lock_failures: Arc<AtomicUsize>,
@@ -398,6 +400,8 @@ impl AsyncPendingMessageStore {
             #[cfg(any(test, feature = "db-test-seam"))]
             claim_blocking_started: None,
             #[cfg(any(test, feature = "db-test-seam"))]
+            claim_approved: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
             release_lock_failures: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "db-test-seam"))]
             complete_lock_failures: Arc::new(AtomicUsize::new(0)),
@@ -424,6 +428,8 @@ impl AsyncPendingMessageStore {
             claim_blocking_delay: self.claim_blocking_delay,
             #[cfg(any(test, feature = "db-test-seam"))]
             claim_blocking_started: self.claim_blocking_started.clone(),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            claim_approved: self.claim_approved.clone(),
             #[cfg(any(test, feature = "db-test-seam"))]
             release_lock_failures: Arc::clone(&self.release_lock_failures),
             #[cfg(any(test, feature = "db-test-seam"))]
@@ -463,6 +469,12 @@ impl AsyncPendingMessageStore {
         started: Arc<tokio::sync::Notify>,
     ) -> Self {
         self.claim_blocking_started = Some(started);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_claim_approved_for_test(mut self, approved: Arc<tokio::sync::Notify>) -> Self {
+        self.claim_approved = Some(approved);
         self
     }
 

@@ -68,6 +68,12 @@ impl AsyncPendingMessageStore {
             _ = shutdown_rx.changed() => false,
             ready = ready_rx => ready.is_ok() && !*shutdown_rx.borrow(),
         };
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if approved {
+            if let Some(claim_approved) = &self.claim_approved {
+                claim_approved.notify_waiters();
+            }
+        }
         let _ = approval_tx.send(approved);
         if !approved && *shutdown_rx.borrow() {
             // The blocking task cannot cross the approval fence, so it owns no
