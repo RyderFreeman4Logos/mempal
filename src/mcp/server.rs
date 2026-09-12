@@ -123,6 +123,10 @@ use super::resource_usage;
 mod operation_receipt;
 use operation_receipt::{OperationLookup, spool_pending_operation_response};
 
+#[path = "server_transient_admission.rs"]
+mod transient_admission;
+use transient_admission::anyhow_chain_has_transient_admission;
+
 #[cfg(test)]
 #[path = "server_operation_receipt_tests.rs"]
 mod operation_receipt_tests;
@@ -1312,7 +1316,10 @@ impl MempalMcpServer {
                     tokio::time::sleep(INGEST_POLL_INTERVAL).await;
                     return Ok(());
                 }
-                Err(error) if anyhow_chain_contains_sqlite_lock(&error) => {
+                Err(error)
+                    if anyhow_chain_contains_sqlite_lock(&error)
+                        || anyhow_chain_has_transient_admission(&error) =>
+                {
                     Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
                     if let Err(error) = Self::release_claim_with_lock_retry(
                         queue,
@@ -1503,7 +1510,10 @@ impl MempalMcpServer {
                     tokio::time::sleep(INGEST_POLL_INTERVAL).await;
                     return Ok(());
                 }
-                Err(error) if anyhow_chain_contains_sqlite_lock(&error) => {
+                Err(error)
+                    if anyhow_chain_contains_sqlite_lock(&error)
+                        || anyhow_chain_has_transient_admission(&error) =>
+                {
                     Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
                     Self::release_claim_with_lock_retry(
                         queue,
@@ -1710,7 +1720,10 @@ impl MempalMcpServer {
                     .context("failed to release scoped ingest claim after writer lease conflict")?;
                     return Ok(ScopedIngestProcessResult::ReleasedForRetry);
                 }
-                Ok(Err(error)) if anyhow_chain_contains_sqlite_lock(&error) => {
+                Ok(Err(error))
+                    if anyhow_chain_contains_sqlite_lock(&error)
+                        || anyhow_chain_has_transient_admission(&error) =>
+                {
                     Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
                     Self::release_claim_with_lock_retry_deadline(
                         queue,
@@ -13598,6 +13611,7 @@ mod tests {
     mod daemon_queue_lease_fence_tests;
     mod delete_busy_retry_836_tests;
     mod delete_receipt_921_tests;
+    mod ingest_lease_admission_retry_1139;
     mod ingest_receipt_tests;
     mod mcp_roots_936_tests;
     mod operation_creation_receipt_tests;
