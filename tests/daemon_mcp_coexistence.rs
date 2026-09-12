@@ -290,6 +290,28 @@ async fn stop_daemon(daemon: &mut CapturedChild) -> Result<ExitStatus> {
     }
 }
 
+#[cfg(debug_assertions)]
+fn assert_shutdown_phases(daemon: &CapturedChild) {
+    let diagnostics = daemon.diagnostics();
+    let mut previous = 0;
+    for phase in [
+        "stall-watchdog",
+        "hook-payload-pruner",
+        "sleep-scheduler",
+        "endpoint-requeue",
+        "rest-server",
+        "ingest-worker",
+        "queue-reclaim",
+    ] {
+        let marker = format!("daemon shutdown phase: {phase}");
+        let position = diagnostics
+            .find(&marker)
+            .unwrap_or_else(|| panic!("missing {marker}\n{diagnostics}"));
+        assert!(position >= previous, "shutdown phases out of order");
+        previous = position;
+    }
+}
+
 async fn wait_for_daemon_output(daemon: &mut CapturedChild, expected: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -506,6 +528,8 @@ async fn assert_daemon_coexists_with_mcp_count(
         "foreground daemon shutdown failed: {status}\n{}",
         daemon.diagnostics()
     );
+    #[cfg(debug_assertions)]
+    assert_shutdown_phases(&daemon);
     for client in &mut clients {
         client.shutdown().await?;
     }

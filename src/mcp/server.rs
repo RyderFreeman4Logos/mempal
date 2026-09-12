@@ -129,6 +129,10 @@ use transient_admission::{
     anyhow_chain_has_transient_admission, db_admission_failure_kind, scoped_ingest_worker_error,
 };
 
+#[path = "server_ingest_claim_shutdown.rs"]
+mod ingest_claim_shutdown;
+use ingest_claim_shutdown::claim_next_ingest_with_io;
+
 #[cfg(test)]
 #[path = "server_operation_receipt_tests.rs"]
 mod operation_receipt_tests;
@@ -1164,7 +1168,15 @@ impl MempalMcpServer {
                 break;
             }
 
-            let claim_result = claim_next_ingest_with_io(&queue, &worker_id).await;
+            let claim_result =
+                claim_next_ingest_with_io(&queue, &worker_id, shutdown_rx.as_mut()).await;
+            if shutdown_rx
+                .as_ref()
+                .is_some_and(|shutdown_rx| *shutdown_rx.borrow())
+                && !matches!(&claim_result, Ok(Some(_)))
+            {
+                break;
+            }
             if let Some(observer) = &self.daemon_write_observer {
                 match &claim_result {
                     Ok(Some(_)) => observer.record_queue_maintenance_success(),
@@ -4358,23 +4370,6 @@ fn ingest_worker_backoff_delay(retry_count: u64) -> Duration {
         4 => Duration::from_secs(16),
         _ => Duration::from_secs(30),
     }
-}
-
-async fn claim_next_ingest_with_io(
-    queue: &AsyncPendingMessageStore,
-    worker_id: &str,
-) -> crate::core::queue::Result<Option<ClaimedMessage>> {
-    let io_guard =
-        crate::observability::IoBurstGuard::start(crate::observability::IoOperationPath::Queue);
-    let result = queue
-        .claim_next_by_kind(
-            worker_id.to_string(),
-            INGEST_CLAIM_TTL_SECS,
-            INGEST_ASYNC_KIND.to_string(),
-        )
-        .await;
-    io_guard.finish();
-    result
 }
 
 fn record_ingest_worker_backoff_snapshot(

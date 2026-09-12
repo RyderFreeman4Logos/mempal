@@ -24,6 +24,9 @@ mod queue_writer_lease_fence;
 #[path = "queue_store_construction.rs"]
 mod queue_store_construction;
 
+#[path = "queue_claim_shutdown.rs"]
+mod queue_claim_shutdown;
+
 pub use super::queue_connection_admission::{
     queue_stats, queue_stats_readonly, queue_stats_readonly_with_busy_timeout,
     queue_write_admission_preflight,
@@ -351,6 +354,8 @@ pub struct AsyncPendingMessageStore {
     #[cfg(any(test, feature = "db-test-seam"))]
     claim_blocking_delay: Option<Duration>,
     #[cfg(any(test, feature = "db-test-seam"))]
+    claim_blocking_started: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(any(test, feature = "db-test-seam"))]
     release_lock_failures: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "db-test-seam"))]
     complete_lock_failures: Arc<AtomicUsize>,
@@ -391,6 +396,8 @@ impl AsyncPendingMessageStore {
             #[cfg(any(test, feature = "db-test-seam"))]
             claim_blocking_delay: None,
             #[cfg(any(test, feature = "db-test-seam"))]
+            claim_blocking_started: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
             release_lock_failures: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "db-test-seam"))]
             complete_lock_failures: Arc::new(AtomicUsize::new(0)),
@@ -415,6 +422,8 @@ impl AsyncPendingMessageStore {
             claim_lock_failures: Arc::clone(&self.claim_lock_failures),
             #[cfg(any(test, feature = "db-test-seam"))]
             claim_blocking_delay: self.claim_blocking_delay,
+            #[cfg(any(test, feature = "db-test-seam"))]
+            claim_blocking_started: self.claim_blocking_started.clone(),
             #[cfg(any(test, feature = "db-test-seam"))]
             release_lock_failures: Arc::clone(&self.release_lock_failures),
             #[cfg(any(test, feature = "db-test-seam"))]
@@ -445,6 +454,15 @@ impl AsyncPendingMessageStore {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_claim_blocking_delay(mut self, delay: Duration) -> Self {
         self.claim_blocking_delay = Some(delay);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_claim_blocking_started_for_test(
+        mut self,
+        started: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.claim_blocking_started = Some(started);
         self
     }
 
@@ -1126,8 +1144,21 @@ impl PendingMessageStore {
         claim_ttl_secs: i64,
         kind_filter: &str,
     ) -> Result<Option<ClaimedMessage>> {
+        self.claim_next_by_kind_with_approval(worker_id, claim_ttl_secs, kind_filter, || true)
+    }
+
+    fn claim_next_by_kind_with_approval(
+        &self,
+        worker_id: &str,
+        claim_ttl_secs: i64,
+        kind_filter: &str,
+        mut approval: impl FnMut() -> bool,
+    ) -> Result<Option<ClaimedMessage>> {
+        let mut approved = None;
         self.with_claim_lock_retry(|| {
-            self.claim_next_by_kind_once(worker_id, claim_ttl_secs, kind_filter)
+            self.claim_next_by_kind_once(worker_id, claim_ttl_secs, kind_filter, &mut || {
+                *approved.get_or_insert_with(&mut approval)
+            })
         })
     }
 
@@ -1136,8 +1167,9 @@ impl PendingMessageStore {
         worker_id: &str,
         claim_ttl_secs: i64,
         kind_filter: &str,
+        approval: &mut impl FnMut() -> bool,
     ) -> Result<Option<ClaimedMessage>> {
-        self.with_claim_connection(|conn| {
+        self.with_claim_connection_if(approval, |conn| {
             self.require_lifecycle_writer_lease(conn, "claim queued message")?;
             let now = now_secs();
             let stale_cutoff = saturating_cutoff(now, claim_ttl_secs);
@@ -1208,6 +1240,7 @@ impl PendingMessageStore {
                 claimed_at: now,
             }))
         })
+        .map(Option::flatten)
     }
 
     pub fn claim_by_id_and_kind(
@@ -1922,11 +1955,23 @@ impl PendingMessageStore {
     }
 
     fn with_claim_connection<T>(&self, op: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+        self.with_claim_connection_if(&mut || true, op)?
+            .ok_or(QueueError::ClaimConnectionUnavailable)
+    }
+
+    fn with_claim_connection_if<T>(
+        &self,
+        approval: &mut impl FnMut() -> bool,
+        op: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<Option<T>> {
         let mut guard = self
             .connection_cache
             .claim_writer
             .lock()
             .map_err(|_| QueueError::ClaimConnectionMutexPoisoned)?;
+        if !approval() {
+            return Ok(None);
+        }
         if guard.is_none() {
             let conn = self.open_connection_with_busy_timeout(Some(CLAIM_BUSY_TIMEOUT))?;
             #[cfg(any(test, feature = "db-test-seam"))]
@@ -1938,7 +1983,7 @@ impl PendingMessageStore {
         let Some(conn) = guard.as_mut() else {
             return Err(QueueError::ClaimConnectionUnavailable);
         };
-        op(conn)
+        op(conn).map(Some)
     }
 
     fn with_claim_lock_retry<T>(&self, op: impl FnMut() -> Result<T>) -> Result<T> {
