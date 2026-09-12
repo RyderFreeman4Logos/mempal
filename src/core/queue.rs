@@ -12,7 +12,7 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 use super::config::scrub_sensitive_text;
-use super::db::{ensure_wal_journal_mode, rusqlite_error_is_lock};
+use super::db::{Database, ensure_wal_journal_mode, rusqlite_error_is_lock};
 use super::queue_connection_admission as queue_admission;
 use super::writer_owner_diagnostics::{
     WriterLockEvidence, transaction_immediate, writer_lock_evidence_for_path,
@@ -694,6 +694,15 @@ impl AsyncPendingMessageStore {
     ) -> Result<u64> {
         self.run(move |store| store.requeue_writer_lease_failures_for_daemon_start(&daemon_owner))
             .await
+    }
+
+    pub(crate) fn requeue_writer_lease_failures_for_daemon_start_on_database(
+        &self,
+        db: &Database,
+        daemon_owner: &str,
+    ) -> Result<u64> {
+        self.inner
+            .requeue_writer_lease_failures_for_daemon_start_on_connection(db.conn(), daemon_owner)
     }
 
     pub async fn release_claim(&self, claim: ClaimedMessage) -> Result<()> {
@@ -1538,11 +1547,20 @@ impl PendingMessageStore {
         &self,
         daemon_owner: &str,
     ) -> Result<u64> {
+        self.with_connection(|conn| {
+            self.requeue_writer_lease_failures_for_daemon_start_on_connection(conn, daemon_owner)
+        })
+    }
+
+    fn requeue_writer_lease_failures_for_daemon_start_on_connection(
+        &self,
+        conn: &Connection,
+        daemon_owner: &str,
+    ) -> Result<u64> {
         let now = now_secs();
         let current_owner_error = format!(" for {daemon_owner} was lost before ");
-        self.with_connection(|conn| {
-            let updated = conn.execute(
-                r#"
+        let updated = conn.execute(
+            r#"
                 UPDATE pending_messages
                 SET retry_count = 0,
                     retry_backoff_ms = 0,
@@ -1567,11 +1585,10 @@ impl PendingMessageStore {
                   )
                   AND last_error LIKE '%SQLite writer lease `sqlite-writer` for mempal-daemon-% was lost before build daemon hook drawer records%'
                   AND instr(last_error, ?2) = 0
-                "#,
-                params![now, current_owner_error],
-            )?;
-            Ok(updated as u64)
-        })
+            "#,
+            params![now, current_owner_error],
+        )?;
+        Ok(updated as u64)
     }
 
     /// Return dead-lettered embed-queue messages to pending for a targeted retry.

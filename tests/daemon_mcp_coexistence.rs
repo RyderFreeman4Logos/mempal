@@ -17,7 +17,10 @@ use local_gate_child::{RecordedProcessIdentity, capture_recorded_process};
 use mempal::core::async_db::RESOURCE_BOUNDED_READERS;
 use mempal::core::config::Config;
 use mempal::core::db::Database;
-use mempal::core::db_admission::{DbHolderClass, ProfileDbAdmission};
+use mempal::core::db_admission::{
+    BudgetExceededReason, DbAdmissionError, DbAdmissionRequest, DbHolderClass, ProfileDbAdmission,
+};
+use mempal::core::queue::PendingMessageStore;
 use mempal::core::types::{Drawer, SourceType};
 use mempal::daemon_bootstrap::DAEMON_TEMPORARY_ADMISSION_REFUSAL_EXIT_STATUS;
 use mempal::daemon_recovery::{DaemonRecovery, MAX_RESTARTS_PER_WINDOW, RecoveryPhase};
@@ -26,7 +29,9 @@ use tempfile::TempDir;
 
 const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
 const ASYNC_DB_CONNECTION_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+const PROFILE_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 const COEXISTENCE_DRAWER_ID: &str = "issue-853-live-mcp";
+const REQUEUE_LOG_MARKER: &str = "requeued hook work blocked by the previous daemon writer lease";
 const MCP_DESCENDANT_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const MCP_DESCENDANT_REAP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -285,9 +290,41 @@ async fn stop_daemon(daemon: &mut CapturedChild) -> Result<ExitStatus> {
     }
 }
 
+async fn wait_for_daemon_output(daemon: &mut CapturedChild, expected: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if daemon.diagnostics().contains(expected) {
+            return Ok(());
+        }
+        if let Some(status) = daemon.try_wait().context("poll daemon startup")? {
+            bail!("daemon exited before startup marker: {status}");
+        }
+        if Instant::now() >= deadline {
+            bail!("daemon did not publish startup marker before deadline");
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+fn seed_previous_writer_lease_failure(db_path: &Path) -> Result<()> {
+    let store = PendingMessageStore::new_without_reclaim(db_path);
+    let previous_owner = "mempal-daemon-1000-previous-start";
+    let id = store.enqueue("hook_post_tool", r#"{"event":"PostToolUse"}"#)?;
+    let claim = store
+        .claim_next(previous_owner, 60)?
+        .context("seeded hook was not claimable")?;
+    store.mark_failed(
+        &claim,
+        "SQLite writer lease `sqlite-writer` for mempal-daemon-1000-previous-start was lost before build daemon hook drawer records",
+    )?;
+    assert_eq!(claim.id, id);
+    Ok(())
+}
+
 async fn assert_daemon_coexists_with_mcp_count(
     mcp_count: usize,
     open_writer_pool: bool,
+    hold_cache_overlap: bool,
 ) -> Result<()> {
     let test_home = TestHome::new()?;
     let mut clients = Vec::with_capacity(mcp_count);
@@ -348,8 +385,49 @@ async fn assert_daemon_coexists_with_mcp_count(
         mcp_count,
         "each MCP status process must own exactly one query-only pool"
     );
+    assert_eq!(before_daemon.configured_holder_limit, 16);
+    assert_eq!(
+        before_daemon.configured_cache_bytes,
+        PROFILE_CACHE_BUDGET_BYTES
+    );
+    assert_eq!(
+        before_daemon.active_cache_bytes,
+        86 * 1024 * 1024 * mcp_count as u64,
+        "writer-capable MCP cache footprint changed"
+    );
+
+    let overlap_holder = if hold_cache_overlap {
+        seed_previous_writer_lease_failure(&test_home.db_path)?;
+        let holder = Database::open(&test_home.db_path).context("open controlled cache overlap")?;
+        let overlap = ProfileDbAdmission::snapshot(&test_home.db_path)?;
+        assert_eq!(
+            overlap.active_cache_bytes,
+            before_daemon.active_cache_bytes + ASYNC_DB_CONNECTION_CACHE_BYTES
+        );
+        let denied = ProfileDbAdmission::acquire(
+            &test_home.db_path,
+            DbAdmissionRequest::new(DbHolderClass::Mcp, 1, overlap.available_cache_bytes + 1),
+        )
+        .expect_err("genuine cache over-budget request must remain denied");
+        assert!(matches!(
+            denied,
+            DbAdmissionError::BudgetExceeded {
+                reason: BudgetExceededReason::CacheBudget,
+                ..
+            }
+        ));
+        Some(holder)
+    } else {
+        None
+    };
 
     let mut daemon = test_home.spawn_daemon(&format!("coexist-{mcp_count}-mcp"))?;
+    if let Some(overlap_holder) = overlap_holder {
+        wait_for_daemon_output(&mut daemon, REQUEUE_LOG_MARKER)
+            .await
+            .with_context(|| daemon.diagnostics())?;
+        drop(overlap_holder);
+    }
     let pid_path = test_home.mempal_home.join("daemon.pid");
     let daemon_pid =
         wait_for_daemon_writer_lease(&test_home.db_path, &pid_path, Duration::from_secs(10))
@@ -437,8 +515,8 @@ async fn assert_daemon_coexists_with_mcp_count(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_coexists_with_one_and_two_writer_capable_mcp_servers() -> Result<()> {
     let _process_lock = local_gate_child::PROCESS_LIFECYCLE_TEST_LOCK.lock().await;
-    assert_daemon_coexists_with_mcp_count(1, true).await?;
-    assert_daemon_coexists_with_mcp_count(2, true).await
+    assert_daemon_coexists_with_mcp_count(1, true, false).await?;
+    assert_daemon_coexists_with_mcp_count(2, true, true).await
 }
 
 #[tokio::test]

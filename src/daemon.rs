@@ -129,9 +129,15 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     global_embed_status().set_audit_db_path(Some(db_path.clone()));
     let writer_lease =
         acquire_daemon_writer_lease(context, &db_path, recovery_faults.clone()).await?;
+    let store = context.store.clone();
+    let daemon_owner = writer_lease.lease().owner.clone();
     let requeued_writer_lease_failures = context
-        .store
-        .requeue_writer_lease_failures_for_daemon_start(writer_lease.lease().owner.clone())
+        .async_db
+        .run_write_anyhow(move |db| {
+            store
+                .requeue_writer_lease_failures_for_daemon_start_on_database(db, &daemon_owner)
+                .map_err(anyhow::Error::from)
+        })
         .await
         .context("failed to requeue previous daemon writer lease failures")?;
     if requeued_writer_lease_failures > 0 {
