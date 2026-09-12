@@ -125,7 +125,9 @@ use operation_receipt::{OperationLookup, spool_pending_operation_response};
 
 #[path = "server_transient_admission.rs"]
 mod transient_admission;
-use transient_admission::anyhow_chain_has_transient_admission;
+use transient_admission::{
+    anyhow_chain_has_transient_admission, db_admission_failure_kind, scoped_ingest_worker_error,
+};
 
 #[cfg(test)]
 #[path = "server_operation_receipt_tests.rs"]
@@ -377,6 +379,8 @@ pub struct MempalMcpServer {
     #[cfg(test)]
     ingest_writer_lease_acquired_hook: Option<IngestWriterLeaseAcquiredHook>,
     #[cfg(test)]
+    ingest_writer_lease_open_hook: Option<IngestWriterLeaseOpenHook>,
+    #[cfg(test)]
     operation_status_json_within_probe_attempts: Arc<AtomicUsize>,
 }
 
@@ -394,6 +398,10 @@ type ContentWriterLeaseAcquiredHook = Arc<dyn Fn(&RuntimeWriterLease) + Send + S
 
 #[cfg(test)]
 type IngestWriterLeaseAcquiredHook = Arc<dyn Fn(&RuntimeWriterLease) + Send + Sync>;
+
+#[cfg(test)]
+type IngestWriterLeaseOpenHook =
+    Arc<dyn Fn(&Path) -> Result<(), crate::core::db_admission::DbAdmissionError> + Send + Sync>;
 
 /// Holds a lease while its blocking acquisition crosses an async cancellation boundary.
 struct AcquiredMcpIngestWriterLease {
@@ -727,6 +735,8 @@ impl MempalMcpServer {
             content_writer_lease_acquired_hook: None,
             #[cfg(test)]
             ingest_writer_lease_acquired_hook: None,
+            #[cfg(test)]
+            ingest_writer_lease_open_hook: None,
             #[cfg(test)]
             operation_status_json_within_probe_attempts: Arc::new(AtomicUsize::new(0)),
         })
@@ -2126,6 +2136,8 @@ impl MempalMcpServer {
         let owner = worker_id.to_string();
         #[cfg(test)]
         let acquired_hook = self.ingest_writer_lease_acquired_hook.clone();
+        #[cfg(test)]
+        let open_hook = self.ingest_writer_lease_open_hook.clone();
         let metadata_json = serde_json::json!({
             "component": "mcp-ingest-worker",
             "worker_role": Self::ingest_worker_role(worker_id),
@@ -2133,6 +2145,10 @@ impl MempalMcpServer {
         })
         .to_string();
         let lease = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(hook) = open_hook {
+                hook(&db_path).context("failed to open database for MCP ingest writer lease")?;
+            }
             let db = Database::open(&db_path).with_context(|| {
                 format!(
                     "failed to open database for MCP ingest writer lease: {}",
@@ -3280,12 +3296,7 @@ impl MempalMcpServer {
                             "scoped async ingest worker failed"
                         );
                     }
-                    let process_result = result.map_err(|error| {
-                        ErrorData::internal_error(
-                            format!("scoped async ingest worker failed: {error}"),
-                            None,
-                        )
-                    })?;
+                    let process_result = result.map_err(scoped_ingest_worker_error)?;
                     if process_result == ScopedIngestProcessResult::TimedOut {
                         return Ok(None);
                     }
@@ -4595,16 +4606,14 @@ fn status_error_summary(error: &(dyn std::error::Error + 'static)) -> String {
 fn status_db_failure_kind(error: &(dyn std::error::Error + 'static)) -> &'static str {
     let mut current = Some(error);
     while let Some(error) = current {
-        if matches!(
-            error.downcast_ref::<crate::core::db::DbError>(),
-            Some(crate::core::db::DbError::Admission(
-                crate::core::db_admission::DbAdmissionError::BudgetExceeded { .. }
-            ))
-        ) || matches!(
-            error.downcast_ref::<crate::core::db_admission::DbAdmissionError>(),
-            Some(crate::core::db_admission::DbAdmissionError::BudgetExceeded { .. })
-        ) {
-            return "holder_budget_exceeded";
+        if let Some(crate::core::db::DbError::Admission(admission)) =
+            error.downcast_ref::<crate::core::db::DbError>()
+        {
+            return db_admission_failure_kind(admission);
+        }
+        if let Some(admission) = error.downcast_ref::<crate::core::db_admission::DbAdmissionError>()
+        {
+            return db_admission_failure_kind(admission);
         }
         if matches!(
             error.downcast_ref::<crate::core::db::DbError>(),
@@ -4620,12 +4629,6 @@ fn status_db_failure_kind(error: &(dyn std::error::Error + 'static)) -> &'static
             )
         ) {
             return "audit_write_failed";
-        }
-        if matches!(
-            error.downcast_ref::<crate::core::db_admission::DbAdmissionError>(),
-            Some(crate::core::db_admission::DbAdmissionError::Busy { .. })
-        ) {
-            return "locked_or_busy";
         }
         if let Some(sqlite) = error.downcast_ref::<rusqlite::Error>()
             && let Some(kind) = status_rusqlite_failure_kind(sqlite)

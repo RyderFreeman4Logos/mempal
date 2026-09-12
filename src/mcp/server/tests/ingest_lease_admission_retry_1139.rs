@@ -1,14 +1,5 @@
 use super::*;
 
-fn saturate_mcp_holders(db_path: &Path, count: usize) -> Vec<ProfileDbAdmission> {
-    (0..count)
-        .map(|_| {
-            ProfileDbAdmission::acquire(db_path, DbAdmissionRequest::new(DbHolderClass::Mcp, 1, 1))
-                .expect("fill MCP service holders")
-        })
-        .collect()
-}
-
 fn sanitized_failure_class(error: &ErrorData) -> Option<&str> {
     error.data.as_ref().and_then(|data| {
         data.get("reason")
@@ -25,39 +16,59 @@ fn sanitized_failure_class(error: &ErrorData) -> Option<&str> {
 fn assert_sanitized_error_surface(error: &ErrorData) {
     let text = format!("{error:?}");
     assert!(
-        !text.contains("/palace.db") && !text.contains("active_cache_bytes="),
+        !text.contains("/private/")
+            && !text.contains("BACKEND_SECRET")
+            && !text.contains("active_cache_bytes="),
         "MCP error must not expose raw paths or backend payload: {text}"
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn test_scoped_ingest_holder_budget_exhaustion_after_queue_admission_is_retryable() {
+async fn test_scoped_ingest_admission_busy_at_lease_open_is_retryable() {
+    use std::os::fd::AsRawFd;
+
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
-    let tempdir = TempDir::new().expect("short tempdir");
-    let db_path = tempdir.path().join("palace.db");
-    Database::open(&db_path).expect("initialize isolated database");
-    let queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
-        .with_admission_holder_class_for_test(DbHolderClass::Mcp);
-    let server = MempalMcpServer::new_with_factory(
-        db_path.clone(),
-        Arc::new(StubEmbedderFactory {
-            vector: vec![0.1, 0.2, 0.3],
-        }),
-    )
-    .expect("create MCP server")
-    .with_async_queue_for_test(queue)
-    .with_query_only_async_db_open_error_for_test("query-only warning fixture")
-    .with_daemon_writer_lease_check_error_for_test("skip query-only lease probe");
-    let _holders = saturate_mcp_holders(&db_path, 15);
-    let snapshot = ProfileDbAdmission::snapshot(&db_path).expect("baseline holder snapshot");
-    assert_eq!(snapshot.active_holders, 15);
-    assert_eq!(snapshot.configured_holder_limit, 16);
+    let (_tempdir, db_path, server) = setup_server();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    let holder_thread = Arc::new(Mutex::new(None));
+    let holder_thread_for_hook = Arc::clone(&holder_thread);
+    let mut server = server;
+    server.ingest_writer_lease_open_hook = Some(Arc::new(move |db_path| {
+        let Some(release_rx) = release_rx
+            .lock()
+            .expect("admission lock release receiver")
+            .take()
+        else {
+            return Ok(());
+        };
+        let lock_path = db_path.with_file_name(".palace.db.admission.lock");
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let thread = std::thread::spawn(move || {
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(lock_path)
+                .expect("open admission lock");
+            assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+            locked_tx.send(()).expect("publish held admission lock");
+            release_rx.recv().expect("release held admission lock");
+            assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+        });
+        *holder_thread_for_hook
+            .lock()
+            .expect("admission lock holder thread") = Some(thread);
+        locked_rx.recv().expect("observe held admission lock");
+        Ok(())
+    }));
 
     let result = server
         .mempal_ingest_with_controls_scoped_worker_releasing(
             IngestRequest {
-                content: "scoped wait must retry after admitted lease open exhausts holders"
-                    .to_string(),
+                content: "scoped wait must retry a real busy admission lock".to_string(),
                 wing: "mcp".to_string(),
                 room: Some("lease-admission".to_string()),
                 wait: Some(true),
@@ -71,17 +82,19 @@ async fn test_scoped_ingest_holder_budget_exhaustion_after_queue_admission_is_re
         )
         .await;
 
-    let peak = ProfileDbAdmission::snapshot(&db_path).expect("peak holder snapshot");
-    assert!(
-        peak.active_holders <= 16,
-        "admission must never exceed 16 holders, got {}",
-        peak.active_holders
-    );
+    release_tx.send(()).expect("release admission lock");
+    holder_thread
+        .lock()
+        .expect("admission lock holder thread")
+        .take()
+        .expect("admission lock holder started")
+        .join()
+        .expect("admission lock holder stopped");
 
     let response = match result {
         Ok(Json(response)) => response,
         Err(error) => panic!(
-            "generic acquire error/missing class, error={error:?} class={:?}",
+            "admission Busy reached the generic acquire error, error={error:?} class={:?}",
             sanitized_failure_class(&error)
         ),
     };
@@ -96,7 +109,6 @@ async fn test_scoped_ingest_holder_budget_exhaustion_after_queue_admission_is_re
     assert!(response.drawer_ids.is_empty());
     assert!(response.drawer_id.is_empty());
 
-    drop(_holders);
     let record = PendingMessageStore::new_without_reclaim(&db_path)
         .operation_status(operation_id)
         .expect("query admitted operation")
@@ -108,7 +120,7 @@ async fn test_scoped_ingest_holder_budget_exhaustion_after_queue_admission_is_re
     assert_eq!(stats.pending, 1);
     assert_eq!(stats.claimed, 0);
     let drawers = Database::open(&db_path)
-        .expect("open after holders released")
+        .expect("open after admission lock released")
         .drawer_count()
         .expect("drawer count");
     assert_eq!(drawers, 0, "retryable admission must not write drawers");
@@ -183,54 +195,92 @@ fn test_writer_lease_retry_classifier_rejects_non_transient_admission() {
 #[tokio::test]
 async fn test_scoped_ingest_non_transient_lease_open_remains_fail_closed() {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
-    let (_tempdir, db_path, server) = setup_server();
-    let server = server.with_ingest_writer_lease_failures_for_test(1);
-
-    let error = match server
-        .mempal_ingest_with_controls_scoped_worker(
-            IngestRequest {
-                content: "permission and schema failures must not retry".to_string(),
-                wing: "mcp".to_string(),
-                room: Some("lease-fail-closed".to_string()),
-                wait: Some(true),
-                wait_timeout_secs: Some(6),
-                ..IngestRequest::default()
+    let failures = vec![
+        (
+            "permission",
+            "path_or_permission",
+            crate::core::db_admission::DbAdmissionError::Io {
+                path: PathBuf::from("/private/permission/palace.db.admission.lock"),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "BACKEND_SECRET permission detail",
+                ),
             },
-            IngestControls {
-                no_gate: true,
-                bypass_novelty: true,
+        ),
+        (
+            "unsafe-sidecar",
+            "unsafe_sidecar",
+            crate::core::db_admission::DbAdmissionError::UnsafeSidecar {
+                path: PathBuf::from("/private/unsafe/palace.db.admission.lock"),
+                reason: "BACKEND_SECRET symlink target",
             },
-        )
-        .await
-    {
-        Ok(_) => panic!("non-transient lease failure must fail closed"),
-        Err(error) => error,
-    };
+        ),
+        (
+            "schema",
+            "unsupported_schema",
+            crate::core::db_admission::DbAdmissionError::UnsupportedStateVersion {
+                path: PathBuf::from("/private/schema/palace.db.admission.state"),
+                version: 99,
+            },
+        ),
+        (
+            "corruption",
+            "corrupt_or_invalid",
+            crate::core::db_admission::DbAdmissionError::InvalidState {
+                path: PathBuf::from("/private/corrupt/palace.db.admission.state"),
+                source: serde_json::from_str::<serde_json::Value>("not-json").unwrap_err(),
+            },
+        ),
+    ];
 
-    assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
-    assert!(
-        error
-            .to_string()
-            .contains("failed to acquire scoped MCP ingest writer lease")
-    );
-    if let Some(class) = sanitized_failure_class(&error) {
-        assert!(
-            matches!(
-                class,
-                "path_or_permission" | "corrupt_or_invalid" | "database_degraded" | "unknown"
-            ),
-            "fail-closed class must stay sanitized, got {class}"
+    for (name, expected_class, failure) in failures {
+        let (_tempdir, db_path, server) = setup_server();
+        let failure = Arc::new(Mutex::new(Some(failure)));
+        let mut server = server;
+        server.ingest_writer_lease_open_hook = Some(Arc::new(move |_| {
+            Err(failure
+                .lock()
+                .expect("injected lease-open error")
+                .take()
+                .expect("lease-open error is injected once"))
+        }));
+        let error = match server
+            .mempal_ingest_with_controls_scoped_worker(
+                IngestRequest {
+                    content: format!("{name} lease-open failure must not retry"),
+                    wing: "mcp".to_string(),
+                    room: Some("lease-fail-closed".to_string()),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(6),
+                    ..IngestRequest::default()
+                },
+                IngestControls {
+                    no_gate: true,
+                    bypass_novelty: true,
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("{name} lease failure must fail closed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            sanitized_failure_class(&error),
+            Some(expected_class),
+            "{name} failure must expose one mandatory sanitized class"
         );
-    }
-    assert_sanitized_error_surface(&error);
+        assert_sanitized_error_surface(&error);
 
-    let stats = PendingMessageStore::new_without_reclaim(&db_path)
-        .stats()
-        .expect("queue stats");
-    assert_eq!(stats.claimed, 0);
-    let drawers = Database::open(&db_path)
-        .expect("open after fail-closed lease")
-        .drawer_count()
-        .expect("drawer count");
-    assert_eq!(drawers, 0);
+        let stats = PendingMessageStore::new_without_reclaim(&db_path)
+            .stats()
+            .expect("queue stats");
+        assert_eq!(stats.claimed, 0);
+        let drawers = Database::open(&db_path)
+            .expect("open after fail-closed lease")
+            .drawer_count()
+            .expect("drawer count");
+        assert_eq!(drawers, 0);
+    }
 }

@@ -425,17 +425,6 @@ impl AsyncPendingMessageStore {
     }
 
     #[cfg(any(test, feature = "db-test-seam"))]
-    pub fn with_admission_holder_class_for_test(
-        mut self,
-        holder_class: crate::core::db_admission::DbHolderClass,
-    ) -> Self {
-        self.inner = self
-            .inner
-            .with_admission_holder_class_for_test(holder_class);
-        self
-    }
-
-    #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_blocking_delay(mut self, delay: Duration) -> Self {
         self.blocking_delay = Some(delay);
         self
@@ -822,17 +811,6 @@ impl PendingMessageStore {
         self.connection_cache
             .claim_open_count
             .load(Ordering::SeqCst)
-    }
-
-    #[cfg(any(test, feature = "db-test-seam"))]
-    pub fn with_admission_holder_class_for_test(
-        self,
-        holder_class: super::db_admission::DbHolderClass,
-    ) -> Self {
-        self.connection_cache
-            .admission
-            .set_holder_class_for_test(holder_class);
-        self
     }
 
     #[cfg(test)]

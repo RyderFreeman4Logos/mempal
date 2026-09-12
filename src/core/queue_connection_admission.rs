@@ -30,14 +30,6 @@ impl QueueConnectionAdmission {
         }
     }
 
-    #[cfg(any(test, feature = "db-test-seam"))]
-    pub(super) fn set_holder_class_for_test(&self, holder_class: DbHolderClass) {
-        *self
-            .holder_class
-            .lock()
-            .expect("queue admission holder class") = holder_class;
-    }
-
     pub(super) fn ensure(&self, db_path: &Path) -> Result<std::path::PathBuf> {
         let mut admission = self
             .guard
