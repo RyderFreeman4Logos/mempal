@@ -14220,14 +14220,17 @@ mod tests {
             )
             .expect("acquire scoped wait writer lease")
             .expect("scoped wait writer lease");
+        let lease_open_count = Arc::new(AtomicUsize::new(0));
+        let lease_open_count_for_hook = Arc::clone(&lease_open_count);
+        let mut server = server;
+        server.ingest_writer_lease_open_hook = Some(Arc::new(move |db_path| {
+            if lease_open_count_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                release_test_ingest_writer_lease(db_path, &scoped_wait_lease);
+            }
+            Ok(())
+        }));
 
-        let release_db_path = db_path.clone();
-        let release_lease = scoped_wait_lease.clone();
-        let release_task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            release_test_ingest_writer_lease(&release_db_path, &release_lease);
-        });
-
+        let started = Instant::now();
         let response = server
             .mempal_ingest_with_controls_scoped_worker(
                 IngestRequest {
@@ -14248,11 +14251,31 @@ mod tests {
             .expect("scoped wait should process once holder exits")
             .0;
 
-        release_task.await.expect("release scoped wait lease");
-
-        assert_eq!(response.state, Some(IngestOperationState::Completed));
-        assert!(!response.timed_out);
-        assert!(!response.created_drawer_ids.is_empty());
+        let hook_count = lease_open_count.load(Ordering::SeqCst);
+        let operation_id = response
+            .operation_id
+            .as_deref()
+            .expect("scoped wait receipt must include operation id");
+        let record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(operation_id)
+            .expect("load scoped wait operation status")
+            .expect("scoped wait operation must stay queryable");
+        let evidence = format!(
+            "hook_count={hook_count} elapsed_ms={} op_state={} claimed_at={:?} completed_at={:?} failure_detail={:?}",
+            started.elapsed().as_millis(),
+            record.op_state,
+            record.claimed_at,
+            record.completed_at,
+            record.failure_detail
+        );
+        assert!(hook_count > 0, "{evidence}");
+        assert_eq!(
+            response.state,
+            Some(IngestOperationState::Completed),
+            "{evidence}"
+        );
+        assert!(!response.timed_out, "{evidence}");
+        assert!(!response.created_drawer_ids.is_empty(), "{evidence}");
     }
 
     fn hold_sqlite_write_lock(db_path: PathBuf, hold_for: Duration) -> thread::JoinHandle<()> {
@@ -16267,7 +16290,7 @@ pattern_boost = 0.2
     }
 
     fn release_test_ingest_writer_lease(db_path: &Path, lease: &RuntimeWriterLease) {
-        let db = Database::open(db_path).expect("open db");
+        let db = Database::open_lease_control(db_path).expect("open lease-control db");
         assert!(
             db.runtime_writer_lease_release(lease)
                 .expect("release test ingest writer lease"),
