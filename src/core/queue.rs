@@ -799,14 +799,15 @@ impl AsyncPendingMessageStore {
             self.permits.clone().acquire_owned().await.map_err(|_| {
                 QueueError::BlockingTaskFailed("queue semaphore closed".to_string())
             })?;
+        // Fixture delay is async so tokio timeouts can cancel it; SQLite stays on spawn_blocking.
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         let store = self.inner.clone();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let join = tokio::task::spawn_blocking(move || {
             let permit = permit;
             tracing::dispatcher::with_default(&dispatch, || {
-                if let Some(delay) = delay {
-                    std::thread::sleep(delay);
-                }
                 let out = f(store);
                 drop(permit);
                 out

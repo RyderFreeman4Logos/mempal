@@ -7890,7 +7890,7 @@ impl MempalMcpServer {
         };
         let ipc_timeout = MCP_DAEMON_INGEST_ENQUEUE_IPC_TIMEOUT
             .min(request_deadline.saturating_duration_since(Instant::now()));
-        if ipc_timeout.is_zero() {
+        if ipc_timeout.is_zero() || !crate::hook_ipc::socket_path(&mempal_home).exists() {
             return Ok(DaemonIngestEnqueue::Fallback {
                 may_have_reached_daemon: false,
             });
@@ -7908,14 +7908,8 @@ impl MempalMcpServer {
                 Ok(DaemonIngestEnqueue::Accepted { operation_id })
             }
             crate::hook_ipc::HookIpcClientOutcome::Fallback(reason) => {
-                let may_have_reached_daemon = reason.may_have_reached_daemon();
-                tracing::debug!(
-                    reason = %reason,
-                    may_have_reached_daemon,
-                    "daemon ingest enqueue unavailable; using local queue"
-                );
                 Ok(DaemonIngestEnqueue::Fallback {
-                    may_have_reached_daemon,
+                    may_have_reached_daemon: reason.may_have_reached_daemon(),
                 })
             }
         }
