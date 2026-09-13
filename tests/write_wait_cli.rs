@@ -1283,11 +1283,9 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
         panic_after_child_cleanup(child, started, "ingest wait stdin");
     }
     child.close_stdin();
-    let operation_id = loop {
-        if handle.request_count() > 0 {
-            break first_ingest_async_operation(&db_path)
-                .expect("embed request follows enqueue")
-                .0;
+    let (operation_id, child_or_output) = loop {
+        if let Some((operation_id, _)) = first_ingest_async_operation(&db_path) {
+            break (operation_id, Ok(child));
         }
         if child.exit_diagnostic().is_err() {
             panic_after_child_cleanup(child, started, "ingest wait checkpoint");
@@ -1295,7 +1293,20 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
         if child.resources().leader != LeaderResourceState::Running {
             let output =
                 wait_child_output_timeout(child, deadline, started, "ingest wait early exit");
-            panic!("early ingest exit {}", output.status);
+            assert!(
+                !output.status.success(),
+                "early ingest exit unexpectedly succeeded: {}",
+                output.status
+            );
+            let stdout: Value =
+                serde_json::from_slice(&output.stdout).expect("early timed-out ingest JSON");
+            assert_eq!(stdout["state"], "queued");
+            assert_eq!(stdout["timed_out"], true);
+            let operation_id = stdout["operation_id"]
+                .as_str()
+                .expect("early timed-out ingest operation id")
+                .to_owned();
+            break (operation_id, Err(output));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1313,7 +1324,10 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
         "unexpected initial state: {}",
         initial.op_state
     );
-    let output = wait_child_output_timeout(child, deadline, started, "ingest wait receipt");
+    let output = match child_or_output {
+        Ok(child) => wait_child_output_timeout(child, deadline, started, "ingest wait receipt"),
+        Err(output) => output,
+    };
     assert!(
         !output.status.success(),
         "stdout={}, stderr={}",
