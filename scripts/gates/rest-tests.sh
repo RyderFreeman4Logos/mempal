@@ -172,8 +172,11 @@ fi
 
 # #934: the hostile-child lifecycle selector gets its own cargo process;
 # its existing process-lifecycle lock cannot fence unrelated test binaries.
+# #1148: included local_gate_child SIGKILL suites also get their own cargo so
+# the 2s MCP initialize window is not shared with those process-tree fixtures.
 mcp_lifecycle_target="daemon_mcp_coexistence"
 mcp_lifecycle_selector="mcp_lifecycle_timeouts_reap_hostile_children"
+mcp_local_gate_child_selector="local_gate_child::"
 mcp_lifecycle_target_present=0
 batch=()
 batch_index=1
@@ -196,7 +199,11 @@ fi
 
 if ((mcp_lifecycle_target_present)); then
     run_cargo_test --workspace --features rest --test "${mcp_lifecycle_target}" -- \
-        --skip "${mcp_lifecycle_selector}"
+        --skip "${mcp_lifecycle_selector}" \
+        --skip "${mcp_local_gate_child_selector}"
+    clean_mempal_artifacts
+    run_cargo_test --workspace --features rest --test "${mcp_lifecycle_target}" \
+        "${mcp_local_gate_child_selector}"
     clean_mempal_artifacts
     run_cargo_test --workspace --features rest --test "${mcp_lifecycle_target}" \
         "${mcp_lifecycle_selector}"
