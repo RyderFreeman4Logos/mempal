@@ -1283,9 +1283,9 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
         panic_after_child_cleanup(child, started, "ingest wait stdin");
     }
     child.close_stdin();
-    let (operation_id, child_or_output) = loop {
-        if let Some((operation_id, _)) = first_ingest_async_operation(&db_path) {
-            break (operation_id, Ok(child));
+    let (operation_id, initial_state, child_or_output) = loop {
+        if let Some((operation_id, op_state)) = first_ingest_async_operation(&db_path) {
+            break (operation_id, op_state, Ok(child));
         }
         if child.exit_diagnostic().is_err() {
             panic_after_child_cleanup(child, started, "ingest wait checkpoint");
@@ -1306,7 +1306,7 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
                 .as_str()
                 .expect("early timed-out ingest operation id")
                 .to_owned();
-            break (operation_id, Err(output));
+            break (operation_id, "queued".to_owned(), Err(output));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1315,14 +1315,10 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
         }
         tokio::time::sleep(Duration::from_millis(25).min(remaining)).await;
     };
-    let initial = PendingMessageStore::new_without_reclaim(&db_path)
-        .operation_status(&operation_id)
-        .expect("load initial status")
-        .expect("operation record exists");
     assert!(
-        matches!(initial.op_state.as_str(), "queued" | "running"),
+        matches!(initial_state.as_str(), "queued" | "running"),
         "unexpected initial state: {}",
-        initial.op_state
+        initial_state
     );
     let output = match child_or_output {
         Ok(child) => wait_child_output_timeout(child, deadline, started, "ingest wait receipt"),
