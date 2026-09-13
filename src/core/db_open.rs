@@ -88,8 +88,7 @@ fn schema_sql_requires_rewrite(table_sql: &str, replacements: &[(&str, &str)]) -
 #[cfg(test)]
 struct SchemaRepairBeginTestHook {
     path: PathBuf,
-    reached: std::sync::mpsc::SyncSender<()>,
-    resume: std::sync::mpsc::Receiver<()>,
+    busy_timeout_ms: std::sync::mpsc::SyncSender<i64>,
 }
 
 #[cfg(test)]
@@ -98,23 +97,16 @@ static SCHEMA_REPAIR_BEGIN_TEST_HOOK: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
-fn install_schema_repair_begin_test_hook(
-    path: &Path,
-) -> (
-    std::sync::mpsc::Receiver<()>,
-    std::sync::mpsc::SyncSender<()>,
-) {
-    let (reached, receiver) = std::sync::mpsc::sync_channel(1);
-    let (resume, resume_receiver) = std::sync::mpsc::sync_channel(0);
+fn install_schema_repair_begin_test_hook(path: &Path) -> std::sync::mpsc::Receiver<i64> {
+    let (busy_timeout_ms, receiver) = std::sync::mpsc::sync_channel(1);
     *SCHEMA_REPAIR_BEGIN_TEST_HOOK
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .expect("lock schema-repair test hook") = Some(SchemaRepairBeginTestHook {
         path: path.to_path_buf(),
-        reached,
-        resume: resume_receiver,
+        busy_timeout_ms,
     });
-    (receiver, resume)
+    receiver
 }
 
 #[cfg(test)]
@@ -132,8 +124,10 @@ pub(super) fn notify_schema_repair_begin_for_test(conn: &Connection) {
                 .then(|| hook.take().expect("matched schema-repair hook"))
         });
     if let Some(hook) = hook {
-        let _ = hook.reached.send(());
-        let _ = hook.resume.recv_timeout(Duration::from_secs(5));
+        let timeout_ms = conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap_or(-1);
+        let _ = hook.busy_timeout_ms.try_send(timeout_ms);
     }
 }
 

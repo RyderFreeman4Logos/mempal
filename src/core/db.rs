@@ -60,6 +60,36 @@ const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 const RUNTIME_WRITER_LEASE_TRANSACTION_RETRY_DEADLINE: Duration = Duration::from_secs(5);
 
+const NOVELTY_CANDIDATE_COUNT_SQL: &str = r#"
+    SELECT COUNT(*)
+    FROM drawers d
+    JOIN drawer_vectors_rowids r ON r.id = d.id
+    WHERE d.deleted_at IS NULL
+      AND (?1 IS NULL OR d.wing = ?1)
+      AND (?2 IS NULL OR d.room = ?2)
+      AND (?3 IS NULL OR d.project_id = ?3)
+"#;
+
+const NOVELTY_CANDIDATES_EXACT_SQL: &str = r#"
+    WITH recent_drawers AS MATERIALIZED (
+        SELECT d.id
+        FROM drawers d NOT INDEXED
+        WHERE d.deleted_at IS NULL
+          AND (?2 IS NULL OR d.wing = ?2)
+          AND (?3 IS NULL OR d.room = ?3)
+          AND (?4 IS NULL OR d.project_id = ?4)
+          AND EXISTS (SELECT 1 FROM drawer_vectors_rowids r WHERE r.id = d.id)
+        ORDER BY d.rowid DESC
+        LIMIT ?6
+    )
+    SELECT rd.id,
+           CAST(1.0 - vec_distance_cosine(v.embedding, vec_f32(?1)) AS REAL) AS similarity
+    FROM recent_drawers rd
+    JOIN drawer_vectors v ON v.id = rd.id
+    ORDER BY similarity DESC
+    LIMIT ?5
+"#;
+
 const CONTENT_HASH_BACKFILL_BATCH: usize = 1_000;
 
 fn content_hash_hex(content: &str) -> String {
@@ -1660,15 +1690,7 @@ impl Database {
 
         self.conn
             .query_row(
-                r#"
-                SELECT COUNT(*)
-                FROM drawers d
-                JOIN drawer_vectors_rowids r ON r.id = d.id
-                WHERE d.deleted_at IS NULL
-                  AND (?1 IS NULL OR d.wing = ?1)
-                  AND (?2 IS NULL OR d.room = ?2)
-                  AND (?3 IS NULL OR d.project_id = ?3)
-                "#,
+                NOVELTY_CANDIDATE_COUNT_SQL,
                 (wing, room, project_id),
                 |row| row.get(0),
             )
@@ -1698,27 +1720,7 @@ impl Database {
             i64::try_from(limit).map_err(|_| DbError::InvalidSourceType("limit".to_string()))?;
         let scan_limit = i64::try_from(scan_limit)
             .map_err(|_| DbError::InvalidSourceType("scan_limit".to_string()))?;
-        let mut statement = self.conn.prepare(
-            r#"
-            WITH recent_drawers AS MATERIALIZED (
-                SELECT d.id
-                FROM drawers d NOT INDEXED
-                WHERE d.deleted_at IS NULL
-                  AND (?2 IS NULL OR d.wing = ?2)
-                  AND (?3 IS NULL OR d.room = ?3)
-                  AND (?4 IS NULL OR d.project_id = ?4)
-                  AND EXISTS (SELECT 1 FROM drawer_vectors_rowids r WHERE r.id = d.id)
-                ORDER BY d.rowid DESC
-                LIMIT ?6
-            )
-            SELECT rd.id,
-                   CAST(1.0 - vec_distance_cosine(v.embedding, vec_f32(?1)) AS REAL) AS similarity
-            FROM recent_drawers rd
-            JOIN drawer_vectors v ON v.id = rd.id
-            ORDER BY similarity DESC
-            LIMIT ?5
-            "#,
-        )?;
+        let mut statement = self.conn.prepare(NOVELTY_CANDIDATES_EXACT_SQL)?;
         statement
             .query_map(
                 (
@@ -5935,6 +5937,9 @@ impl UnionFind {
 fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
     let current_version = ensure_supported_schema_version(conn)?;
 
+    #[cfg(test)]
+    db_open::notify_schema_repair_begin_for_test(conn);
+
     for migration in migrations()
         .iter()
         .filter(|migration| migration.version > current_version)
@@ -6173,8 +6178,6 @@ fn ensure_v13_typed_pinned_schema(conn: &Connection, current_version: u32) -> Re
     let missing_pin_order = !existing_columns.contains("pin_order");
     let missing_supersedes = !existing_columns.contains("supersedes");
 
-    #[cfg(test)]
-    db_open::notify_schema_repair_begin_for_test(conn);
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     if let Err(error) = (|| -> Result<(), DbError> {
         if missing_is_pinned {

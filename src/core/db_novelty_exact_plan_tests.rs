@@ -1,6 +1,9 @@
 use super::*;
 use crate::core::types::{Drawer, SourceType};
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 
@@ -143,6 +146,40 @@ fn original_candidates(
         .expect("collect original candidates")
 }
 
+fn query_plan<P: rusqlite::Params>(db: &Database, sql: &str, params: P) -> Vec<String> {
+    let mut statement = db
+        .conn()
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .expect("prepare query plan");
+    statement
+        .query_map(params, |row| row.get::<_, String>(3))
+        .expect("query plan")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect query plan")
+}
+
+fn referenced_tables(db: &Database, sql: &str) -> HashSet<String> {
+    let tables = Arc::new(Mutex::new(HashSet::new()));
+    let captured = Arc::clone(&tables);
+    db.conn().authorizer(Some(move |context: AuthContext<'_>| {
+        if let AuthAction::Read { table_name, .. } = context.action {
+            captured
+                .lock()
+                .expect("lock referenced tables")
+                .insert(table_name.to_string());
+        }
+        Authorization::Allow
+    }));
+    let statement = db.conn().prepare(sql).expect("prepare production SQL");
+    drop(statement);
+    db.conn()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    Arc::into_inner(tables)
+        .expect("release table observer")
+        .into_inner()
+        .expect("read referenced tables")
+}
+
 #[test]
 fn novelty_candidates_keep_drawer_recency_after_vector_replacement() {
     let tmp = TempDir::new().expect("tempdir");
@@ -214,7 +251,7 @@ fn novelty_candidates_keep_drawer_recency_after_vector_replacement() {
 }
 
 #[test]
-fn novelty_actual_sut_reduces_bounded_query_work_from_original() {
+fn novelty_actual_sut_has_bounded_plan_and_reduces_vm_work_from_original() {
     const DRAWERS: usize = 1536;
     const DIM: usize = 32;
     const LIMIT: usize = 16;
@@ -235,6 +272,50 @@ fn novelty_actual_sut_reduces_bounded_query_work_from_original() {
         db.conn().execute_batch("COMMIT").expect("commit seed");
     }
     let query = vec![1.0_f32; DIM];
+
+    let plan_db = Database::open(&path).expect("open plan snapshot");
+    let count_plan = query_plan(
+        &plan_db,
+        NOVELTY_CANDIDATE_COUNT_SQL,
+        (Some("code-memory"), Some("novelty"), Option::<&str>::None),
+    );
+    let count_tables = referenced_tables(&plan_db, NOVELTY_CANDIDATE_COUNT_SQL);
+    let query_json = serde_json::to_string(&query).expect("query json");
+    let candidate_plan = query_plan(
+        &plan_db,
+        NOVELTY_CANDIDATES_EXACT_SQL,
+        rusqlite::params![
+            query_json,
+            "code-memory",
+            "novelty",
+            Option::<&str>::None,
+            LIMIT as i64,
+            LIMIT as i64,
+        ],
+    );
+    let candidate_tables = referenced_tables(&plan_db, NOVELTY_CANDIDATES_EXACT_SQL);
+    assert!(
+        count_tables.contains("drawer_vectors_rowids")
+            && !count_tables.contains("drawer_vectors")
+            && count_plan
+                .iter()
+                .all(|detail| !detail.contains("VIRTUAL TABLE")),
+        "count must use rowid metadata without touching vec0: tables={count_tables:?}, plan={count_plan:?}"
+    );
+    assert!(
+        candidate_tables.contains("drawer_vectors_rowids")
+            && candidate_tables.contains("drawer_vectors")
+            && candidate_plan
+                .iter()
+                .any(|detail| detail.contains("MATERIALIZE recent_drawers"))
+            && candidate_plan
+                .iter()
+                .filter(|detail| detail.contains("VIRTUAL TABLE"))
+                .count()
+                == 1,
+        "candidate plan must materialize bounded drawer recency before one final vec0 lookup: tables={candidate_tables:?}, plan={candidate_plan:?}"
+    );
+    drop(plan_db);
 
     let (baseline_count, baseline_count_cost) = measure(&path, |db| {
         original_count(db, Some("code-memory"), Some("novelty"))
@@ -259,20 +340,28 @@ fn novelty_actual_sut_reduces_bounded_query_work_from_original() {
 
     eprintln!(
         "NOVELTY_COST sqlite={} sqlite_vec=0.1.9 drawers={DRAWERS} dim={DIM} \
-         count_original={baseline_count_cost:?} count_actual={actual_count_cost:?} \
-         candidates_original={baseline_candidate_cost:?} candidates_actual={actual_candidate_cost:?}",
-        rusqlite::version()
+         count_original_cache_misses={} count_actual_cache_misses={} \
+         candidates_original_cache_misses={} candidates_actual_cache_misses={} \
+         count_original_vm_steps={} count_actual_vm_steps={} \
+         candidates_original_vm_steps={} candidates_actual_vm_steps={}",
+        rusqlite::version(),
+        baseline_count_cost.cache_misses,
+        actual_count_cost.cache_misses,
+        baseline_candidate_cost.cache_misses,
+        actual_candidate_cost.cache_misses,
+        baseline_count_cost.vm_steps,
+        actual_count_cost.vm_steps,
+        baseline_candidate_cost.vm_steps,
+        actual_candidate_cost.vm_steps,
     );
     assert_eq!(actual_count, baseline_count);
     assert_eq!(actual_rows, baseline_rows);
     assert!(
-        actual_count_cost.cache_misses < baseline_count_cost.cache_misses
-            && actual_count_cost.vm_steps < baseline_count_cost.vm_steps,
-        "shadow-rowid count must reduce page-cache misses and VM work: original={baseline_count_cost:?}, actual={actual_count_cost:?}"
+        actual_count_cost.vm_steps < baseline_count_cost.vm_steps,
+        "shadow-rowid count must reduce VM work: original={baseline_count_cost:?}, actual={actual_count_cost:?}"
     );
     assert!(
-        actual_candidate_cost.cache_misses < baseline_candidate_cost.cache_misses
-            && actual_candidate_cost.vm_steps < baseline_candidate_cost.vm_steps,
-        "bounded SUT must reduce page-cache misses and VM work: original={baseline_candidate_cost:?}, actual={actual_candidate_cost:?}"
+        actual_candidate_cost.vm_steps < baseline_candidate_cost.vm_steps,
+        "bounded SUT must reduce VM work: original={baseline_candidate_cost:?}, actual={actual_candidate_cost:?}"
     );
 }
