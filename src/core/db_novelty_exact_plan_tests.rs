@@ -78,11 +78,13 @@ fn cache_misses(db: &Database) -> i32 {
     current
 }
 
-fn measure<T>(db: &Database, query: impl FnOnce() -> T) -> (T, QueryCost) {
+fn measure<T>(path: &std::path::Path, query: impl FnOnce(&Database) -> T) -> (T, QueryCost) {
+    // Keep each arm independent of pages retained by the seeding connection.
+    let db = Database::open(path).expect("open fresh cost snapshot");
     db.conn()
         .execute_batch("PRAGMA cache_size = -64; PRAGMA shrink_memory;")
-        .expect("reset SQLite page cache");
-    let misses_before = cache_misses(db);
+        .expect("set SQLite page-cache budget");
+    let misses_before = cache_misses(&db);
     let steps = Arc::new(AtomicUsize::new(0));
     let counted_steps = Arc::clone(&steps);
     db.conn().progress_handler(
@@ -92,12 +94,12 @@ fn measure<T>(db: &Database, query: impl FnOnce() -> T) -> (T, QueryCost) {
             false
         }),
     );
-    let result = query();
+    let result = query(&db);
     db.conn().progress_handler(0, None::<fn() -> bool>);
     (
         result,
         QueryCost {
-            cache_misses: cache_misses(db) - misses_before,
+            cache_misses: cache_misses(&db) - misses_before,
             vm_steps: steps.load(Ordering::Relaxed),
         },
     )
@@ -217,30 +219,33 @@ fn novelty_actual_sut_reduces_bounded_query_work_from_original() {
     const DIM: usize = 32;
     const LIMIT: usize = 16;
     let tmp = TempDir::new().expect("tempdir");
-    let db = Database::open(&tmp.path().join("cost.db")).expect("open db");
-    assert_eq!(rusqlite::version(), "3.50.2");
-    db.conn().execute_batch("BEGIN").expect("begin seed");
-    for index in 0..DRAWERS {
-        let id = format!("d{index:04}");
-        insert_drawer(&db, &id, "code-memory", "novelty");
-        let mut vector = vec![0.0_f32; DIM];
-        vector[0] = 1.0;
-        vector[1] = (index % 7) as f32;
-        db.insert_vector(&id, &vector).expect("insert vector");
+    let path = tmp.path().join("cost.db");
+    {
+        let db = Database::open(&path).expect("open db");
+        assert_eq!(rusqlite::version(), "3.50.2");
+        db.conn().execute_batch("BEGIN").expect("begin seed");
+        for index in 0..DRAWERS {
+            let id = format!("d{index:04}");
+            insert_drawer(&db, &id, "code-memory", "novelty");
+            let mut vector = vec![0.0_f32; DIM];
+            vector[0] = 1.0;
+            vector[1] = (index % 7) as f32;
+            db.insert_vector(&id, &vector).expect("insert vector");
+        }
+        db.conn().execute_batch("COMMIT").expect("commit seed");
     }
-    db.conn().execute_batch("COMMIT").expect("commit seed");
     let query = vec![1.0_f32; DIM];
 
-    let (baseline_count, baseline_count_cost) = measure(&db, || {
-        original_count(&db, Some("code-memory"), Some("novelty"))
+    let (baseline_count, baseline_count_cost) = measure(&path, |db| {
+        original_count(db, Some("code-memory"), Some("novelty"))
     });
-    let (actual_count, actual_count_cost) = measure(&db, || {
+    let (actual_count, actual_count_cost) = measure(&path, |db| {
         db.count_novelty_candidate_drawers(Some("code-memory"), Some("novelty"), None)
             .expect("actual count")
     });
     let (baseline_rows, baseline_candidate_cost) =
-        measure(&db, || original_candidates(&db, &query, LIMIT, LIMIT));
-    let (actual_rows, actual_candidate_cost) = measure(&db, || {
+        measure(&path, |db| original_candidates(db, &query, LIMIT, LIMIT));
+    let (actual_rows, actual_candidate_cost) = measure(&path, |db| {
         db.novelty_candidates_exact(
             &query,
             Some("code-memory"),
