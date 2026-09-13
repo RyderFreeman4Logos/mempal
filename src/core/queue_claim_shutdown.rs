@@ -1,12 +1,43 @@
-use super::{AsyncPendingMessageStore, ClaimedMessage, QueueError, Result};
+use super::{AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore, QueueError, Result};
 #[cfg(any(test, feature = "db-test-seam"))]
 use super::{consume_lock_failure, sqlite_busy_queue_error};
 
 #[cfg(any(test, feature = "db-test-seam"))]
 pub(super) type ClaimApprovalTestControl = (
     std::sync::Arc<tokio::sync::Notify>,
-    Option<std::sync::Arc<[tokio::sync::Notify; 3]>>,
+    Option<(
+        std::sync::Arc<std::sync::Barrier>,
+        std::sync::mpsc::Sender<()>,
+        std::sync::Arc<std::sync::Barrier>,
+    )>,
 );
+
+struct ApprovedClaimOwner {
+    store: PendingMessageStore,
+    claim: Option<ClaimedMessage>,
+}
+
+impl Drop for ApprovedClaimOwner {
+    fn drop(&mut self) {
+        if let Some(claim) = self.claim.take()
+            && let Err(error) = self.store.release_owned_claim_after_cancellation(&claim)
+        {
+            tracing::warn!(
+                ?error,
+                "failed to release approved queue claim after caller cancellation"
+            );
+        }
+    }
+}
+
+impl PendingMessageStore {
+    /// Release only this physical owner's exact token after runtime teardown.
+    fn release_owned_claim_after_cancellation(&self, claim: &ClaimedMessage) -> Result<()> {
+        let mut cleanup = self.clone();
+        cleanup.lifecycle_writer_lease = None;
+        cleanup.release_claim(claim)
+    }
+}
 
 impl AsyncPendingMessageStore {
     pub(crate) async fn claim_next_by_kind_until_shutdown(
@@ -40,13 +71,13 @@ impl AsyncPendingMessageStore {
         let started: Option<std::sync::Arc<tokio::sync::Notify>> = None;
         #[cfg(any(test, feature = "db-test-seam"))]
         let claim_approved = self.claim_approved.clone();
-        #[cfg(any(test, feature = "db-test-seam"))]
-        let claim_committed = self.claim_approved.clone();
         let store = self.inner.clone();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (approval_tx, approval_rx) = tokio::sync::oneshot::channel();
-        let join = tokio::task::spawn_blocking(move || {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        tokio::task::spawn_blocking(move || {
             let _permit = permit;
             tracing::dispatcher::with_default(&dispatch, || {
                 if let Some(started) = started {
@@ -57,7 +88,7 @@ impl AsyncPendingMessageStore {
                 }
                 let mut ready_tx = Some(ready_tx);
                 let mut approval_rx = Some(approval_rx);
-                store.claim_next_by_kind_with_approval(
+                let result = store.claim_next_by_kind_with_approval(
                     &worker_id,
                     claim_ttl_secs,
                     &kind_filter,
@@ -72,46 +103,38 @@ impl AsyncPendingMessageStore {
                         #[cfg(any(test, feature = "db-test-seam"))]
                         if approved && let Some((approved, gate)) = &claim_approved {
                             approved.notify_waiters();
-                            if let Some(gate) = gate {
-                                tokio::runtime::Handle::current().block_on(async {
-                                    tokio::time::timeout(
-                                        std::time::Duration::from_secs(1),
-                                        gate[0].notified(),
-                                    )
-                                    .await
-                                    .expect("test approval gate timed out");
-                                });
+                            if let Some((gate, _, _)) = gate {
+                                gate.wait();
                             }
                         }
                         approved
                     },
-                )
-            })
-        });
-        let owner_queue = self.clone();
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let _result_owner = tokio::spawn(async move {
-            let result = match join.await {
-                Ok(out) => out,
-                Err(error) => Err(QueueError::BlockingTaskFailed(error.to_string())),
-            };
-            #[cfg(any(test, feature = "db-test-seam"))]
-            if matches!(&result, Ok(Some(_)))
-                && let Some((_, Some(gate))) = &claim_committed
-            {
-                gate[1].notify_one();
-                tokio::time::timeout(std::time::Duration::from_secs(1), gate[2].notified())
-                    .await
-                    .expect("test settlement gate timed out");
-            }
-            if let Err(Ok(Some(claim))) = result_tx.send(result)
-                && let Err(error) = owner_queue.release_claim(claim).await
-            {
-                tracing::warn!(
-                    ?error,
-                    "failed to release approved queue claim after caller cancellation"
                 );
-            }
+                #[cfg(any(test, feature = "db-test-seam"))]
+                if matches!(&result, Ok(Some(_)))
+                    && let Some((_, Some((_, committed, cleanup_gate)))) = &claim_approved
+                {
+                    let _ = committed.send(());
+                    cleanup_gate.wait();
+                }
+                match result {
+                    Ok(Some(claim)) => {
+                        let transferred_claim = claim.clone();
+                        let mut owner = ApprovedClaimOwner {
+                            store,
+                            claim: Some(claim),
+                        };
+                        if result_tx.send(Ok(Some(transferred_claim))).is_ok()
+                            && accepted_rx.recv().is_ok()
+                        {
+                            owner.claim = None;
+                        }
+                    }
+                    result => {
+                        let _ = result_tx.send(result);
+                    }
+                }
+            })
         });
         let approved = tokio::select! {
             biased;
@@ -124,8 +147,12 @@ impl AsyncPendingMessageStore {
             // claim and may finish off-runtime after the scoped worker exits.
             return Ok(None);
         }
-        result_rx.await.map_err(|error| {
+        let result = result_rx.await.map_err(|error| {
             QueueError::BlockingTaskFailed(format!("queue claim result owner failed: {error}"))
-        })?
+        })?;
+        if matches!(&result, Ok(Some(_))) {
+            let _ = accepted_tx.send(());
+        }
+        result
     }
 }

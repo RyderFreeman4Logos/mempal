@@ -60,73 +60,85 @@ async fn test_scoped_ingest_shutdown_keeps_approved_claim_owner() {
     );
 }
 
-#[tokio::test]
-async fn test_zero_budget_shutdown_releases_claim_approved_after_reclaim() {
-    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
+#[test]
+fn test_actual_runtime_shutdown_releases_late_approved_claim() {
+    let _worker_lifecycle_lock =
+        crate::observability::test_support::acquire_ingest_worker_lifecycle_lock_blocking();
     let (_tempdir, db_path, server) = setup_server();
     let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
     let operation_id = queue
         .enqueue(INGEST_ASYNC_KIND, "{}")
         .expect("enqueue operation");
+    let db = crate::core::db::Database::open(&db_path).expect("open lease owner");
+    let lease = db
+        .runtime_writer_lease_acquire(
+            "sqlite-writer",
+            "runtime-shutdown-test",
+            "daemon",
+            120,
+            None,
+        )
+        .expect("acquire runtime writer lease")
+        .expect("runtime writer lease available");
     let claim_approved = Arc::new(tokio::sync::Notify::new());
-    let approved = claim_approved.notified();
-    let gate = Arc::new([
-        tokio::sync::Notify::new(),
-        tokio::sync::Notify::new(),
-        tokio::sync::Notify::new(),
-    ]);
+    let claim_gate = Arc::new(std::sync::Barrier::new(2));
+    let cleanup_gate = Arc::new(std::sync::Barrier::new(2));
+    let (committed_tx, committed_rx) = std::sync::mpsc::channel();
     let async_queue = AsyncPendingMessageStore::from_store(queue.clone())
+        .with_lifecycle_writer_lease(lease.clone())
         .with_claim_approved_for_test((
             Arc::clone(&claim_approved),
-            Some(Arc::clone(&gate)),
+            Some((
+                Arc::clone(&claim_gate),
+                committed_tx,
+                Arc::clone(&cleanup_gate),
+            )),
         ));
-    let verification_queue = AsyncPendingMessageStore::from_store(queue.clone());
-    let handle = server
-        .with_async_queue_for_test(async_queue)
-        .spawn_scoped_ingest_drain_worker();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build private daemon-style runtime");
+    runtime.block_on(async {
+        let approved = claim_approved.notified();
+        let handle = server
+            .with_async_queue_for_test(async_queue)
+            .spawn_scoped_ingest_drain_worker();
+        tokio::time::timeout(Duration::from_secs(1), approved)
+            .await
+            .expect("claim approval did not reach the blocking owner");
+        handle
+            .shutdown_and_drain_with_budget(Some(Duration::ZERO))
+            .await;
+        assert_eq!(queue.reclaim_stale(0).expect("one-shot shutdown reclaim"), 0);
+    });
+    runtime.shutdown_timeout(Duration::ZERO);
 
-    tokio::time::timeout(Duration::from_secs(1), approved)
-        .await
-        .expect("claim approval did not reach the blocking owner");
-    handle
-        .shutdown_and_drain_with_budget(Some(Duration::ZERO))
-        .await;
-    assert_eq!(queue.reclaim_stale(0).expect("one-shot shutdown reclaim"), 0);
-
-    gate[0].notify_one();
-    tokio::time::timeout(Duration::from_secs(1), gate[1].notified())
-        .await
-        .expect("late claim did not commit");
-    let record = queue
-        .operation_status(&operation_id)
-        .expect("load late-claimed operation")
-        .expect("operation remains durable");
-    assert_eq!(record.op_state, IngestOperationState::Running.as_str());
-    assert!(record.claimed_at.is_some());
-    gate[2].notify_one();
-    let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let recovered = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if let Some(claim) = verification_queue
-                .claim_next_by_kind_until_shutdown(
-                    "verification-worker".to_string(),
-                    INGEST_CLAIM_TTL_SECS,
-                    INGEST_ASYNC_KIND.to_string(),
-                    &mut shutdown_rx,
-                )
-                .await
-                .expect("verification claim failed")
-            {
-                break claim;
-            }
-            tokio::task::yield_now().await;
+    claim_gate.wait();
+    committed_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("blocking claim did not commit after runtime shutdown");
+    assert!(
+        db.runtime_writer_lease_release(&lease)
+            .expect("release runtime writer lease before owner cleanup"),
+        "runtime writer lease must remain owned until explicit teardown"
+    );
+    cleanup_gate.wait();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let record = queue
+            .operation_status(&operation_id)
+            .expect("load late-claimed operation")
+            .expect("operation remains durable");
+        if record.op_state == IngestOperationState::Queued.as_str()
+            && record.claimed_at.is_none()
+        {
+            break;
         }
-    })
-    .await
-    .expect("approved late claim was not released after worker abort");
-    assert_eq!(recovered.id, operation_id);
-    verification_queue
-        .release_claim(recovered)
-        .await
-        .expect("release verification claim");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "late claim remained owned after runtime shutdown: {record:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
