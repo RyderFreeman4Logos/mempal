@@ -105,7 +105,7 @@ fn install_schema_repair_begin_test_hook(
     std::sync::mpsc::SyncSender<()>,
 ) {
     let (reached, receiver) = std::sync::mpsc::sync_channel(1);
-    let (resume, resume_receiver) = std::sync::mpsc::sync_channel(1);
+    let (resume, resume_receiver) = std::sync::mpsc::sync_channel(0);
     *SCHEMA_REPAIR_BEGIN_TEST_HOOK
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()

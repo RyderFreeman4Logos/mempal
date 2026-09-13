@@ -23,9 +23,15 @@ fn repair_required_current_schema_open_fails_bounded_then_repairs_after_writer_r
     let (opened_tx, opened_rx) = std::sync::mpsc::channel();
     let (repair_begin_rx, repair_resume_tx) =
         super::install_schema_repair_begin_test_hook(&db_path);
+    assert!(
+        matches!(
+            repair_resume_tx.try_send(()),
+            Err(std::sync::mpsc::TrySendError::Full(()))
+        ),
+        "repair resume must rendezvous with the matching opener"
+    );
     let open_path = db_path.clone();
     let opener = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300));
         let _ = opened_tx.send(Database::open_with_busy_timeout(
             &open_path,
             Duration::from_millis(25),
