@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn fsynced_spool_receipt_is_publicly_followable_through_replay() {
-    let tempdir = tempfile::TempDir::new_in("/tmp").expect("short tempdir");
+    let tempdir = tempfile::TempDir::new().expect("short tempdir");
     let db_path = tempdir.path().join("palace.db");
     Database::open(&db_path).expect("open database");
     let server = MempalMcpServer::new(db_path.clone(), Config::default()).expect("create server");

@@ -46,6 +46,58 @@
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_enqueue_after_blocking_start_finishes_original_work() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let store = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+            .with_blocking_delay(Duration::from_millis(200))
+            .with_blocking_started_for_test(Arc::clone(&started));
+        let idempotency_key = "cancel-after-blocking-start";
+        let operation_id =
+            PendingMessageStore::idempotent_message_id("ingest_async", idempotency_key);
+
+        let enqueue = tokio::spawn(async move {
+            store
+                .enqueue_idempotent_with_key_fail_fast(
+                    "ingest_async".to_string(),
+                    "{}".to_string(),
+                    idempotency_key.to_string(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("blocking queue work started");
+        enqueue.abort();
+        assert!(enqueue.await.expect_err("enqueue cancelled").is_cancelled());
+
+        let verification = PendingMessageStore::new_without_reclaim(&db_path);
+        assert!(
+            verification
+                .operation_status(&operation_id)
+                .expect("query operation before blocking delay")
+                .is_none(),
+            "started handshake must precede the delayed durable mutation"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if verification
+                    .operation_status(&operation_id)
+                    .expect("query operation after cancellation")
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled caller's blocking work must finish");
+    }
+
     #[test]
     fn claim_next_skips_ingest_async_rows_for_dedicated_workers() {
         let tmp = tempfile::TempDir::new().expect("tempdir");

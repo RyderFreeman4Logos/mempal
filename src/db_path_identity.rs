@@ -226,7 +226,10 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     fn short_tempdir() -> tempfile::TempDir {
-        tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temp root");
+        tempfile::TempDir::new_in(temp_root).expect("short tempdir")
     }
 
     #[test]

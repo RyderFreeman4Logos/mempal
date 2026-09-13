@@ -2,8 +2,8 @@
 
 use std::io::Write;
 use std::net::TcpListener;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ pub enum StubOutcome {
 /// RAII owner: `Drop` stops and joins the accept thread on panic/error paths.
 pub struct EmbeddingStub {
     endpoint: String,
+    listener: Weak<TcpListener>,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<StubOutcome>>,
 }
@@ -34,7 +35,12 @@ impl EmbeddingStub {
     /// Stop the accept loop and join. Surfaces join errors on the success path.
     pub fn stop_and_join(mut self) -> StubOutcome {
         self.stop.store(true, Ordering::Relaxed);
-        self.take_handle().join().expect("join embedding stub")
+        let outcome = self.take_handle().join().expect("join embedding stub");
+        assert!(
+            self.listener.upgrade().is_none(),
+            "joined stub must release its listener"
+        );
+        outcome
     }
 
     fn take_handle(&mut self) -> thread::JoinHandle<StubOutcome> {
@@ -53,11 +59,12 @@ impl Drop for EmbeddingStub {
 
 pub fn start(expected_query: &str, vector: Vec<f32>) -> EmbeddingStub {
     let stop = Arc::new(AtomicBool::new(false));
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding stub");
+    let listener = Arc::new(TcpListener::bind("127.0.0.1:0").expect("bind embedding stub"));
     listener
         .set_nonblocking(true)
         .expect("set embedding stub nonblocking");
     let address = listener.local_addr().expect("local addr");
+    let listener_witness = Arc::downgrade(&listener);
     let expected_query = expected_query.to_string();
     let stop_for_thread = Arc::clone(&stop);
 
@@ -107,6 +114,7 @@ pub fn start(expected_query: &str, vector: Vec<f32>) -> EmbeddingStub {
 
     EmbeddingStub {
         endpoint: format!("http://{address}/v1"),
+        listener: listener_witness,
         stop,
         handle: Some(handle),
     }
@@ -139,13 +147,8 @@ mod owner_tests {
     #[test]
     fn stop_before_accept_is_stopped_not_served() {
         let stub = start("q", vec![0.25; 2]);
-        let addr = listen_addr(stub.endpoint());
         let outcome = stub.stop_and_join();
         assert_eq!(outcome, StubOutcome::Stopped);
-        assert!(
-            TcpStream::connect(&addr).is_err(),
-            "stopped stub must release the listen socket"
-        );
     }
 
     #[test]
@@ -175,15 +178,15 @@ mod owner_tests {
     #[test]
     fn drop_stops_and_joins_after_panic() {
         let stub = start("q", vec![0.25; 2]);
-        let addr = listen_addr(stub.endpoint());
+        let listener = stub.listener.clone();
         let panicked = catch_unwind(AssertUnwindSafe(|| {
             let _stub = stub;
             panic!("forced owner cleanup");
         }));
         assert!(panicked.is_err(), "fixture must unwind through Drop");
         assert!(
-            TcpStream::connect(&addr).is_err(),
-            "panic cleanup must join and release the listen socket"
+            listener.upgrade().is_none(),
+            "panic cleanup must release the original listener"
         );
     }
 }

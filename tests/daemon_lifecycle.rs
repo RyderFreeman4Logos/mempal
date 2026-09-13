@@ -9,6 +9,7 @@ use common::harness::{
     CapturedChild, embed_mock::start as start_embed_mock, hold_sqlite_lock_for,
     write_daemon_home_diagnostics,
 };
+use common::socket_temp_dir::SocketTempDir;
 use mempal::bootstrap_events::BootstrapEvent;
 use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
@@ -16,14 +17,13 @@ use mempal::daemon_bootstrap::DaemonContext;
 use mempal::hook::{CapturedHookEnvelope, HookEvent};
 use mockito::Server;
 use serde_json::json;
-use tempfile::TempDir;
 
 fn mempal_bin() -> String {
     env!("CARGO_BIN_EXE_mempal").to_string()
 }
 
-fn setup_daemon_home() -> (TempDir, PathBuf, PathBuf) {
-    let tmp = TempDir::new_in("/tmp").expect("short tempdir");
+fn setup_daemon_home() -> (SocketTempDir, PathBuf, PathBuf) {
+    let tmp = SocketTempDir::new().expect("short tempdir");
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
     let db_path = mempal_home.join("palace.db");

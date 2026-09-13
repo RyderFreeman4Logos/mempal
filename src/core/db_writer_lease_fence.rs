@@ -328,6 +328,24 @@ impl Database {
     where
         E: From<DbError>,
     {
+        self.with_runtime_writer_lease_transaction_until(
+            lease,
+            operation,
+            std::time::Instant::now() + super::RUNTIME_WRITER_LEASE_TRANSACTION_RETRY_DEADLINE,
+            write,
+        )
+    }
+
+    pub(super) fn with_runtime_writer_lease_transaction_until<T, E>(
+        &self,
+        lease: Option<&RuntimeWriterLease>,
+        operation: &'static str,
+        deadline: std::time::Instant,
+        write: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<DbError>,
+    {
         if !self.conn.is_autocommit() {
             if let Some(lease) = lease {
                 self.runtime_writer_lease_cleanup_expired_tx(true)
@@ -339,7 +357,7 @@ impl Database {
         }
 
         let owner = crate::core::sqlite_retry::retry_content_mutation_sqlite_lock_until(
-            std::time::Instant::now() + super::RUNTIME_WRITER_LEASE_TRANSACTION_RETRY_DEADLINE,
+            deadline,
             || {
                 crate::core::writer_owner_diagnostics::begin_immediate(&self.conn, operation)
                     .map_err(DbError::from)
@@ -374,6 +392,43 @@ impl Database {
         };
         owner.release();
         outcome
+    }
+
+    pub(crate) fn runtime_writer_lease_release_until(
+        &self,
+        lease: &RuntimeWriterLease,
+        deadline: std::time::Instant,
+    ) -> Result<bool, DbError> {
+        self.runtime_writer_lease_release_fenced_until(
+            &lease.name,
+            &lease.owner,
+            &lease.session_id,
+            lease.generation,
+            deadline,
+        )
+    }
+
+    pub(super) fn runtime_writer_lease_release_fenced_until(
+        &self,
+        name: &str,
+        owner: &str,
+        session_id: &str,
+        generation: u64,
+        deadline: std::time::Instant,
+    ) -> Result<bool, DbError> {
+        self.with_runtime_writer_lease_transaction_until(
+            None,
+            "runtime writer lease control",
+            deadline,
+            || {
+                let rows = self.conn.execute(
+                    "DELETE FROM runtime_writer_leases \
+                     WHERE name = ?1 AND owner = ?2 AND session_id = ?3 AND generation = ?4",
+                    params![name, owner, session_id, generation as i64],
+                )?;
+                Ok(rows > 0)
+            },
+        )
     }
 
     pub(super) fn require_runtime_writer_lease_tx(

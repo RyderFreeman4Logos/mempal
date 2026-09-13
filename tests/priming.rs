@@ -39,7 +39,7 @@ struct PrimeEnv {
 impl PrimeEnv {
     fn new() -> Self {
         let _class_lock = db_admission_class_lock();
-        let tmp = TempDir::new_in("/tmp").expect("external tempdir");
+        let tmp = TempDir::new().expect("external tempdir");
         let home = tmp.path().join("home");
         let mempal_home = home.join(".mempal");
         fs::create_dir_all(&mempal_home).expect("create mempal home");

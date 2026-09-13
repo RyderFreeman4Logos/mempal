@@ -16,9 +16,29 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
+
+thread_local! {
+    static CONTENTION_OBSERVER_FOR_TEST: std::cell::RefCell<Option<mpsc::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install a one-shot observer for the next lock contention on this thread.
+#[doc(hidden)]
+pub fn set_contention_observer_for_test(observer: mpsc::Sender<()>) {
+    CONTENTION_OBSERVER_FOR_TEST.with(|slot| *slot.borrow_mut() = Some(observer));
+}
+
+fn notify_contention_observer_for_test() {
+    CONTENTION_OBSERVER_FOR_TEST.with(|slot| {
+        if let Some(observer) = slot.borrow_mut().take() {
+            let _ = observer.send(());
+        }
+    });
+}
 
 #[derive(Debug, Error)]
 pub enum LockError {
@@ -110,6 +130,7 @@ pub fn acquire_source_lock(
                 });
             }
             Err(imp::LockAcquire::WouldBlock) => {
+                notify_contention_observer_for_test();
                 if start.elapsed() >= timeout {
                     return Err(LockError::Timeout {
                         path: lock_path,
@@ -267,5 +288,35 @@ mod tests {
         for h in handles {
             h.join().expect("thread");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_contention_observer_is_one_shot() {
+        use std::sync::Arc;
+        use std::sync::mpsc::TryRecvError;
+        use std::thread;
+
+        let tmp = Arc::new(tempfile::tempdir().unwrap());
+        let key = source_key(Path::new("/tmp/contention-observer"));
+        let holder =
+            acquire_source_lock(tmp.path(), &key, Duration::from_secs(1)).expect("holder acquire");
+        let (observed_tx, observed_rx) = mpsc::channel();
+
+        let waiter_tmp = Arc::clone(&tmp);
+        let waiter_key = key.clone();
+        let waiter = thread::spawn(move || {
+            set_contention_observer_for_test(observed_tx);
+            acquire_source_lock(waiter_tmp.path(), &waiter_key, Duration::from_secs(1))
+                .expect("waiter acquire")
+        });
+
+        observed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("observe contention");
+        drop(holder);
+        let waiter_guard = waiter.join().expect("waiter thread");
+        assert!(waiter_guard.wait_duration() > Duration::ZERO);
+        assert_eq!(observed_rx.try_recv(), Err(TryRecvError::Disconnected));
     }
 }

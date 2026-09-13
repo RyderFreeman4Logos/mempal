@@ -6,6 +6,9 @@ use super::{
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+
+#[path = "temp_fixture_check.rs"]
+mod temp_fixture_check;
 use std::time::Duration;
 
 pub(super) fn fixture_justfile() -> &'static str {

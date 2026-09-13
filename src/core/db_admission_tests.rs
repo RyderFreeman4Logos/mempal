@@ -10,7 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 fn short_tempdir() -> tempfile::TempDir {
-    tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+    tempfile::TempDir::new().expect("short tempdir")
 }
 
 #[cfg(target_os = "linux")]

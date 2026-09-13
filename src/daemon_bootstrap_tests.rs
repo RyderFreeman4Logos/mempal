@@ -359,7 +359,7 @@ async fn write_observer_stall_checks_record_queue_io_burst() {
 }
 
 fn short_tempdir() -> tempfile::TempDir {
-    tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+    tempfile::TempDir::new().expect("short tempdir")
 }
 
 #[test]

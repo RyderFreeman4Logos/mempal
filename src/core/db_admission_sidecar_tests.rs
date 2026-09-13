@@ -9,7 +9,7 @@ use super::db_admission_state::MAX_ADMISSION_STATE_BYTES;
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 fn short_tempdir() -> tempfile::TempDir {
-    tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+    tempfile::TempDir::new().expect("short tempdir")
 }
 
 fn request() -> DbAdmissionRequest {

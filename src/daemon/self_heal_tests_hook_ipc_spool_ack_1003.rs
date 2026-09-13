@@ -8,7 +8,7 @@ use crate::hook::HookEvent;
 async fn test_hook_ipc_spools_before_ack_when_sqlite_locked() {
     let _test_guard = super::lock_hook_ipc_tests().await;
     super::super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
-    let tmp = tempfile::TempDir::new_in("/tmp").expect("short tempdir");
+    let tmp = tempfile::TempDir::new().expect("short tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
     let lock_conn = rusqlite::Connection::open(&db_path).expect("open lock connection");
@@ -41,17 +41,20 @@ async fn test_hook_ipc_spools_before_ack_when_sqlite_locked() {
         .await
         .expect("flush request");
 
+    let mut reader = tokio::io::BufReader::new(client);
+    let mut line = String::new();
     let response = tokio::time::timeout(crate::hook_ipc::HOOK_IPC_TIMEOUT, async {
-        let mut reader = tokio::io::BufReader::new(client);
-        let mut line = String::new();
         tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
             .await
             .expect("read response");
-        handler.await.expect("handler task");
         serde_json::from_str(line.trim()).expect("hook IPC response")
     })
     .await
     .expect("locked SQLite enqueue must ACK from the fsynced spool");
+    tokio::time::timeout(crate::hook_ipc::HOOK_IPC_READ_TIMEOUT, handler)
+        .await
+        .expect("hook IPC handler must finish after ACK")
+        .expect("handler task");
     match response {
         crate::hook_ipc::HookIpcEnqueueResponse::Accepted => {}
         crate::hook_ipc::HookIpcEnqueueResponse::Error { message } => {

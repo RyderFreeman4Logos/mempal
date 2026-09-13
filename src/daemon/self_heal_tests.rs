@@ -1,4 +1,8 @@
+#[cfg(target_os = "linux")]
+use std::fs::File;
 use std::io::{self, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -24,7 +28,18 @@ impl Drop for ShutdownResetGuard {
 }
 
 fn short_tempdir() -> tempfile::TempDir {
-    tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+    tempfile::TempDir::new().expect("short tempdir")
+}
+
+#[cfg(target_os = "linux")]
+fn short_mempal_home(tempdir: &tempfile::TempDir) -> (File, PathBuf) {
+    let directory = File::open(tempdir.path()).expect("open temporary directory");
+    let path = PathBuf::from(format!(
+        "/proc/{}/fd/{}/.mempal",
+        std::process::id(),
+        directory.as_raw_fd()
+    ));
+    (directory, path)
 }
 
 struct LogCapture {
@@ -463,14 +478,16 @@ async fn test_hook_ipc_listener_bounds_active_handlers() {
     super::reset_hook_ipc_handler_counters_for_test();
     let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
+    #[cfg(target_os = "linux")]
+    let (_tempdir_fd, mempal_home) = short_mempal_home(&tmp);
+    #[cfg(not(target_os = "linux"))]
     let mempal_home = tmp.path().join(".mempal");
     std::fs::create_dir_all(&mempal_home).expect("create mempal home");
     Database::open(&db_path).expect("open db");
     let (listener, socket_guard) =
         crate::hook_ipc::bind_listener(&mempal_home).expect("bind hook IPC listener");
     let socket_path = socket_guard.path().to_path_buf();
-    let store = AsyncPendingMessageStore::new_without_reclaim(&db_path)
-        .with_blocking_delay(Duration::from_millis(250));
+    let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
     let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
     let spool = Arc::new(crate::ingress_spool::IngressSpool::new(&mempal_home));
     let listener_task = tokio::spawn(super::run_hook_ipc_listener(
@@ -478,50 +495,63 @@ async fn test_hook_ipc_listener_bounds_active_handlers() {
     ));
     let mut clients = Vec::new();
 
-    for attempt in 0..(super::HOOK_IPC_HANDLER_LIMIT + 8) {
-        let mut client = match tokio::time::timeout(
-            Duration::from_millis(100),
+    for attempt in 0..=super::HOOK_IPC_HANDLER_LIMIT {
+        let mut client = tokio::time::timeout(
+            Duration::from_secs(2),
             tokio::net::UnixStream::connect(&socket_path),
         )
         .await
-        {
-            Ok(Ok(client)) => client,
-            Ok(Err(_)) | Err(_) => continue,
-        };
+        .expect("connect hook IPC holder")
+        .expect("hook IPC holder");
         let request = crate::hook_ipc::HookIpcEnqueueRequest::new(
             HookEvent::UserPromptSubmit.queue_kind(),
             &format!(r#"{{"event":"UserPromptSubmit","attempt":{attempt}}}"#),
         );
-        let mut frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
-        frame.push(b'\n');
+        let frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
         tokio::io::AsyncWriteExt::write_all(&mut client, &frame)
             .await
-            .expect("write request");
+            .expect("write incomplete request");
         tokio::io::AsyncWriteExt::flush(&mut client)
             .await
-            .expect("flush request");
+            .expect("flush incomplete request");
         clients.push(client);
     }
 
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let (_, peak) = super::hook_ipc_handler_counts_for_test();
-            if peak >= super::HOOK_IPC_HANDLER_LIMIT {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("listener should reach the declared handler limit");
+    super::wait_for_active_handler_count(super::HOOK_IPC_HANDLER_LIMIT, "cap occupancy").await;
     let (_, peak) = super::hook_ipc_handler_counts_for_test();
     assert!(
         peak <= super::HOOK_IPC_HANDLER_LIMIT,
         "active handler peak {peak} exceeded limit {}",
         super::HOOK_IPC_HANDLER_LIMIT
     );
+    assert_eq!(peak, super::HOOK_IPC_HANDLER_LIMIT);
 
-    drop(clients);
+    tokio::time::timeout(super::HOOK_IPC_HANDLER_DRAIN_BUDGET, async {
+        for client in &mut clients {
+            tokio::io::AsyncWriteExt::write_all(client, b"\n")
+                .await
+                .expect("complete request");
+            tokio::io::AsyncWriteExt::flush(client)
+                .await
+                .expect("flush completed request");
+        }
+        for client in clients {
+            let mut reader = tokio::io::BufReader::new(client);
+            let mut line = String::new();
+            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+                .await
+                .expect("read response");
+            assert_eq!(
+                serde_json::from_str::<crate::hook_ipc::HookIpcEnqueueResponse>(line.trim())
+                    .expect("hook IPC response"),
+                crate::hook_ipc::HookIpcEnqueueResponse::Accepted
+            );
+        }
+    })
+    .await
+    .expect("all queued clients should receive responses within the drain budget");
+    super::wait_for_active_handler_count(0, "client release").await;
+
     super::super::request_shutdown();
     tokio::time::timeout(Duration::from_secs(5), listener_task)
         .await
@@ -539,7 +569,7 @@ async fn test_hook_ipc_listener_recovers_after_real_sqlite_contention() {
     super::reset_hook_ipc_handler_counters_for_test();
     let tmp = short_tempdir();
     let db_path = tmp.path().join("palace.db");
-    let mempal_home = tmp.path().join(".mempal");
+    let (_tempdir_fd, mempal_home) = short_mempal_home(&tmp);
     std::fs::create_dir_all(&mempal_home).expect("create mempal home");
     Database::open(&db_path).expect("open db");
     let (listener, _socket_guard) =

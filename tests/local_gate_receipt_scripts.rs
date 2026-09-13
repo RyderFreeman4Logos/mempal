@@ -425,7 +425,7 @@ fn fixture_script(source: &str, aggregate: &str) -> String {
 }
 
 fn fixture(aggregate: &str) -> GateFixture {
-    let tempdir = tempfile::tempdir().expect("create fixture directory");
+    let tempdir = tempfile::tempdir().expect("create fixture");
     let root = tempdir.path().to_path_buf();
     let script_dir = root.join("scripts/gates");
     fs::create_dir_all(&script_dir).expect("create fixture script directory");
@@ -434,6 +434,8 @@ fn fixture(aggregate: &str) -> GateFixture {
         .expect("read local gate receipt script");
     let script = script_dir.join("local-gate-receipt.sh");
     write_executable(&script, &fixture_script(&source, aggregate));
+    let check = "scripts/gates/check-test-temp-fixtures.sh";
+    fs::copy(repo_root().join(check), root.join(check)).expect("copy script");
     fs::write(root.join("justfile"), failure_modes::fixture_justfile())
         .expect("write fixture justfile");
     fs::write(root.join("lefthook.yml"), "pre-push:\n  commands: {}\n")
@@ -454,6 +456,7 @@ fn fixture(aggregate: &str) -> GateFixture {
             ".gitignore",
             "justfile",
             "lefthook.yml",
+            check,
             "scripts/gates/local-gate-receipt.sh",
         ],
     );

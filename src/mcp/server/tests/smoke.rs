@@ -518,11 +518,14 @@ async fn test_mcp_smoke_wait_writer_lease_error_releases_and_starts_drain() {
         Err(error) => error,
     };
 
-    assert!(
+    assert_eq!(
         error
-            .to_string()
-            .contains("failed to acquire scoped MCP ingest writer lease"),
-        "error={error}"
+            .data
+            .as_ref()
+            .and_then(|data| data.get("failure_kind"))
+            .and_then(Value::as_str),
+        Some("unknown"),
+        "lease failure must retain a mandatory sanitized class: {error}"
     );
     let db = Database::open(&db_path).expect("open queue database");
     let operation_id = db

@@ -14,7 +14,7 @@ use crate::mcp::MempalMcpServer;
 
 #[tokio::test]
 async fn test_schema_ready_gate_migrates_fresh_database() {
-    let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+    let tempdir = TempDir::new().expect("short tempdir");
     let db_path = tempdir.path().join("palace.db");
     let config = Config {
         db_path: db_path.display().to_string(),
@@ -41,7 +41,7 @@ async fn test_schema_ready_gate_migrates_fresh_database() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_schema_ready_gate_rejects_stale_schema_with_live_daemon_writer() {
-    let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+    let tempdir = TempDir::new().expect("short tempdir");
     let db_path = tempdir.path().join("palace.db");
     let db = Database::open(&db_path).expect("initialize database");
     let lease = db
@@ -83,7 +83,7 @@ async fn test_schema_ready_gate_rejects_stale_schema_with_live_daemon_writer() {
 
 #[tokio::test]
 async fn test_status_read_survives_writer_pool_open_failure() {
-    let tempdir = TempDir::new_in("/tmp").expect("short tempdir");
+    let tempdir = TempDir::new().expect("short tempdir");
     let db_path = tempdir.path().join("palace.db");
     drop(Database::open(&db_path).expect("initialize status database"));
     let config = Config {

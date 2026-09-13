@@ -85,6 +85,52 @@ fn schema_sql_requires_rewrite(table_sql: &str, replacements: &[(&str, &str)]) -
         .any(|(legacy, _)| table_sql.contains(legacy))
 }
 
+#[cfg(test)]
+struct SchemaRepairBeginTestHook {
+    path: PathBuf,
+    busy_timeout_ms: std::sync::mpsc::SyncSender<i64>,
+}
+
+#[cfg(test)]
+static SCHEMA_REPAIR_BEGIN_TEST_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<SchemaRepairBeginTestHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_schema_repair_begin_test_hook(path: &Path) -> std::sync::mpsc::Receiver<i64> {
+    let (busy_timeout_ms, receiver) = std::sync::mpsc::sync_channel(1);
+    *SCHEMA_REPAIR_BEGIN_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("lock schema-repair test hook") = Some(SchemaRepairBeginTestHook {
+        path: path.to_path_buf(),
+        busy_timeout_ms,
+    });
+    receiver
+}
+
+#[cfg(test)]
+pub(super) fn notify_schema_repair_begin_for_test(conn: &Connection) {
+    let Some(path) = conn.path().map(Path::new) else {
+        return;
+    };
+    let hook = SCHEMA_REPAIR_BEGIN_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|mut hook| {
+            hook.as_ref()
+                .is_some_and(|hook| hook.path == path)
+                .then(|| hook.take().expect("matched schema-repair hook"))
+        });
+    if let Some(hook) = hook {
+        let timeout_ms = conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap_or(-1);
+        let _ = hook.busy_timeout_ms.try_send(timeout_ms);
+    }
+}
+
 pub(super) fn table_sql(conn: &Connection, table_name: &str) -> Result<String, DbError> {
     conn.query_row(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -320,7 +366,10 @@ mod tests {
     use crate::ingress_spool::AppendOutcome;
 
     fn short_tempdir() -> tempfile::TempDir {
-        tempfile::TempDir::new_in("/tmp").expect("short tempdir")
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temp root");
+        tempfile::TempDir::new_in(temp_root).expect("short tempdir")
     }
 
     #[test]

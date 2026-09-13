@@ -297,7 +297,6 @@ impl AsyncDb {
     /// The deadline is installed on the checked-out reader connection via
     /// SQLite's progress handler, so long-running SQL is interrupted inside the
     /// blocking thread instead of continuing after the async caller times out.
-    #[cfg(any(feature = "rest", test))]
     pub(crate) async fn run_read_anyhow_until<F, R>(
         &self,
         deadline: Instant,
@@ -363,6 +362,8 @@ impl AsyncDb {
             Arc::clone(&self._admission),
             delay,
             deadline,
+            #[cfg(test)]
+            None,
             f,
         )
         .await
@@ -603,6 +604,7 @@ async fn exec_with_deadline<F, R>(
     _admission: Arc<ProfileDbAdmission>,
     delay: Option<Duration>,
     deadline: Instant,
+    #[cfg(test)] owner_observed: Option<tokio::sync::oneshot::Sender<()>>,
     f: F,
 ) -> Result<R, DbError>
 where
@@ -650,6 +652,14 @@ where
             checkin_pool.checkin(conn);
             out
         })
+    });
+    let join = tokio::spawn(async move {
+        let result = await_write_join(join).await;
+        #[cfg(test)]
+        if let Some(owner_observed) = owner_observed {
+            let _ = owner_observed.send(());
+        }
+        result
     });
     let approval_tx =
         match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), ready_rx).await {
@@ -743,8 +753,8 @@ where
         if Instant::now() >= deadline {
             return Err(anyhow::Error::new(ReadDeadlineExceeded));
         }
-        tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
+        tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
             pool.sem.clone().acquire_owned(),
         )
         .await
@@ -795,8 +805,14 @@ where
                 other => other,
             }
         })
-    })
-    .await;
+    });
+    let join = if let Some(deadline) = deadline {
+        tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), join)
+            .await
+            .map_err(|_| anyhow::Error::new(ReadDeadlineExceeded))?
+    } else {
+        join.await
+    };
     match join {
         Ok(out) => out,
         Err(join_err) => Err(anyhow::anyhow!("blocking database task failed: {join_err}")),

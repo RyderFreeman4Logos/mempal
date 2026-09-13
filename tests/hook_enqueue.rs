@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 #[cfg(unix)]
@@ -11,21 +13,21 @@ use std::thread;
 #[cfg(unix)]
 use std::time::Duration;
 
+use common::socket_temp_dir::SocketTempDir;
 use mempal::core::{db::Database, queue::PendingMessageStore};
 use rusqlite::Connection;
 use serde_json::Value;
-use tempfile::TempDir;
 
 fn mempal_bin() -> String {
     env!("CARGO_BIN_EXE_mempal").to_string()
 }
 
-fn setup_home() -> (TempDir, PathBuf) {
+fn setup_home() -> (SocketTempDir, PathBuf) {
     setup_home_with_extra_config("")
 }
 
-fn setup_home_without_opening_db() -> (TempDir, PathBuf) {
-    let tmp = TempDir::new_in("/tmp").expect("short tempdir");
+fn setup_home_without_opening_db() -> (SocketTempDir, PathBuf) {
+    let tmp = SocketTempDir::new().expect("short tempdir");
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
     let db_path = mempal_home.join("palace.db");
@@ -45,8 +47,8 @@ enabled = true
     (tmp, db_path)
 }
 
-fn setup_home_with_extra_config(extra_config: &str) -> (TempDir, PathBuf) {
-    let tmp = TempDir::new_in("/tmp").expect("short tempdir");
+fn setup_home_with_extra_config(extra_config: &str) -> (SocketTempDir, PathBuf) {
+    let tmp = SocketTempDir::new().expect("short tempdir");
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
     let db_path = mempal_home.join("palace.db");
@@ -68,7 +70,7 @@ enabled = true
     (tmp, db_path)
 }
 
-fn run_hook(home: &TempDir, command: &str, payload: &[u8]) -> std::process::Output {
+fn run_hook(home: &SocketTempDir, command: &str, payload: &[u8]) -> std::process::Output {
     let mut child = Command::new(mempal_bin())
         .args(["hook", command])
         .env("HOME", home.path())
@@ -116,7 +118,7 @@ fn hold_sqlite_write_lock(db_path: PathBuf, hold_for: Duration) -> thread::JoinH
 
 #[cfg(unix)]
 fn spawn_fake_daemon_ipc(
-    home: &TempDir,
+    home: &SocketTempDir,
     response: &'static str,
     response_delay: Option<Duration>,
 ) -> thread::JoinHandle<String> {
@@ -144,7 +146,7 @@ fn spawn_fake_daemon_ipc(
 
 #[cfg(unix)]
 fn spawn_fake_persisting_daemon_ipc(
-    home: &TempDir,
+    home: &SocketTempDir,
     db_path: PathBuf,
     response_delay: Duration,
 ) -> thread::JoinHandle<String> {
@@ -158,7 +160,7 @@ fn spawn_fake_persisting_daemon_ipc(
 
 #[cfg(unix)]
 fn spawn_fake_persisting_daemon_ipc_with_response(
-    home: &TempDir,
+    home: &SocketTempDir,
     db_path: PathBuf,
     response_delay: Duration,
     response: Option<&'static str>,

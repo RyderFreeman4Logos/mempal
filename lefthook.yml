@@ -13,6 +13,8 @@ pre-commit:
       run: scripts/hooks/branch-protection.sh
     quick-format-check:
       run: just fmt-check
+    test-temp-fixtures:
+      run: bash scripts/gates/check-test-temp-fixtures.sh
     fast-gates:
       files: git diff --cached --name-only --diff-filter=ACMR | grep -E '(^|/)(Cargo\.toml|Cargo\.lock)$|\.rs$' || true
       env:

@@ -10,7 +10,7 @@ use tempfile::TempDir;
 #[cfg(unix)]
 #[test]
 fn captured_child_timeout_kills_and_reaps_with_diagnostics() {
-    let diagnostics = TempDir::new_in("/tmp").expect("short diagnostics dir");
+    let diagnostics = TempDir::new().expect("short diagnostics dir");
     let mut command = Command::new("sleep");
     command.arg("120").stdin(Stdio::null());
     let mut child = CapturedChild::spawn(&mut command, diagnostics.path(), "timeout-child", None)
@@ -41,7 +41,7 @@ fn captured_child_waits_for_delayed_stderr_event() {
         captured_child_harness::hold_sqlite_lock_for,
         captured_child_harness::write_daemon_home_diagnostics,
     );
-    let diagnostics = TempDir::new_in("/tmp").expect("short diagnostics dir");
+    let diagnostics = TempDir::new().expect("short diagnostics dir");
     let mut command = Command::new("sh");
     command
         .args(["-c", "sleep 0.2; printf 'captured child ready\n' >&2"])

@@ -2,6 +2,7 @@
 mod regression_tests {
     use super::*;
     use std::fs;
+    use std::io::{Read, Write};
     use std::path::Path;
     use std::process::{Command, Stdio};
 
@@ -196,6 +197,186 @@ mod regression_tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         spawn_in_own_session(&mut command).expect("spawn closing-pipe escape fixture")
+    }
+
+    fn wait_for_owned_child_ready(
+        child: &mut OwnedGateChild,
+        process: &ProcessHandle,
+        ready_file: &Path,
+        timeout: Duration,
+        description: &str,
+    ) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if ready_file.exists() {
+                let recorded = escaped_identity(ready_file);
+                if recorded.pid != process.identity.pid
+                    || recorded.start_time_ticks != process.identity.start_time_ticks
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{description} published the wrong identity: expected {:?}, got {recorded:?}",
+                            process.identity
+                        ),
+                    ));
+                }
+                if process.is_running()? {
+                    return Ok(());
+                }
+            }
+            if let Some(status) = child.child_mut().try_wait()? {
+                let mut stderr = Vec::new();
+                if let Some(pipe) = child.child_mut().stderr.take() {
+                    pipe.take(4096).read_to_end(&mut stderr)?;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "{description} exited before readiness: {status}; stderr={}",
+                        String::from_utf8_lossy(&stderr)
+                    ),
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{description} did not become ready"),
+                ));
+            }
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(10)),
+            );
+        }
+    }
+
+    fn spawn_non_utf8_comm_process(ready_file: &Path) -> OwnedGateChild {
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .args([
+                "-c",
+                r#"
+import ctypes
+import os
+import time
+
+if ctypes.CDLL(None, use_errno=True).prctl(15, b"\xff", 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "prctl(PR_SET_NAME) failed")
+pid = os.getpid()
+comm = open("/proc/self/comm", "rb").read()
+if comm != b"\xff\n":
+    raise RuntimeError(f"non-UTF-8 comm was not established: {comm!r}")
+fields = open(f"/proc/{pid}/stat", "rb").read().rpartition(b") ")[2].split()
+ready = os.environ["READY_FILE"]
+temporary = ready + ".tmp"
+with open(temporary, "xb") as marker:
+    marker.write(str(pid).encode() + b" " + fields[19] + b"\n")
+os.replace(temporary, ready)
+while True:
+    time.sleep(60)
+                "#,
+            ])
+            .env("READY_FILE", ready_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        spawn_in_own_session(&mut command).expect("spawn non-UTF-8 comm fixture")
+    }
+
+    pub(super) fn assert_non_utf8_comm_does_not_abort_pipe_cleanup() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
+        let fixture = tempfile::tempdir().expect("create non-UTF-8 comm fixture");
+        let ready_file = fixture.path().join("identity");
+        let mut unrelated = spawn_non_utf8_comm_process(&ready_file);
+        let unrelated_process =
+            capture_owned_child(unrelated.child()).expect("capture non-UTF-8 fixture identity");
+        let unrelated_identity = unrelated_process.identity;
+        wait_for_owned_child_ready(
+            &mut unrelated,
+            &unrelated_process,
+            &ready_file,
+            Duration::from_secs(2),
+            "non-UTF-8 comm process",
+        )
+        .expect("wait for identity-bound non-UTF-8 readiness");
+        let comm = fs::read(format!("/proc/{}/comm", unrelated_identity.pid))
+            .expect("read live non-UTF-8 fixture comm");
+        assert_eq!(comm, b"\xff\n", "fixture must establish non-UTF-8 comm");
+
+        let mut writer_command = Command::new("/bin/sleep");
+        writer_command
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let writer = spawn_in_own_session(&mut writer_command).expect("spawn pipe writer");
+        let mut gate = GateChild::new(writer).expect("capture pipe writer identity");
+        let scan_result = gate.refresh_tracked_processes();
+        let cleanup_result = gate.terminate_and_collect_until(cleanup_deadline()).map(|_| ());
+        let unrelated_cleanup = reap_owned_child(unrelated);
+
+        scan_result.expect("unrelated non-UTF-8 comm must be skipped during global scan");
+        cleanup_result.expect("pipe cleanup must complete after scanning unrelated processes");
+        unrelated_cleanup.expect("clean up non-UTF-8 comm fixture");
+        assert!(
+            !unrelated_identity
+                .is_running()
+                .expect("inspect reaped non-UTF-8 fixture identity"),
+            "non-UTF-8 fixture remained alive after cleanup"
+        );
+    }
+
+    #[test]
+    fn readiness_wait_reports_pre_ready_child_exit_promptly() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
+        let fixture = tempfile::tempdir().expect("create pre-ready exit fixture");
+        let ready_file = fixture.path().join("never-ready");
+        let mut command = Command::new("/bin/bash");
+        command
+            .args(["-c", "read -r _; printf 'fixture failed' >&2; exit 23"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = spawn_in_own_session(&mut command).expect("spawn pre-ready exit fixture");
+        let process =
+            capture_owned_child(child.child()).expect("capture pre-ready fixture identity");
+        let identity = process.identity;
+        child
+            .child_mut()
+            .stdin
+            .take()
+            .expect("pre-ready fixture stdin")
+            .write_all(b"exit\n")
+            .expect("release pre-ready fixture");
+
+        let started = Instant::now();
+        let error = wait_for_owned_child_ready(
+            &mut child,
+            &process,
+            &ready_file,
+            Duration::from_secs(2),
+            "pre-ready fixture",
+        )
+        .expect_err("pre-ready exit must fail readiness");
+        let elapsed = started.elapsed();
+        let message = error.to_string();
+        drop(child);
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "pre-ready child exit was reported only after {elapsed:?}: {message}"
+        );
+        assert!(message.contains("exit status: 23"), "message={message}");
+        assert!(message.contains("fixture failed"), "message={message}");
+        assert!(
+            !identity
+                .is_running()
+                .expect("inspect reaped pre-ready fixture identity"),
+            "pre-ready fixture remained alive after cleanup"
+        );
     }
 
     #[test]

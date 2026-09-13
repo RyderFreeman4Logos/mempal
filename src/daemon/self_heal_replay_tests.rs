@@ -1,3 +1,6 @@
+use std::fs::File;
+use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +28,7 @@ impl Drop for ShutdownResetGuard {
 async fn spool_replay_preserves_sqlite_contention_for_watchdog() {
     let _shutdown_guard = super::super::global_shutdown_test_lock().lock_owned().await;
     let _reset_guard = ShutdownResetGuard::new();
-    let tmp = tempfile::TempDir::new_in("/tmp").expect("short tempdir");
+    let tmp = tempfile::TempDir::new().expect("short tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
     PendingMessageStore::new(&db_path)
@@ -46,8 +49,13 @@ async fn spool_replay_preserves_sqlite_contention_for_watchdog() {
 
     let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
     observer.force_last_successful_write_for_test(0);
-    let listener =
-        tokio::net::UnixListener::bind(tmp.path().join("hook.sock")).expect("bind hook listener");
+    let tempdir_fd = File::open(tmp.path()).expect("open temporary directory");
+    let short_socket_path = PathBuf::from(format!(
+        "/proc/{}/fd/{}/hook.sock",
+        std::process::id(),
+        tempdir_fd.as_raw_fd()
+    ));
+    let listener = tokio::net::UnixListener::bind(short_socket_path).expect("bind hook listener");
     let listener_task = tokio::spawn(super::run_hook_ipc_listener(
         listener,
         store.clone(),
@@ -86,7 +94,7 @@ async fn spool_replay_preserves_sqlite_contention_for_watchdog() {
 
 #[tokio::test]
 async fn post_publish_parent_sync_failure_then_fallback_replay_yields_one_queue_row() {
-    let tmp = tempfile::TempDir::new_in("/tmp").expect("short tempdir");
+    let tmp = tempfile::TempDir::new().expect("short tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
     let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
@@ -142,7 +150,7 @@ async fn post_publish_parent_sync_failure_then_fallback_replay_yields_one_queue_
 
 #[tokio::test]
 async fn sigkill_equivalent_after_durable_ack_replays_once_after_duplicate_retry() {
-    let tmp = tempfile::TempDir::new_in("/tmp").expect("short tempdir");
+    let tmp = tempfile::TempDir::new().expect("short tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
     let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
@@ -207,7 +215,7 @@ fn plant_orphan_claim(mempal_home: &std::path::Path) {
 
 #[tokio::test]
 async fn leftover_claim_after_mid_drain_abort_replays_once_after_duplicate_retry() {
-    let tmp = tempfile::TempDir::new_in("/tmp").expect("short tempdir");
+    let tmp = tempfile::TempDir::new().expect("short tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
     let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
@@ -290,7 +298,7 @@ fn pending_row_count(db_path: &std::path::Path) -> i64 {
 
 #[tokio::test]
 async fn stale_writer_lease_releases_claimed_spool_record_for_takeover_replay() {
-    let tmp = tempfile::TempDir::new_in("/tmp").expect("short tempdir");
+    let tmp = tempfile::TempDir::new().expect("short tempdir");
     let db_path = tmp.path().join("palace.db");
     let db = Database::open(&db_path).expect("open db");
     let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);

@@ -1,5 +1,101 @@
 use super::*;
 
+#[test]
+fn absent_daemon_socket_skips_saturated_blocking_pool() {
+    let (tempdir, _db_path, server) = setup_server();
+    assert!(!crate::hook_ipc::socket_path(tempdir.path()).exists());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("build constrained runtime");
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (started_tx, started_rx) = mpsc::channel();
+    runtime.spawn_blocking(move || {
+        started_tx.send(()).expect("signal blocking pool occupancy");
+        let _ = release_rx.recv_timeout(Duration::from_secs(2));
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("blocking pool is saturated");
+
+    let outcome = runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            server.try_enqueue_ingest_operation_via_daemon(
+                "{}".to_string(),
+                "absent-socket".to_string(),
+                Instant::now() + MCP_DAEMON_INGEST_ENQUEUE_IPC_TIMEOUT,
+            ),
+        )
+        .await
+    });
+    drop(release_tx);
+    runtime.shutdown_timeout(Duration::from_secs(1));
+
+    assert_eq!(
+        outcome
+            .expect("absent socket must not queue blocking IPC work")
+            .expect("absent socket fallback"),
+        DaemonIngestEnqueue::Fallback {
+            may_have_reached_daemon: false,
+        }
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn release_test_ingest_writer_lease_resolves_symlinked_ancestor() {
+    let tempdir = tempfile::tempdir().expect("short tempdir");
+    let real_dir = tempdir.path().join("real");
+    std::fs::create_dir(&real_dir).expect("create real database directory");
+    let linked_dir = tempdir.path().join("linked");
+    std::os::unix::fs::symlink(&real_dir, &linked_dir).expect("link database directory");
+    let db_path = linked_dir.join("palace.db");
+    let lease = acquire_test_ingest_writer_lease(&db_path, "symlink-ancestor-test");
+    release_test_ingest_writer_lease(&db_path, &lease);
+}
+
+#[tokio::test]
+async fn test_ingest_json_for_test_settles_repeated_operations() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
+    let (_tempdir, db_path, server) = setup_server();
+
+    for index in 0..10 {
+        let response = server
+            .ingest_json_for_test(serde_json::json!({
+                "content": format!("settled test ingest {index}"),
+                "wing": "mcp",
+                "room": "fixture-settlement"
+            }))
+            .await
+            .expect("test ingest reaches terminal state");
+        let operation_id = response.operation_id.expect("operation id");
+        let record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(&operation_id)
+            .expect("query operation")
+            .expect("operation row");
+        assert!(
+            record
+                .op_state
+                .parse::<IngestOperationState>()
+                .is_ok_and(IngestOperationState::is_terminal),
+            "operation {index} remained {}",
+            record.op_state
+        );
+    }
+
+    let stats = PendingMessageStore::new_without_reclaim(&db_path)
+        .stats()
+        .expect("queue stats");
+    assert_eq!((stats.pending, stats.claimed), (0, 0));
+    assert!(
+        !server.ingest_worker_started.load(Ordering::Acquire),
+        "test helper left its background ingest worker running after all operations were terminal"
+    );
+}
+
 #[tokio::test]
 async fn test_self_held_queue_lock_fails_before_returning_receipts() {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
@@ -194,6 +290,7 @@ async fn test_fsynced_daemon_ack_returns_receipt_before_queue_visibility() {
             config.as_ref(),
             compiled_privacy.as_ref(),
             project_id,
+            Instant::now() + MCP_INGEST_ADMISSION_DEADLINE,
         )
         .await
         .expect("prepare queued ingest");
@@ -289,4 +386,45 @@ async fn test_fsynced_daemon_ack_returns_receipt_before_queue_visibility() {
         )
         .expect("count created drawers");
     assert_eq!((completion_count, created_count), (1, 1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_mcp_ingest_replacement_target_uses_request_budget_for_admission() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
+    let (_tempdir, db_path, server) = setup_server();
+    insert_drawer(
+        &db_path,
+        "replacement-timeout-target",
+        "replacement target before timeout",
+        "mcp",
+        Some("deadline"),
+        "/tmp/replacement-timeout.md",
+        2,
+    );
+    let async_db = AsyncDb::open(&db_path, 4)
+        .expect("open async db")
+        .with_read_delay(Duration::from_secs(5));
+    let server = server
+        .with_async_db_for_test(async_db)
+        .with_mcp_deadline_for_test(Duration::from_millis(400));
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        server.mempal_ingest(Parameters(IngestRequest {
+            content: "replacement target should use request-wide admission budget".to_string(),
+            wing: "mcp".to_string(),
+            room: Some("deadline".to_string()),
+            replace_text: Some("replacement target before timeout".to_string()),
+            dry_run: Some(false),
+            wait: Some(false),
+            ..IngestRequest::default()
+        })),
+    )
+    .await
+    .expect("MCP ingest should return before client timeout")
+    .expect("slow replacement target resolution should use the request-wide budget")
+    .0;
+
+    assert_eq!(response.state, Some(IngestOperationState::Queued));
+    assert!(response.operation_id.is_some());
 }

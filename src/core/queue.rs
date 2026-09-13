@@ -12,7 +12,7 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 use super::config::scrub_sensitive_text;
-use super::db::{ensure_wal_journal_mode, rusqlite_error_is_lock};
+use super::db::{Database, ensure_wal_journal_mode, rusqlite_error_is_lock};
 use super::queue_connection_admission as queue_admission;
 use super::writer_owner_diagnostics::{
     WriterLockEvidence, transaction_immediate, writer_lock_evidence_for_path,
@@ -23,6 +23,9 @@ mod queue_writer_lease_fence;
 
 #[path = "queue_store_construction.rs"]
 mod queue_store_construction;
+
+#[path = "queue_claim_shutdown.rs"]
+mod queue_claim_shutdown;
 
 pub use super::queue_connection_admission::{
     queue_stats, queue_stats_readonly, queue_stats_readonly_with_busy_timeout,
@@ -351,6 +354,10 @@ pub struct AsyncPendingMessageStore {
     #[cfg(any(test, feature = "db-test-seam"))]
     claim_blocking_delay: Option<Duration>,
     #[cfg(any(test, feature = "db-test-seam"))]
+    blocking_started: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    claim_approved: Option<queue_claim_shutdown::ClaimApprovalTestControl>,
+    #[cfg(any(test, feature = "db-test-seam"))]
     release_lock_failures: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "db-test-seam"))]
     complete_lock_failures: Arc<AtomicUsize>,
@@ -391,6 +398,10 @@ impl AsyncPendingMessageStore {
             #[cfg(any(test, feature = "db-test-seam"))]
             claim_blocking_delay: None,
             #[cfg(any(test, feature = "db-test-seam"))]
+            blocking_started: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
+            claim_approved: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
             release_lock_failures: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "db-test-seam"))]
             complete_lock_failures: Arc::new(AtomicUsize::new(0)),
@@ -415,6 +426,10 @@ impl AsyncPendingMessageStore {
             claim_lock_failures: Arc::clone(&self.claim_lock_failures),
             #[cfg(any(test, feature = "db-test-seam"))]
             claim_blocking_delay: self.claim_blocking_delay,
+            #[cfg(any(test, feature = "db-test-seam"))]
+            blocking_started: self.blocking_started.clone(),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            claim_approved: self.claim_approved.clone(),
             #[cfg(any(test, feature = "db-test-seam"))]
             release_lock_failures: Arc::clone(&self.release_lock_failures),
             #[cfg(any(test, feature = "db-test-seam"))]
@@ -445,6 +460,21 @@ impl AsyncPendingMessageStore {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_claim_blocking_delay(mut self, delay: Duration) -> Self {
         self.claim_blocking_delay = Some(delay);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_blocking_started_for_test(mut self, started: Arc<tokio::sync::Notify>) -> Self {
+        self.blocking_started = Some(started);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_claim_approved_for_test(
+        mut self,
+        control: queue_claim_shutdown::ClaimApprovalTestControl,
+    ) -> Self {
+        self.claim_approved = Some(control);
         self
     }
 
@@ -696,6 +726,15 @@ impl AsyncPendingMessageStore {
             .await
     }
 
+    pub(crate) fn requeue_writer_lease_failures_for_daemon_start_on_database(
+        &self,
+        db: &Database,
+        daemon_owner: &str,
+    ) -> Result<u64> {
+        self.inner
+            .requeue_writer_lease_failures_for_daemon_start_on_connection(db.conn(), daemon_owner)
+    }
+
     pub async fn release_claim(&self, claim: ClaimedMessage) -> Result<()> {
         #[cfg(any(test, feature = "db-test-seam"))]
         if consume_lock_failure(&self.release_lock_failures) {
@@ -761,10 +800,17 @@ impl AsyncPendingMessageStore {
                 QueueError::BlockingTaskFailed("queue semaphore closed".to_string())
             })?;
         let store = self.inner.clone();
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let started = self.blocking_started.clone();
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let started: Option<Arc<tokio::sync::Notify>> = None;
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let join = tokio::task::spawn_blocking(move || {
             let permit = permit;
             tracing::dispatcher::with_default(&dispatch, || {
+                if let Some(started) = started {
+                    started.notify_one();
+                }
                 if let Some(delay) = delay {
                     std::thread::sleep(delay);
                 }
@@ -1040,8 +1086,13 @@ impl PendingMessageStore {
         claim_ttl_secs: i64,
     ) -> Result<Option<ClaimedMessage>> {
         self.with_claim_connection(|conn| {
+            let now = now_secs();
+            let stale_cutoff = saturating_cutoff(now, claim_ttl_secs);
+            if !claim_work_available(conn, stale_cutoff, now, None, true)? {
+                return Ok(None);
+            }
             let tx = transaction_immediate(conn, "claim queued message")?;
-            reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
+            reclaim_stale_tx(&tx, stale_cutoff)?;
 
             let now = now_secs();
             let row = tx
@@ -1112,8 +1163,21 @@ impl PendingMessageStore {
         claim_ttl_secs: i64,
         kind_filter: &str,
     ) -> Result<Option<ClaimedMessage>> {
+        self.claim_next_by_kind_with_approval(worker_id, claim_ttl_secs, kind_filter, || true)
+    }
+
+    fn claim_next_by_kind_with_approval(
+        &self,
+        worker_id: &str,
+        claim_ttl_secs: i64,
+        kind_filter: &str,
+        mut approval: impl FnMut() -> bool,
+    ) -> Result<Option<ClaimedMessage>> {
+        let mut approved = None;
         self.with_claim_lock_retry(|| {
-            self.claim_next_by_kind_once(worker_id, claim_ttl_secs, kind_filter)
+            self.claim_next_by_kind_once(worker_id, claim_ttl_secs, kind_filter, &mut || {
+                *approved.get_or_insert_with(&mut approval)
+            })
         })
     }
 
@@ -1122,11 +1186,18 @@ impl PendingMessageStore {
         worker_id: &str,
         claim_ttl_secs: i64,
         kind_filter: &str,
+        approval: &mut impl FnMut() -> bool,
     ) -> Result<Option<ClaimedMessage>> {
-        self.with_claim_connection(|conn| {
+        self.with_claim_connection_if(approval, |conn| {
+            self.require_lifecycle_writer_lease(conn, "claim queued message")?;
+            let now = now_secs();
+            let stale_cutoff = saturating_cutoff(now, claim_ttl_secs);
+            if !claim_work_available(conn, stale_cutoff, now, Some(kind_filter), false)? {
+                return Ok(None);
+            }
             let tx = transaction_immediate(conn, "claim queued message")?;
             self.require_lifecycle_writer_lease(&tx, "claim queued message")?;
-            reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
+            reclaim_stale_tx(&tx, stale_cutoff)?;
 
             let now = now_secs();
             let row = tx
@@ -1188,6 +1259,7 @@ impl PendingMessageStore {
                 claimed_at: now,
             }))
         })
+        .map(Option::flatten)
     }
 
     pub fn claim_by_id_and_kind(
@@ -1223,9 +1295,15 @@ impl PendingMessageStore {
         kind_filter: &str,
     ) -> Result<Option<ClaimedMessage>> {
         self.with_claim_connection(|conn| {
+            self.require_lifecycle_writer_lease(conn, "claim queued message by id")?;
+            let now = now_secs();
+            let stale_cutoff = saturating_cutoff(now, claim_ttl_secs);
+            if !claim_by_id_work_available(conn, stale_cutoff, now, id_filter, kind_filter)? {
+                return Ok(None);
+            }
             let tx = transaction_immediate(conn, "claim queued message by id")?;
             self.require_lifecycle_writer_lease(&tx, "claim queued message by id")?;
-            reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
+            reclaim_stale_tx(&tx, stale_cutoff)?;
 
             let now = now_secs();
             let row = tx
@@ -1521,11 +1599,20 @@ impl PendingMessageStore {
         &self,
         daemon_owner: &str,
     ) -> Result<u64> {
+        self.with_connection(|conn| {
+            self.requeue_writer_lease_failures_for_daemon_start_on_connection(conn, daemon_owner)
+        })
+    }
+
+    fn requeue_writer_lease_failures_for_daemon_start_on_connection(
+        &self,
+        conn: &Connection,
+        daemon_owner: &str,
+    ) -> Result<u64> {
         let now = now_secs();
         let current_owner_error = format!(" for {daemon_owner} was lost before ");
-        self.with_connection(|conn| {
-            let updated = conn.execute(
-                r#"
+        let updated = conn.execute(
+            r#"
                 UPDATE pending_messages
                 SET retry_count = 0,
                     retry_backoff_ms = 0,
@@ -1550,11 +1637,10 @@ impl PendingMessageStore {
                   )
                   AND last_error LIKE '%SQLite writer lease `sqlite-writer` for mempal-daemon-% was lost before build daemon hook drawer records%'
                   AND instr(last_error, ?2) = 0
-                "#,
-                params![now, current_owner_error],
-            )?;
-            Ok(updated as u64)
-        })
+            "#,
+            params![now, current_owner_error],
+        )?;
+        Ok(updated as u64)
     }
 
     /// Return dead-lettered embed-queue messages to pending for a targeted retry.
@@ -1888,11 +1974,23 @@ impl PendingMessageStore {
     }
 
     fn with_claim_connection<T>(&self, op: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+        self.with_claim_connection_if(&mut || true, op)?
+            .ok_or(QueueError::ClaimConnectionUnavailable)
+    }
+
+    fn with_claim_connection_if<T>(
+        &self,
+        approval: &mut impl FnMut() -> bool,
+        op: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<Option<T>> {
         let mut guard = self
             .connection_cache
             .claim_writer
             .lock()
             .map_err(|_| QueueError::ClaimConnectionMutexPoisoned)?;
+        if !approval() {
+            return Ok(None);
+        }
         if guard.is_none() {
             let conn = self.open_connection_with_busy_timeout(Some(CLAIM_BUSY_TIMEOUT))?;
             #[cfg(any(test, feature = "db-test-seam"))]
@@ -1904,7 +2002,7 @@ impl PendingMessageStore {
         let Some(conn) = guard.as_mut() else {
             return Err(QueueError::ClaimConnectionUnavailable);
         };
-        op(conn)
+        op(conn).map(Some)
     }
 
     fn with_claim_lock_retry<T>(&self, op: impl FnMut() -> Result<T>) -> Result<T> {
@@ -2814,6 +2912,68 @@ fn min_optional_i64(left: Option<i64>, right: Option<i64>) -> Option<i64> {
     }
 }
 
+fn claim_work_available(
+    conn: &Connection,
+    stale_cutoff: i64,
+    now: i64,
+    kind_filter: Option<&str>,
+    exclude_dedicated_kinds: bool,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM pending_messages
+            WHERE status = 'claimed'
+              AND (heartbeat_at IS NULL OR heartbeat_at < ?1)
+            LIMIT 1
+        ) OR EXISTS (
+            SELECT 1 FROM pending_messages
+            WHERE status = 'pending' AND next_attempt_at <= ?2
+              AND (?3 IS NULL OR kind = ?3)
+              AND (?4 = 0 OR kind NOT IN ('llm_task', 'ingest_async'))
+            LIMIT 1
+        )
+        "#,
+        params![
+            stale_cutoff,
+            now,
+            kind_filter,
+            i64::from(exclude_dedicated_kinds)
+        ],
+        |row| row.get::<_, i64>(0).map(|available| available != 0),
+    )
+}
+
+const CLAIM_BY_ID_WORK_AVAILABLE_SQL: &str = r#"
+    SELECT EXISTS (
+        SELECT 1 FROM pending_messages
+        WHERE status = 'claimed'
+          AND (heartbeat_at IS NULL OR heartbeat_at < ?1)
+        LIMIT 1
+    ) OR EXISTS (
+        SELECT 1 FROM pending_messages
+        WHERE id = ?3
+          AND status = 'pending'
+          AND next_attempt_at <= ?2
+          AND kind = ?4
+        LIMIT 1
+    )
+"#;
+
+fn claim_by_id_work_available(
+    conn: &Connection,
+    stale_cutoff: i64,
+    now: i64,
+    id_filter: &str,
+    kind_filter: &str,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        CLAIM_BY_ID_WORK_AVAILABLE_SQL,
+        params![stale_cutoff, now, id_filter, kind_filter],
+        |row| row.get::<_, i64>(0).map(|available| available != 0),
+    )
+}
+
 fn reclaim_stale_tx(conn: &rusqlite::Transaction<'_>, stale_cutoff: i64) -> rusqlite::Result<u64> {
     let updated = conn.execute(
         r#"
@@ -2992,5 +3152,6 @@ mod tests {
     use crate::core::db::Database;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    include!("queue_claim_contention_tests.rs");
     include!("queue_operation_key_tests.rs");
 }

@@ -27,7 +27,7 @@ struct LiveMcp {
 }
 
 fn fixture() -> Result<(TempDir, PathBuf, Config, MempalMcpServer)> {
-    let tempdir = TempDir::new_in("/tmp").context("create MCP HTTP fixture")?;
+    let tempdir = TempDir::new().context("create MCP HTTP fixture")?;
     let db_path = tempdir.path().join("palace.db");
     Database::open(&db_path).context("initialize MCP HTTP database")?;
     let config = Config {

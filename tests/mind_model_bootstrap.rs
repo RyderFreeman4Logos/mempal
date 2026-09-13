@@ -105,7 +105,7 @@ fn create_v4_db(path: &std::path::Path) {
 const HERMETIC_REST_ADDR: &str = "127.0.0.1:0";
 
 fn short_tempdir() -> TempDir {
-    TempDir::new_in("/tmp").expect("short tempdir")
+    TempDir::new().expect("short tempdir")
 }
 
 fn isolated_mcp_test_config(db_path: &Path) -> Config {
@@ -1673,7 +1673,7 @@ async fn test_git_worktree_derives_worktree_anchor_and_repo_parent() {
 #[tokio::test]
 async fn test_non_git_cwd_falls_back_to_standalone_worktree_anchor() {
     let (_tmp, db, server) = setup_mcp_server();
-    let non_git_tmp = TempDir::new_in("/tmp").expect("external tempdir");
+    let non_git_tmp = TempDir::new().expect("external tempdir");
     let non_git = non_git_tmp.path().join("standalone");
     fs::create_dir_all(&non_git).expect("create standalone dir");
 

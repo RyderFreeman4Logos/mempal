@@ -61,3 +61,66 @@ async fn test_mcp_async_ingest_worker_backs_off_when_idle() {
     handle.shutdown_and_drain().await;
     assert_ingest_worker_backoff_snapshot(0, 0, None);
 }
+
+#[tokio::test]
+async fn test_scoped_ingest_shutdown_cancels_blocked_claim_without_late_mutation() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
+    let (_tempdir, db_path, server) = setup_server();
+    let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
+    let operation_id = queue
+        .enqueue(INGEST_ASYNC_KIND, "{}")
+        .expect("enqueue operation");
+    let claim_started = Arc::new(tokio::sync::Notify::new());
+    let started = claim_started.notified();
+    let async_queue = AsyncPendingMessageStore::from_store(queue.clone())
+        .with_claim_blocking_delay(Duration::from_millis(200))
+        .with_blocking_started_for_test(Arc::clone(&claim_started));
+    let verification_queue = async_queue.clone();
+    let handle = server
+        .with_async_queue_for_test(async_queue)
+        .spawn_scoped_ingest_drain_worker();
+
+    tokio::time::timeout(Duration::from_secs(1), started)
+        .await
+        .expect("worker did not enter blocked claim");
+    let shutdown = tokio::time::timeout(Duration::from_millis(100), handle.shutdown_and_drain())
+        .await;
+
+    let late_mutation = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let record = queue
+                .operation_status(&operation_id)
+                .expect("load operation")
+                .expect("operation remains durable");
+            if record.op_state != IngestOperationState::Queued.as_str()
+                || record.claimed_at.is_some()
+            {
+                break record;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(shutdown.is_ok(), "blocked claim delayed scoped shutdown");
+    assert!(
+        late_mutation.is_err(),
+        "blocked claim mutated after scoped worker shutdown: {late_mutation:?}"
+    );
+
+    let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let claim = tokio::time::timeout(
+        Duration::from_secs(1),
+        verification_queue.claim_next_by_kind_until_shutdown(
+            "verification-worker".to_string(),
+            INGEST_CLAIM_TTL_SECS,
+            INGEST_ASYNC_KIND.to_string(),
+            &mut shutdown_rx,
+        ),
+    )
+    .await
+    .expect("approved claim timed out")
+    .expect("approved claim failed")
+    .expect("queued work was lost");
+    assert_eq!(claim.id, operation_id);
+    queue.release_claim(&claim).expect("release verification claim");
+}

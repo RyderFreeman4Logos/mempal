@@ -4,16 +4,21 @@
 //! the same source file, plus timeout / dry-run / panic-release
 //! semantics.
 
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::mpsc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use mempal::core::db::Database;
 use mempal::embed::{Embedder, Result as EmbedResult};
-use mempal::ingest::{IngestOptions, ingest_dir_with_options, ingest_file_with_options};
+use mempal::ingest::lock::set_contention_observer_for_test;
+use mempal::ingest::{
+    IngestOptions, IngestStats, ingest_dir_with_options, ingest_file_with_options,
+};
 use tempfile::TempDir;
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Stub embedder: returns a fixed vector regardless of input. 3 dims so
 /// `sqlite-vec` can store it without bloating the test DB.
@@ -33,19 +38,19 @@ impl Embedder for StubEmbedder {
 }
 
 struct HoldEmbedder {
-    delay: Duration,
-    entered: Option<mpsc::Sender<()>>,
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
 }
 
 #[async_trait]
 impl Embedder for HoldEmbedder {
     async fn embed(&self, texts: &[&str]) -> EmbedResult<Vec<Vec<f32>>> {
-        if let Some(tx) = &self.entered {
-            let _ = tx.send(());
-        }
-        if !self.delay.is_zero() {
-            tokio::time::sleep(self.delay).await;
-        }
+        self.entered.send(()).expect("signal holder entered");
+        self.release
+            .lock()
+            .expect("lock holder release channel")
+            .recv_timeout(HANDSHAKE_TIMEOUT)
+            .expect("release holder");
         Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
     }
 
@@ -58,73 +63,95 @@ impl Embedder for HoldEmbedder {
     }
 }
 
-fn write_file(dir: &Path, name: &str, content: &str) -> std::path::PathBuf {
+fn write_file(dir: &Path, name: &str, content: &str) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, content).expect("write fixture");
     path
 }
 
-/// Run an ingest on a fresh tokio runtime — matches the cross-process
-/// topology that the lock actually protects. `Database` is !Sync so we
-/// cannot share `&Database` across tokio tasks within one runtime; each
-/// thread must own its own Database + Runtime, exactly mirroring the
-/// Claude Code / Codex process pair.
-fn ingest_in_thread(
-    db_path: std::path::PathBuf,
-    file: std::path::PathBuf,
-) -> mempal::ingest::IngestStats {
-    ingest_in_thread_with_embedder(db_path, file, StubEmbedder, IngestOptions::default())
+/// Open each worker-owned database before admitting its ingest. This mirrors
+/// separate processes without racing the independent profile-admission lock.
+fn spawn_ingest_worker<E: Embedder + 'static>(
+    db_path: PathBuf,
+    file: PathBuf,
+    embedder: E,
+    start: Arc<Barrier>,
+    contention: Option<mpsc::Sender<()>>,
+) -> (mpsc::Receiver<()>, JoinHandle<IngestStats>) {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let db = Database::open(&db_path).expect("open db");
+        if let Some(observer) = contention {
+            set_contention_observer_for_test(observer);
+        }
+        ready_tx.send(()).expect("signal database ready");
+        start.wait();
+        runtime.block_on(async move {
+            ingest_file_with_options(&db, &embedder, &file, "test", IngestOptions::default())
+                .await
+                .expect("ingest")
+        })
+    });
+    (ready_rx, handle)
 }
 
-fn ingest_in_thread_with_embedder<E: Embedder + 'static>(
-    db_path: std::path::PathBuf,
-    file: std::path::PathBuf,
-    embedder: E,
-    options: IngestOptions<'static>,
-) -> mempal::ingest::IngestStats {
-    let rt = tokio::runtime::Runtime::new().expect("runtime");
-    rt.block_on(async move {
-        let db = Database::open(&db_path).expect("open db");
-        ingest_file_with_options(&db, &embedder, &file, "test", options)
-            .await
-            .expect("ingest")
-    })
+fn wait_until_ready(ready: &mpsc::Receiver<()>) {
+    ready
+        .recv_timeout(HANDSHAKE_TIMEOUT)
+        .expect("database worker ready");
+}
+
+fn ingest_same_source_pair(db_path: &Path, file: &Path) -> (IngestStats, IngestStats) {
+    let (holder_entered_tx, holder_entered_rx) = mpsc::channel();
+    let (release_holder_tx, release_holder_rx) = mpsc::channel();
+    let holder_start = Arc::new(Barrier::new(2));
+    let (holder_ready, holder) = spawn_ingest_worker(
+        db_path.to_path_buf(),
+        file.to_path_buf(),
+        HoldEmbedder {
+            entered: holder_entered_tx,
+            release: Mutex::new(release_holder_rx),
+        },
+        Arc::clone(&holder_start),
+        None,
+    );
+    wait_until_ready(&holder_ready);
+    holder_start.wait();
+    holder_entered_rx
+        .recv_timeout(HANDSHAKE_TIMEOUT)
+        .expect("holder entered critical section");
+
+    let (waiter_contended_tx, waiter_contended_rx) = mpsc::channel();
+    let waiter_start = Arc::new(Barrier::new(2));
+    let (waiter_ready, waiter) = spawn_ingest_worker(
+        db_path.to_path_buf(),
+        file.to_path_buf(),
+        StubEmbedder,
+        Arc::clone(&waiter_start),
+        Some(waiter_contended_tx),
+    );
+    wait_until_ready(&waiter_ready);
+    waiter_start.wait();
+    waiter_contended_rx
+        .recv_timeout(HANDSHAKE_TIMEOUT)
+        .expect("waiter observed source-lock contention");
+    release_holder_tx.send(()).expect("release holder");
+
+    (
+        holder.join().expect("holder thread"),
+        waiter.join().expect("waiter thread"),
+    )
 }
 
 #[test]
 fn test_concurrent_ingest_same_source_single_drawer() {
-    use std::thread;
-
     let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("init db");
 
     let file = write_file(tmp.path(), "doc.md", "hello P9-B test content");
-
-    let db_path_a = db_path.clone();
-    let db_path_b = db_path.clone();
-    let file_a = file.clone();
-    let file_b = file.clone();
-    let (entered_tx, entered_rx) = mpsc::channel();
-
-    let handle_a = thread::spawn(move || {
-        ingest_in_thread_with_embedder(
-            db_path_a,
-            file_a,
-            HoldEmbedder {
-                delay: Duration::from_millis(250),
-                entered: Some(entered_tx),
-            },
-            IngestOptions::default(),
-        )
-    });
-    entered_rx
-        .recv()
-        .expect("first ingest entered critical section");
-    let handle_b = thread::spawn(move || ingest_in_thread(db_path_b, file_b));
-
-    let stats_a = handle_a.join().expect("thread a");
-    let stats_b = handle_b.join().expect("thread b");
+    let (stats_a, stats_b) = ingest_same_source_pair(&db_path, &file);
 
     let db = Database::open(&db_path).expect("reopen");
     let drawer_count = db.drawer_count().expect("drawer_count");
@@ -212,23 +239,34 @@ async fn test_dry_run_ingest_stats_do_not_include_drawer_ids() {
 
 #[test]
 fn test_concurrent_ingest_different_source_no_blocking() {
-    use std::thread;
-
     let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("init db");
 
     let file_a = write_file(tmp.path(), "a.md", "content A unique");
     let file_b = write_file(tmp.path(), "b.md", "content B unique");
+    let start = Arc::new(Barrier::new(3));
 
-    let db_path_a = db_path.clone();
-    let db_path_b = db_path.clone();
+    let (ready_a, worker_a) = spawn_ingest_worker(
+        db_path.clone(),
+        file_a,
+        StubEmbedder,
+        Arc::clone(&start),
+        None,
+    );
+    wait_until_ready(&ready_a);
+    let (ready_b, worker_b) = spawn_ingest_worker(
+        db_path.clone(),
+        file_b,
+        StubEmbedder,
+        Arc::clone(&start),
+        None,
+    );
+    wait_until_ready(&ready_b);
+    start.wait();
 
-    let handle_a = thread::spawn(move || ingest_in_thread(db_path_a, file_a));
-    let handle_b = thread::spawn(move || ingest_in_thread(db_path_b, file_b));
-
-    let stats_a = handle_a.join().expect("thread a");
-    let stats_b = handle_b.join().expect("thread b");
+    let stats_a = worker_a.join().expect("thread a");
+    let stats_b = worker_b.join().expect("thread b");
 
     let wait_a = stats_a.lock_wait_ms.unwrap_or(0);
     let wait_b = stats_b.lock_wait_ms.unwrap_or(0);
@@ -273,38 +311,12 @@ async fn test_dry_run_does_not_acquire_lock() {
 
 #[test]
 fn test_double_check_after_lock_skips_duplicate() {
-    use std::thread;
-
     let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("init db");
 
     let file = write_file(tmp.path(), "doc.md", "second ingest should dedup");
-
-    let db_path_a = db_path.clone();
-    let db_path_b = db_path.clone();
-    let file_a = file.clone();
-    let file_b = file.clone();
-    let (entered_tx, entered_rx) = mpsc::channel();
-
-    let handle_a = thread::spawn(move || {
-        ingest_in_thread_with_embedder(
-            db_path_a,
-            file_a,
-            HoldEmbedder {
-                delay: Duration::from_millis(250),
-                entered: Some(entered_tx),
-            },
-            IngestOptions::default(),
-        )
-    });
-    entered_rx
-        .recv()
-        .expect("first ingest entered critical section");
-    let handle_b = thread::spawn(move || ingest_in_thread(db_path_b, file_b));
-
-    let stats_1 = handle_a.join().expect("thread a");
-    let stats_2 = handle_b.join().expect("thread b");
+    let (stats_1, stats_2) = ingest_same_source_pair(&db_path, &file);
 
     assert_eq!(stats_1.chunks, 1);
     assert_eq!(stats_2.chunks, 0, "second ingest writes no new chunks");
@@ -339,35 +351,34 @@ fn test_lock_released_on_guard_drop() {
 #[test]
 fn test_lock_timeout_returns_error() {
     use mempal::ingest::lock::{LockError, acquire_source_lock, source_key};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::thread;
 
     let tmp = Arc::new(TempDir::new().unwrap());
     let key = source_key(Path::new("/tmp/test-timeout"));
-    let done = Arc::new(AtomicBool::new(false));
+    let (holder_ready_tx, holder_ready_rx) = mpsc::channel();
+    let (release_holder_tx, release_holder_rx) = mpsc::channel();
 
     let tmp_a = Arc::clone(&tmp);
     let key_a = key.clone();
-    let done_a = Arc::clone(&done);
     let holder = thread::spawn(move || {
         let _guard = acquire_source_lock(tmp_a.path(), &key_a, Duration::from_secs(1))
             .expect("holder acquire");
-        while !done_a.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(20));
-        }
+        holder_ready_tx.send(()).expect("signal holder ready");
+        release_holder_rx
+            .recv_timeout(HANDSHAKE_TIMEOUT)
+            .expect("release timeout holder");
     });
-
-    // Give holder time to grab the lock.
-    thread::sleep(Duration::from_millis(100));
+    holder_ready_rx
+        .recv_timeout(HANDSHAKE_TIMEOUT)
+        .expect("timeout holder ready");
 
     let result = acquire_source_lock(tmp.path(), &key, Duration::from_millis(300));
+    release_holder_tx.send(()).expect("release timeout holder");
+    holder.join().expect("holder thread");
+
     assert!(
         matches!(result, Err(LockError::Timeout { .. })),
         "expected Timeout; got {result:?}"
     );
-
-    done.store(true, Ordering::SeqCst);
-    holder.join().unwrap();
 }
 
 #[tokio::test]

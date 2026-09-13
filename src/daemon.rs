@@ -82,6 +82,14 @@ pub const DAEMON_DRAIN_BUDGET: Duration = Duration::from_secs(30);
 /// `spawn_blocking` tasks cannot be aborted, so runtime teardown must be bounded.
 const DAEMON_BLOCKING_TASK_DRAIN_BUDGET: Duration = Duration::from_secs(1);
 const DAEMON_HOOK_WORKER_LIMIT: usize = 4;
+
+#[cfg(debug_assertions)]
+fn observe_shutdown_phase(phase: &str) {
+    tracing::info!("daemon shutdown phase: {phase}");
+}
+
+#[cfg(not(debug_assertions))]
+fn observe_shutdown_phase(_: &str) {}
 const MAX_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const ENDPOINT_RECOVERY_REQUEUE_INTERVAL: Duration = Duration::from_secs(30);
 const AUTOMATIC_HOOK_LLM_GATE_MAX_SECS: u64 = 30;
@@ -129,9 +137,15 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     global_embed_status().set_audit_db_path(Some(db_path.clone()));
     let writer_lease =
         acquire_daemon_writer_lease(context, &db_path, recovery_faults.clone()).await?;
+    let store = context.store.clone();
+    let daemon_owner = writer_lease.lease().owner.clone();
     let requeued_writer_lease_failures = context
-        .store
-        .requeue_writer_lease_failures_for_daemon_start(writer_lease.lease().owner.clone())
+        .async_db
+        .run_write_anyhow(move |db| {
+            store
+                .requeue_writer_lease_failures_for_daemon_start_on_database(db, &daemon_owner)
+                .map_err(anyhow::Error::from)
+        })
         .await
         .context("failed to requeue previous daemon writer lease failures")?;
     if requeued_writer_lease_failures > 0 {
@@ -201,9 +215,24 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         .context("failed to start daemon async ingest worker")?;
 
     if !context.config.hooks.enabled {
-        recovery
+        if let Err(error) = recovery
             .record_recovered()
-            .context("failed to mark daemon recovery complete")?;
+            .context("failed to mark daemon recovery complete")
+        {
+            #[cfg(unix)]
+            request_shutdown_and_notify();
+            #[cfg(feature = "rest")]
+            drain_rest_server(rest_task).await;
+            ingest_drain_worker
+                .shutdown_and_drain_with_budget(Some(DAEMON_DRAIN_BUDGET))
+                .await;
+            sleep_scheduler::drain(sleep_scheduler_handle).await;
+            let _ = context.store.reclaim_stale(0).await;
+            if let Err(release_error) = writer_lease.release(&context.async_db).await {
+                tracing::error!(error = %release_error, "failed to release daemon writer lease after startup failure");
+            }
+            return Err(error);
+        }
         ensure_daemon_runtime_writer_lease_active(&*context.db.lock().await, writer_lease.lease())?;
         if let Err(error) = notify_systemd_ready() {
             #[cfg(unix)]
@@ -215,6 +244,9 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                 .await;
             sleep_scheduler::drain(sleep_scheduler_handle).await;
             let _ = context.store.reclaim_stale(0).await;
+            if let Err(release_error) = writer_lease.release(&context.async_db).await {
+                tracing::error!(error = %release_error, "failed to release daemon writer lease after readiness failure");
+            }
             return Err(error);
         }
         eprintln!("hooks not enabled; daemon running configured background services only");
@@ -412,10 +444,10 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     #[cfg(unix)]
     hook_ipc_service.shutdown().await;
 
+    let drain_start = tokio::time::Instant::now();
     drain_hook_workers_with_budget(&mut hook_workers, DAEMON_DRAIN_BUDGET).await;
 
     // Give LLM workers a window to finish their current tasks, then abort.
-    let drain_start = tokio::time::Instant::now();
     for handle in llm_worker_handles {
         let elapsed = drain_start.elapsed();
         let remaining = DAEMON_DRAIN_BUDGET.saturating_sub(elapsed);
@@ -434,25 +466,34 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         }
     }
     tracing::info!("LLM workers stopped");
+    observe_shutdown_phase("stall-watchdog");
     stall_watchdog_handle.abort();
     let _ = stall_watchdog_handle.await;
+    observe_shutdown_phase("hook-payload-pruner");
     hook_payload_prune_handle.abort();
     let _ = hook_payload_prune_handle.await;
+    observe_shutdown_phase("sleep-scheduler");
     sleep_scheduler::drain(sleep_scheduler_handle).await;
+    observe_shutdown_phase("endpoint-requeue");
     endpoint_requeue_handle.abort();
     let _ = endpoint_requeue_handle.await;
     #[cfg(feature = "rest")]
-    drain_rest_server(rest_task).await;
+    {
+        observe_shutdown_phase("rest-server");
+        drain_rest_server(rest_task).await;
+    }
     // Bound the final ingest-worker join like hooks/LLM workers. A claimed
     // op can block on embed/network I/O against a dead endpoint; unbounded
     // await here previously prevented SIGTERM from completing within the
     // daemon stop grace used by CLI/tests (#843 write_wait_cli).
     let ingest_drain_remaining = DAEMON_DRAIN_BUDGET.saturating_sub(drain_start.elapsed());
+    observe_shutdown_phase("ingest-worker");
     ingest_drain_worker
         .shutdown_and_drain_with_budget(Some(ingest_drain_remaining))
         .await;
 
     // Release any tasks still claimed by workers that were aborted or did not finish.
+    observe_shutdown_phase("queue-reclaim");
     let released = context
         .store
         .reclaim_stale(0)

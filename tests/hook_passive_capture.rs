@@ -1,6 +1,8 @@
 #![cfg(feature = "integration")]
 
 mod common;
+#[path = "hook_passive_capture/daemon_fixture.rs"]
+mod daemon_fixture;
 
 use std::collections::HashMap;
 use std::fs;
@@ -11,6 +13,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use common::harness::{BootstrapObserver, DaemonSupervisor, FailMode, start as start_embed_mock};
+use common::socket_temp_dir::SocketTempDir as T;
 use mempal::bootstrap_events::BootstrapEvent;
 use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
@@ -18,11 +21,10 @@ use mempal::daemon_bootstrap::DaemonContext;
 use mempal::hook::{CapturedHookEnvelope, HookEvent};
 use mempal::session_review::split_hooks_raw_metadata;
 use rusqlite::Connection;
-use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-fn mempal_bin() -> String {
-    env!("CARGO_BIN_EXE_mempal").to_string()
+fn bin() -> &'static str {
+    env!("CARGO_BIN_EXE_mempal")
 }
 
 async fn test_guard() -> OwnedMutexGuard<()> {
@@ -34,8 +36,8 @@ async fn test_guard() -> OwnedMutexGuard<()> {
         .await
 }
 
-fn setup_home() -> (TempDir, PathBuf, PathBuf, PathBuf) {
-    let tmp = TempDir::new().expect("tempdir");
+fn setup_home() -> (T, PathBuf, PathBuf, PathBuf) {
+    let tmp = T::new().expect("tempdir");
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
     let db_path = mempal_home.join("palace.db");
@@ -46,7 +48,8 @@ fn setup_home() -> (TempDir, PathBuf, PathBuf, PathBuf) {
 fn write_config(
     config_path: &Path,
     db_path: &Path,
-    enabled: bool,
+    hooks_enabled: bool,
+    api_enabled: bool,
     poll_ms: u64,
     claim_ttl_secs: u64,
     base_url: Option<&str>,
@@ -75,10 +78,11 @@ backend = "stub"
         format!(
             r#"
 db_path = "{}"
+api.enabled={api_enabled}
 api.addr="127.0.0.1:0"
 {embed}
 [hooks]
-enabled = {enabled}
+enabled = {hooks_enabled}
 daemon_poll_interval_ms = {poll_ms}
 daemon_claim_ttl_secs = {claim_ttl_secs}
 
@@ -113,7 +117,7 @@ fn command_output_with_timeout(command: &mut Command, timeout: Duration, label: 
 }
 
 fn run_hook(home: &Path, command: &str, payload: &[u8]) -> Output {
-    let mut child = Command::new(mempal_bin())
+    let mut child = Command::new(bin())
         .args(["hook", command])
         .env("HOME", home)
         .stdin(Stdio::piped())
@@ -177,22 +181,6 @@ where
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("condition not satisfied within {timeout:?}");
-}
-
-async fn wait_for_daemon_stderr_line(daemon: &DaemonSupervisor, timeout: Duration, needle: &str) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        if daemon
-            .stderr_lines()
-            .await
-            .iter()
-            .any(|line| line.contains(needle))
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("daemon stderr did not contain {needle:?} within {timeout:?}");
 }
 
 fn drawer_count(db_path: &Path) -> i64 {
@@ -269,6 +257,7 @@ async fn test_daemon_crash_reclaim_stale() {
         &config_path,
         &db_path,
         true,
+        false,
         50,
         1,
         Some(&format!("http://{addr}/v1")),
@@ -336,16 +325,14 @@ async fn test_daemon_crash_reclaim_stale() {
 #[test]
 fn test_daemon_exits_when_disabled() {
     let (tmp, _mempal_home, db_path, config_path) = setup_home();
-    write_config(&config_path, &db_path, false, 50, 60, None);
+    write_config(&config_path, &db_path, false, false, 50, 60, None);
 
-    let output = Command::new(mempal_bin())
+    let mut command = Command::new(bin());
+    command
         .args(["daemon", "--foreground"])
         .env("HOME", tmp.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("run daemon");
+        .stdin(Stdio::null());
+    let output = command_output_with_timeout(&mut command, Duration::from_secs(5), "daemon");
 
     assert!(
         output.status.success(),
@@ -371,6 +358,7 @@ async fn test_daemon_handles_truncated_envelope_without_retry() {
         &config_path,
         &db_path,
         true,
+        false,
         50,
         60,
         Some(&format!("http://{addr}/v1")),
@@ -437,6 +425,7 @@ async fn test_daemon_processes_hook_post_tool_to_drawer() {
         &config_path,
         &db_path,
         true,
+        false,
         50,
         60,
         Some(&format!("http://{addr}/v1")),
@@ -511,6 +500,7 @@ async fn test_daemon_promotes_spooled_hook_payload_to_raw_mirror_and_cleans_spoo
         &config_path,
         &db_path,
         true,
+        false,
         50,
         60,
         Some(&format!("http://{addr}/v1")),
@@ -566,7 +556,10 @@ async fn test_daemon_promotes_spooled_hook_payload_to_raw_mirror_and_cleans_spoo
         .wait_ready(Duration::from_secs(5))
         .await
         .expect("wait ready");
-    wait_for_condition(Duration::from_secs(10), || drawer_count(&db_path) > 0).await;
+    wait_for_condition(Duration::from_secs(10), || {
+        drawer_count(&db_path) > 0 && !spool_path.exists()
+    })
+    .await;
 
     let (wing, room, content, source_file) = latest_drawer_row(&db_path);
     assert_eq!(wing, "hooks-raw");
@@ -575,10 +568,6 @@ async fn test_daemon_promotes_spooled_hook_payload_to_raw_mirror_and_cleans_spoo
     assert_eq!(
         fs::read_to_string(&source_file).expect("read promoted raw mirror"),
         raw_payload
-    );
-    assert!(
-        !spool_path.exists(),
-        "successful daemon processing must remove temporary hook spool"
     );
     assert!(
         Path::new(&source_file).starts_with(mempal_home.join("hook-payloads")),
@@ -725,6 +714,7 @@ async fn test_daemon_slow_hook_does_not_block_later_hook() {
         &config_path,
         &db_path,
         true,
+        false,
         20,
         60,
         Some(&format!("http://{addr}/v1")),
@@ -821,6 +811,7 @@ async fn test_daemon_sigterm_wakes_long_poll_hook_workers() {
         &config_path,
         &db_path,
         true,
+        false,
         10_000,
         60,
         Some(&format!("http://{addr}/v1")),
@@ -836,7 +827,7 @@ async fn test_daemon_sigterm_wakes_long_poll_hook_workers() {
         .wait_ready(Duration::from_secs(5))
         .await
         .expect("wait ready");
-    wait_for_daemon_stderr_line(
+    daemon_fixture::wait_for_stderr_line(
         &daemon,
         Duration::from_secs(5),
         "daemon hook workers started",
@@ -862,6 +853,7 @@ async fn test_daemon_sigterm_graceful_shutdown() {
         &config_path,
         &db_path,
         true,
+        false,
         50,
         60,
         Some(&format!("http://{addr}/v1")),
@@ -921,8 +913,8 @@ async fn test_daemon_sigterm_graceful_shutdown() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_daemon_status_reports_state_and_queue() {
     let _guard = test_guard().await;
-    let (tmp, mempal_home, db_path, config_path) = setup_home();
-    write_config(&config_path, &db_path, true, 50, 60, None);
+    let (tmp, _mempal_home, db_path, config_path) = setup_home();
+    write_config(&config_path, &db_path, false, true, 50, 60, None);
 
     let store = queue_store(&db_path);
     store
@@ -938,13 +930,9 @@ async fn test_daemon_status_reports_state_and_queue() {
     store
         .refresh_heartbeat(&claimed.id, "status-worker")
         .expect("refresh heartbeat");
-    fs::write(
-        mempal_home.join("daemon.pid"),
-        std::process::id().to_string(),
-    )
-    .expect("write daemon pid");
+    let mut daemon = daemon_fixture::spawn_status(tmp.path()).await;
 
-    let mut status_cmd = Command::new(mempal_bin());
+    let mut status_cmd = Command::new(bin());
     status_cmd.arg("status").env("HOME", tmp.path());
     let output = command_output_with_timeout(&mut status_cmd, Duration::from_secs(5), "status");
     assert!(output.status.success(), "status must succeed");
@@ -956,7 +944,7 @@ async fn test_daemon_status_reports_state_and_queue() {
     assert!(stdout.contains("claimed: 1"), "{stdout}");
     assert!(stdout.contains("last_heartbeat_unix_secs:"), "{stdout}");
 
-    let mut daemon_status_cmd = Command::new(mempal_bin());
+    let mut daemon_status_cmd = Command::new(bin());
     daemon_status_cmd
         .arg("daemon")
         .arg("status")
@@ -984,12 +972,14 @@ async fn test_daemon_status_reports_state_and_queue() {
         daemon_stdout.contains("queue.failed_retryable_model: embedding=0 llm=0"),
         "{daemon_stdout}"
     );
+
+    daemon_fixture::stop_status(&mut daemon).await;
 }
 
 #[test]
 fn test_no_sqlite_before_daemonize() {
     let (_tmp, _mempal_home, db_path, config_path) = setup_home();
-    write_config(&config_path, &db_path, true, 50, 60, None);
+    write_config(&config_path, &db_path, true, false, 50, 60, None);
 
     let runtime = tokio::runtime::Runtime::new().expect("bootstrap runtime");
     let (tx, mut observer): (_, BootstrapObserver) = common::harness::channel();
@@ -1027,6 +1017,7 @@ async fn test_truncated_envelope_preview_is_scrubbed() {
         &config_path,
         &db_path,
         true,
+        false,
         50,
         60,
         Some(&format!("http://{addr}/v1")),
