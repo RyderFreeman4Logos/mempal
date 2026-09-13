@@ -753,8 +753,8 @@ where
         if Instant::now() >= deadline {
             return Err(anyhow::Error::new(ReadDeadlineExceeded));
         }
-        tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
+        tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
             pool.sem.clone().acquire_owned(),
         )
         .await
@@ -807,7 +807,7 @@ where
         })
     });
     let join = if let Some(deadline) = deadline {
-        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), join)
+        tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), join)
             .await
             .map_err(|_| anyhow::Error::new(ReadDeadlineExceeded))?
     } else {
