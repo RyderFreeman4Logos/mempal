@@ -6767,13 +6767,21 @@ impl MempalMcpServer {
         let embedder = self.embedder_factory.build().await.map_err(|error| {
             ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
         })?;
-        let query_vector = embedder
-            .embed(&[request.query.as_str()])
-            .await
-            .map_err(|error| ErrorData::internal_error(format!("embedding failed: {error}"), None))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| ErrorData::internal_error("embedder returned no query vector", None))?;
+        let embed_deadline = self.search_embed_deadline_for_request(config.as_ref());
+        let query_vector =
+            tokio::time::timeout(embed_deadline, embedder.embed(&[request.query.as_str()]))
+                .await
+                .map_err(|_| {
+                    mcp_stage_timeout_error("mempal_context", "embedding", embed_deadline)
+                })?
+                .map_err(|error| {
+                    ErrorData::internal_error(format!("embedding failed: {error}"), None)
+                })?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    ErrorData::internal_error("embedder returned no query vector", None)
+                })?;
 
         let context_request = crate::context::ContextRequest {
             query: request.query,
@@ -13613,6 +13621,7 @@ mod tests {
     mod ingest_receipt_tests;
     mod mcp_roots_936_tests;
     mod operation_creation_receipt_tests;
+    mod query_timeout_tests;
     mod read_tests;
     #[derive(Clone)]
     struct StubEmbedderFactory {
@@ -19038,37 +19047,6 @@ prototypes = ["keep"]
                 || !response.system_warnings.is_empty(),
             "brief must return a structured response"
         );
-    }
-
-    #[tokio::test]
-    async fn test_mcp_context_surfaces_query_read_timeout_error() {
-        let (_tempdir, _db_path, server) = setup_server();
-        let server = server
-            .with_query_only_read_delay_for_test(Duration::from_millis(150))
-            .with_mcp_deadline_for_test(Duration::from_millis(20));
-
-        let result = tokio::time::timeout(
-            Duration::from_millis(500),
-            server.context_json_for_test(serde_json::json!({
-                "query": "debug",
-                "max_items": 3
-            })),
-        )
-        .await
-        .expect("context should return before client timeout");
-        let error = match result {
-            Ok(_) => panic!("context must not convert read timeout to empty success"),
-            Err(error) => error,
-        };
-
-        assert!(
-            error
-                .to_string()
-                .contains("mempal_context query-only database read exceeded"),
-            "unexpected error: {error}"
-        );
-
-        tokio::time::sleep(Duration::from_millis(180)).await;
     }
 
     #[tokio::test]

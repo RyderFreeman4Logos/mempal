@@ -805,8 +805,14 @@ where
                 other => other,
             }
         })
-    })
-    .await;
+    });
+    let join = if let Some(deadline) = deadline {
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), join)
+            .await
+            .map_err(|_| anyhow::Error::new(ReadDeadlineExceeded))?
+    } else {
+        join.await
+    };
     match join {
         Ok(out) => out,
         Err(join_err) => Err(anyhow::anyhow!("blocking database task failed: {join_err}")),
