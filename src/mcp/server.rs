@@ -16285,7 +16285,9 @@ pattern_boost = 0.2
     }
 
     fn release_test_ingest_writer_lease(db_path: &Path, lease: &RuntimeWriterLease) {
-        let db = Database::open_lease_control(db_path).expect("open lease-control db");
+        let db_path = ProfileDbAdmission::resolve_database_path(db_path)
+            .expect("resolve lease-control database path");
+        let db = Database::open_lease_control(&db_path).expect("open lease-control db");
         assert!(
             db.runtime_writer_lease_release(lease)
                 .expect("release test ingest writer lease"),

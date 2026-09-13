@@ -1,5 +1,18 @@
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn release_test_ingest_writer_lease_resolves_symlinked_ancestor() {
+    let tempdir = tempfile::tempdir().expect("short tempdir");
+    let real_dir = tempdir.path().join("real");
+    std::fs::create_dir(&real_dir).expect("create real database directory");
+    let linked_dir = tempdir.path().join("linked");
+    std::os::unix::fs::symlink(&real_dir, &linked_dir).expect("link database directory");
+    let db_path = linked_dir.join("palace.db");
+    let lease = acquire_test_ingest_writer_lease(&db_path, "symlink-ancestor-test");
+    release_test_ingest_writer_lease(&db_path, &lease);
+}
+
 #[tokio::test]
 async fn test_ingest_json_for_test_settles_repeated_operations() {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
