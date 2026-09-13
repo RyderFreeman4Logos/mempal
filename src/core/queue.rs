@@ -356,7 +356,7 @@ pub struct AsyncPendingMessageStore {
     #[cfg(any(test, feature = "db-test-seam"))]
     blocking_started: Option<Arc<tokio::sync::Notify>>,
     #[cfg(any(test, feature = "db-test-seam"))]
-    claim_approved: Option<Arc<tokio::sync::Notify>>,
+    claim_approved: Option<queue_claim_shutdown::ClaimApprovalTestControl>,
     #[cfg(any(test, feature = "db-test-seam"))]
     release_lock_failures: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "db-test-seam"))]
@@ -470,8 +470,11 @@ impl AsyncPendingMessageStore {
     }
 
     #[cfg(any(test, feature = "db-test-seam"))]
-    pub fn with_claim_approved_for_test(mut self, approved: Arc<tokio::sync::Notify>) -> Self {
-        self.claim_approved = Some(approved);
+    pub fn with_claim_approved_for_test(
+        mut self,
+        control: queue_claim_shutdown::ClaimApprovalTestControl,
+    ) -> Self {
+        self.claim_approved = Some(control);
         self
     }
 
