@@ -29,7 +29,7 @@ impl AsyncPendingMessageStore {
         #[cfg(not(any(test, feature = "db-test-seam")))]
         let delay = None;
         #[cfg(any(test, feature = "db-test-seam"))]
-        let started = self.claim_blocking_started.clone();
+        let started = self.blocking_started.clone();
         #[cfg(not(any(test, feature = "db-test-seam")))]
         let started: Option<std::sync::Arc<tokio::sync::Notify>> = None;
         let store = self.inner.clone();

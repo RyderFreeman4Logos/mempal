@@ -354,7 +354,7 @@ pub struct AsyncPendingMessageStore {
     #[cfg(any(test, feature = "db-test-seam"))]
     claim_blocking_delay: Option<Duration>,
     #[cfg(any(test, feature = "db-test-seam"))]
-    claim_blocking_started: Option<Arc<tokio::sync::Notify>>,
+    blocking_started: Option<Arc<tokio::sync::Notify>>,
     #[cfg(any(test, feature = "db-test-seam"))]
     claim_approved: Option<Arc<tokio::sync::Notify>>,
     #[cfg(any(test, feature = "db-test-seam"))]
@@ -398,7 +398,7 @@ impl AsyncPendingMessageStore {
             #[cfg(any(test, feature = "db-test-seam"))]
             claim_blocking_delay: None,
             #[cfg(any(test, feature = "db-test-seam"))]
-            claim_blocking_started: None,
+            blocking_started: None,
             #[cfg(any(test, feature = "db-test-seam"))]
             claim_approved: None,
             #[cfg(any(test, feature = "db-test-seam"))]
@@ -427,7 +427,7 @@ impl AsyncPendingMessageStore {
             #[cfg(any(test, feature = "db-test-seam"))]
             claim_blocking_delay: self.claim_blocking_delay,
             #[cfg(any(test, feature = "db-test-seam"))]
-            claim_blocking_started: self.claim_blocking_started.clone(),
+            blocking_started: self.blocking_started.clone(),
             #[cfg(any(test, feature = "db-test-seam"))]
             claim_approved: self.claim_approved.clone(),
             #[cfg(any(test, feature = "db-test-seam"))]
@@ -464,11 +464,8 @@ impl AsyncPendingMessageStore {
     }
 
     #[cfg(any(test, feature = "db-test-seam"))]
-    pub fn with_claim_blocking_started_for_test(
-        mut self,
-        started: Arc<tokio::sync::Notify>,
-    ) -> Self {
-        self.claim_blocking_started = Some(started);
+    pub fn with_blocking_started_for_test(mut self, started: Arc<tokio::sync::Notify>) -> Self {
+        self.blocking_started = Some(started);
         self
     }
 
@@ -799,15 +796,21 @@ impl AsyncPendingMessageStore {
             self.permits.clone().acquire_owned().await.map_err(|_| {
                 QueueError::BlockingTaskFailed("queue semaphore closed".to_string())
             })?;
-        // Fixture delay is async so tokio timeouts can cancel it; SQLite stays on spawn_blocking.
-        if let Some(delay) = delay {
-            tokio::time::sleep(delay).await;
-        }
         let store = self.inner.clone();
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let started = self.blocking_started.clone();
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let started: Option<Arc<tokio::sync::Notify>> = None;
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let join = tokio::task::spawn_blocking(move || {
             let permit = permit;
             tracing::dispatcher::with_default(&dispatch, || {
+                if let Some(started) = started {
+                    started.notify_one();
+                }
+                if let Some(delay) = delay {
+                    std::thread::sleep(delay);
+                }
                 let out = f(store);
                 drop(permit);
                 out

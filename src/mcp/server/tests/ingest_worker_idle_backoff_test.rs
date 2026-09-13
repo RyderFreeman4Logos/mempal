@@ -74,7 +74,7 @@ async fn test_scoped_ingest_shutdown_cancels_blocked_claim_without_late_mutation
     let started = claim_started.notified();
     let async_queue = AsyncPendingMessageStore::from_store(queue.clone())
         .with_claim_blocking_delay(Duration::from_millis(200))
-        .with_claim_blocking_started_for_test(Arc::clone(&claim_started));
+        .with_blocking_started_for_test(Arc::clone(&claim_started));
     let verification_queue = async_queue.clone();
     let handle = server
         .with_async_queue_for_test(async_queue)

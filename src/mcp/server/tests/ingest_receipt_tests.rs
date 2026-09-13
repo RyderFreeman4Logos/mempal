@@ -1,5 +1,49 @@
 use super::*;
 
+#[test]
+fn absent_daemon_socket_skips_saturated_blocking_pool() {
+    let (tempdir, _db_path, server) = setup_server();
+    assert!(!crate::hook_ipc::socket_path(tempdir.path()).exists());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("build constrained runtime");
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (started_tx, started_rx) = mpsc::channel();
+    runtime.spawn_blocking(move || {
+        started_tx.send(()).expect("signal blocking pool occupancy");
+        let _ = release_rx.recv_timeout(Duration::from_secs(2));
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("blocking pool is saturated");
+
+    let outcome = runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            server.try_enqueue_ingest_operation_via_daemon(
+                "{}".to_string(),
+                "absent-socket".to_string(),
+                Instant::now() + MCP_DAEMON_INGEST_ENQUEUE_IPC_TIMEOUT,
+            ),
+        )
+        .await
+    });
+    drop(release_tx);
+    runtime.shutdown_timeout(Duration::from_secs(1));
+
+    assert_eq!(
+        outcome
+            .expect("absent socket must not queue blocking IPC work")
+            .expect("absent socket fallback"),
+        DaemonIngestEnqueue::Fallback {
+            may_have_reached_daemon: false,
+        }
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn release_test_ingest_writer_lease_resolves_symlinked_ancestor() {
