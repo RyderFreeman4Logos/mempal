@@ -1,6 +1,8 @@
 mod common;
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -48,15 +50,7 @@ fn wait_for_scheduled_phase(child: &mut CapturedChild, db_path: &Path) -> String
                 child.diagnostics()
             );
         }
-        let phase = Database::open(db_path).ok().and_then(|db| {
-            db.conn()
-                .query_row(
-                    "SELECT phase FROM sleep_log ORDER BY created_at DESC, id DESC LIMIT 1",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok()
-        });
+        let phase = latest_scheduled_phase(db_path);
         if let Some(phase) = phase {
             return phase;
         }
@@ -65,6 +59,49 @@ fn wait_for_scheduled_phase(child: &mut CapturedChild, db_path: &Path) -> String
     panic!(
         "daemon did not run a scheduled sleep cycle\n{}",
         child.diagnostics()
+    );
+}
+
+fn latest_scheduled_phase(db_path: &Path) -> Option<String> {
+    Database::with_diagnostic_read_only(db_path, |db| {
+        db.conn()
+            .query_row(
+                "SELECT phase FROM sleep_log ORDER BY created_at DESC, id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+    })
+    .ok()
+    .flatten()
+}
+
+#[cfg(unix)]
+#[test]
+fn scheduled_phase_observer_does_not_use_profile_admission() {
+    let home = SocketTempDir::new().expect("short temporary home");
+    let db_path = home.path().join("palace.db");
+    let db = Database::open(&db_path).expect("initialize database");
+    db.conn()
+        .execute(
+            "INSERT INTO sleep_log (id, created_at, phase) VALUES ('observed', 'now', 'salience')",
+            [],
+        )
+        .expect("seed scheduled phase");
+    drop(db);
+
+    let lock_path = home.path().join(".palace.db.admission.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .expect("open admission lock");
+    // SAFETY: this test owns the file descriptor until `lock` is dropped.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    assert_eq!(
+        latest_scheduled_phase(&db_path).as_deref(),
+        Some("salience")
     );
 }
 
