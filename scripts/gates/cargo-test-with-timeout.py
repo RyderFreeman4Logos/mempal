@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Run one command with Linux process-tree ownership and bounded cleanup."""
+"""Run one command with Linux process-tree ownership and bounded cleanup.
+
+This supervisor also owns one mkdtemp fixture root for the child. SIGKILL of
+the supervisor itself or a host crash cannot run that cleanup; the exact root
+may remain for later identity-validated removal. This script does not claim
+to clean up after its own SIGKILL.
+"""
 
 from __future__ import annotations
 
@@ -8,9 +14,12 @@ import errno
 import os
 import select
 import shlex
+import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +63,7 @@ class Supervisor:
         self.owned: dict[int, OwnedProcess] = {}
         self.seen_identities: dict[int, Identity] = {}
         self.ownership_uncertain = False
+        self.cleanup_proved = False
         self._libc = ctypes.CDLL(None, use_errno=True)
         self._libc.syscall.restype = ctypes.c_long
         self._libc.syscall.argtypes = [
@@ -404,11 +414,13 @@ class Supervisor:
         deadline = time.monotonic() + timeout
         next_discovery = time.monotonic()
         snapshots: dict[int, Snapshot] = {}
+        self.cleanup_proved = False
         try:
             while True:
                 if _pending_signal is not None:
                     signum = _pending_signal
                     clean = self.cleanup()
+                    self.cleanup_proved = clean
                     if not clean:
                         print("failed to prove owned process cleanup", file=sys.stderr)
                         self.process_cleanup_failure()
@@ -417,6 +429,7 @@ class Supervisor:
                 status = self.child.poll()
                 if status is not None:
                     clean = self.cleanup()
+                    self.cleanup_proved = clean
                     if not clean:
                         print("failed to prove owned process cleanup", file=sys.stderr)
                         self.process_cleanup_failure()
@@ -424,11 +437,11 @@ class Supervisor:
                     return shell_status(status)
                 if time.monotonic() >= deadline:
                     snapshots = self.discover()
-                    timed_out = True
                     print(f"cargo test command timed out after {timeout:g}s", file=sys.stderr)
                     print(f"active command: {shlex.join(self.child.args)}", file=sys.stderr)
                     self.process_context(snapshots)
                     clean = self.cleanup()
+                    self.cleanup_proved = clean
                     if not clean:
                         print("failed to prove owned process cleanup", file=sys.stderr)
                         self.process_cleanup_failure()
@@ -536,6 +549,103 @@ def parse_positive_seconds(name: str, default: str) -> float:
     return float(int(value))
 
 
+@dataclass(frozen=True)
+class FixtureIdentity:
+    path: str
+    dev: int
+    ino: int
+    uid: int
+    mode: int
+
+
+def _parent_path(path: str) -> str:
+    parent = os.path.dirname(path.rstrip("/"))
+    return parent if parent else "/"
+
+
+def capture_fixture_identity(path: str) -> FixtureIdentity:
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise OSError("fixture root is not a directory")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        raise OSError("fixture root mode is not 0700")
+    parent_st = os.lstat(_parent_path(path))
+    if st.st_dev != parent_st.st_dev:
+        raise OSError("fixture root is a mount point")
+    return FixtureIdentity(path, st.st_dev, st.st_ino, st.st_uid, stat.S_IMODE(st.st_mode))
+
+
+def fixture_identity_matches(path: str, expected: FixtureIdentity) -> bool:
+    if path != expected.path:
+        return False
+    try:
+        st = os.lstat(path)
+        parent_st = os.lstat(_parent_path(path))
+    except OSError:
+        return False
+    return (
+        not stat.S_ISLNK(st.st_mode)
+        and stat.S_ISDIR(st.st_mode)
+        and stat.S_IMODE(st.st_mode) == 0o700
+        and st.st_dev == expected.dev
+        and st.st_ino == expected.ino
+        and st.st_uid == expected.uid
+        and st.st_dev == parent_st.st_dev
+    )
+
+
+def fixture_tree_stays_on_device(path: str, dev: int) -> bool:
+    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+        try:
+            if os.lstat(dirpath).st_dev != dev:
+                return False
+            for name in dirnames + filenames:
+                if os.lstat(os.path.join(dirpath, name)).st_dev != dev:
+                    return False
+        except OSError:
+            return False
+    return True
+
+
+def allocate_fixture_root() -> FixtureIdentity:
+    parent = os.environ.get("TMPDIR") or os.environ.get("TMP") or os.environ.get("TEMP")
+    if not parent:
+        parent = tempfile.gettempdir()
+    root = tempfile.mkdtemp(dir=parent)
+    os.chmod(root, 0o700)
+    try:
+        return capture_fixture_identity(root)
+    except OSError:
+        try:
+            os.rmdir(root)
+        except OSError:
+            pass
+        raise
+
+
+def remove_owned_root(identity: FixtureIdentity) -> bool:
+    if not fixture_identity_matches(identity.path, identity):
+        print(f"fixture root identity changed or uncertain: {identity.path}", file=sys.stderr)
+        return False
+    if not fixture_tree_stays_on_device(identity.path, identity.dev):
+        print(f"fixture root contains a mount or unreadable entry: {identity.path}", file=sys.stderr)
+        return False
+    try:
+        shutil.rmtree(identity.path)
+    except OSError as error:
+        print(f"failed to remove fixture root {identity.path}: {error}", file=sys.stderr)
+        return False
+    if os.path.lexists(identity.path):
+        print(f"fixture root still present: {identity.path}", file=sys.stderr)
+        return False
+    return True
+
+
+def retain_fixture_root(identity: FixtureIdentity, reason: str) -> int:
+    print(f"{reason}; retaining fixture root {identity.path}", file=sys.stderr)
+    return 125
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         print(f"usage: {sys.argv[0]} <cargo-test-command> [args...]", file=sys.stderr)
@@ -553,13 +663,42 @@ def main(argv: list[str]) -> int:
         return 128 + _pending_signal
 
     try:
-        child = subprocess.Popen(argv, start_new_session=True)
+        fixture = allocate_fixture_root()
+    except OSError as error:
+        print(f"failed to allocate fixture root: {error}", file=sys.stderr)
+        return 125
+
+    if _pending_signal is not None:
+        signum = _pending_signal
+        if not remove_owned_root(fixture):
+            return retain_fixture_root(fixture, "failed to remove empty fixture root after signal")
+        return 128 + signum
+
+    child_env = os.environ.copy()
+    child_env["TMPDIR"] = fixture.path
+    child_env["TMP"] = fixture.path
+    child_env["TEMP"] = fixture.path
+    try:
+        child = subprocess.Popen(argv, start_new_session=True, env=child_env)
     except OSError as error:
         print(f"failed to launch {shlex.join(argv)}: {error}", file=sys.stderr)
+        if not remove_owned_root(fixture):
+            return retain_fixture_root(fixture, "failed to remove empty fixture root after spawn failure")
         return 127
 
     supervisor = Supervisor(child, grace)
-    return supervisor.run(timeout)
+    status = supervisor.run(timeout)
+    if not supervisor.cleanup_proved:
+        return retain_fixture_root(
+            fixture,
+            f"owned process cleanup was not proved (child status {status})",
+        )
+    if not remove_owned_root(fixture):
+        return retain_fixture_root(
+            fixture,
+            f"fixture root cleanup failed (child status {status})",
+        )
+    return status
 
 
 if __name__ == "__main__":
