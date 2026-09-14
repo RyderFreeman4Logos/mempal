@@ -35,7 +35,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Budget/suite locks; Busy non-budget; post-admission preflight (#893,#947,#1064–#1075,#934/#1077/#1078,#1161).
 - Diagnostic readonly queue stats skip SQLite 5s busy wait: `queue_stats_readonly` under held writer lock returns a bounded lock diagnostic not stall (#911); sleep observer is read-only (#1157).
 
-- **Daemon readiness CLI tests**: shared Linux supervisor for bounded redacted lifecycle handling (#892).
+- **Daemon readiness tests**: bounded lifecycle and poison recovery (#892, #1162).
 
 - **Hermes receipts**: scoped smoke ingest; live-daemon polls `created_drawer_ids`; `chunk_count` keeps IDs; same-op partial retry; smoke skips REST retry on followable update; soft-deleted `mempal_delete` succeeds; cleanup IDs survive CLI/MCP/REST; breaker-open conclude replay pending success not tool error; keyed FIFO; quarantine corrupt head (worker lives); GET exact receipt identity; GET-only no POST-breaker reset; open-breaker ≤1 probe; open REST/Hermes breakers admit typed/redacted `mempal_search`/`mempal_profile`; daemon down ≥100 pending → `doctor`/`status`/MCP high-severity; unreadable config/queue/PIDs → privacy-safe `unavailable`; drain/terminal failures, no DB edits; saturated MCP holder-budget no-write receipts and owner-bound smoke cleanup prevent false/cross-op IDs; MCP empty/invalid/failed roots → no project (#871,#876,#888,#918,#921,#923,#924,#927,#936,#1096,#1101,#1000).
 
