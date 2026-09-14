@@ -28,6 +28,11 @@ pub mod design_insights;
 mod evidence_config;
 pub mod foresight;
 pub mod hot_reload;
+#[cfg(test)]
+#[path = "hot_reload_registration_tests.rs"]
+mod hot_reload_registration_tests;
+#[cfg(test)]
+mod hot_reload_watch_gate;
 pub mod patterns;
 pub mod phase3;
 pub mod priming;

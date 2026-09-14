@@ -108,7 +108,6 @@ pub struct HotReloadState {
     event_log: Mutex<VecDeque<String>>,
     event_log_path: Mutex<Option<PathBuf>>,
     parse_attempts: AtomicUsize,
-    // harness-point: PR0 — counts successful reload applications (version changes)
     reload_count: Arc<AtomicUsize>,
     runtime_prototypes: ArcSwap<Vec<String>>,
     /// Incremented whenever a hot-reloadable LLM field changes (endpoint,
@@ -230,7 +229,6 @@ impl HotReloadState {
     }
 
     /// Number of successful reloads (version actually changed).
-    // harness-point: PR0
     pub fn reload_count(&self) -> usize {
         self.reload_count.load(Ordering::SeqCst)
     }
@@ -384,7 +382,6 @@ impl HotReloadState {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."));
             let mut watcher = create_watcher(notify_tx, file_name.clone());
-
             if let Some(active_watcher) = watcher.as_mut() {
                 if let Err(error) = active_watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
                     state.push_event(format!(
@@ -397,7 +394,6 @@ impl HotReloadState {
             } else {
                 fallback_poll_enabled.store(true, Ordering::SeqCst);
             }
-
             let _ = ready_tx.send(());
 
             if std::env::var_os("MEMPAL_TEST_NOTIFY_FAIL_AFTER_START").is_some() {
@@ -567,7 +563,6 @@ impl HotReloadState {
             }
         };
         self.snapshot.store(Arc::new(next_snapshot));
-        // harness-point: PR0 — increment reload counter on successful version change
         self.reload_count.fetch_add(1, Ordering::SeqCst);
 
         // Notify LLM workers when any hot-reloadable LLM field changes so they
@@ -758,6 +753,8 @@ fn create_watcher(
     tx: mpsc::Sender<WatchMessage>,
     file_name: Option<OsString>,
 ) -> Option<RecommendedWatcher> {
+    #[cfg(test)]
+    super::hot_reload_watch_gate::wait_before_watch();
     notify::recommended_watcher(move |result: notify::Result<Event>| match result {
         Ok(event) if should_reload_event(&event, file_name.as_deref()) => {
             let _ = tx.send(WatchMessage::FileChanged);
