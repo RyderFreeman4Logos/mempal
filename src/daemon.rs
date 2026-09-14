@@ -122,6 +122,7 @@ pub fn run_command_with_bootstrap_events(
         .take()
         .context("daemon runtime was already consumed")?;
     let result = runtime.block_on(run_loop(&context));
+    observe_shutdown_phase("runtime-teardown");
     runtime.shutdown_timeout(DAEMON_BLOCKING_TASK_DRAIN_BUDGET);
     result
 }
@@ -273,10 +274,15 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                 }
             }
         }
+        observe_shutdown_phase("signal-observed");
+        observe_shutdown_phase("ingest-worker");
         ingest_drain_worker
             .shutdown_and_drain_with_budget(Some(DAEMON_DRAIN_BUDGET))
             .await;
+        observe_shutdown_phase("sleep-scheduler");
         sleep_scheduler::drain(sleep_scheduler_handle).await;
+        #[cfg(feature = "rest")]
+        observe_shutdown_phase("rest-server");
         #[cfg(feature = "rest")]
         drain_rest_server(rest_task).await;
         return Ok(());

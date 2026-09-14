@@ -33,7 +33,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Typed/redacted MCP admission and audit-write diagnostics (#879).
 - Daemon pidfile validates identity; scoped ingest release honors remaining retry budget (#885/#895).
 - Profile locks retain byte-budget rejection and suite-load isolation; Busy waits non-budget (#893,#947,#1064–#1075,#934/#1077/#1078).
-- Diagnostic readonly queue stats skip SQLite 5s busy wait: `queue_stats_readonly` under held writer lock returns a bounded lock diagnostic not stall (#911).
+- Diagnostic readonly queue stats skip SQLite 5s busy wait: `queue_stats_readonly` under held writer lock returns a bounded lock diagnostic not stall (#911); sleep observer is read-only (#1157).
 
 - **Daemon readiness CLI tests**: shared Linux supervisor for bounded redacted lifecycle handling (#892).
 
@@ -41,33 +41,21 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - **Daemon SQLite busy**: lease retries Busy/locked (#929); BUSY not 75; systemd avoids extra-MCP churn (#931); REST install recycles daemon (#928, #940); default `rest` (#1091); Hermes writes authoritative; local conclusions avoid breaker retrips (#941).
 - **MCP search deadlines**: bounds embed/DB/route; no 240s hangs.
-- **Hermetic daemon tests**: isolate REST/MCP/ingest-wait/mark-failed/dashboard from live `:3080`; timeout reaps trees, authenticates sccache, readiness handshake, absent /proc as exit; ingest admission-warning fixture locks worker before setup_server (#988,#989,#973,#991,#993,#1011,#1108,#1110,#1115).
+- **Hermetic daemon tests**: isolate REST/MCP/ingest-wait/mark-failed/dashboard from live `:3080`; timeout reaps trees, sccache auth, readiness handshake, absent /proc as exit; ingest admission-warning fixture locks worker before setup_server; blocked-sleep SIGTERM records shutdown phases, hang unresolved (#988,#989,#973,#991,#993,#1011,#1108,#1110,#1115,#1158).
 - Lease #882/#889/#890,#944/#956,#958/#961/#962/#965/#971/#975/#976/#968,#1013,#1010,#1009,#1008,#1023/#1024,#1006/#1007,#1027,#1005,#1029,#1004,#1031,#980,#1003,#1002,#1001,#1035,#999,#998,#1037,#1038,#997,#996,#994,#1044,#990,#984,#1047,#970,#1049,#1050,#1051,#1040,#1054/#1059/#1060
 - **MCP delete retry**: force SQLite Busy before synchronized lock release (#886).
 
-- **Daemon supervisor cooldowns**: wait through active restart-budget
-  cooldowns and retry bootstrap in-process; true temporary refusals retain
-  `75` (`EX_TEMPFAIL`), while the canonical unit keeps
-  `RestartPreventExitStatus=75` for thrash protection (#847, #868).
+- **Daemon supervisor cooldowns**: wait through active restart-budget cooldowns and retry bootstrap in-process; true temporary refusals retain `75` (`EX_TEMPFAIL`), while the canonical unit keeps `RestartPreventExitStatus=75` for thrash protection (#847, #868).
 
-- **Daemon restart recovery**: keep the persisted restart cooldown anchored to
-  its original deadline when a supervisor races replacement generations, freeze
-  fault history for the full cooldown (including after the rolling window ages
-  out), attribute faults to a monotonic admission epoch so same-second prior
-  faults do not stick to a healthy replacement, keep same-generation
-  post-admission faults charged, and replenish the rolling restart budget only
-  after a daemon generation finishes startup without post-admission faults;
-  cooldown-blocked retries can no longer extend an outage indefinitely (#844).
+- **Daemon restart recovery**: keep the persisted restart cooldown anchored to its original deadline when a supervisor races replacement generations, freeze fault history for the full cooldown (including after the rolling window ages out), attribute faults to a monotonic admission epoch so same-second prior faults do not stick to a healthy replacement, keep same-generation post-admission faults charged, and replenish the rolling restart budget only after a daemon generation finishes startup without post-admission faults; cooldown-blocked retries can no longer extend an outage indefinitely (#844).
 
 - **Daemon/MCP/CLI coexistence**: both typed temporary admission refusals—restart-budget cooldowns and still-held live `sqlite-writer` leases after bounded retry—map to exit `75` (`EX_TEMPFAIL`) to prevent systemd restart thrash (#843, #849, #850, #853, #856, #858, #859, #864, #869, #870).
 
 - **MCP reads**: retry transient SQLite busy/locked errors on all query-only MCP reads (read_drawer, search, timeline, context, brief) under the existing search deadline, preventing opaque -32603 under daemon contention (#840).
 - **SQLite mutation retries**: bound shared 10-second CLI/MCP retry backoff, writer admission, and SQLite busy waits; a mutation that commits reports success, while unstarted expired MCP deletes return structured retryable lock errors (#838).
 - **MCP delete**: retry cached async-pool SQLite busy/locked soft deletes for 10 seconds, matching CLI content mutations (#836).
-- **MCP ingest**: preserve queued `wait=true` recovery when daemon hook IPC and
-  REST are unavailable, retaining an operation receipt for reconciliation (#834).
-- **CLI search**: reserve BM25 fallback budget so hybrid search cannot consume
-  the full CLI deadline (#833).
+- **MCP ingest**: preserve queued `wait=true` recovery when daemon hook IPC and REST are unavailable, retaining an operation receipt for reconciliation (#834).
+- **CLI search**: reserve BM25 fallback budget so hybrid search cannot consume the full CLI deadline (#833).
 - **CLI writes/search**: retry pin, unpin, and delete SQLite locks for 10 seconds; enforce a 120-second search deadline, including embedder initialization and bounded runtime teardown (#831, #1079).
 - **MCP full smoke**: follow accepted ingest wait-timeout operation receipts to
   recover cleanup-safe drawer IDs before classifying create or update as missing
