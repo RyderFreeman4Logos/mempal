@@ -27,6 +27,10 @@ mod queue_store_construction;
 #[path = "queue_claim_shutdown.rs"]
 mod queue_claim_shutdown;
 
+#[cfg(any(test, feature = "db-test-seam"))]
+#[path = "queue_blocking_test_support.rs"]
+mod queue_blocking_test_support;
+
 pub use super::queue_connection_admission::{
     queue_stats, queue_stats_readonly, queue_stats_readonly_with_busy_timeout,
     queue_write_admission_preflight,
@@ -335,12 +339,7 @@ pub struct PendingMessageStore {
     lifecycle_writer_lease: Option<super::types::RuntimeWriterLease>,
 }
 
-/// Bounded async facade for [`PendingMessageStore`].
-///
-/// The queue store intentionally remains a synchronous SQLite API for CLI and
-/// test callers. Daemon and MCP async tasks must use this facade so claim,
-/// confirm, retry, release, heartbeat, and stats calls run on Tokio's blocking
-/// pool instead of occupying runtime worker threads.
+/// Async facade that runs SQLite work on Tokio's blocking pool.
 #[derive(Debug, Clone)]
 pub struct AsyncPendingMessageStore {
     inner: PendingMessageStore,
@@ -806,9 +805,11 @@ impl AsyncPendingMessageStore {
         let started: Option<Arc<tokio::sync::Notify>> = None;
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let join = tokio::task::spawn_blocking(move || {
+            #[cfg(any(test, feature = "db-test-seam"))]
+            let _finished = queue_blocking_test_support::BlockingFinished(started.clone());
             let permit = permit;
             tracing::dispatcher::with_default(&dispatch, || {
-                if let Some(started) = started {
+                if let Some(started) = &started {
                     started.notify_one();
                 }
                 if let Some(delay) = delay {
