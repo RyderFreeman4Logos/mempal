@@ -475,7 +475,7 @@ impl HotReloadState {
         });
         let poller_thread = poller.thread().clone();
 
-        let _ = ready_rx.recv_timeout(Duration::from_secs(1));
+        ready_rx.recv().expect("watcher registration aborted");
 
         RuntimeControl {
             stop,
