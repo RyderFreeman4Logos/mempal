@@ -1189,11 +1189,14 @@ impl PendingMessageStore {
         kind_filter: &str,
         approval: &mut impl FnMut() -> bool,
     ) -> Result<Option<ClaimedMessage>> {
-        self.with_claim_connection_if(approval, |conn| {
+        self.with_claim_connection(|conn| {
             self.require_lifecycle_writer_lease(conn, "claim queued message")?;
             let now = now_secs();
             let stale_cutoff = saturating_cutoff(now, claim_ttl_secs);
             if !claim_work_available(conn, stale_cutoff, now, Some(kind_filter), false)? {
+                return Ok(None);
+            }
+            if !approval() {
                 return Ok(None);
             }
             let tx = transaction_immediate(conn, "claim queued message")?;
@@ -1260,7 +1263,6 @@ impl PendingMessageStore {
                 claimed_at: now,
             }))
         })
-        .map(Option::flatten)
     }
 
     pub fn claim_by_id_and_kind(

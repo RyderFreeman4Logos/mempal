@@ -63,6 +63,37 @@ async fn test_mcp_async_ingest_worker_backs_off_when_idle() {
 }
 
 #[tokio::test]
+async fn test_idle_claim_does_not_take_shutdown_ownership() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
+    let (_tempdir, db_path, _server) = setup_server();
+    let approval = Arc::new(tokio::sync::Notify::new());
+    let approved = approval.notified();
+    tokio::pin!(approved);
+    approved.as_mut().enable();
+    let queue = AsyncPendingMessageStore::from_store(
+        crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path),
+    )
+    .with_claim_approved_for_test((Arc::clone(&approval), None));
+    let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let claim = queue
+        .claim_next_by_kind_until_shutdown(
+            "idle-owner-test".to_string(),
+            INGEST_CLAIM_TTL_SECS,
+            INGEST_ASYNC_KIND.to_string(),
+            &mut shutdown_rx,
+        )
+        .await
+        .expect("idle claim");
+
+    assert!(claim.is_none());
+    assert!(
+        tokio::time::timeout(Duration::ZERO, approved).await.is_err(),
+        "an idle poll must not cross the ownership fence that shutdown has to drain"
+    );
+}
+
+#[tokio::test]
 async fn test_scoped_ingest_shutdown_cancels_blocked_claim_without_late_mutation() {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
