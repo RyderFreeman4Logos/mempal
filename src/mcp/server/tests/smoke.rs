@@ -467,31 +467,90 @@ async fn test_mcp_scoped_smoke_preflight_uses_remaining_request_budget() {
         .lock_owned()
         .await;
     let (_tempdir, db_path, server) = setup_server();
+    let admission_progress = Arc::new(Notify::new());
     let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
-        .with_blocking_delay(Duration::from_millis(700));
+        .with_blocking_delay(Duration::from_millis(700))
+        .with_blocking_started_for_test(Arc::clone(&admission_progress));
+    let async_queue_observer = async_queue.clone();
+    let query_only_async_db = QueryOnlyAsyncDb::open(&db_path, 4)
+        .expect("open query-only async db")
+        .with_read_delay(Duration::from_millis(500));
+    let query_only_async_db_observer = query_only_async_db.clone();
     let server = server
         .with_async_queue_for_test(async_queue)
-        .with_query_only_read_delay_for_test(Duration::from_millis(500));
+        .with_query_only_async_db_for_test(query_only_async_db);
+    server.ingest_worker_started.store(true, Ordering::SeqCst);
 
-    let response = tokio::time::timeout(
-        Duration::from_millis(1100),
-        server.mempal_ingest(Parameters(IngestRequest {
-            content: "smoke preflight lease checks must honor the request budget".to_string(),
-            wing: "smoke".to_string(),
-            room: Some("mcp".to_string()),
-            smoke: Some(true),
-            wait: Some(true),
-            wait_timeout_secs: Some(1),
-            ..IngestRequest::default()
-        })),
-    )
+    let mut request_task = tokio::spawn(async move {
+        server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "smoke preflight lease checks must honor the request budget".to_string(),
+                wing: "smoke".to_string(),
+                room: Some("mcp".to_string()),
+                smoke: Some(true),
+                wait: Some(true),
+                wait_timeout_secs: Some(1),
+                ..IngestRequest::default()
+            }))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), admission_progress.notified())
+        .await
+        .expect("queue admission must start within the cleanup bound");
+    tokio::time::timeout(Duration::from_secs(5), admission_progress.notified())
+        .await
+        .expect("durable queue admission must finish within the cleanup bound");
+
+    // Admission consumes 700ms of the 1s wait. This leaves 100ms of scheduling
+    // headroom while still rejecting a fresh 500ms lease-probe budget.
+    let post_admission_deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+    let lease_probe_started = tokio::time::timeout_at(post_admission_deadline, async {
+        while query_only_async_db_observer.available_reader_permits_for_test() == 4 {
+            tokio::task::yield_now().await;
+        }
+    })
     .await
-    .expect("scoped smoke preflight must not outlive the request budget")
+    .is_ok();
+    let response_within_budget =
+        tokio::time::timeout_at(post_admission_deadline, &mut request_task).await;
+    let exceeded_post_admission_budget = response_within_budget.is_err();
+    let response = match response_within_budget {
+        Ok(response) => response,
+        Err(_) => tokio::time::timeout(Duration::from_secs(5), &mut request_task)
+            .await
+            .expect("request task must settle within the cleanup bound"),
+    }
+    .expect("request task must not panic")
     .expect("scoped smoke preflight should return a durable receipt")
     .0;
 
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while query_only_async_db_observer.available_reader_permits_for_test() != 4
+            || async_queue_observer.available_blocking_permits_for_test() != 4
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed-out blocking tasks must release their permits during cleanup");
+
+    assert!(
+        lease_probe_started,
+        "fixture must exercise a meaningful nonzero residual lease-preflight budget"
+    );
+    assert!(
+        !exceeded_post_admission_budget,
+        "scoped smoke preflight must return within 400ms after durable admission"
+    );
     assert_eq!(response.state, Some(IngestOperationState::Queued));
     assert!(response.timed_out);
+    let operation_id = response.operation_id.expect("durable operation id");
+    let record = PendingMessageStore::new_without_reclaim(&db_path)
+        .operation_status(&operation_id)
+        .expect("load operation status")
+        .expect("operation must stay queryable");
+    assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
+    assert!(record.claimed_at.is_none());
 }
 
 #[tokio::test]
