@@ -428,3 +428,80 @@ async fn test_mcp_ingest_replacement_target_uses_request_budget_for_admission() 
     assert_eq!(response.state, Some(IngestOperationState::Queued));
     assert!(response.operation_id.is_some());
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_mcp_ingest_scoped_zero_wait_skips_status_refresh_after_budget() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
+    let (_tempdir, db_path, server) = setup_server();
+    let admission_progress = Arc::new(Notify::new());
+    let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+        .with_blocking_delay(Duration::from_millis(300))
+        .with_blocking_started_for_test(Arc::clone(&admission_progress));
+    let server = server
+        .with_async_queue_for_test(async_queue)
+        .with_operation_status_probe_delay_for_test(Duration::from_millis(500));
+
+    let (response, ()) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.mempal_ingest_with_controls_scoped_worker(
+                IngestRequest {
+                    content: "scoped zero wait must not refresh status after budget".to_string(),
+                    wing: "mcp".to_string(),
+                    room: Some("receipt".to_string()),
+                    dry_run: Some(false),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(0),
+                    ..IngestRequest::default()
+                },
+                IngestControls::default(),
+            ),
+        ),
+        async {
+            tokio::time::timeout(Duration::from_secs(5), admission_progress.notified())
+                .await
+                .expect("queue admission must start within the cleanup bound");
+            tokio::time::timeout(Duration::from_secs(5), admission_progress.notified())
+                .await
+                .expect("durable queue admission must finish within the cleanup bound");
+        }
+    );
+    let response = response
+        .expect("zero-wait request must settle after durable admission")
+        .expect("scoped zero-wait ingest should return a receipt")
+        .0;
+
+    assert_eq!(response.state, Some(IngestOperationState::Queued));
+    assert!(response.timed_out);
+    let operation_id = response
+        .operation_id
+        .as_deref()
+        .expect("zero-wait receipt must include operation id")
+        .to_string();
+    assert!(response.created_drawer_ids.is_empty());
+    let record = PendingMessageStore::new_without_reclaim(&db_path)
+        .operation_status(&operation_id)
+        .expect("load zero-wait operation status")
+        .expect("zero-wait operation must be durable after admission");
+    assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
+    assert_eq!(
+        server
+            .operation_status_json_within_probe_attempts
+            .load(Ordering::Relaxed),
+        0,
+        "zero wait must not begin a bounded status probe"
+    );
+
+    let status = server
+        .operation_status_json_within(&operation_id, Duration::from_millis(1))
+        .await
+        .expect("positive-budget status probe must time out cleanly");
+    assert!(status.is_none());
+    assert_eq!(
+        server
+            .operation_status_json_within_probe_attempts
+            .load(Ordering::Relaxed),
+        1,
+        "positive-budget status probe must increment its observer"
+    );
+}
