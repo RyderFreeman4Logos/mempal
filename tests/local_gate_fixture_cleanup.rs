@@ -100,7 +100,7 @@ struct Case {
 
 fn physical_bytes(path: &Path) -> u64 {
     let meta = fs::symlink_metadata(path).expect("stat leftover path");
-    u64::from(meta.blocks()) * 512
+    meta.blocks() * 512
 }
 
 fn run_case(base: &Path, sentinel: &Path, case: &Case) {
