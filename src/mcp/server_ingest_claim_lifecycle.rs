@@ -3,10 +3,38 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 
 use super::{
-    AsyncPendingMessageStore, ClaimedMessage, MempalMcpServer, ScopedIngestProcessResult,
-    anyhow_chain_contains_sqlite_lock, anyhow_chain_has_transient_admission,
-    complete_failed_ingest_claim, queue_wait_ms, status_db_failure_kind,
+    AsyncPendingMessageStore, ClaimedMessage, IngestWaitWorkerMode, MempalMcpServer,
+    ScopedIngestProcessResult, anyhow_chain_contains_sqlite_lock,
+    anyhow_chain_has_transient_admission, complete_failed_ingest_claim, queue_wait_ms,
+    status_db_failure_kind,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ScopedIngestClaimPolicy {
+    PollOnly,
+    InlineWithinDeadline,
+    InlineOwnedWithinDeadline,
+    InlineSmokeWithinDeadline,
+    InlineUntilTerminal,
+}
+
+pub(super) fn scoped_ingest_claim_policy(
+    wait_timeout_secs: u64,
+    smoke: bool,
+    worker_mode: IngestWaitWorkerMode,
+) -> ScopedIngestClaimPolicy {
+    if wait_timeout_secs == u64::MAX {
+        ScopedIngestClaimPolicy::InlineUntilTerminal
+    } else if wait_timeout_secs == 0 {
+        ScopedIngestClaimPolicy::PollOnly
+    } else if smoke {
+        ScopedIngestClaimPolicy::InlineSmokeWithinDeadline
+    } else if matches!(worker_mode, IngestWaitWorkerMode::ScopedReleasing) {
+        ScopedIngestClaimPolicy::InlineWithinDeadline
+    } else {
+        ScopedIngestClaimPolicy::InlineOwnedWithinDeadline
+    }
+}
 
 impl MempalMcpServer {
     pub(super) async fn process_ingest_claim_with_owned_task_budget(

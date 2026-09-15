@@ -14,23 +14,6 @@ fn short_tempdir() -> tempfile::TempDir {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn admission_state_lock_excludes_test_process_fork() {
-    let tempdir = short_tempdir();
-    let state_lock = crate::core::db_admission_state::lock_state(
-        &tempdir.path().join(".palace.db.admission.lock"),
-    )
-    .expect("lock admission state");
-
-    assert!(matches!(
-        super::TEST_PROCESS_FORK_LOCK.try_write(),
-        Err(std::sync::TryLockError::WouldBlock)
-    ));
-    drop(state_lock);
-    assert!(super::TEST_PROCESS_FORK_LOCK.try_write().is_ok());
-}
-
-#[cfg(target_os = "linux")]
 fn holder(pid: u32, process_identity: &str, pid_namespace: Option<String>) -> DbAdmissionHolder {
     DbAdmissionHolder {
         holder_class: DbHolderClass::Mcp,

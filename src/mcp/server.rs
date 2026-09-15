@@ -135,6 +135,7 @@ use ingest_claim_shutdown::claim_next_ingest_with_io;
 
 #[path = "server_ingest_claim_lifecycle.rs"]
 mod ingest_claim_lifecycle;
+use ingest_claim_lifecycle::{ScopedIngestClaimPolicy, scoped_ingest_claim_policy};
 
 #[cfg(test)]
 #[path = "server_operation_receipt_tests.rs"]
@@ -377,6 +378,10 @@ pub struct MempalMcpServer {
     ingest_writer_lease_acquired_hook: Option<IngestWriterLeaseAcquiredHook>,
     #[cfg(test)]
     ingest_writer_lease_open_hook: Option<IngestWriterLeaseOpenHook>,
+    #[cfg(test)]
+    ingest_source_lock_contention_observer: Option<std::sync::mpsc::Sender<()>>,
+    #[cfg(test)]
+    ingest_wait_lease_check_budget_observer: Option<std::sync::mpsc::Sender<Duration>>,
     #[cfg(test)]
     operation_status_json_within_probe_attempts: Arc<AtomicUsize>,
 }
@@ -761,6 +766,10 @@ impl MempalMcpServer {
             ingest_writer_lease_acquired_hook: None,
             #[cfg(test)]
             ingest_writer_lease_open_hook: None,
+            #[cfg(test)]
+            ingest_source_lock_contention_observer: None,
+            #[cfg(test)]
+            ingest_wait_lease_check_budget_observer: None,
             #[cfg(test)]
             operation_status_json_within_probe_attempts: Arc::new(AtomicUsize::new(0)),
         })
@@ -2323,9 +2332,15 @@ impl MempalMcpServer {
         let worker = self.clone();
         #[cfg(any(test, feature = "db-test-seam"))]
         let ingest_processing_delay = self.ingest_processing_delay;
+        #[cfg(test)]
+        let source_lock_contention_observer = self.ingest_source_lock_contention_observer.clone();
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
         tokio::task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatcher, || {
+                #[cfg(test)]
+                if let Some(observer) = source_lock_contention_observer {
+                    crate::ingest::lock::set_contention_observer_for_test(observer);
+                }
                 #[cfg(any(test, feature = "db-test-seam"))]
                 if let Some(delay) = ingest_processing_delay {
                     std::thread::sleep(delay);
@@ -2648,6 +2663,10 @@ impl MempalMcpServer {
         remaining: Duration,
         fail_closed: bool,
     ) -> bool {
+        #[cfg(test)]
+        if let Some(observer) = self.ingest_wait_lease_check_budget_observer.as_ref() {
+            let _ = observer.send(remaining);
+        }
         #[cfg(any(test, feature = "db-test-seam"))]
         if let Some(error) = self.daemon_writer_lease_check_error.as_deref() {
             tracing::warn!(
@@ -4290,33 +4309,6 @@ enum IngestWaitWorkerMode {
     Background,
     Scoped,
     ScopedReleasing,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ScopedIngestClaimPolicy {
-    PollOnly,
-    InlineWithinDeadline,
-    InlineOwnedWithinDeadline,
-    InlineSmokeWithinDeadline,
-    InlineUntilTerminal,
-}
-
-fn scoped_ingest_claim_policy(
-    wait_timeout_secs: u64,
-    smoke: bool,
-    worker_mode: IngestWaitWorkerMode,
-) -> ScopedIngestClaimPolicy {
-    if wait_timeout_secs == u64::MAX {
-        ScopedIngestClaimPolicy::InlineUntilTerminal
-    } else if wait_timeout_secs == 0 {
-        ScopedIngestClaimPolicy::PollOnly
-    } else if smoke {
-        ScopedIngestClaimPolicy::InlineSmokeWithinDeadline
-    } else if matches!(worker_mode, IngestWaitWorkerMode::ScopedReleasing) {
-        ScopedIngestClaimPolicy::InlineWithinDeadline
-    } else {
-        ScopedIngestClaimPolicy::InlineOwnedWithinDeadline
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

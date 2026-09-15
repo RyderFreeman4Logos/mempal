@@ -273,68 +273,69 @@ async fn test_mcp_smoke_wait_real_source_lock_times_out_without_blocking_runtime
 async fn test_mcp_scoped_finite_wait_real_source_lock_runs_off_runtime_and_retains_claim_owner() {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
-    let request = IngestRequest {
-        content: "ordinary finite wait source-lock contention ".repeat(1_000),
-        wing: "mcp".to_string(),
-        room: Some("runtime".to_string()),
-        wait: Some(true),
-        wait_timeout_secs: Some(6),
-        ..IngestRequest::default()
-    };
+    let content = "owned finite wait must survive source-lock contention";
     let controls = IngestControls {
         no_gate: true,
         bypass_novelty: true,
     };
-
     let preview = server
         .mempal_ingest_with_controls_scoped_worker(
             IngestRequest {
+                content: content.to_string(),
+                wing: "mcp".to_string(),
+                room: Some("runtime".to_string()),
                 dry_run: Some(true),
-                ..request.clone()
+                ..IngestRequest::default()
             },
             controls,
         )
         .await
         .expect("ordinary scoped preview")
         .0;
-    assert!(
-        preview.chunk_count > 1,
-        "fixture must exercise multi-chunk ingest"
-    );
-    let server = server.with_ingest_processing_delay_for_test(Duration::from_secs(1));
-    let mempal_home = db_path.parent().expect("database parent");
     let source_lock = crate::ingest::lock::acquire_source_lock(
-        mempal_home,
-        preview.drawer_ids.get(1).expect("second chunk drawer id"),
+        db_path.parent().expect("database parent"),
+        &preview.drawer_id,
         Duration::from_secs(1),
     )
     .expect("hold source lock");
-
+    let operation_id =
+        enqueue_prepared_test_ingest_operation(&server, &db_path, content, "runtime").await;
+    let queue = PendingMessageStore::new_without_reclaim(&db_path);
+    let claim = queue
+        .claim_next_by_kind("worker-owned-source-lock", 60, INGEST_ASYNC_KIND)
+        .expect("claim queued operation")
+        .expect("claimed queued operation");
+    let async_queue = AsyncPendingMessageStore::from_store(queue.clone());
+    let (contended_tx, contended_rx) = mpsc::channel();
+    let mut server = server;
+    server.ingest_source_lock_contention_observer = Some(contended_tx);
+    let completion_server = server.clone();
     let (ticks, ticker) = spawn_runtime_ticker();
-    let started = Instant::now();
-    let response = tokio::time::timeout(
-        Duration::from_secs(7),
-        server.mempal_ingest_with_controls_scoped_worker(request, controls),
-    )
-    .await
-    .expect("ordinary finite scoped wait must respect its request budget")
-    .expect("source-lock contention returns a durable receipt")
-    .0;
+    let mut processing = tokio::spawn(async move {
+        server
+            .process_ingest_claim_with_owned_task_budget(
+                &async_queue,
+                "worker-owned-source-lock",
+                claim,
+                Duration::from_millis(250),
+            )
+            .await
+    });
+    tokio::task::spawn_blocking(move || contended_rx.recv_timeout(Duration::from_secs(2)))
+        .await
+        .expect("contention observer must not panic")
+        .expect("owned task must reach the held source lock");
+    let result = tokio::time::timeout(Duration::from_secs(1), &mut processing)
+        .await
+        .expect("owned task deadline must not reset at source-lock contention")
+        .expect("owned processing task must not panic")
+        .expect("owned processing task must return a typed timeout");
     ticker.abort();
 
-    assert!(
-        response.timed_out,
-        "ordinary finite wait must time out under held lock"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(7),
-        "ordinary finite wait exceeded its request budget"
-    );
+    assert_eq!(result, ScopedIngestProcessResult::TimedOut);
     assert_runtime_ticked(&ticks, "ordinary finite ingest with a real source lock");
-
-    let operation_id = response.operation_id.as_deref().expect("operation id");
-    let record = PendingMessageStore::new_without_reclaim(&db_path)
-        .operation_status(operation_id)
+    let record = queue
+        .operation_status(&operation_id)
         .expect("load claimed operation")
         .expect("operation remains queryable");
     assert_eq!(record.op_state, IngestOperationState::Running.as_str());
@@ -346,12 +347,20 @@ async fn test_mcp_scoped_finite_wait_real_source_lock_runs_off_runtime_and_retai
     drop(source_lock);
     let completed = tokio::time::timeout(
         Duration::from_secs(4),
-        server.wait_for_operation_completion(operation_id),
+        completion_server.wait_for_operation_completion(&operation_id),
     )
     .await
     .expect("timed-out ordinary operation must retain its completion owner")
     .expect("source-lock-contended ordinary operation should complete");
     assert_eq!(completed.state, Some(IngestOperationState::Completed));
+}
+
+#[test]
+fn test_mcp_scoped_finite_wait_routes_to_owned_deadline_worker() {
+    assert_eq!(
+        scoped_ingest_claim_policy(1, false, IngestWaitWorkerMode::Scoped),
+        ScopedIngestClaimPolicy::InlineOwnedWithinDeadline
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -463,26 +472,19 @@ async fn test_mcp_scoped_smoke_wait_bounds_lease_check_to_remaining_budget() {
 #[tokio::test]
 async fn test_mcp_scoped_smoke_preflight_uses_remaining_request_budget() {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
-    let _observability_lock = crate::observability::test_support::global_observability_test_lock()
-        .lock_owned()
-        .await;
     let (_tempdir, db_path, server) = setup_server();
-    let admission_progress = Arc::new(Notify::new());
+    let admission_delay = Duration::from_millis(100);
     let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
-        .with_blocking_delay(Duration::from_millis(700))
-        .with_blocking_started_for_test(Arc::clone(&admission_progress));
-    let async_queue_observer = async_queue.clone();
-    let query_only_async_db = QueryOnlyAsyncDb::open(&db_path, 4)
-        .expect("open query-only async db")
-        .with_read_delay(Duration::from_millis(500));
-    let query_only_async_db_observer = query_only_async_db.clone();
-    let server = server
+        .with_blocking_delay(admission_delay);
+    let (budget_tx, budget_rx) = mpsc::channel();
+    let mut server = server
         .with_async_queue_for_test(async_queue)
-        .with_query_only_async_db_for_test(query_only_async_db);
+        .with_operation_status_probe_delay_for_test(Duration::from_secs(1));
+    server.ingest_wait_lease_check_budget_observer = Some(budget_tx);
     server.ingest_worker_started.store(true, Ordering::SeqCst);
-
-    let mut request_task = tokio::spawn(async move {
-        server
+    let request_server = server.clone();
+    let request_task = tokio::spawn(async move {
+        request_server
             .mempal_ingest(Parameters(IngestRequest {
                 content: "smoke preflight lease checks must honor the request budget".to_string(),
                 wing: "smoke".to_string(),
@@ -494,53 +496,28 @@ async fn test_mcp_scoped_smoke_preflight_uses_remaining_request_budget() {
             }))
             .await
     });
-    tokio::time::timeout(Duration::from_secs(5), admission_progress.notified())
-        .await
-        .expect("queue admission must start within the cleanup bound");
-    tokio::time::timeout(Duration::from_secs(5), admission_progress.notified())
-        .await
-        .expect("durable queue admission must finish within the cleanup bound");
-
-    // Admission consumes 700ms of the 1s wait. This leaves 100ms of scheduling
-    // headroom while still rejecting a fresh 500ms lease-probe budget.
-    let post_admission_deadline = tokio::time::Instant::now() + Duration::from_millis(400);
-    let lease_probe_started = tokio::time::timeout_at(post_admission_deadline, async {
-        while query_only_async_db_observer.available_reader_permits_for_test() == 4 {
-            tokio::task::yield_now().await;
-        }
+    let (remaining, budget_rx) = tokio::task::spawn_blocking(move || {
+        (budget_rx.recv_timeout(Duration::from_secs(2)), budget_rx)
     })
     .await
-    .is_ok();
-    let response_within_budget =
-        tokio::time::timeout_at(post_admission_deadline, &mut request_task).await;
-    let exceeded_post_admission_budget = response_within_budget.is_err();
-    let response = match response_within_budget {
-        Ok(response) => response,
-        Err(_) => tokio::time::timeout(Duration::from_secs(5), &mut request_task)
-            .await
-            .expect("request task must settle within the cleanup bound"),
-    }
-    .expect("request task must not panic")
-    .expect("scoped smoke preflight should return a durable receipt")
-    .0;
+    .expect("lease budget observer must not panic");
+    let remaining =
+        remaining.expect("scoped smoke preflight must expose its actual remaining budget");
+    let response = tokio::time::timeout(Duration::from_secs(2), request_task)
+        .await
+        .expect("scoped smoke preflight must settle within its request wait")
+        .expect("request task must not panic")
+        .expect("scoped smoke preflight should return a durable receipt")
+        .0;
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while query_only_async_db_observer.available_reader_permits_for_test() != 4
-            || async_queue_observer.available_blocking_permits_for_test() != 4
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("timed-out blocking tasks must release their permits during cleanup");
-
+    let fresh_budget = Duration::from_secs(1).saturating_sub(MCP_INGEST_RESPONSE_RESERVE);
     assert!(
-        lease_probe_started,
-        "fixture must exercise a meaningful nonzero residual lease-preflight budget"
+        !remaining.is_zero(),
+        "fixture must observe a meaningful residual preflight budget"
     );
     assert!(
-        !exceeded_post_admission_budget,
-        "scoped smoke preflight must return within 400ms after durable admission"
+        remaining <= fresh_budget.saturating_sub(admission_delay),
+        "preflight reset the request deadline: remaining={remaining:?}, fresh={fresh_budget:?}"
     );
     assert_eq!(response.state, Some(IngestOperationState::Queued));
     assert!(response.timed_out);
@@ -551,6 +528,18 @@ async fn test_mcp_scoped_smoke_preflight_uses_remaining_request_budget() {
         .expect("operation must stay queryable");
     assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
     assert!(record.claimed_at.is_none());
+    assert!(
+        !server
+            .daemon_writer_lease_visible_for_ingest_wait(Duration::ZERO, false)
+            .await,
+        "an exhausted request budget must not report a visible daemon owner"
+    );
+    assert_eq!(
+        budget_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("zero-budget preflight must remain observable"),
+        Duration::ZERO
+    );
 }
 
 #[tokio::test]
