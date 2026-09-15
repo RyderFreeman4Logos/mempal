@@ -7,7 +7,6 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,21 +19,7 @@ pub(super) const MAX_ADMISSION_STATE_BYTES: usize = 64 * 1024;
 const MAX_STAGED_STATE_CREATE_ATTEMPTS: u8 = 8;
 static STAGED_STATE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-pub(super) struct StateLock {
-    file: File,
-    #[cfg(target_os = "linux")]
-    _fork_guard: std::sync::RwLockReadGuard<'static, ()>,
-}
-
-impl Deref for StateLock {
-    type Target = File;
-
-    fn deref(&self) -> &Self::Target {
-        &self.file
-    }
-}
-
-pub(super) fn lock_state(path: &Path) -> Result<StateLock, DbAdmissionError> {
+pub(super) fn lock_state(path: &Path) -> Result<File, DbAdmissionError> {
     let started = std::time::Instant::now();
     let deadline = started
         .checked_add(super::db_admission::ADMISSION_LOCK_TIMEOUT)
@@ -46,9 +31,7 @@ fn lock_state_until(
     path: &Path,
     deadline: std::time::Instant,
     mut now: impl FnMut() -> std::time::Instant,
-) -> Result<StateLock, DbAdmissionError> {
-    #[cfg(target_os = "linux")]
-    let fork_guard = super::db_admission::admission_state_fork_guard(path, deadline)?;
+) -> Result<File, DbAdmissionError> {
     let file = open_sidecar(path, true, true)?;
     verify_sidecar_inode(path, &file)?;
     let busy = || DbAdmissionError::Busy {
@@ -62,13 +45,7 @@ fn lock_state_until(
         }
         match imp::try_lock_exclusive(&file) {
             Ok(true) if waited && now() >= deadline => return Err(busy()),
-            Ok(true) => {
-                return Ok(StateLock {
-                    file,
-                    #[cfg(target_os = "linux")]
-                    _fork_guard: fork_guard,
-                });
-            }
+            Ok(true) => return Ok(file),
             Ok(false) if now() < deadline => {
                 waited = true;
                 std::thread::sleep(

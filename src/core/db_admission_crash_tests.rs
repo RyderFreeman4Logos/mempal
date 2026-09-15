@@ -52,34 +52,22 @@ fn admission_crash_fixture() {
 }
 
 #[test]
-fn fork_waits_for_admission_state_unlock_before_starting_child() {
+fn fork_does_not_wait_for_unrelated_admission_state_lock() {
     let temp = tempfile::tempdir().expect("temp dir");
     let lock_path = temp.path().join(".palace.db.admission.lock");
     let state_lock = super::db_admission_state::lock_state(&lock_path)
         .expect("lock admission state before fork");
     let (gate, child_gate) = TestSetupGate::new().expect("create setup gate");
-    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
 
     std::thread::scope(|scope| {
         let worker = scope.spawn(move || {
             let mut spec = SpawnSpec::new("/bin/true").expect("absolute true executable");
             spec.setup_gate(child_gate);
-            started_tx.send(()).expect("report launch start");
             DeadlineChild::output(spec, Duration::from_secs(2))
         });
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("launch worker started");
-
-        let blocked = gate
-            .wait_ready(Instant::now() + Duration::from_millis(50))
-            .expect_err("child started while admission state remained locked");
-        assert_eq!(blocked.kind(), std::io::ErrorKind::TimedOut);
-
-        drop(state_lock);
         let ready_pid = gate
             .wait_ready(Instant::now() + Duration::from_secs(1))
-            .expect("child starts after admission state unlock");
+            .expect("unrelated admission lock must not delay child setup");
         gate.release().expect("release setup gate");
         let output = worker
             .join()
@@ -102,57 +90,7 @@ fn fork_waits_for_admission_state_unlock_before_starting_child() {
             Some(libc::ECHILD)
         );
     });
-}
-
-#[test]
-fn fork_fence_wait_honors_launch_deadline_without_starting_child() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let lock_path = temp.path().join(".palace.db.admission.lock");
-    let state_lock = super::db_admission_state::lock_state(&lock_path)
-        .expect("lock admission state before bounded launch");
-    let (gate, child_gate) = TestSetupGate::new().expect("create setup gate");
-    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
-    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
-
-    std::thread::scope(|scope| {
-        let worker = scope.spawn(move || {
-            let mut spec = SpawnSpec::new("/bin/true").expect("absolute true executable");
-            spec.setup_gate(child_gate);
-            started_tx.send(()).expect("report bounded launch start");
-            let started = Instant::now();
-            let result = DeadlineChild::output(spec, Duration::from_millis(100));
-            finished_tx
-                .send((started.elapsed(), result))
-                .expect("report bounded launch result");
-        });
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("bounded launch worker started");
-
-        let finished = finished_rx.recv_timeout(Duration::from_secs(1));
-        drop(state_lock);
-        worker.join().expect("bounded launch worker");
-        let (elapsed, result) = finished.expect(
-            "fork fence exceeded the existing launch deadline while admission state was locked",
-        );
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "bounded launch returned too slowly: {elapsed:?}"
-        );
-        let error = result.expect_err("expired fork fence must cancel before creating a child");
-        let SupervisionError::Io(error) = error else {
-            panic!("fork fence deadline returned the wrong error: {error:?}");
-        };
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        let gate_error = gate
-            .wait_ready(Instant::now() + Duration::from_millis(100))
-            .expect_err("deadline-expired launch unexpectedly created a child");
-        assert_eq!(gate_error.kind(), std::io::ErrorKind::UnexpectedEof);
-        drop(
-            super::db_admission_state::lock_state(&lock_path)
-                .expect("deadline cancellation released the fork fence"),
-        );
-    });
+    drop(state_lock);
 }
 
 #[test]

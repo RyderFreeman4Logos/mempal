@@ -237,12 +237,14 @@ pub(super) fn decode_setup_record(bytes: [u8; SETUP_RECORD_BYTES]) -> (SetupStag
     (SetupStage::from_wire(record.stage), record.errno)
 }
 
-pub(super) fn spawn_owned(spec: SpawnSpec, deadline: Instant) -> io::Result<RawSpawn> {
+pub(super) fn spawn_owned(spec: SpawnSpec) -> io::Result<RawSpawn> {
     let prepared = PreparedSpawn::new(spec)?;
-    // SAFETY: the helper suppresses child-side Rust lock destruction; the child branch then
-    // delegates directly to child_exec, which uses only async-signal-safe libc operations until
-    // execve or _exit. The parent retains `prepared`.
-    let pid = unsafe { mempal::core::db_admission::fork_test_process(deadline)? };
+    // SAFETY: the child branch immediately delegates to child_exec, which uses only
+    // async-signal-safe libc operations until execve or _exit. The parent retains `prepared`.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
     if pid == 0 {
         // SAFETY: this is the fork child and `prepared` remains valid in its copied address
         // space until child_exec replaces it with execve or terminates with _exit.

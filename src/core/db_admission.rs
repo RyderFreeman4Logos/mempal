@@ -12,7 +12,7 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -41,97 +41,6 @@ pub(super) const ADMISSION_LOCK_RETRY: Duration = Duration::from_millis(2);
 pub(super) const ADMISSION_RELEASE_MAX_ATTEMPTS: u8 = 3;
 pub(super) const ADMISSION_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(50);
 pub(super) const HOLDER_LEASE_VERSION: u8 = 1;
-#[cfg(target_os = "linux")]
-static TEST_PROCESS_FORK_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
-#[cfg(target_os = "linux")]
-pub(super) fn admission_state_fork_guard(
-    path: &Path,
-    deadline: Instant,
-) -> Result<std::sync::RwLockReadGuard<'static, ()>, DbAdmissionError> {
-    let mut waited = false;
-    let guard = loop {
-        match TEST_PROCESS_FORK_LOCK.try_read() {
-            Ok(guard) => break guard,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                waited = true;
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(DbAdmissionError::Busy {
-                        path: path.to_path_buf(),
-                        timeout_ms: ADMISSION_LOCK_TIMEOUT.as_millis() as u64,
-                    });
-                }
-                std::thread::sleep(ADMISSION_LOCK_RETRY.min(deadline.duration_since(now)));
-            }
-        }
-    };
-    if waited && Instant::now() >= deadline {
-        return Err(DbAdmissionError::Busy {
-            path: path.to_path_buf(),
-            timeout_ms: ADMISSION_LOCK_TIMEOUT.as_millis() as u64,
-        });
-    }
-    Ok(guard)
-}
-
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn test_process_fork_write_guard_for_test() -> std::sync::RwLockWriteGuard<'static, ()> {
-    TEST_PROCESS_FORK_LOCK
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Forks a test process without inheriting a live admission-state lock.
-///
-/// Waiting for the fork fence consumes the caller's existing launch deadline.
-///
-/// # Safety
-///
-/// The caller must obey `fork(2)` requirements in a multithreaded process.
-#[cfg(target_os = "linux")]
-#[doc(hidden)]
-pub unsafe fn fork_test_process(deadline: Instant) -> io::Result<libc::pid_t> {
-    let mut waited = false;
-    let guard = loop {
-        match TEST_PROCESS_FORK_LOCK.try_write() {
-            Ok(guard) => break guard,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                waited = true;
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "test process fork fence exceeded launch deadline",
-                    ));
-                }
-                std::thread::sleep(ADMISSION_LOCK_RETRY.min(deadline.duration_since(now)));
-            }
-        }
-    };
-    if waited && Instant::now() >= deadline {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "test process fork fence exceeded launch deadline",
-        ));
-    }
-    // SAFETY: the caller accepts the `fork(2)` contract.
-    let pid = unsafe { libc::fork() };
-    if pid == 0 {
-        // `forget` is a no-op that prevents child-side Rust lock drop/unlock before child_exec.
-        std::mem::forget(guard);
-        return Ok(pid);
-    }
-    let result = if pid < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(pid)
-    };
-    drop(guard);
-    result
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
