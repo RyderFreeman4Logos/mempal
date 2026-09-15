@@ -14,7 +14,6 @@ import errno
 import os
 import select
 import shlex
-import shutil
 import signal
 import stat
 import subprocess
@@ -556,6 +555,7 @@ class FixtureIdentity:
     ino: int
     uid: int
     mode: int
+    parent: tuple[int, int]
 
 
 def _parent_path(path: str) -> str:
@@ -572,7 +572,8 @@ def capture_fixture_identity(path: str) -> FixtureIdentity:
     parent_st = os.lstat(_parent_path(path))
     if st.st_dev != parent_st.st_dev:
         raise OSError("fixture root is a mount point")
-    return FixtureIdentity(path, st.st_dev, st.st_ino, st.st_uid, stat.S_IMODE(st.st_mode))
+    return FixtureIdentity(path, st.st_dev, st.st_ino, st.st_uid, stat.S_IMODE(st.st_mode),
+                           (parent_st.st_dev, parent_st.st_ino))
 
 
 def fixture_identity_matches(path: str, expected: FixtureIdentity) -> bool:
@@ -590,21 +591,81 @@ def fixture_identity_matches(path: str, expected: FixtureIdentity) -> bool:
         and st.st_dev == expected.dev
         and st.st_ino == expected.ino
         and st.st_uid == expected.uid
-        and st.st_dev == parent_st.st_dev
+        and (parent_st.st_dev, parent_st.st_ino) == expected.parent
     )
 
 
-def fixture_tree_stays_on_device(path: str, dev: int) -> bool:
-    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+def _entry_identity(st: os.stat_result) -> tuple[int, int, int, int]:
+    return st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode), st.st_nlink
+
+TreeSnapshot = dict[tuple[str, ...], dict[str, tuple[int, int, int, int]]]
+
+def fixture_tree_stays_on_device(root_fd: int, dev: int) -> TreeSnapshot | None:
+    snapshot: TreeSnapshot = {}
+
+    def capture(directory_fd: int, relative: tuple[str, ...]) -> bool:
+        children: dict[str, tuple[int, int, int, int]] = {}
+        snapshot[relative] = children
         try:
-            if os.lstat(dirpath).st_dev != dev:
-                return False
-            for name in dirnames + filenames:
-                if os.lstat(os.path.join(dirpath, name)).st_dev != dev:
-                    return False
+            names = os.listdir(directory_fd)
         except OSError:
             return False
-    return True
+        for name in names:
+            try:
+                st = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if st.st_dev != dev:
+                    return False
+                children[name] = _entry_identity(st)
+                if stat.S_ISDIR(st.st_mode):
+                    child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW |
+                                       os.O_CLOEXEC, dir_fd=directory_fd)
+                    try:
+                        same = _entry_identity(os.fstat(child_fd)) == children[name]
+                        if not same or not capture(child_fd, relative + (name,)):
+                            return False
+                    finally:
+                        os.close(child_fd)
+            except OSError:
+                return False
+        return True
+
+    return snapshot if capture(root_fd, ()) else None
+
+
+def _remove_snapshot(directory_fd: int, relative: tuple[str, ...], snapshot: TreeSnapshot) -> None:
+    expected = snapshot[relative]
+    names = os.listdir(directory_fd)
+    if set(names) != set(expected):
+        raise OSError(errno.EBUSY, "fixture tree entries changed during cleanup")
+    for name in sorted(names):
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if _entry_identity(current) != expected[name]:
+            raise OSError(errno.EBUSY, "fixture tree entry identity changed during cleanup")
+        if stat.S_ISDIR(current.st_mode):
+            child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW |
+                               os.O_CLOEXEC, dir_fd=directory_fd)
+            try:
+                if _entry_identity(os.fstat(child_fd)) != expected[name]:
+                    raise OSError(errno.EBUSY, "fixture directory changed while opening")
+                _remove_snapshot(child_fd, relative + (name,), snapshot)
+                if _entry_identity(
+                    os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                ) != _entry_identity(os.fstat(child_fd)):
+                    raise OSError(errno.EBUSY, "fixture directory changed before removal")
+                os.rmdir(name, dir_fd=directory_fd)
+            finally:
+                os.close(child_fd)
+        else:
+            leaf_fd = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+                              dir_fd=directory_fd)
+            try:
+                if _entry_identity(os.fstat(leaf_fd)) != expected[name]:
+                    raise OSError(errno.EBUSY, "fixture entry changed while opening")
+                os.unlink(name, dir_fd=directory_fd)
+                if os.fstat(leaf_fd).st_nlink != expected[name][3] - 1:
+                    raise OSError(errno.EBUSY, "fixture entry changed before removal")
+            finally:
+                os.close(leaf_fd)
 
 
 def allocate_fixture_root() -> FixtureIdentity:
@@ -624,17 +685,51 @@ def allocate_fixture_root() -> FixtureIdentity:
 
 
 def remove_owned_root(identity: FixtureIdentity) -> bool:
-    if not fixture_identity_matches(identity.path, identity):
-        print(f"fixture root identity changed or uncertain: {identity.path}", file=sys.stderr)
-        return False
-    if not fixture_tree_stays_on_device(identity.path, identity.dev):
-        print(f"fixture root contains a mount or unreadable entry: {identity.path}", file=sys.stderr)
-        return False
+    parent_fd = root_fd = None
     try:
-        shutil.rmtree(identity.path)
+        parent_fd = os.open(
+            _parent_path(identity.path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        parent_st = os.fstat(parent_fd)
+        if (parent_st.st_dev, parent_st.st_ino) != identity.parent:
+            raise OSError(errno.EBUSY, "fixture parent identity changed")
+        name = os.path.basename(identity.path.rstrip("/"))
+        root_fd = os.open(
+            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+        root_st = os.fstat(root_fd)
+        if (
+            root_st.st_dev,
+            root_st.st_ino,
+            root_st.st_uid,
+            stat.S_IMODE(root_st.st_mode),
+        ) != (identity.dev, identity.ino, identity.uid, identity.mode):
+            raise OSError(errno.EBUSY, "fixture root identity changed")
+        snapshot = fixture_tree_stays_on_device(root_fd, identity.dev)
+        if snapshot is None:
+            raise OSError(errno.EBUSY, "fixture root contains a mount or unreadable entry")
+        if not fixture_identity_matches(identity.path, identity):
+            raise OSError(errno.EBUSY, "fixture root identity changed before removal")
+        _remove_snapshot(root_fd, (), snapshot)
+        if _entry_identity(
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        ) != _entry_identity(os.fstat(root_fd)):
+            raise OSError(errno.EBUSY, "fixture root identity changed before removal")
+        os.rmdir(name, dir_fd=parent_fd)
+        # Linux cannot rmdir an opened directory by fd. A final exchange can
+        # only remove an empty substitute; this link check proves the owned
+        # inode, rather than a populated replacement, was removed.
+        if os.fstat(root_fd).st_nlink != 0:
+            raise OSError(errno.EBUSY, "fixture root changed during final removal")
     except OSError as error:
         print(f"failed to remove fixture root {identity.path}: {error}", file=sys.stderr)
         return False
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
     if os.path.lexists(identity.path):
         print(f"fixture root still present: {identity.path}", file=sys.stderr)
         return False

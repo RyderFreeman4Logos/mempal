@@ -240,3 +240,83 @@ fn cargo_test_wrapper_owns_and_cleans_real_fixture_root() {
         );
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cargo_test_wrapper_preserves_exchanged_fixture_trees() {
+    let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
+    let harness = r#"
+import importlib.util
+import os
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("timeout_wrapper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+def populated(path, marker):
+    os.mkdir(path, 0o700)
+    with open(os.path.join(path, marker), "w", encoding="utf-8") as handle:
+        handle.write(marker)
+
+def run_case(exchange_descendant):
+    with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as base:
+        root = os.path.join(base, "owned")
+        held = os.path.join(base, "held")
+        victim = os.path.join(base, "victim")
+        populated(root, "owned-content")
+        if exchange_descendant:
+            os.mkdir(os.path.join(root, "child"), 0o700)
+            with open(os.path.join(root, "child", "owned-child"), "w", encoding="utf-8") as handle:
+                handle.write("owned")
+        populated(victim, "victim-content")
+        identity = module.capture_fixture_identity(root)
+        real_check = module.fixture_tree_stays_on_device
+        exchanged = False
+
+        def check_then_exchange(path, dev):
+            nonlocal exchanged
+            result = real_check(path, dev)
+            if exchange_descendant:
+                os.rename(os.path.join(root, "child"), held)
+                os.rename(victim, os.path.join(root, "child"))
+            else:
+                os.rename(root, held)
+                os.rename(victim, root)
+            exchanged = True
+            return result
+
+        module.fixture_tree_stays_on_device = check_then_exchange
+        try:
+            removed = module.remove_owned_root(identity)
+        finally:
+            module.fixture_tree_stays_on_device = real_check
+
+        substitute = os.path.join(root, "child") if exchange_descendant else root
+        return (
+            exchanged,
+            not removed,
+            os.path.exists(os.path.join(substitute, "victim-content")),
+            os.path.exists(held),
+        )
+
+results = [run_case(False), run_case(True)]
+assert all(all(checks) for checks in results), results
+"#;
+    let output = Command::new("python3")
+        .args(["-c", harness])
+        .arg(script)
+        .env("TMPDIR", std::env::temp_dir())
+        .env("TMP", std::env::temp_dir())
+        .env("TEMP", std::env::temp_dir())
+        .output()
+        .expect("run fixture exchange harness");
+    assert!(
+        output.status.success(),
+        "fixture exchange harness failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
