@@ -45,10 +45,35 @@ pub(super) const HOLDER_LEASE_VERSION: u8 = 1;
 static TEST_PROCESS_FORK_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 #[cfg(target_os = "linux")]
-pub(super) fn admission_state_fork_guard() -> std::sync::RwLockReadGuard<'static, ()> {
-    TEST_PROCESS_FORK_LOCK
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+pub(super) fn admission_state_fork_guard(
+    path: &Path,
+    deadline: Instant,
+) -> Result<std::sync::RwLockReadGuard<'static, ()>, DbAdmissionError> {
+    let mut waited = false;
+    let guard = loop {
+        match TEST_PROCESS_FORK_LOCK.try_read() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                waited = true;
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(DbAdmissionError::Busy {
+                        path: path.to_path_buf(),
+                        timeout_ms: ADMISSION_LOCK_TIMEOUT.as_millis() as u64,
+                    });
+                }
+                std::thread::sleep(ADMISSION_LOCK_RETRY.min(deadline.duration_since(now)));
+            }
+        }
+    };
+    if waited && Instant::now() >= deadline {
+        return Err(DbAdmissionError::Busy {
+            path: path.to_path_buf(),
+            timeout_ms: ADMISSION_LOCK_TIMEOUT.as_millis() as u64,
+        });
+    }
+    Ok(guard)
 }
 
 #[cfg(all(test, target_os = "linux"))]

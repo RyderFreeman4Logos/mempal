@@ -3,6 +3,7 @@ use std::time::Instant;
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_mcp_ingest_admission_db_work_runs_off_runtime() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, _db_path, server) = setup_server();
     let server = server.with_ingest_warning_snapshot_delay_for_test(Duration::from_millis(300));
     let (ticks, ticker) = spawn_runtime_ticker();
@@ -93,7 +94,7 @@ async fn test_mcp_ingest_admission_warning_uses_request_budget_and_returns_recei
 
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "current_thread")]
-async fn fork_fence_contention_consumes_actual_ingest_client_budget() {
+async fn fork_fence_contention_refuses_ingest_within_admission_budget() {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, _db_path, server) = setup_server();
     let (stage_tx, stage_rx) = mpsc::channel();
@@ -117,7 +118,7 @@ async fn fork_fence_contention_consumes_actual_ingest_client_budget() {
     let request = tokio::time::timeout(
         Duration::from_secs(1),
         server.mempal_ingest(Parameters(IngestRequest {
-            content: "fork fence causal control".to_string(),
+            content: "fork fence bounded refusal".to_string(),
             wing: "mcp".to_string(),
             room: Some("deadline".to_string()),
             dry_run: Some(false),
@@ -137,14 +138,40 @@ async fn fork_fence_contention_consumes_actual_ingest_client_budget() {
     fence.join().expect("fork fence holder");
     drop(crate::core::db_admission::test_process_fork_write_guard_for_test());
 
-    eprintln!(
-        "fork_fence_causal_measurement client_elapsed_ms={} stages={blocked_stages:?}",
-        elapsed.as_millis()
-    );
+    let error = match request_result
+        .expect("fork-fence admission must finish before the 1s client watchdog")
+    {
+        Ok(_) => panic!("held fork fence admitted ingest before SQLite opened"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
     assert!(
-        request_result.is_err(),
-        "the branch-added fork fence can consume the unchanged 1s client budget"
+        error
+            .message
+            .contains("write admission was not confirmed (locked_or_busy)"),
+        "unexpected admission error: {error:?}"
     );
+    let data = error.data.expect("typed admission refusal data");
+    assert_eq!(data["reason"], "database_locked");
+    assert_eq!(data["action"], "retry_after_transient_lock");
     assert_eq!(blocked_stages, vec![IngestAdmissionStage::PoolOpenEnter]);
-    assert!(elapsed >= Duration::from_secs(1));
+    assert!(elapsed < Duration::from_millis(500), "elapsed: {elapsed:?}");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        server.mempal_ingest(Parameters(IngestRequest {
+            content: "fork fence immediate release control".to_string(),
+            wing: "mcp".to_string(),
+            room: Some("deadline".to_string()),
+            dry_run: Some(false),
+            wait: Some(false),
+            ..IngestRequest::default()
+        })),
+    )
+    .await
+    .expect("released fork fence must not exhaust the client watchdog")
+    .expect("released fork fence must admit ingest")
+    .0;
+    assert_eq!(result.state, Some(IngestOperationState::Queued));
+    assert!(result.operation_id.is_some());
 }

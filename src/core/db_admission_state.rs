@@ -35,11 +35,14 @@ impl Deref for StateLock {
 }
 
 pub(super) fn lock_state(path: &Path) -> Result<StateLock, DbAdmissionError> {
+    let started = std::time::Instant::now();
+    let deadline = started
+        .checked_add(super::db_admission::ADMISSION_LOCK_TIMEOUT)
+        .unwrap_or(started);
     #[cfg(target_os = "linux")]
-    let fork_guard = super::db_admission::admission_state_fork_guard();
+    let fork_guard = super::db_admission::admission_state_fork_guard(path, deadline)?;
     let file = open_sidecar(path, true, true)?;
     verify_sidecar_inode(path, &file)?;
-    let started = std::time::Instant::now();
     loop {
         match imp::try_lock_exclusive(&file) {
             Ok(true) => {
@@ -49,8 +52,11 @@ pub(super) fn lock_state(path: &Path) -> Result<StateLock, DbAdmissionError> {
                     _fork_guard: fork_guard,
                 });
             }
-            Ok(false) if started.elapsed() < super::db_admission::ADMISSION_LOCK_TIMEOUT => {
-                std::thread::sleep(super::db_admission::ADMISSION_LOCK_RETRY);
+            Ok(false) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(
+                    super::db_admission::ADMISSION_LOCK_RETRY
+                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
             }
             Ok(false) => {
                 return Err(DbAdmissionError::Busy {

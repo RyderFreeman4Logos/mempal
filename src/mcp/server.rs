@@ -3665,6 +3665,13 @@ impl MempalMcpServer {
                 });
                 Ok(warnings)
             }
+            Err(error) if anyhow_chain_has_transient_admission(&error) => {
+                Err(database_write_refused_error(
+                    &self.db_path,
+                    "stale vector index check",
+                    error.as_ref(),
+                ))
+            }
             Err(error) => Ok(database_warning_snapshot(
                 current_system_warnings(),
                 &self.db_path,
