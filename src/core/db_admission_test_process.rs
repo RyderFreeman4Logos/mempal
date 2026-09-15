@@ -366,7 +366,7 @@ impl DeadlineChild {
     pub fn spawn(spec: SpawnSpec, timeout: Duration) -> Result<Self, SupervisionError> {
         let deadline = deadline_after(timeout);
         let setup_deadline = work_deadline(deadline, timeout);
-        let mut child = Self::launch(spec)?;
+        let mut child = Self::launch(spec, deadline)?;
         match child.wait_for_setup(setup_deadline)? {
             SetupWait::Ready => Ok(child),
             SetupWait::Failed { stage, errno } => {
@@ -409,7 +409,7 @@ impl DeadlineChild {
     pub fn output(spec: SpawnSpec, timeout: Duration) -> Result<DeadlineOutput, SupervisionError> {
         let deadline = deadline_after(timeout);
         let collection_deadline = work_deadline(deadline, timeout);
-        let mut child = Self::launch(spec)?;
+        let mut child = Self::launch(spec, deadline)?;
         let setup = child.wait_for_setup(collection_deadline)?;
         if let SetupWait::Failed { stage, errno } = setup {
             return match child.cleanup_until(deadline, CleanupMode::Kill) {
@@ -459,8 +459,8 @@ impl DeadlineChild {
         }
     }
 
-    fn launch(spec: SpawnSpec) -> Result<Self, SupervisionError> {
-        let raw = spawn_owned(spec)?;
+    fn launch(spec: SpawnSpec, deadline: Instant) -> Result<Self, SupervisionError> {
+        let raw = spawn_owned(spec, deadline)?;
         Ok(Self::from_raw(raw))
     }
 

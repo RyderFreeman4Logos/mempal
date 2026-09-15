@@ -7,6 +7,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,20 +22,15 @@ static STAGED_STATE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub(super) struct StateLock {
     file: File,
-    #[cfg(unix)]
-    creator_pid: libc::pid_t,
+    #[cfg(target_os = "linux")]
+    _fork_guard: std::sync::RwLockReadGuard<'static, ()>,
 }
 
-impl Drop for StateLock {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        // SAFETY: both calls operate on process-local scalar values and the live descriptor
-        // owned by this guard. A fork child must close, never unlock, the parent's shared OFD.
-        unsafe {
-            if libc::getpid() == self.creator_pid {
-                let _ = libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN);
-            }
-        }
+impl Deref for StateLock {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
     }
 }
 
@@ -51,6 +47,8 @@ fn lock_state_until(
     deadline: std::time::Instant,
     mut now: impl FnMut() -> std::time::Instant,
 ) -> Result<StateLock, DbAdmissionError> {
+    #[cfg(target_os = "linux")]
+    let fork_guard = super::db_admission::admission_state_fork_guard(path, deadline)?;
     let file = open_sidecar(path, true, true)?;
     verify_sidecar_inode(path, &file)?;
     let busy = || DbAdmissionError::Busy {
@@ -67,9 +65,8 @@ fn lock_state_until(
             Ok(true) => {
                 return Ok(StateLock {
                     file,
-                    #[cfg(unix)]
-                    // SAFETY: getpid has no pointer arguments and is async-signal-safe.
-                    creator_pid: unsafe { libc::getpid() },
+                    #[cfg(target_os = "linux")]
+                    _fork_guard: fork_guard,
                 });
             }
             Ok(false) if now() < deadline => {

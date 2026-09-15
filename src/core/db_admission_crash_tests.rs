@@ -1,5 +1,4 @@
 use std::fs::OpenOptions;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -18,15 +17,10 @@ use super::db_admission_test_process::{
 
 const FIXTURE_CASE_ENV: &str = "MEMPAL_DB_ADMISSION_FIXTURE_CASE";
 const FIXTURE_DATABASE_ENV: &str = "MEMPAL_DB_ADMISSION_FIXTURE_DATABASE";
-const PRE_CLOSE_PARENT_CRASH_LOCK_ENV: &str = "MEMPAL_PRE_CLOSE_PARENT_CRASH_LOCK";
 const FIXTURE_TEST: &str = "core::db_admission_crash_tests::admission_crash_fixture";
-const PARENT_CRASH_EXIT_CODE: i32 = 86;
 
 #[test]
 fn admission_crash_fixture() {
-    if let Some(lock_path) = std::env::var_os(PRE_CLOSE_PARENT_CRASH_LOCK_ENV) {
-        run_pre_close_parent_crash_fixture(PathBuf::from(lock_path));
-    }
     let Some(case) = std::env::var_os(FIXTURE_CASE_ENV) else {
         return;
     };
@@ -58,22 +52,34 @@ fn admission_crash_fixture() {
 }
 
 #[test]
-fn fork_does_not_wait_for_unrelated_admission_state_lock() {
+fn fork_waits_for_admission_state_unlock_before_starting_child() {
     let temp = tempfile::tempdir().expect("temp dir");
     let lock_path = temp.path().join(".palace.db.admission.lock");
     let state_lock = super::db_admission_state::lock_state(&lock_path)
         .expect("lock admission state before fork");
     let (gate, child_gate) = TestSetupGate::new().expect("create setup gate");
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
 
     std::thread::scope(|scope| {
         let worker = scope.spawn(move || {
             let mut spec = SpawnSpec::new("/bin/true").expect("absolute true executable");
             spec.setup_gate(child_gate);
+            started_tx.send(()).expect("report launch start");
             DeadlineChild::output(spec, Duration::from_secs(2))
         });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("launch worker started");
+
+        let blocked = gate
+            .wait_ready(Instant::now() + Duration::from_millis(50))
+            .expect_err("child started while admission state remained locked");
+        assert_eq!(blocked.kind(), std::io::ErrorKind::TimedOut);
+
+        drop(state_lock);
         let ready_pid = gate
             .wait_ready(Instant::now() + Duration::from_secs(1))
-            .expect("unrelated admission lock must not delay child setup");
+            .expect("child starts after admission state unlock");
         gate.release().expect("release setup gate");
         let output = worker
             .join()
@@ -96,113 +102,57 @@ fn fork_does_not_wait_for_unrelated_admission_state_lock() {
             Some(libc::ECHILD)
         );
     });
-    drop(state_lock);
 }
 
 #[test]
-fn released_state_lock_does_not_remain_held_by_pre_close_child() {
+fn fork_fence_wait_honors_launch_deadline_without_starting_child() {
     let temp = tempfile::tempdir().expect("temp dir");
     let lock_path = temp.path().join(".palace.db.admission.lock");
     let state_lock = super::db_admission_state::lock_state(&lock_path)
-        .expect("lock admission state before fork");
-    let (gate, child_gate) = TestSetupGate::new().expect("create pre-close gate");
+        .expect("lock admission state before bounded launch");
+    let (gate, child_gate) = TestSetupGate::new().expect("create setup gate");
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
 
     std::thread::scope(|scope| {
-        let worker = scope.spawn(|| {
+        let worker = scope.spawn(move || {
             let mut spec = SpawnSpec::new("/bin/true").expect("absolute true executable");
-            spec.pre_close_gate(child_gate);
-            DeadlineChild::output(spec, Duration::from_secs(2))
+            spec.setup_gate(child_gate);
+            started_tx.send(()).expect("report bounded launch start");
+            let started = Instant::now();
+            let result = DeadlineChild::output(spec, Duration::from_millis(100));
+            finished_tx
+                .send((started.elapsed(), result))
+                .expect("report bounded launch result");
         });
-        gate.wait_ready(Instant::now() + Duration::from_millis(500))
-            .expect("child stopped before inherited descriptors close");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("bounded launch worker started");
 
+        let finished = finished_rx.recv_timeout(Duration::from_secs(1));
         drop(state_lock);
+        worker.join().expect("bounded launch worker");
+        let (elapsed, result) = finished.expect(
+            "fork fence exceeded the existing launch deadline while admission state was locked",
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "bounded launch returned too slowly: {elapsed:?}"
+        );
+        let error = result.expect_err("expired fork fence must cancel before creating a child");
+        let SupervisionError::Io(error) = error else {
+            panic!("fork fence deadline returned the wrong error: {error:?}");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let gate_error = gate
+            .wait_ready(Instant::now() + Duration::from_millis(100))
+            .expect_err("deadline-expired launch unexpectedly created a child");
+        assert_eq!(gate_error.kind(), std::io::ErrorKind::UnexpectedEof);
         drop(
             super::db_admission_state::lock_state(&lock_path)
-                .expect("released state lock must be acquirable while child remains stopped"),
+                .expect("deadline cancellation released the fork fence"),
         );
-
-        gate.release().expect("release pre-close child");
-        let output = worker
-            .join()
-            .expect("launch worker")
-            .expect("released child output");
-        assert!(output.success());
-        assert!(!output.timed_out);
-        assert!(output.cleanup.errors.is_empty(), "{:#?}", output.cleanup);
     });
-}
-
-#[test]
-fn raw_close_negative_control_retains_lock_until_pre_close_child_exits() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let lock_path = temp.path().join(".palace.db.admission.lock");
-    let raw_lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-        .expect("open raw lock");
-    // SAFETY: raw_lock owns this descriptor until it is dropped below.
-    assert_eq!(
-        unsafe { libc::flock(raw_lock.as_raw_fd(), libc::LOCK_EX) },
-        0
-    );
-    let (gate, child_gate) = TestSetupGate::new().expect("create pre-close gate");
-
-    std::thread::scope(|scope| {
-        let worker = scope.spawn(|| {
-            let mut spec = SpawnSpec::new("/bin/true").expect("absolute true executable");
-            spec.pre_close_gate(child_gate);
-            DeadlineChild::output(spec, Duration::from_secs(2))
-        });
-        gate.wait_ready(Instant::now() + Duration::from_millis(500))
-            .expect("child stopped before inherited descriptors close");
-
-        drop(raw_lock);
-        assert!(matches!(
-            super::db_admission_state::lock_state(&lock_path),
-            Err(DbAdmissionError::Busy {
-                timeout_ms: 250,
-                ..
-            })
-        ));
-
-        gate.release().expect("release pre-close child");
-        let output = worker
-            .join()
-            .expect("launch worker")
-            .expect("released child output");
-        assert!(output.success());
-        assert!(!output.timed_out);
-        assert!(output.cleanup.errors.is_empty(), "{:#?}", output.cleanup);
-    });
-
-    drop(
-        super::db_admission_state::lock_state(&lock_path)
-            .expect("child exit releases the inherited raw lock descriptor"),
-    );
-}
-
-#[test]
-fn parent_crash_releases_inherited_pre_close_state_lock() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let lock_path = temp.path().join(".palace.db.admission.lock");
-    let executable = std::env::current_exe().expect("current unit-test executable");
-    let mut spec = SpawnSpec::new(executable).expect("absolute unit-test executable");
-    spec.args(["--exact", FIXTURE_TEST, "--nocapture", "--test-threads=1"])
-        .env(PRE_CLOSE_PARENT_CRASH_LOCK_ENV, lock_path.as_os_str());
-
-    let output = DeadlineChild::output(spec, Duration::from_secs(6))
-        .expect("run pre-close parent-crash fixture");
-    assert_eq!(output.status.code(), Some(PARENT_CRASH_EXIT_CODE));
-    assert!(!output.timed_out);
-    assert!(output.cleanup.kill_fence_sent);
-    assert!(output.cleanup.errors.is_empty(), "{:#?}", output.cleanup);
-    drop(
-        super::db_admission_state::lock_state(&lock_path)
-            .expect("owned cleanup releases the crashed parent's inherited lock"),
-    );
 }
 
 #[test]
@@ -353,23 +303,6 @@ fn release_surfaces_one_time_unlink_failure_then_a_real_retry_removes_orphan() {
     assert!(lease_paths(&paths).is_empty());
     drop(admission);
     assert_capacity_reusable(&database);
-}
-
-fn run_pre_close_parent_crash_fixture(lock_path: PathBuf) -> ! {
-    let _state_lock = super::db_admission_state::lock_state(&lock_path)
-        .expect("lock admission state before parent crash");
-    let (gate, child_gate) = TestSetupGate::new().expect("create pre-close gate");
-    let _worker = std::thread::spawn(move || {
-        let mut spec = SpawnSpec::new("/bin/true").expect("absolute true executable");
-        spec.pre_close_gate(child_gate);
-        DeadlineChild::output(spec, Duration::from_secs(6))
-    });
-    gate.wait_ready(Instant::now() + Duration::from_millis(500))
-        .expect("child stopped before parent crash");
-
-    // SAFETY: the fixture intentionally models an uncatchable owner crash without running
-    // StateLock::drop; the outer DeadlineChild owns bounded cleanup of this process group.
-    unsafe { libc::_exit(PARENT_CRASH_EXIT_CODE) }
 }
 
 fn assert_crashes_at(database: &Path, point: CrashPoint) {
