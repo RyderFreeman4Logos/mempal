@@ -41,6 +41,30 @@ pub(super) const ADMISSION_LOCK_RETRY: Duration = Duration::from_millis(2);
 pub(super) const ADMISSION_RELEASE_MAX_ATTEMPTS: u8 = 3;
 pub(super) const ADMISSION_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(50);
 pub(super) const HOLDER_LEASE_VERSION: u8 = 1;
+#[cfg(target_os = "linux")]
+static TEST_PROCESS_FORK_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[cfg(target_os = "linux")]
+pub(super) fn admission_state_fork_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+    TEST_PROCESS_FORK_LOCK
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Forks a test process without inheriting a live admission-state lock.
+///
+/// # Safety
+///
+/// The caller must obey `fork(2)` requirements in a multithreaded process.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub unsafe fn fork_test_process() -> libc::pid_t {
+    let _guard = TEST_PROCESS_FORK_LOCK
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // SAFETY: the caller accepts the `fork(2)` contract.
+    unsafe { libc::fork() }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -241,7 +241,7 @@ pub(super) fn spawn_owned(spec: SpawnSpec) -> io::Result<RawSpawn> {
     let prepared = PreparedSpawn::new(spec)?;
     // SAFETY: the child branch immediately delegates to child_exec, whose post-fork path uses
     // only async-signal-safe libc operations until execve or _exit; the parent retains `prepared`.
-    let pid = unsafe { libc::fork() };
+    let pid = unsafe { mempal::core::db_admission::fork_test_process() };
     if pid < 0 {
         return Err(io::Error::last_os_error());
     }
