@@ -13,6 +13,8 @@ mod db_admission_crash_tests;
 mod db_admission_diagnostics;
 #[cfg(test)]
 mod db_admission_fault_injection;
+#[cfg(target_os = "linux")]
+mod db_admission_fork_intent;
 mod db_admission_lease;
 mod db_admission_paths;
 mod db_admission_release;

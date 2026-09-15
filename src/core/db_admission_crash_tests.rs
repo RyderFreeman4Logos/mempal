@@ -17,10 +17,15 @@ use super::db_admission_test_process::{
 
 const FIXTURE_CASE_ENV: &str = "MEMPAL_DB_ADMISSION_FIXTURE_CASE";
 const FIXTURE_DATABASE_ENV: &str = "MEMPAL_DB_ADMISSION_FIXTURE_DATABASE";
+const FORK_BARGING_FIXTURE_ENV: &str = "MEMPAL_FORK_BARGING_FIXTURE";
 const FIXTURE_TEST: &str = "core::db_admission_crash_tests::admission_crash_fixture";
 
 #[test]
 fn admission_crash_fixture() {
+    if std::env::var_os(FORK_BARGING_FIXTURE_ENV).is_some() {
+        run_fork_barging_fixture();
+        return;
+    }
     let Some(case) = std::env::var_os(FIXTURE_CASE_ENV) else {
         return;
     };
@@ -49,6 +54,77 @@ fn admission_crash_fixture() {
         }
     }
     panic!("configured crash point {point:?} was not reached");
+}
+
+#[test]
+fn waiting_fork_writer_blocks_new_admission_readers() {
+    let executable = std::env::current_exe().expect("current unit-test executable");
+    let mut spec = SpawnSpec::new(executable).expect("absolute unit-test executable");
+    spec.args(["--exact", FIXTURE_TEST, "--nocapture", "--test-threads=1"])
+        .env(FORK_BARGING_FIXTURE_ENV, "1");
+
+    let output = DeadlineChild::output(spec, Duration::from_secs(5))
+        .expect("run isolated fork-barging fixture");
+    assert!(
+        output.success(),
+        "fork-barging fixture failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn run_fork_barging_fixture() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let first = super::db_admission_state::lock_state(&temp.path().join("first.lock"))
+        .expect("acquire first admission reader");
+    let (waiting_tx, waiting_rx) = std::sync::mpsc::sync_channel(1);
+    super::db_admission::test_signal_next_process_fork_wait(waiting_tx);
+
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let spec = SpawnSpec::new("/bin/true").expect("absolute true executable");
+            DeadlineChild::output(spec, Duration::from_secs(2))
+        });
+        waiting_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("fork writer did not report waiting behind the first reader");
+
+        let late_reader_started = Instant::now();
+        let late_reader =
+            super::db_admission_state::lock_state(&temp.path().join("late-reader.lock"));
+        let late_reader_elapsed = late_reader_started.elapsed();
+        let late_reader_error = match late_reader {
+            Ok(lock) => {
+                drop(lock);
+                None
+            }
+            Err(error) => Some(error),
+        };
+        drop(first);
+
+        let output = writer
+            .join()
+            .expect("fork writer thread")
+            .expect("fork writer output");
+        assert!(
+            output.success(),
+            "waiting fork writer did not make progress"
+        );
+        assert!(
+            late_reader_elapsed < Duration::from_secs(1),
+            "late reader exceeded its 250ms admission budget: {late_reader_elapsed:?}"
+        );
+        assert!(
+            matches!(
+                late_reader_error,
+                Some(DbAdmissionError::Busy {
+                    timeout_ms: 250,
+                    ..
+                })
+            ),
+            "a new admission reader barged while a fork writer was waiting"
+        );
+    });
 }
 
 #[test]

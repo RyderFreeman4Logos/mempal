@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use super::db_admission_budget as budget;
 #[cfg(test)]
 use super::db_admission_fault_injection::{self as fault_injection, CrashPoint};
+#[cfg(target_os = "linux")]
+use super::db_admission_fork_intent::{PendingForkWriter, pending as fork_writer_pending};
 use super::db_admission_lease::{
     HolderLiveness, create_holder_lease, holder_lease_liveness, remove_holder_lease,
     sweep_unreferenced_holder_leases,
@@ -44,6 +46,17 @@ pub(super) const HOLDER_LEASE_VERSION: u8 = 1;
 #[cfg(target_os = "linux")]
 static TEST_PROCESS_FORK_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+#[cfg(all(test, target_os = "linux"))]
+static TEST_PROCESS_FORK_WAIT_SIGNAL: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn test_signal_next_process_fork_wait(sender: std::sync::mpsc::SyncSender<()>) {
+    *TEST_PROCESS_FORK_WAIT_SIGNAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
+}
+
 #[cfg(target_os = "linux")]
 pub(super) fn admission_state_fork_guard(
     path: &Path,
@@ -51,21 +64,29 @@ pub(super) fn admission_state_fork_guard(
 ) -> Result<std::sync::RwLockReadGuard<'static, ()>, DbAdmissionError> {
     let mut waited = false;
     let guard = loop {
-        match TEST_PROCESS_FORK_LOCK.try_read() {
-            Ok(guard) => break guard,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                waited = true;
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(DbAdmissionError::Busy {
-                        path: path.to_path_buf(),
-                        timeout_ms: ADMISSION_LOCK_TIMEOUT.as_millis() as u64,
-                    });
-                }
-                std::thread::sleep(ADMISSION_LOCK_RETRY.min(deadline.duration_since(now)));
+        let guard = if !fork_writer_pending() {
+            match TEST_PROCESS_FORK_LOCK.try_read() {
+                Ok(guard) => Some(guard),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            }
+        } else {
+            None
+        };
+        if let Some(guard) = guard {
+            if !fork_writer_pending() {
+                break guard;
             }
         }
+        waited = true;
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(DbAdmissionError::Busy {
+                path: path.to_path_buf(),
+                timeout_ms: ADMISSION_LOCK_TIMEOUT.as_millis() as u64,
+            });
+        }
+        std::thread::sleep(ADMISSION_LOCK_RETRY.min(deadline.duration_since(now)));
     };
     if waited && Instant::now() >= deadline {
         return Err(DbAdmissionError::Busy {
@@ -93,12 +114,21 @@ pub(crate) fn test_process_fork_write_guard_for_test() -> std::sync::RwLockWrite
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub unsafe fn fork_test_process(deadline: Instant) -> io::Result<libc::pid_t> {
+    let pending_writer = PendingForkWriter::register()?;
     let mut waited = false;
     let guard = loop {
         match TEST_PROCESS_FORK_LOCK.try_write() {
             Ok(guard) => break guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                if let Some(sender) = TEST_PROCESS_FORK_WAIT_SIGNAL
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = sender.try_send(());
+                }
                 waited = true;
                 let now = Instant::now();
                 if now >= deadline {
@@ -120,8 +150,9 @@ pub unsafe fn fork_test_process(deadline: Instant) -> io::Result<libc::pid_t> {
     // SAFETY: the caller accepts the `fork(2)` contract.
     let pid = unsafe { libc::fork() };
     if pid == 0 {
-        // `forget` is a no-op that prevents child-side Rust lock drop/unlock before child_exec.
+        // `forget` is a no-op that prevents child-side Rust lock destruction before child_exec.
         std::mem::forget(guard);
+        std::mem::forget(pending_writer);
         return Ok(pid);
     }
     let result = if pid < 0 {
@@ -130,6 +161,7 @@ pub unsafe fn fork_test_process(deadline: Instant) -> io::Result<libc::pid_t> {
         Ok(pid)
     };
     drop(guard);
+    drop(pending_writer);
     result
 }
 
