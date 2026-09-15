@@ -383,6 +383,9 @@ pub struct MempalMcpServer {
     #[cfg(test)]
     ingest_wait_lease_check_budget_observer: Option<std::sync::mpsc::Sender<Duration>>,
     #[cfg(test)]
+    ingest_admission_stage_observer:
+        Option<std::sync::mpsc::Sender<(IngestAdmissionStage, Instant)>>,
+    #[cfg(test)]
     operation_status_json_within_probe_attempts: Arc<AtomicUsize>,
 }
 
@@ -393,6 +396,19 @@ pub(crate) enum McpIngestSideEffectStage {
     AfterInsertFallbackDrawer,
     Repair,
     Pattern,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IngestAdmissionStage {
+    PoolOpenEnter,
+    PoolOpenReturn,
+    WarningBlockingEnter,
+    WarningBlockingReturn,
+    PreparationReturn,
+    DurableQueueEnter,
+    DurableQueueReturn,
+    LeaseCheckEnter,
 }
 
 #[cfg(test)]
@@ -771,6 +787,8 @@ impl MempalMcpServer {
             #[cfg(test)]
             ingest_wait_lease_check_budget_observer: None,
             #[cfg(test)]
+            ingest_admission_stage_observer: None,
+            #[cfg(test)]
             operation_status_json_within_probe_attempts: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -909,6 +927,22 @@ impl MempalMcpServer {
     pub fn with_stale_penalty_delay_for_test(mut self, delay: Duration) -> Self {
         self.stale_penalty_delay = Some(delay);
         self
+    }
+
+    #[cfg(test)]
+    fn with_ingest_admission_stage_observer_for_test(
+        mut self,
+        observer: std::sync::mpsc::Sender<(IngestAdmissionStage, Instant)>,
+    ) -> Self {
+        self.ingest_admission_stage_observer = Some(observer);
+        self
+    }
+
+    #[cfg(test)]
+    fn observe_ingest_admission_stage(&self, stage: IngestAdmissionStage) {
+        if let Some(observer) = &self.ingest_admission_stage_observer {
+            let _ = observer.send((stage, Instant::now()));
+        }
     }
 
     #[cfg(test)]
@@ -2614,6 +2648,11 @@ impl MempalMcpServer {
             .map_err(|error| error.context(format!("{stage} failed to open database")))?;
         let sqlite_deadline = Instant::now() + deadline;
 
+        #[cfg(test)]
+        if stage == "stale vector index check" {
+            self.observe_ingest_admission_stage(IngestAdmissionStage::WarningBlockingEnter);
+        }
+
         // #840: query-only reads previously had no application-level retry on
         // transient SQLite BUSY/LOCKED errors, so under daemon/ingest contention
         // a read surfaced as an opaque JSON-RPC -32603. Wrap the read in the
@@ -2642,6 +2681,11 @@ impl MempalMcpServer {
         )
         .await;
 
+        #[cfg(test)]
+        if stage == "stale vector index check" {
+            self.observe_ingest_admission_stage(IngestAdmissionStage::WarningBlockingReturn);
+        }
+
         match read {
             Ok(_) if Instant::now() >= sqlite_deadline => Ok(None),
             Ok(result) => Ok(Some(result)),
@@ -2663,6 +2707,8 @@ impl MempalMcpServer {
         remaining: Duration,
         fail_closed: bool,
     ) -> bool {
+        #[cfg(test)]
+        self.observe_ingest_admission_stage(IngestAdmissionStage::LeaseCheckEnter);
         #[cfg(test)]
         if let Some(observer) = self.ingest_wait_lease_check_budget_observer.as_ref() {
             let _ = observer.send(remaining);
@@ -2701,6 +2747,8 @@ impl MempalMcpServer {
     }
 
     async fn reader_db(&self) -> anyhow::Result<QueryOnlyAsyncDb> {
+        #[cfg(test)]
+        self.observe_ingest_admission_stage(IngestAdmissionStage::PoolOpenEnter);
         #[cfg(any(test, feature = "db-test-seam"))]
         if let Some(error) = self.query_only_async_db_open_error.as_deref() {
             anyhow::bail!("{error}");
@@ -2726,6 +2774,8 @@ impl MempalMcpServer {
                 .context("blocking MCP query-only async database pool open failed")?
             })
             .await?;
+        #[cfg(test)]
+        self.observe_ingest_admission_stage(IngestAdmissionStage::PoolOpenReturn);
         Ok(async_db.clone())
     }
 
@@ -7425,7 +7475,11 @@ impl MempalMcpServer {
         )
         .await
         {
-            Ok(Ok(prepared)) => prepared,
+            Ok(Ok(prepared)) => {
+                #[cfg(test)]
+                self.observe_ingest_admission_stage(IngestAdmissionStage::PreparationReturn);
+                prepared
+            }
             Ok(Err(error)) => return Err(error),
             Err(_) => {
                 return Err(mcp_stage_timeout_error(
@@ -7852,15 +7906,19 @@ impl MempalMcpServer {
         deadline: Instant,
     ) -> std::result::Result<String, crate::core::queue::QueueError> {
         loop {
-            match self
+            #[cfg(test)]
+            self.observe_ingest_admission_stage(IngestAdmissionStage::DurableQueueEnter);
+            let enqueue = self
                 .async_queue
                 .enqueue_idempotent_with_key_fail_fast(
                     INGEST_ASYNC_KIND.to_string(),
                     payload.clone(),
                     idempotency_key.clone(),
                 )
-                .await
-            {
+                .await;
+            #[cfg(test)]
+            self.observe_ingest_admission_stage(IngestAdmissionStage::DurableQueueReturn);
+            match enqueue {
                 Ok(operation_id) => return Ok(operation_id),
                 Err(error) if error.is_sqlite_lock() => {
                     if self.ingest_admission_current_mcp_server_holder_visible() {
@@ -13610,6 +13668,7 @@ mod tests {
         acquire_ingest_worker_lifecycle_lock, global_observability_test_lock,
     };
 
+    mod admission_warning_stage_tests;
     mod context_scope_schema_tests;
     mod daemon_queue_lease_fence_tests;
     mod delete_busy_retry_836_tests;
@@ -16611,66 +16670,6 @@ pattern_boost = 0.2
             "system warning should expose embed timeout: {:?}",
             response.system_warnings
         );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_ingest_admission_db_work_runs_off_runtime() {
-        let (_tempdir, _db_path, server) = setup_server();
-        let server = server.with_ingest_warning_snapshot_delay_for_test(Duration::from_millis(300));
-        let (ticks, ticker) = spawn_runtime_ticker();
-
-        let response = server
-            .mempal_ingest(Parameters(IngestRequest {
-                content: "offruntime ingest admission".to_string(),
-                wing: "mcp".to_string(),
-                room: Some("runtime".to_string()),
-                dry_run: Some(false),
-                wait: Some(false),
-                ..IngestRequest::default()
-            }))
-            .await
-            .expect("ingest")
-            .0;
-        ticker.abort();
-
-        assert_eq!(response.state, Some(IngestOperationState::Queued));
-        assert!(response.operation_id.is_some());
-        assert_runtime_ticked(&ticks, "mempal_ingest admission");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_ingest_admission_warning_uses_request_budget_and_returns_receipt() {
-        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
-        let (_tempdir, _db_path, server) = setup_server();
-        let server = server
-            .with_ingest_warning_snapshot_delay_for_test(Duration::from_millis(150))
-            .with_mcp_deadline_for_test(Duration::from_millis(500))
-            .with_daemon_writer_lease_check_error_for_test("skip unrelated lease probe");
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            server.mempal_ingest(Parameters(IngestRequest {
-                content: "bounded ingest admission".to_string(),
-                wing: "mcp".to_string(),
-                room: Some("deadline".to_string()),
-                dry_run: Some(false),
-                wait: Some(false),
-                ..IngestRequest::default()
-            })),
-        )
-        .await
-        .expect("MCP ingest should return before client timeout")
-        .expect("stale-index warning snapshot must preserve a durable queue receipt")
-        .0;
-
-        assert_eq!(result.state, Some(IngestOperationState::Queued));
-        assert!(result.operation_id.is_some());
-        assert!(!result.system_warnings.iter().any(|warning| {
-            warning.source == "mcp_timeout"
-                && warning
-                    .message
-                    .contains("stale vector index check exceeded")
-        }));
     }
 
     #[tokio::test(flavor = "current_thread")]

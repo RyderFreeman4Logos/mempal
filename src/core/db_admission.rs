@@ -51,6 +51,13 @@ pub(super) fn admission_state_fork_guard() -> std::sync::RwLockReadGuard<'static
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn test_process_fork_write_guard_for_test() -> std::sync::RwLockWriteGuard<'static, ()> {
+    TEST_PROCESS_FORK_LOCK
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Forks a test process without inheriting a live admission-state lock.
 ///
 /// Waiting for the fork fence consumes the caller's existing launch deadline.
