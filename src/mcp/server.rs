@@ -133,6 +133,9 @@ use transient_admission::{
 mod ingest_claim_shutdown;
 use ingest_claim_shutdown::claim_next_ingest_with_io;
 
+#[path = "server_ingest_claim_lifecycle.rs"]
+mod ingest_claim_lifecycle;
+
 #[cfg(test)]
 #[path = "server_operation_receipt_tests.rs"]
 mod operation_receipt_tests;
@@ -397,6 +400,18 @@ type IngestWriterLeaseAcquiredHook = Arc<dyn Fn(&RuntimeWriterLease) + Send + Sy
 type IngestWriterLeaseOpenHook =
     Arc<dyn Fn(&Path) -> Result<(), crate::core::db_admission::DbAdmissionError> + Send + Sync>;
 
+#[cfg(test)]
+static INGEST_WRITER_LEASE_RELEASE_LOCK_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn consume_ingest_writer_lease_release_lock_failure() -> bool {
+    INGEST_WRITER_LEASE_RELEASE_LOCK_FAILURES
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+}
+
 /// Holds a lease while its blocking acquisition crosses an async cancellation boundary.
 struct AcquiredMcpIngestWriterLease {
     db_path: PathBuf,
@@ -461,6 +476,16 @@ impl McpIngestWriterLeaseGuard {
         }
         let db_path = self.db_path.clone();
         let lease = self.lease.clone();
+        #[cfg(test)]
+        if consume_ingest_writer_lease_release_lock_failure() {
+            return Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::DatabaseBusy,
+                    extended_code: rusqlite::ffi::SQLITE_BUSY,
+                },
+                Some("forced writer lease release lock".to_string()),
+            )));
+        }
         tokio::task::spawn_blocking(move || {
             let db = Database::open_lease_control(&db_path).with_context(|| {
                 format!(
@@ -487,7 +512,12 @@ impl Drop for McpIngestWriterLeaseGuard {
         if let Some(heartbeat) = self.heartbeat.take() {
             heartbeat.abort();
         }
+        #[cfg(test)]
+        let release_locked = consume_ingest_writer_lease_release_lock_failure();
+        #[cfg(not(test))]
+        let release_locked = false;
         if !self.released
+            && !release_locked
             && let Ok(db) = Database::open_lease_control(&self.db_path)
         {
             let _ = db.runtime_writer_lease_release(&self.lease);
@@ -1922,84 +1952,6 @@ impl MempalMcpServer {
         completed?;
         released?;
         Ok(ScopedIngestProcessResult::Processed)
-    }
-
-    async fn process_ingest_claim_with_owned_task_budget(
-        &self,
-        queue: &AsyncPendingMessageStore,
-        worker_id: &str,
-        claim: ClaimedMessage,
-        budget: Duration,
-    ) -> anyhow::Result<ScopedIngestProcessResult> {
-        // Acquire on this task so a fail-closed lease-open cannot be timeout-detached
-        // when the blocking pool is delayed under rest-lib load.
-        let writer_lease = if self.external_ingest_writer_lease.is_some() {
-            None
-        } else {
-            match self.acquire_ingest_writer_lease(worker_id).await {
-                Ok(Some(lease)) => Some(lease),
-                Ok(None) => {
-                    Self::release_claim_with_lock_retry(
-                        queue,
-                        claim,
-                        self.daemon_write_observer.as_ref(),
-                    )
-                    .await
-                    .context("failed to release scoped ingest claim after writer lease conflict")?;
-                    return Ok(ScopedIngestProcessResult::ReleasedForRetry);
-                }
-                Err(error)
-                    if anyhow_chain_contains_sqlite_lock(&error)
-                        || anyhow_chain_has_transient_admission(&error) =>
-                {
-                    Self::release_claim_with_lock_retry(
-                        queue,
-                        claim,
-                        self.daemon_write_observer.as_ref(),
-                    )
-                    .await
-                    .context(
-                        "failed to release scoped ingest claim after transient writer lease lock",
-                    )?;
-                    return Ok(ScopedIngestProcessResult::ReleasedForRetry);
-                }
-                Err(error) => {
-                    Self::release_claim_with_lock_retry(
-                        queue,
-                        claim,
-                        self.daemon_write_observer.as_ref(),
-                    )
-                    .await
-                    .context("failed to release scoped ingest claim after writer lease error")?;
-                    return Err(error).context("failed to acquire scoped MCP ingest writer lease");
-                }
-            }
-        };
-
-        let mut scoped_worker = self.clone();
-        if let Some(ref lease) = writer_lease {
-            scoped_worker.external_ingest_writer_lease = Some(lease.lease().clone());
-        }
-        let scoped_queue = queue.clone();
-        let scoped_worker_id = worker_id.to_string();
-        let processing = tokio::spawn(async move {
-            let result = scoped_worker
-                .process_ingest_claim_inline(&scoped_queue, &scoped_worker_id, claim)
-                .await;
-            drop(writer_lease);
-            result
-        });
-
-        match tokio::time::timeout(budget, processing).await {
-            Ok(Ok(Ok(()))) => Ok(ScopedIngestProcessResult::Processed),
-            Ok(Ok(Err(error))) => Err(error),
-            Ok(Err(error)) => {
-                Err(anyhow::Error::new(error).context("scoped ingest claim task failed"))
-            }
-            // Dropping a JoinHandle detaches the task. That task owns the claim,
-            // heartbeat, and writer lease until it records the terminal receipt.
-            Err(_) => Ok(ScopedIngestProcessResult::TimedOut),
-        }
     }
 
     async fn complete_ingest_claim_outcome(
