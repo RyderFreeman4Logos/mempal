@@ -284,3 +284,34 @@ async fn test_scoped_ingest_non_transient_lease_open_remains_fail_closed() {
         assert_eq!(drawers, 0);
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_ingest_writer_lease_acquire_bypasses_profile_admission_lock() {
+    use std::os::fd::AsRawFd;
+
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
+    let (_tempdir, db_path, server) = setup_server();
+    let lock_path = db_path.with_file_name(".palace.db.admission.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .expect("open admission lock");
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    let acquired = tokio::time::timeout(
+        Duration::from_secs(2),
+        server.acquire_ingest_writer_lease("mcp-ingest-worker-admission-independent"),
+    )
+    .await;
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+
+    let lease = acquired
+        .expect("writer lease acquisition deadlocked behind profile admission")
+        .expect("writer lease acquisition must not consume profile admission")
+        .expect("writer lease must be available");
+    lease.release().await.expect("release writer lease");
+}

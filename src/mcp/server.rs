@@ -2151,7 +2151,10 @@ impl MempalMcpServer {
             if let Some(hook) = open_hook {
                 hook(&db_path).context("failed to open database for MCP ingest writer lease")?;
             }
-            let db = Database::open(&db_path).with_context(|| {
+            let db_path =
+                crate::core::db_admission::ProfileDbAdmission::resolve_database_path(&db_path)
+                    .context("failed to resolve database path for MCP ingest writer lease")?;
+            let db = Database::open_lease_control(&db_path).with_context(|| {
                 format!(
                     "failed to open database for MCP ingest writer lease: {}",
                     db_path.display()
