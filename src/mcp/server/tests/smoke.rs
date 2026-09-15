@@ -557,9 +557,23 @@ async fn test_mcp_scoped_smoke_preflight_uses_remaining_request_budget() {
 async fn test_mcp_smoke_wait_writer_lease_error_releases_and_starts_drain() {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();
+    let (drain_acquired_tx, drain_acquired_rx) = mpsc::sync_channel(1);
+    let (release_drain_tx, release_drain_rx) = mpsc::sync_channel(1);
+    let release_drain_rx = Arc::new(std::sync::Mutex::new(Some(release_drain_rx)));
     let server = server
         .with_ingest_writer_lease_failures_for_test(1)
-        .with_ingest_processing_delay_for_test(Duration::from_millis(500));
+        .with_ingest_writer_lease_acquired_hook_for_test(Arc::new(move |_lease| {
+            drain_acquired_tx
+                .send(())
+                .expect("report drain writer lease acquisition");
+            release_drain_rx
+                .lock()
+                .expect("drain release receiver")
+                .take()
+                .expect("drain release receiver used once")
+                .recv()
+                .expect("release drain writer lease acquisition");
+        }));
 
     let error = match server
         .mempal_ingest(Parameters(IngestRequest {
@@ -586,6 +600,11 @@ async fn test_mcp_smoke_wait_writer_lease_error_releases_and_starts_drain() {
         Some("unknown"),
         "lease failure must retain a mandatory sanitized class: {error}"
     );
+    tokio::task::spawn_blocking(move || drain_acquired_rx.recv_timeout(Duration::from_secs(2)))
+        .await
+        .expect("drain acquisition observer must not panic")
+        .expect("writer lease error must release the admitted operation for the drain worker");
+
     let db = Database::open(&db_path).expect("open queue database");
     let operation_id = db
         .conn()
@@ -595,6 +614,18 @@ async fn test_mcp_smoke_wait_writer_lease_error_releases_and_starts_drain() {
             |row| row.get::<_, String>(0),
         )
         .expect("writer lease error must retain an admitted operation");
+    let retained = PendingMessageStore::new_without_reclaim(&db_path)
+        .operation_status(&operation_id)
+        .expect("load retained operation")
+        .expect("retained operation must remain queryable");
+    assert_eq!(retained.op_state, IngestOperationState::Running.as_str());
+    assert!(
+        retained.claimed_at.is_some(),
+        "drain acquisition must claim the retained operation"
+    );
+    release_drain_tx
+        .send(())
+        .expect("release drain writer lease acquisition");
     let completed = tokio::time::timeout(
         Duration::from_secs(4),
         server.wait_for_operation_completion(&operation_id),

@@ -68,7 +68,21 @@ impl MempalMcpServer {
                         return Ok(ScopedIngestProcessResult::ReleasedForRetry);
                     }
                     Err(error) => {
+                        let before_deadline = Instant::now() < deadline;
                         Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
+                        if before_deadline {
+                            Self::release_claim_with_lock_retry(
+                                &scoped_queue,
+                                claim,
+                                scoped_worker.daemon_write_observer.as_ref(),
+                            )
+                            .await
+                            .context(
+                                "failed to release scoped ingest claim after writer lease error",
+                            )?;
+                            return Err(error)
+                                .context("failed to acquire scoped MCP ingest writer lease");
+                        }
                         let failure_kind = status_db_failure_kind(error.as_ref());
                         complete_failed_ingest_claim(
                             &scoped_queue,
