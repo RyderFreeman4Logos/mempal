@@ -43,14 +43,26 @@ async fn test_hook_ipc_spools_before_ack_when_sqlite_locked() {
 
     let mut reader = tokio::io::BufReader::new(client);
     let mut line = String::new();
-    let response = tokio::time::timeout(crate::hook_ipc::HOOK_IPC_TIMEOUT, async {
+    let response = match tokio::time::timeout(crate::hook_ipc::HOOK_IPC_TIMEOUT, async {
         tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
             .await
             .expect("read response");
         serde_json::from_str(line.trim()).expect("hook IPC response")
     })
     .await
-    .expect("locked SQLite enqueue must ACK from the fsynced spool");
+    {
+        Ok(response) => {
+            eprintln!(
+                "hook_ipc_ack_checkpoints ok {}",
+                super::hook_ipc_ack_checkpoint_report_for_test()
+            );
+            response
+        }
+        Err(_) => panic!(
+            "locked SQLite enqueue must ACK from the fsynced spool: Elapsed(()) {}",
+            super::hook_ipc_ack_checkpoint_report_for_test()
+        ),
+    };
     tokio::time::timeout(crate::hook_ipc::HOOK_IPC_READ_TIMEOUT, handler)
         .await
         .expect("hook IPC handler must finish after ACK")
