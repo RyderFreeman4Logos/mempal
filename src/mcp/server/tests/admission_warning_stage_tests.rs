@@ -1,5 +1,20 @@
 use super::*;
+use std::path::Path;
 use std::time::Instant;
+
+#[cfg(target_os = "linux")]
+#[path = "../../../core/db_admission_test_process.rs"]
+mod db_admission_test_process;
+
+#[cfg(target_os = "linux")]
+use db_admission_test_process::{DeadlineChild, SpawnSpec, SupervisionError};
+#[cfg(target_os = "linux")]
+const _: fn() = db_admission_test_process::reference_shared_test_api;
+
+#[cfg(target_os = "linux")]
+const FORK_FENCE_FIXTURE_ROOT_ENV: &str = "MEMPAL_FORK_FENCE_FIXTURE_ROOT";
+#[cfg(target_os = "linux")]
+const FORK_FENCE_TEST: &str = "mcp::server::tests::admission_warning_stage_tests::fork_fence_contention_refuses_ingest_within_admission_budget";
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_mcp_ingest_admission_db_work_runs_off_runtime() {
@@ -95,6 +110,59 @@ async fn test_mcp_ingest_admission_warning_uses_request_budget_and_returns_recei
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "current_thread")]
 async fn fork_fence_contention_refuses_ingest_within_admission_budget() {
+    if let Some(root) = std::env::var_os(FORK_FENCE_FIXTURE_ROOT_ENV) {
+        run_fork_fence_contention_fixture(Path::new(&root)).await;
+        return;
+    }
+
+    let fixture = tempfile::tempdir().expect("fixture marker directory");
+    let ready = fixture.path().join("ready");
+    let busy = fixture.path().join("busy");
+    let release = fixture.path().join("release");
+    let executable = std::env::current_exe().expect("current unit-test executable");
+    let mut spec = SpawnSpec::new(executable).expect("absolute unit-test executable");
+    spec.args([
+        "--exact",
+        FORK_FENCE_TEST,
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(FORK_FENCE_FIXTURE_ROOT_ENV, fixture.path().as_os_str());
+
+    let child = thread::spawn(move || DeadlineChild::output(spec, Duration::from_secs(30)));
+    let ready_seen = wait_for_marker(&ready, Duration::from_secs(10));
+    let neighbor = ready_seen.then(|| {
+        let temp = tempfile::tempdir().expect("concurrent neighbor temp dir");
+        let result = Database::open(&temp.path().join("palace.db"));
+        (temp, result)
+    });
+    let busy_seen = ready_seen && wait_for_marker(&busy, Duration::from_secs(10));
+    fs::write(&release, b"").expect("release fork-fence fixture");
+    let output = match child.join().expect("fork-fence fixture supervisor") {
+        Ok(output) => output,
+        Err(SupervisionError::CleanupIncomplete(incomplete)) => incomplete
+            .finish_output(Duration::from_secs(5))
+            .expect("finish fork-fence fixture cleanup"),
+        Err(error) => panic!("run fork-fence fixture: {error:?}"),
+    };
+
+    assert!(ready_seen, "child did not acquire its fork fence");
+    assert!(busy_seen, "child did not prove bounded AdmissionBusy");
+    let (_temp, neighbor) = neighbor.expect("ready child requires a concurrent neighbor");
+    drop(neighbor.expect("child-local fork fence must not block parent admission"));
+    assert!(
+        output.success(),
+        "fork-fence fixture failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.timed_out);
+    assert!(output.cleanup.kill_fence_sent);
+    assert!(output.cleanup.errors.is_empty(), "{:#?}", output.cleanup);
+}
+
+#[cfg(target_os = "linux")]
+async fn run_fork_fence_contention_fixture(fixture: &Path) {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, _db_path, server) = setup_server();
     let (stage_tx, stage_rx) = mpsc::channel();
@@ -114,8 +182,13 @@ async fn fork_fence_contention_refuses_ingest_within_admission_budget() {
         release_fence_rx.recv().expect("release fork fence");
         drop(guard);
     });
+    fence_acquired_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("fork fence must be held within the existing client budget");
+    fs::write(fixture.join("ready"), b"").expect("publish held fork fence");
+
     let client_started = Instant::now();
-    let request = tokio::time::timeout(
+    let request_result = tokio::time::timeout(
         Duration::from_secs(1),
         server.mempal_ingest(Parameters(IngestRequest {
             content: "fork fence bounded refusal".to_string(),
@@ -125,18 +198,10 @@ async fn fork_fence_contention_refuses_ingest_within_admission_budget() {
             wait: Some(false),
             ..IngestRequest::default()
         })),
-    );
-    tokio::pin!(request);
-    fence_acquired_rx
-        .recv_timeout(Duration::from_millis(500))
-        .expect("fork fence must be held within the existing client budget");
-
-    let request_result = request.await;
+    )
+    .await;
     let elapsed = client_started.elapsed();
     let blocked_stages: Vec<_> = stage_rx.try_iter().map(|(stage, _)| stage).collect();
-    release_fence_tx.send(()).expect("release fork fence");
-    fence.join().expect("fork fence holder");
-    drop(crate::core::db_admission::test_process_fork_write_guard_for_test());
 
     let error = match request_result
         .expect("fork-fence admission must finish before the 1s client watchdog")
@@ -156,6 +221,14 @@ async fn fork_fence_contention_refuses_ingest_within_admission_budget() {
     assert_eq!(data["action"], "retry_after_transient_lock");
     assert_eq!(blocked_stages, vec![IngestAdmissionStage::PoolOpenEnter]);
     assert!(elapsed < Duration::from_millis(500), "elapsed: {elapsed:?}");
+    fs::write(fixture.join("busy"), b"").expect("publish bounded refusal proof");
+    assert!(
+        wait_for_marker(&fixture.join("release"), Duration::from_secs(10)),
+        "parent did not release fork-fence fixture"
+    );
+    release_fence_tx.send(()).expect("release fork fence");
+    fence.join().expect("fork fence holder");
+    drop(crate::core::db_admission::test_process_fork_write_guard_for_test());
 
     let result = tokio::time::timeout(
         Duration::from_secs(1),
@@ -174,4 +247,16 @@ async fn fork_fence_contention_refuses_ingest_within_admission_budget() {
     .0;
     assert_eq!(result.state, Some(IngestOperationState::Queued));
     assert!(result.operation_id.is_some());
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_marker(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.is_file() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    path.is_file()
 }
