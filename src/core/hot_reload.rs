@@ -374,6 +374,9 @@ impl HotReloadState {
         let debounce = Duration::from_millis(debounce_ms.max(1));
         let poll_interval = Duration::from_secs(poll_fallback_secs.max(1));
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        #[cfg(test)]
+        super::hot_reload_watch_gate::wait_before_poll_baseline();
+        let mut previous = file_signature(&poll_path);
 
         let coordinator = thread::spawn(move || {
             let file_name = watch_path.file_name().map(OsStr::to_os_string);
@@ -451,7 +454,6 @@ impl HotReloadState {
         });
 
         let poller = thread::spawn(move || {
-            let mut previous = file_signature(&poll_path);
             while !stop_for_poller.load(Ordering::SeqCst) {
                 thread::park_timeout(poll_interval);
                 if stop_for_poller.load(Ordering::SeqCst) {

@@ -6,41 +6,52 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 use super::config::ConfigHandle;
-use super::hot_reload_watch_gate::{ENTERED_NAME, GATE_ENV, RELEASE_NAME, WATCHED_NAME};
+use super::hot_reload_watch_gate::{
+    ENTERED_NAME, GATE_ENV, POLL_ENTERED_NAME, POLL_GATE_ENV, POLL_RELEASE_NAME, RELEASE_NAME,
+    WATCHED_NAME,
+};
 
-struct WatchGate {
+struct FileGate {
     dir: TempDir,
+    env: &'static str,
+    entered: &'static str,
+    release: &'static str,
 }
 
-impl WatchGate {
-    fn arm() -> Self {
-        let dir = TempDir::new().expect("watch gate tempdir");
+impl FileGate {
+    fn arm(env: &'static str, entered: &'static str, release: &'static str) -> Self {
+        let dir = TempDir::new().expect("gate tempdir");
         // SAFETY: callers hold global_config_test_lock for the singleton watcher.
         unsafe {
-            std::env::set_var(GATE_ENV, dir.path());
+            std::env::set_var(env, dir.path());
         }
-        Self { dir }
+        Self {
+            dir,
+            env,
+            entered,
+            release,
+        }
     }
 
     fn entered(&self) -> bool {
-        self.dir.path().join(ENTERED_NAME).exists()
+        self.dir.path().join(self.entered).exists()
     }
 
-    fn watched(&self) -> bool {
-        self.dir.path().join(WATCHED_NAME).exists()
+    fn exists(&self, name: &str) -> bool {
+        self.dir.path().join(name).exists()
     }
 
     fn release(&self) {
-        fs::write(self.dir.path().join(RELEASE_NAME), b"").expect("write watch release");
+        fs::write(self.dir.path().join(self.release), b"").expect("write gate release");
     }
 }
 
-impl Drop for WatchGate {
+impl Drop for FileGate {
     fn drop(&mut self) {
         self.release();
         // SAFETY: same lock scope as arm(); always clear so later tests are not gated.
         unsafe {
-            std::env::remove_var(GATE_ENV);
+            std::env::remove_var(self.env);
         }
         ConfigHandle::harness_reset();
     }
@@ -61,7 +72,7 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
 async fn bootstrap_waits_until_watcher_registration_completes() {
     let lock = super::config::global_config_test_lock();
     let _lock = lock.lock().await;
-    let gate = WatchGate::arm();
+    let gate = FileGate::arm(GATE_ENV, ENTERED_NAME, RELEASE_NAME);
     let tmp = TempDir::new().expect("config tempdir");
     let config_path = tmp.path().join("config.toml");
     fs::write(
@@ -100,8 +111,53 @@ poll_fallback_secs = 1
         .expect("bootstrap thread")
         .expect("bootstrap config");
     assert!(
-        gate.watched(),
+        gate.exists(WATCHED_NAME),
         "bootstrap returned before parent-directory watch() was attempted"
     );
+    assert!(ConfigHandle::harness_runtime_active());
+}
+
+#[tokio::test]
+async fn bootstrap_waits_until_poll_fallback_baseline_completes() {
+    let lock = super::config::global_config_test_lock();
+    let _lock = lock.lock().await;
+    let gate = FileGate::arm(POLL_GATE_ENV, POLL_ENTERED_NAME, POLL_RELEASE_NAME);
+    let tmp = TempDir::new().expect("config tempdir");
+    let config_path = tmp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[config_hot_reload]
+enabled = true
+debounce_ms = 10
+poll_fallback_secs = 1
+"#,
+    )
+    .expect("write config");
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let bootstrap_path = config_path.clone();
+    let worker = thread::spawn(move || {
+        let result = ConfigHandle::bootstrap(&bootstrap_path);
+        let _ = done_tx.send(());
+        result
+    });
+
+    assert!(
+        wait_until(Duration::from_secs(2), || gate.entered()),
+        "poller never reached the baseline gate"
+    );
+    if done_rx.recv_timeout(Duration::from_millis(1500)).is_ok() {
+        panic!("bootstrap returned before poll fallback baseline completed");
+    }
+
+    gate.release();
+    done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("bootstrap must return after poll fallback baseline");
+    worker
+        .join()
+        .expect("bootstrap thread")
+        .expect("bootstrap config");
     assert!(ConfigHandle::harness_runtime_active());
 }
