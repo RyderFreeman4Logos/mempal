@@ -1,9 +1,9 @@
 //! Bounded-subprocess regression fixtures for #795.
 
 use super::cli_deadline::{
-    HANGING_FIXTURE_DEADLINE, HANGING_FIXTURE_RETURN_BOUND, hanging_shell_ignoring_stdin,
-    hanging_shell_with_pipe_descendant, run_spec_output, run_spec_output_strict,
-    run_spec_stdin_output_strict,
+    DeadlineChild, HANGING_FIXTURE_DEADLINE, HANGING_FIXTURE_RETURN_BOUND, SupervisionError,
+    hanging_shell_ignoring_stdin, hanging_shell_with_pipe_descendant, panic_supervision,
+    run_spec_output, run_spec_output_strict, run_spec_stdin_output_strict,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
@@ -112,8 +112,26 @@ fn deadline_helper_timeout_message_is_role_and_elapsed_only() {
 #[test]
 fn cleanup_incomplete_panics_without_hard_exit() {
     let role = "cli-cleanup-incomplete";
+    let child = DeadlineChild::spawn(
+        hanging_shell_with_pipe_descendant(),
+        HANGING_FIXTURE_DEADLINE,
+    )
+    .expect("cleanup fixture must complete launch before its cleanup budget expires");
+    let identity = child.identity();
+    assert!(
+        identity.still_refers_to_original_process(),
+        "cleanup fixture must prove its real child started"
+    );
+    let started = Instant::now();
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let _ = run_spec_output_strict(role, hanging_shell_with_pipe_descendant(), Duration::ZERO);
+        let error = child
+            .wait_output(Duration::ZERO)
+            .expect_err("zero cleanup budget must retain incomplete child ownership");
+        assert!(
+            matches!(&error, SupervisionError::CleanupIncomplete(_)),
+            "started child must reach cleanup, not fail launch: {error:?}"
+        );
+        panic_supervision(role, started.elapsed(), error);
     }));
 
     let payload = result.expect_err("an expired cleanup deadline must panic");
@@ -131,8 +149,26 @@ fn cleanup_incomplete_panics_without_hard_exit() {
         "cleanup message must identify the incomplete cleanup: {message}"
     );
     assert!(
+        message.contains("kill_fence=true") && message.contains("term_grace_expired=true"),
+        "cleanup message must prove TERM escalation and the KILL fence: {message}"
+    );
+    assert!(
         !message.contains("hang-fixture-ready"),
         "cleanup message must not leak pipe content: {message}"
+    );
+    assert!(
+        !identity.still_refers_to_original_process(),
+        "panic unwinding must reap the exact started child"
+    );
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(identity.pid, &mut status, libc::WNOHANG) },
+        -1,
+        "the supervised child must already be reaped"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
     );
 }
 

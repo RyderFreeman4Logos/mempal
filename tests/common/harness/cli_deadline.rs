@@ -29,7 +29,8 @@ use std::path::Path;
 use std::process::Output;
 use std::time::{Duration, Instant};
 
-use process::{DeadlineChild, DeadlineOutput, SpawnSpec, StdioMode, SupervisionError};
+pub(super) use process::{DeadlineChild, SupervisionError};
+use process::{DeadlineOutput, SpawnSpec, StdioMode};
 
 /// References the complete path-included helper API without running a process.
 pub fn reference_shared_cli_deadline_api() {
@@ -303,7 +304,11 @@ fn panic_timeout(role: &'static str, elapsed: Duration, output: Option<DeadlineO
     );
 }
 
-fn panic_supervision(role: &'static str, elapsed: Duration, error: SupervisionError) -> ! {
+pub(super) fn panic_supervision(
+    role: &'static str,
+    elapsed: Duration,
+    error: SupervisionError,
+) -> ! {
     match error {
         SupervisionError::CleanupIncomplete(cleanup) => {
             panic!(
