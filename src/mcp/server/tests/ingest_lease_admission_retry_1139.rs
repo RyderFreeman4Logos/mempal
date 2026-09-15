@@ -285,6 +285,90 @@ async fn test_scoped_ingest_non_transient_lease_open_remains_fail_closed() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn test_owned_scoped_ingest_non_transient_lease_open_is_not_timeout_detached() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
+    let (_tempdir, db_path, mut server) = setup_server();
+    let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+    let request = IngestRequest {
+        content: "owned-task InvalidState must fail closed".to_string(),
+        wing: "mcp".to_string(),
+        room: Some("lease-fail-closed".to_string()),
+        dry_run: Some(false),
+        ..IngestRequest::default()
+    };
+    let project_id = server
+        .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+        .await
+        .expect("resolve project");
+    let prepared = server
+        .prepare_async_ingest_operation(
+            &request,
+            IngestControls {
+                no_gate: true,
+                bypass_novelty: true,
+            },
+            config.as_ref(),
+            compiled_privacy.as_ref(),
+            project_id,
+            Instant::now() + MCP_INGEST_ADMISSION_DEADLINE,
+        )
+        .await
+        .expect("prepare async ingest");
+    let payload = serde_json::to_string(&prepared).expect("serialize prepared ingest");
+    let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
+    let operation_id = queue
+        .enqueue(INGEST_ASYNC_KIND, &payload)
+        .expect("enqueue async ingest");
+    let claim = queue
+        .claim_next_by_kind("worker-owned-fail-closed", 60, INGEST_ASYNC_KIND)
+        .expect("claim queued op")
+        .expect("claimed queued op");
+    let async_queue = AsyncPendingMessageStore::from_store(queue.clone());
+    server.ingest_writer_lease_open_hook = Some(Arc::new(move |_| {
+        std::thread::sleep(Duration::from_millis(50));
+        Err(crate::core::db_admission::DbAdmissionError::InvalidState {
+            path: PathBuf::from("/private/corrupt/palace.db.admission.state"),
+            source: serde_json::from_str::<serde_json::Value>("not-json").unwrap_err(),
+        })
+    }));
+
+    let started = Instant::now();
+    let result = server
+        .process_ingest_claim_with_owned_task_budget(
+            &async_queue,
+            "worker-owned-fail-closed",
+            claim,
+            Duration::from_millis(1),
+        )
+        .await;
+    let error = match result {
+        Ok(outcome) => {
+            panic!("corruption lease failure must fail closed, not timeout-detach as {outcome:?}")
+        }
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("failed to acquire scoped MCP ingest writer lease"),
+        "{error:#}"
+    );
+    assert!(
+        !anyhow_chain_has_transient_admission(&error),
+        "InvalidState must remain fail-closed: {error:#}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "fail-closed acquire must not wait out the caller budget"
+    );
+    let record = queue
+        .operation_status(&operation_id)
+        .expect("load operation")
+        .expect("operation exists");
+    assert_ne!(record.op_state, "completed");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_ingest_writer_lease_acquire_bypasses_profile_admission_lock() {

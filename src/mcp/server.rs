@@ -1931,13 +1931,63 @@ impl MempalMcpServer {
         claim: ClaimedMessage,
         budget: Duration,
     ) -> anyhow::Result<ScopedIngestProcessResult> {
-        let scoped_worker = self.clone();
+        // Acquire on this task so a fail-closed lease-open cannot be timeout-detached
+        // when the blocking pool is delayed under rest-lib load.
+        let writer_lease = if self.external_ingest_writer_lease.is_some() {
+            None
+        } else {
+            match self.acquire_ingest_writer_lease(worker_id).await {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) => {
+                    Self::release_claim_with_lock_retry(
+                        queue,
+                        claim,
+                        self.daemon_write_observer.as_ref(),
+                    )
+                    .await
+                    .context("failed to release scoped ingest claim after writer lease conflict")?;
+                    return Ok(ScopedIngestProcessResult::ReleasedForRetry);
+                }
+                Err(error)
+                    if anyhow_chain_contains_sqlite_lock(&error)
+                        || anyhow_chain_has_transient_admission(&error) =>
+                {
+                    Self::release_claim_with_lock_retry(
+                        queue,
+                        claim,
+                        self.daemon_write_observer.as_ref(),
+                    )
+                    .await
+                    .context(
+                        "failed to release scoped ingest claim after transient writer lease lock",
+                    )?;
+                    return Ok(ScopedIngestProcessResult::ReleasedForRetry);
+                }
+                Err(error) => {
+                    Self::release_claim_with_lock_retry(
+                        queue,
+                        claim,
+                        self.daemon_write_observer.as_ref(),
+                    )
+                    .await
+                    .context("failed to release scoped ingest claim after writer lease error")?;
+                    return Err(error).context("failed to acquire scoped MCP ingest writer lease");
+                }
+            }
+        };
+
+        let mut scoped_worker = self.clone();
+        if let Some(ref lease) = writer_lease {
+            scoped_worker.external_ingest_writer_lease = Some(lease.lease().clone());
+        }
         let scoped_queue = queue.clone();
         let scoped_worker_id = worker_id.to_string();
         let processing = tokio::spawn(async move {
-            scoped_worker
+            let result = scoped_worker
                 .process_ingest_claim_inline(&scoped_queue, &scoped_worker_id, claim)
-                .await
+                .await;
+            drop(writer_lease);
+            result
         });
 
         match tokio::time::timeout(budget, processing).await {
