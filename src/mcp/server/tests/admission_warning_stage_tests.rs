@@ -3,11 +3,7 @@ use std::path::Path;
 use std::time::Instant;
 
 #[cfg(target_os = "linux")]
-#[path = "../../../core/db_admission_test_process.rs"]
-mod db_admission_test_process;
-
-#[cfg(target_os = "linux")]
-use db_admission_test_process::{DeadlineChild, SpawnSpec, SupervisionError};
+use crate::core::db_admission_test_process::{self, DeadlineChild, SpawnSpec, SupervisionError};
 #[cfg(target_os = "linux")]
 const _: fn() = db_admission_test_process::reference_shared_test_api;
 

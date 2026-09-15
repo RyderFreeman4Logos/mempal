@@ -19,6 +19,8 @@ mod db_admission_release;
 #[cfg(test)]
 mod db_admission_sidecar_tests;
 mod db_admission_state;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod db_admission_test_process;
 pub(crate) mod db_connection;
 mod db_operation_creation;
 pub(crate) mod deadline;
