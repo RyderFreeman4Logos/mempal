@@ -19,7 +19,26 @@ pub(super) const MAX_ADMISSION_STATE_BYTES: usize = 64 * 1024;
 const MAX_STAGED_STATE_CREATE_ATTEMPTS: u8 = 8;
 static STAGED_STATE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-pub(super) fn lock_state(path: &Path) -> Result<File, DbAdmissionError> {
+pub(super) struct StateLock {
+    file: File,
+    #[cfg(unix)]
+    creator_pid: libc::pid_t,
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        // SAFETY: both calls operate on process-local scalar values and the live descriptor
+        // owned by this guard. A fork child must close, never unlock, the parent's shared OFD.
+        unsafe {
+            if libc::getpid() == self.creator_pid {
+                let _ = libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
+pub(super) fn lock_state(path: &Path) -> Result<StateLock, DbAdmissionError> {
     let started = std::time::Instant::now();
     let deadline = started
         .checked_add(super::db_admission::ADMISSION_LOCK_TIMEOUT)
@@ -31,7 +50,7 @@ fn lock_state_until(
     path: &Path,
     deadline: std::time::Instant,
     mut now: impl FnMut() -> std::time::Instant,
-) -> Result<File, DbAdmissionError> {
+) -> Result<StateLock, DbAdmissionError> {
     let file = open_sidecar(path, true, true)?;
     verify_sidecar_inode(path, &file)?;
     let busy = || DbAdmissionError::Busy {
@@ -45,7 +64,14 @@ fn lock_state_until(
         }
         match imp::try_lock_exclusive(&file) {
             Ok(true) if waited && now() >= deadline => return Err(busy()),
-            Ok(true) => return Ok(file),
+            Ok(true) => {
+                return Ok(StateLock {
+                    file,
+                    #[cfg(unix)]
+                    // SAFETY: getpid has no pointer arguments and is async-signal-safe.
+                    creator_pid: unsafe { libc::getpid() },
+                });
+            }
             Ok(false) if now() < deadline => {
                 waited = true;
                 std::thread::sleep(

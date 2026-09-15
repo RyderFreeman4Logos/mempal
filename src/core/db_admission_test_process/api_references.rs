@@ -33,6 +33,7 @@ pub fn reference_shared_test_api() {
     let _ = TestSetupGate::new;
     let _ = TestSetupGate::wait_ready;
     let _ = TestSetupGate::release;
+    let _ = SpawnSpec::pre_close_gate;
 
     let _ = ProcessIdentity::still_refers_to_original_process;
     let _ = CleanupProgress::expect_complete;

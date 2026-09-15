@@ -27,6 +27,7 @@ pub struct SpawnSpec {
     environment: BTreeMap<OsString, OsString>,
     current_dir: PathBuf,
     stdio: StdioMode,
+    pre_close_gate: Option<ChildSetupGate>,
     setup_gate: Option<ChildSetupGate>,
 }
 
@@ -45,6 +46,7 @@ impl SpawnSpec {
             environment: std::env::vars_os().collect(),
             current_dir: std::env::current_dir()?,
             stdio: StdioMode::Capture,
+            pre_close_gate: None,
             setup_gate: None,
         })
     }
@@ -111,6 +113,11 @@ impl SpawnSpec {
 
     pub fn setup_gate(&mut self, gate: ChildSetupGate) -> &mut Self {
         self.setup_gate = Some(gate);
+        self
+    }
+
+    pub fn pre_close_gate(&mut self, gate: ChildSetupGate) -> &mut Self {
+        self.pre_close_gate = Some(gate);
         self
     }
 }
@@ -214,6 +221,7 @@ struct PreparedSpawn {
     stdout_pipe: Option<Pipe>,
     stderr_pipe: Option<Pipe>,
     setup_pipe: Pipe,
+    pre_close_gate: Option<ChildSetupGate>,
     setup_gate: Option<ChildSetupGate>,
     close_fds: Vec<RawFd>,
     preserved_child_fds: Vec<RawFd>,
@@ -363,7 +371,10 @@ impl PreparedSpawn {
         }
         close_fds.push(setup_pipe.read.as_raw_fd());
         close_fds.push(setup_pipe.write.as_raw_fd());
-        if let Some(gate) = &spec.setup_gate {
+        for gate in [&spec.pre_close_gate, &spec.setup_gate]
+            .into_iter()
+            .flatten()
+        {
             close_fds.push(gate.ready_write.as_raw_fd());
             close_fds.push(gate.release_read.as_raw_fd());
             close_fds.extend(gate.inherited_parent_fds);
@@ -448,6 +459,7 @@ impl PreparedSpawn {
             stdout_pipe,
             stderr_pipe,
             setup_pipe,
+            pre_close_gate: spec.pre_close_gate,
             setup_gate: spec.setup_gate,
             close_fds,
             preserved_child_fds,
@@ -467,6 +479,9 @@ unsafe fn child_exec(prepared: &PreparedSpawn) -> ! {
     // pointer arrays, and SetupFailureRecord storage were prepared before fork and stay valid;
     // every libc call here is async-signal-safe until execve or _exit.
     unsafe {
+        if let Some(gate) = &prepared.pre_close_gate {
+            child_wait_gate(prepared, gate)
+        }
         if libc::setpgid(0, 0) != 0 {
             child_fail(prepared, SetupStage::SetProcessGroup)
         }
@@ -475,35 +490,7 @@ unsafe fn child_exec(prepared: &PreparedSpawn) -> ! {
         }
 
         if let Some(gate) = &prepared.setup_gate {
-            libc::close(gate.inherited_parent_fds[0]);
-            libc::close(gate.inherited_parent_fds[1]);
-            let pid = libc::getpid();
-            let pid_bytes = std::slice::from_raw_parts(
-                (&pid as *const libc::pid_t).cast::<u8>(),
-                std::mem::size_of::<libc::pid_t>(),
-            );
-            if !child_write_all(gate.ready_write.as_raw_fd(), pid_bytes) {
-                child_fail(prepared, SetupStage::ReadyHandshake)
-            }
-            let mut release = 0u8;
-            loop {
-                let result = libc::read(
-                    gate.release_read.as_raw_fd(),
-                    (&mut release as *mut u8).cast(),
-                    1,
-                );
-                if result == 1 {
-                    break;
-                }
-                if result == 0 {
-                    child_fail_with_errno(prepared, SetupStage::SetupGate, libc::EPIPE)
-                }
-                if *libc::__errno_location() != libc::EINTR {
-                    child_fail(prepared, SetupStage::SetupGate)
-                }
-            }
-            libc::close(gate.ready_write.as_raw_fd());
-            libc::close(gate.release_read.as_raw_fd());
+            child_wait_gate(prepared, gate)
         }
 
         if libc::chdir(prepared.current_dir.as_ptr()) != 0 {
@@ -537,6 +524,41 @@ unsafe fn child_exec(prepared: &PreparedSpawn) -> ! {
             prepared.environment_pointers.as_ptr(),
         );
         child_fail(prepared, SetupStage::Exec)
+    }
+}
+
+// SAFETY: call only in the post-fork child with a gate prepared before fork.
+unsafe fn child_wait_gate(prepared: &PreparedSpawn, gate: &ChildSetupGate) {
+    unsafe {
+        libc::close(gate.inherited_parent_fds[0]);
+        libc::close(gate.inherited_parent_fds[1]);
+        let pid = libc::getpid();
+        let pid_bytes = std::slice::from_raw_parts(
+            (&pid as *const libc::pid_t).cast::<u8>(),
+            std::mem::size_of::<libc::pid_t>(),
+        );
+        if !child_write_all(gate.ready_write.as_raw_fd(), pid_bytes) {
+            child_fail(prepared, SetupStage::ReadyHandshake)
+        }
+        let mut release = 0u8;
+        loop {
+            let result = libc::read(
+                gate.release_read.as_raw_fd(),
+                (&mut release as *mut u8).cast(),
+                1,
+            );
+            if result == 1 {
+                break;
+            }
+            if result == 0 {
+                child_fail_with_errno(prepared, SetupStage::SetupGate, libc::EPIPE)
+            }
+            if *libc::__errno_location() != libc::EINTR {
+                child_fail(prepared, SetupStage::SetupGate)
+            }
+        }
+        libc::close(gate.ready_write.as_raw_fd());
+        libc::close(gate.release_read.as_raw_fd());
     }
 }
 
