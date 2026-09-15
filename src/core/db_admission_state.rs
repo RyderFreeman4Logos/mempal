@@ -39,12 +39,29 @@ pub(super) fn lock_state(path: &Path) -> Result<StateLock, DbAdmissionError> {
     let deadline = started
         .checked_add(super::db_admission::ADMISSION_LOCK_TIMEOUT)
         .unwrap_or(started);
+    lock_state_until(path, deadline, std::time::Instant::now)
+}
+
+fn lock_state_until(
+    path: &Path,
+    deadline: std::time::Instant,
+    mut now: impl FnMut() -> std::time::Instant,
+) -> Result<StateLock, DbAdmissionError> {
     #[cfg(target_os = "linux")]
     let fork_guard = super::db_admission::admission_state_fork_guard(path, deadline)?;
     let file = open_sidecar(path, true, true)?;
     verify_sidecar_inode(path, &file)?;
+    let busy = || DbAdmissionError::Busy {
+        path: path.to_path_buf(),
+        timeout_ms: super::db_admission::ADMISSION_LOCK_TIMEOUT.as_millis() as u64,
+    };
+    let mut waited = false;
     loop {
+        if waited && now() >= deadline {
+            return Err(busy());
+        }
         match imp::try_lock_exclusive(&file) {
+            Ok(true) if waited && now() >= deadline => return Err(busy()),
             Ok(true) => {
                 return Ok(StateLock {
                     file,
@@ -52,18 +69,14 @@ pub(super) fn lock_state(path: &Path) -> Result<StateLock, DbAdmissionError> {
                     _fork_guard: fork_guard,
                 });
             }
-            Ok(false) if std::time::Instant::now() < deadline => {
+            Ok(false) if now() < deadline => {
+                waited = true;
                 std::thread::sleep(
                     super::db_admission::ADMISSION_LOCK_RETRY
-                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                        .min(deadline.saturating_duration_since(now())),
                 );
             }
-            Ok(false) => {
-                return Err(DbAdmissionError::Busy {
-                    path: path.to_path_buf(),
-                    timeout_ms: super::db_admission::ADMISSION_LOCK_TIMEOUT.as_millis() as u64,
-                });
-            }
+            Ok(false) => return Err(busy()),
             Err(source) => {
                 return Err(DbAdmissionError::Io {
                     path: path.to_path_buf(),
@@ -367,4 +380,60 @@ fn verify_current_sidecar_inode(path: &Path, file: &File) -> io::Result<()> {
         return Err(io::Error::other("unsafe sidecar inode"));
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_lock_does_not_admit_after_contended_deadline() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("admission.lock");
+        let holder = open_sidecar(&path, true, true).expect("open lock holder");
+        assert!(
+            imp::try_lock_exclusive(&holder).expect("lock holder"),
+            "new lock file must be lockable"
+        );
+        let started = std::time::Instant::now();
+        let deadline = started + super::super::db_admission::ADMISSION_LOCK_TIMEOUT;
+        let mut holder = Some(holder);
+        let mut clock_reads = 0;
+
+        let result = lock_state_until(&path, deadline, || {
+            clock_reads += 1;
+            if clock_reads == 1 {
+                started
+            } else {
+                drop(holder.take());
+                deadline
+            }
+        });
+
+        let error = match result {
+            Ok(_) => panic!("late file-lock release must not admit after the deadline"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            DbAdmissionError::Busy {
+                path: busy_path,
+                timeout_ms: 250,
+            } if busy_path == path
+        ));
+    }
+
+    #[test]
+    fn file_lock_keeps_nonblocking_first_attempt_at_expired_deadline() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("admission.lock");
+        let deadline = std::time::Instant::now();
+
+        let lock = lock_state_until(&path, deadline, || {
+            panic!("an uncontended first attempt must not consult the expired deadline")
+        })
+        .expect("uncontended first attempt remains nonblocking");
+
+        drop(lock);
+    }
 }
