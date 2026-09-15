@@ -663,7 +663,7 @@ def _remove_snapshot(directory_fd: int, relative: tuple[str, ...], snapshot: Tre
                     raise OSError(errno.EBUSY, "fixture entry changed while opening")
                 os.unlink(name, dir_fd=directory_fd)
                 if os.fstat(leaf_fd).st_nlink != expected[name][3] - 1:
-                    raise OSError(errno.EBUSY, "fixture entry changed before removal")
+                    raise OSError(errno.EBUSY, "fixture entry changed during final removal")
             finally:
                 os.close(leaf_fd)
 
@@ -685,6 +685,9 @@ def allocate_fixture_root() -> FixtureIdentity:
 
 
 def remove_owned_root(identity: FixtureIdentity) -> bool:
+    # ponytail: Unix UID is the trust boundary; callers must quiesce same-UID fixture
+    # mutation. These checks fail closed on observed drift, but only a kernel-enforced
+    # credential/LSM/private-backing boundary can prevent a final pathname exchange.
     parent_fd = root_fd = None
     try:
         parent_fd = os.open(
@@ -717,9 +720,6 @@ def remove_owned_root(identity: FixtureIdentity) -> bool:
         ) != _entry_identity(os.fstat(root_fd)):
             raise OSError(errno.EBUSY, "fixture root identity changed before removal")
         os.rmdir(name, dir_fd=parent_fd)
-        # Linux cannot rmdir an opened directory by fd. A final exchange can
-        # only remove an empty substitute; this link check proves the owned
-        # inode, rather than a populated replacement, was removed.
         if os.fstat(root_fd).st_nlink != 0:
             raise OSError(errno.EBUSY, "fixture root changed during final removal")
     except OSError as error:

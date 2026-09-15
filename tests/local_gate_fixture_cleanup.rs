@@ -320,3 +320,108 @@ assert all(all(checks) for checks in results), results
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cargo_test_wrapper_documents_unsupported_same_uid_final_exchanges() {
+    let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
+    let harness = r#"
+import importlib.util
+import os
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("timeout_wrapper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+def open_directory(path):
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+def run_case(kind):
+    with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as base:
+        root = os.path.join(base, "owned")
+        held = os.path.join(base, "held")
+        victim = os.path.join(base, "victim")
+        os.mkdir(root, 0o700)
+        identity = module.capture_fixture_identity(root)
+        exchanged = False
+
+        if kind == "file":
+            owned = os.path.join(root, "leaf")
+            with open(owned, "wb") as handle:
+                handle.write(b"owned")
+            with open(victim, "wb") as handle:
+                handle.write(b"victim")
+            owned_fd = os.open(owned, os.O_PATH | os.O_CLOEXEC)
+            victim_fd = os.open(victim, os.O_PATH | os.O_CLOEXEC)
+            real_remove = module.os.unlink
+
+            def exchange_then_remove(name, *, dir_fd):
+                nonlocal exchanged
+                if not exchanged:
+                    os.rename(owned, held)
+                    os.rename(victim, owned)
+                    exchanged = True
+                return real_remove(name, dir_fd=dir_fd)
+
+            module.os.unlink = exchange_then_remove
+        else:
+            owned = root if kind == "root" else os.path.join(root, "child")
+            if kind == "child":
+                os.mkdir(owned, 0o700)
+            os.mkdir(victim, 0o700)
+            owned_fd = open_directory(owned)
+            victim_fd = open_directory(victim)
+            real_remove = module.os.rmdir
+
+            def exchange_then_remove(name, *, dir_fd):
+                nonlocal exchanged
+                final_name = "owned" if kind == "root" else "child"
+                if not exchanged and name == final_name:
+                    os.rename(owned, held)
+                    os.rename(victim, owned)
+                    exchanged = True
+                return real_remove(name, dir_fd=dir_fd)
+
+            module.os.rmdir = exchange_then_remove
+
+        try:
+            removed = module.remove_owned_root(identity)
+            owned_links = os.fstat(owned_fd).st_nlink
+            victim_links = os.fstat(victim_fd).st_nlink
+        finally:
+            if kind == "file":
+                module.os.unlink = real_remove
+            else:
+                module.os.rmdir = real_remove
+            os.close(owned_fd)
+            os.close(victim_fd)
+    assert not os.path.lexists(base), base
+    return exchanged, removed, owned_links, victim_links
+
+# These are counterexamples for the explicitly unsupported adversarial same-UID
+# threat, not safety-pass assertions. The original inode survives and the
+# substituted victim is removed at each final pathname mutation.
+results = {kind: run_case(kind) for kind in ("file", "child", "root")}
+for kind, expected_removed in (("file", False), ("child", True), ("root", False)):
+    exchanged, removed, owned_links, victim_links = results[kind]
+    assert exchanged and removed is expected_removed, results
+    assert owned_links > 0 and victim_links == 0, results
+"#;
+    let output = Command::new("python3")
+        .args(["-c", harness])
+        .arg(script)
+        .env("TMPDIR", std::env::temp_dir())
+        .env("TMP", std::env::temp_dir())
+        .env("TEMP", std::env::temp_dir())
+        .output()
+        .expect("run final exchange counterexamples");
+    assert!(
+        output.status.success(),
+        "final exchange counterexamples failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
