@@ -216,6 +216,7 @@ struct PreparedSpawn {
     setup_pipe: Pipe,
     setup_gate: Option<ChildSetupGate>,
     close_fds: Vec<RawFd>,
+    preserved_child_fds: Vec<RawFd>,
     failure_record: SetupFailureRecord,
 }
 
@@ -418,6 +419,19 @@ impl PreparedSpawn {
             }
         };
 
+        let mut preserved_child_fds = vec![
+            child_stdin,
+            child_stdout,
+            child_stderr,
+            setup_pipe.write.as_raw_fd(),
+        ];
+        if let Some(gate) = &spec.setup_gate {
+            preserved_child_fds.push(gate.ready_write.as_raw_fd());
+            preserved_child_fds.push(gate.release_read.as_raw_fd());
+        }
+        preserved_child_fds.sort_unstable();
+        preserved_child_fds.dedup();
+
         Ok(Self {
             executable,
             _argv: argv,
@@ -436,6 +450,7 @@ impl PreparedSpawn {
             setup_pipe,
             setup_gate: spec.setup_gate,
             close_fds,
+            preserved_child_fds,
             failure_record: SetupFailureRecord {
                 stage: 0,
                 padding: [0; 3],
@@ -454,6 +469,9 @@ unsafe fn child_exec(prepared: &PreparedSpawn) -> ! {
     unsafe {
         if libc::setpgid(0, 0) != 0 {
             child_fail(prepared, SetupStage::SetProcessGroup)
+        }
+        if !close_inherited_fds_except(&prepared.preserved_child_fds) {
+            child_fail(prepared, SetupStage::Exec)
         }
 
         if let Some(gate) = &prepared.setup_gate {
@@ -520,6 +538,29 @@ unsafe fn child_exec(prepared: &PreparedSpawn) -> ! {
         );
         child_fail(prepared, SetupStage::Exec)
     }
+}
+
+// SAFETY: call only in the post-fork child. `preserved` is sorted pre-fork and
+// every syscall operates only on the child's descriptor table.
+unsafe fn close_inherited_fds_except(preserved: &[RawFd]) -> bool {
+    let mut first = libc::STDERR_FILENO as u32 + 1;
+    for &preserved_fd in preserved {
+        if preserved_fd <= libc::STDERR_FILENO {
+            continue;
+        }
+        let preserved_fd = preserved_fd as u32;
+        if first < preserved_fd
+            // SAFETY: this branch runs only in the fork child and excludes every required fd.
+            && unsafe {
+                libc::syscall(libc::SYS_close_range, first, preserved_fd - 1, 0u32)
+            } != 0
+        {
+            return false;
+        }
+        first = preserved_fd.saturating_add(1);
+    }
+    // SAFETY: all required descriptors were excluded by the sorted gaps above.
+    unsafe { libc::syscall(libc::SYS_close_range, first, u32::MAX, 0u32) == 0 }
 }
 
 // SAFETY: call only from the post-fork child with a valid pre-fork `prepared` allocation; it
