@@ -208,6 +208,22 @@ fn test_writer_lease_retry_classifier_rejects_non_transient_admission() {
     })
     .context("failed to open database for MCP ingest writer lease");
     assert!(!anyhow_chain_contains_sqlite_lock(&corrupt));
+    assert_eq!(
+        status_db_failure_kind(permission.as_ref()),
+        "path_or_permission"
+    );
+    assert_eq!(
+        status_db_failure_kind(unsafe_sidecar.as_ref()),
+        "unsafe_sidecar"
+    );
+    assert_eq!(
+        status_db_failure_kind(schema.as_ref()),
+        "unsupported_schema"
+    );
+    assert_eq!(
+        status_db_failure_kind(corrupt.as_ref()),
+        "corrupt_or_invalid"
+    );
 
     let busy = anyhow::Error::new(crate::core::db_admission::DbAdmissionError::Busy {
         path: PathBuf::from("palace.db.admission.lock"),
@@ -242,97 +258,69 @@ fn test_writer_lease_retry_classifier_rejects_non_transient_admission() {
     assert!(!anyhow_chain_has_transient_admission(&corrupt));
 }
 
-#[tokio::test]
-async fn test_scoped_ingest_non_transient_lease_open_remains_fail_closed() {
+#[tokio::test(flavor = "current_thread")]
+async fn test_scoped_ingest_timely_lease_failure_returns_error_and_releases_claim() {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
-    let failures = vec![
-        (
-            "permission",
-            "path_or_permission",
-            crate::core::db_admission::DbAdmissionError::Io {
-                path: PathBuf::from("/private/permission/palace.db.admission.lock"),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "BACKEND_SECRET permission detail",
-                ),
-            },
-        ),
-        (
-            "unsafe-sidecar",
-            "unsafe_sidecar",
-            crate::core::db_admission::DbAdmissionError::UnsafeSidecar {
-                path: PathBuf::from("/private/unsafe/palace.db.admission.lock"),
-                reason: "BACKEND_SECRET symlink target",
-            },
-        ),
-        (
-            "schema",
-            "unsupported_schema",
-            crate::core::db_admission::DbAdmissionError::UnsupportedStateVersion {
-                path: PathBuf::from("/private/schema/palace.db.admission.state"),
-                version: 99,
-            },
-        ),
-        (
-            "corruption",
-            "corrupt_or_invalid",
-            crate::core::db_admission::DbAdmissionError::InvalidState {
-                path: PathBuf::from("/private/corrupt/palace.db.admission.state"),
-                source: serde_json::from_str::<serde_json::Value>("not-json").unwrap_err(),
-            },
-        ),
-    ];
+    let (_tempdir, db_path, server) = setup_server();
+    let server = server.with_ingest_writer_lease_failures_for_test(1);
 
-    for (name, expected_class, failure) in failures {
-        let (_tempdir, db_path, server) = setup_server();
-        let failure = Arc::new(Mutex::new(Some(failure)));
-        let mut server = server;
-        server.ingest_writer_lease_open_hook = Some(Arc::new(move |_| {
-            Err(failure
-                .lock()
-                .expect("injected lease-open error")
-                .take()
-                .expect("lease-open error is injected once"))
-        }));
-        let error = match server
-            .mempal_ingest_with_controls_scoped_worker(
-                IngestRequest {
-                    content: format!("{name} lease-open failure must not retry"),
-                    wing: "mcp".to_string(),
-                    room: Some("lease-fail-closed".to_string()),
-                    wait: Some(true),
-                    wait_timeout_secs: Some(6),
-                    ..IngestRequest::default()
-                },
-                IngestControls {
-                    no_gate: true,
-                    bypass_novelty: true,
-                },
-            )
-            .await
-        {
-            Ok(_) => panic!("{name} lease failure must fail closed"),
-            Err(error) => error,
-        };
+    let error = match tokio::time::timeout(
+        Duration::from_secs(3),
+        server.mempal_ingest_with_controls_scoped_worker(
+            IngestRequest {
+                content: "timely lease failure must fail closed before the request deadline"
+                    .to_string(),
+                wing: "mcp".to_string(),
+                room: Some("lease-fail-closed".to_string()),
+                wait: Some(true),
+                wait_timeout_secs: Some(6),
+                ..IngestRequest::default()
+            },
+            IngestControls {
+                no_gate: true,
+                bypass_novelty: true,
+            },
+        ),
+    )
+    .await
+    .expect("pre-spawn lease failure must arrive before the request deadline")
+    {
+        Ok(_) => panic!("timely lease failure must return a synchronous MCP error"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+    assert_sanitized_error_surface(&error);
 
-        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
-        assert_eq!(
-            sanitized_failure_class(&error),
-            Some(expected_class),
-            "{name} failure must expose one mandatory sanitized class"
-        );
-        assert_sanitized_error_surface(&error);
-
-        let stats = PendingMessageStore::new_without_reclaim(&db_path)
-            .stats()
-            .expect("queue stats");
-        assert_eq!(stats.claimed, 0);
-        let drawers = Database::open(&db_path)
-            .expect("open after fail-closed lease")
+    let queue = PendingMessageStore::new_without_reclaim(&db_path);
+    let claim = queue
+        .claim_next_by_kind("timely-failure-verifier", 60, INGEST_ASYNC_KIND)
+        .expect("claim retryable operation")
+        .expect("timely failure must release its exact queue row");
+    let operation_id = claim.id.clone();
+    queue
+        .release_claim(&claim)
+        .expect("release verifier claim after proving retryability");
+    let record = queue
+        .operation_status(&operation_id)
+        .expect("query timely failure operation")
+        .expect("timely failure operation must remain queryable");
+    assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
+    assert!(record.claimed_at.is_none());
+    assert_eq!(
+        Database::open(&db_path)
+            .expect("open after timely lease failure")
             .drawer_count()
-            .expect("drawer count");
-        assert_eq!(drawers, 0);
-    }
+            .expect("drawer count"),
+        0
+    );
+    assert!(
+        Database::open(&db_path)
+            .expect("open lease status after timely failure")
+            .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+            .expect("read writer leases")
+            .is_empty(),
+        "timely lease failure must not strand a writer lease"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -425,16 +413,9 @@ async fn test_owned_scoped_ingest_lease_acquire_uses_original_deadline() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn test_owned_scoped_ingest_late_non_transient_acquire_records_failure() {
+async fn test_scoped_ingest_late_non_transient_lease_open_records_failure() {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, mut server) = setup_server();
-    let (queue, async_queue, operation_id, claim) = claimed_test_ingest(
-        &server,
-        &db_path,
-        "worker-owned-late-failure",
-        "late InvalidState must leave a durable failed receipt",
-    )
-    .await;
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     let release_rx = Arc::new(Mutex::new(Some(release_rx)));
@@ -452,50 +433,78 @@ async fn test_owned_scoped_ingest_late_non_transient_acquire_records_failure() {
             source: serde_json::from_str::<serde_json::Value>("not-json").unwrap_err(),
         })
     }));
-    let processing = tokio::spawn(async move {
-        server
-            .process_ingest_claim_with_owned_task_budget(
-                &async_queue,
-                "worker-owned-late-failure",
-                claim,
-                Duration::from_millis(20),
+    let request_server = server.clone();
+    let mut request = tokio::spawn(async move {
+        request_server
+            .mempal_ingest_with_controls_scoped_worker(
+                IngestRequest {
+                    content: "late corruption must return a non-success receipt".to_string(),
+                    wing: "mcp".to_string(),
+                    room: Some("lease-fail-closed".to_string()),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(6),
+                    ..IngestRequest::default()
+                },
+                IngestControls {
+                    no_gate: true,
+                    bypass_novelty: true,
+                },
             )
             .await
     });
-    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(1)))
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(2)))
         .await
         .expect("lease-open observer must not panic")
         .expect("lease-open must start");
-    let mut processing = processing;
-    let bounded = tokio::time::timeout(Duration::from_millis(100), &mut processing).await;
-    let returned_before_release = bounded.is_ok();
-    release_tx.send(()).expect("release lease-open");
-    let result = match bounded {
+    let response_before_release = tokio::time::timeout(Duration::from_secs(8), &mut request).await;
+    let returned_before_release = response_before_release.is_ok();
+    release_tx
+        .send(())
+        .expect("release late lease-open failure");
+    let response = match response_before_release {
         Ok(joined) => joined,
-        Err(_) => processing.await,
+        Err(_) => tokio::time::timeout(Duration::from_secs(5), &mut request)
+            .await
+            .expect("request must settle during cleanup"),
     }
-    .expect("owned processing task must not panic")
-    .expect("request deadline must return a typed timeout");
+    .expect("request task must not panic")
+    .unwrap_or_else(|error| {
+        panic!(
+            "late failure must not cross the elapsed caller deadline as a synchronous error: {error:?}"
+        )
+    })
+    .0;
 
     assert!(
         returned_before_release,
-        "late corruption exceeded the request deadline"
+        "caller must return before the late lease-open failure is released"
     );
-    assert_eq!(result, ScopedIngestProcessResult::TimedOut);
+    assert!(
+        response.timed_out || response.state == Some(IngestOperationState::Failed),
+        "late corruption must return a non-success receipt: {response:?}"
+    );
+    assert_ne!(response.state, Some(IngestOperationState::Completed));
+    assert!(response.created_drawer_ids.is_empty());
+    assert!(response.drawer_ids.is_empty());
+    assert!(response.drawer_id.is_empty());
+    let operation_id = response
+        .operation_id
+        .as_deref()
+        .expect("late failure receipt must remain queryable");
+
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let record = queue
-                .operation_status(&operation_id)
-                .expect("load operation")
-                .expect("operation exists");
+            let record = PendingMessageStore::new_without_reclaim(&db_path)
+                .operation_status(operation_id)
+                .expect("load late failure operation")
+                .expect("late failure operation exists");
             if record.op_state == IngestOperationState::Failed.as_str() {
-                assert!(
-                    record
-                        .failure_detail
-                        .as_deref()
-                        .is_some_and(|detail| detail.contains("corrupt_or_invalid")),
-                    "late failure must persist its sanitized class: {record:?}"
-                );
+                let detail = record
+                    .failure_detail
+                    .as_deref()
+                    .expect("late failure must persist a sanitized detail");
+                assert!(detail.contains("corrupt_or_invalid"), "{record:?}");
+                assert!(!detail.contains("/private/") && !detail.contains("BACKEND_SECRET"));
                 break;
             }
             tokio::task::yield_now().await;
@@ -503,6 +512,25 @@ async fn test_owned_scoped_ingest_late_non_transient_acquire_records_failure() {
     })
     .await
     .expect("late non-transient acquire must reach durable failure");
+    let stats = PendingMessageStore::new_without_reclaim(&db_path)
+        .stats()
+        .expect("queue stats after late failure");
+    assert_eq!(stats.claimed, 0);
+    assert_eq!(
+        Database::open(&db_path)
+            .expect("open after late failure")
+            .drawer_count()
+            .expect("drawer count"),
+        0
+    );
+    assert!(
+        Database::open(&db_path)
+            .expect("open lease status after late failure")
+            .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+            .expect("read writer leases")
+            .is_empty(),
+        "late lease-open failure must not strand a writer lease"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

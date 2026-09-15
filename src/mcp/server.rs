@@ -16774,33 +16774,98 @@ pattern_boost = 0.2
     async fn test_mcp_ingest_wait_budget_includes_queue_admission() {
         let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (_tempdir, db_path, server) = setup_server();
+        let admission_progress = Arc::new(Notify::new());
         let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
-            .with_blocking_delay(Duration::from_millis(1200));
+            .with_blocking_delay(Duration::from_millis(1200))
+            .with_blocking_started_for_test(Arc::clone(&admission_progress));
+        let async_queue_observer = async_queue.clone();
         let server = server
             .with_async_queue_for_test(async_queue)
             .with_daemon_writer_lease_check_error_for_test("skip unrelated lease probe");
+        server.ingest_worker_started.store(true, Ordering::SeqCst);
 
-        let response = tokio::time::timeout(
-            Duration::from_millis(1700),
-            server.mempal_ingest(Parameters(IngestRequest {
-                content: "slow queue admission should not extend MCP wait budget".to_string(),
-                wing: "mcp".to_string(),
-                room: Some("receipt".to_string()),
-                dry_run: Some(false),
-                wait: Some(true),
-                wait_timeout_secs: Some(1),
-                ..IngestRequest::default()
-            })),
-        )
-        .await
-        .expect("MCP ingest should return the queued receipt without a second slow status lookup")
+        let admission_started = admission_progress.notified();
+        tokio::pin!(admission_started);
+        let request_server = server.clone();
+        let mut request = tokio::spawn(async move {
+            request_server
+                .mempal_ingest(Parameters(IngestRequest {
+                    content: "slow queue admission should not extend MCP wait budget".to_string(),
+                    wing: "mcp".to_string(),
+                    room: Some("receipt".to_string()),
+                    dry_run: Some(false),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(1),
+                    ..IngestRequest::default()
+                }))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), &mut admission_started)
+            .await
+            .expect("queue admission must start within the cleanup bound");
+        tokio::time::timeout(Duration::from_secs(5), admission_progress.notified())
+            .await
+            .expect("durable queue admission must finish within the cleanup bound");
+
+        let post_admission = tokio::time::timeout(Duration::from_millis(300), &mut request).await;
+        let returned_after_admission = post_admission.is_ok();
+        let response = match post_admission {
+            Ok(joined) => joined,
+            Err(_) => tokio::time::timeout(Duration::from_secs(5), &mut request)
+                .await
+                .expect("request must settle within the cleanup bound"),
+        }
+        .expect("request task must not panic")
         .expect("slow queue admission should still return a receipt")
         .0;
 
+        assert!(
+            returned_after_admission,
+            "request must return promptly after durable admission without another status probe"
+        );
         assert_eq!(response.state, Some(IngestOperationState::Queued));
         assert!(response.timed_out);
-        assert!(response.operation_id.is_some());
         assert!(response.created_drawer_ids.is_empty());
+        assert!(response.drawer_ids.is_empty());
+        assert!(response.drawer_id.is_empty());
+        let operation_id = response
+            .operation_id
+            .as_deref()
+            .expect("queued response must include an operation id");
+        let record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(operation_id)
+            .expect("load admitted operation")
+            .expect("returned operation must be durable");
+        assert_eq!(record.id, operation_id);
+        assert_eq!(record.kind, INGEST_ASYNC_KIND);
+        assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
+        assert!(record.claimed_at.is_none());
+        assert_eq!(
+            server
+                .operation_status_json_within_probe_attempts
+                .load(Ordering::Relaxed),
+            0,
+            "exhausted wait budget must skip the post-admission status probe"
+        );
+        assert_eq!(
+            async_queue_observer.available_blocking_permits_for_test(),
+            4
+        );
+        assert_eq!(
+            Database::open(&db_path)
+                .expect("open after queue admission")
+                .drawer_count()
+                .expect("drawer count"),
+            0
+        );
+        assert!(
+            Database::open(&db_path)
+                .expect("open lease status after queue admission")
+                .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+                .expect("read writer leases")
+                .is_empty(),
+            "queue-only admission must not hold a writer lease"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
