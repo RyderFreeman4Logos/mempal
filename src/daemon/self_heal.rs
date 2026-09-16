@@ -267,13 +267,19 @@ const HOOK_IPC_ACK_BLOCKING_ENTER: u8 = 2;
 const HOOK_IPC_ACK_APPEND_RETURN: u8 = 3;
 #[cfg(all(test, unix))]
 const HOOK_IPC_ACK_RESPONSE_FLUSH: u8 = 4;
+#[cfg(all(test, unix))]
+const HOOK_IPC_ACK_BLOCKING_SUBMIT: u8 = 5;
+#[cfg(all(test, unix))]
+const HOOK_IPC_ACK_APPEND_RESUMED: u8 = 6;
 
 #[cfg(all(test, unix))]
 static HOOK_IPC_ACK_ORIGIN: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 #[cfg(all(test, unix))]
 static HOOK_IPC_ACK_LAST: AtomicU8 = AtomicU8::new(0);
 #[cfg(all(test, unix))]
-static HOOK_IPC_ACK_NS: [AtomicU64; 4] = [
+static HOOK_IPC_ACK_NS: [AtomicU64; 6] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -317,22 +323,26 @@ fn hook_ipc_ack_checkpoint_report_for_test() -> String {
         HOOK_IPC_ACK_BLOCKING_ENTER => "blocking_closure_enter",
         HOOK_IPC_ACK_APPEND_RETURN => "append_return",
         HOOK_IPC_ACK_RESPONSE_FLUSH => "response_flush",
+        HOOK_IPC_ACK_BLOCKING_SUBMIT => "blocking_submit",
+        HOOK_IPC_ACK_APPEND_RESUMED => "append_resumed",
         _ => "none",
     };
     let fmt = |phase: u8| {
         let ns = HOOK_IPC_ACK_NS[usize::from(phase) - 1].load(Ordering::SeqCst);
-        if ns == 0 && last < phase {
+        if ns == 0 {
             "none".to_string()
         } else {
             format!("{}ms", ns / 1_000_000)
         }
     };
     format!(
-        "last={last_name} request_read={} blocking_closure_enter={} append_return={} response_flush={}",
+        "last={last_name} request_read={} blocking_closure_enter={} append_return={} response_flush={} blocking_submit={} append_resumed={}",
         fmt(HOOK_IPC_ACK_REQUEST_READ),
         fmt(HOOK_IPC_ACK_BLOCKING_ENTER),
         fmt(HOOK_IPC_ACK_APPEND_RETURN),
-        fmt(HOOK_IPC_ACK_RESPONSE_FLUSH)
+        fmt(HOOK_IPC_ACK_RESPONSE_FLUSH),
+        fmt(HOOK_IPC_ACK_BLOCKING_SUBMIT),
+        fmt(HOOK_IPC_ACK_APPEND_RESUMED)
     )
 }
 
@@ -436,15 +446,20 @@ async fn persist_hook_ipc_request(
     let kind = request.kind.clone();
     let append_result = {
         let spool = spool.clone();
+        #[cfg(all(test, unix))]
+        mark_hook_ipc_ack_checkpoint_for_test(HOOK_IPC_ACK_BLOCKING_SUBMIT);
         tokio::task::spawn_blocking(move || {
             #[cfg(all(test, unix))]
             mark_hook_ipc_ack_checkpoint_for_test(HOOK_IPC_ACK_BLOCKING_ENTER);
-            spool.append(&request)
+            let result = spool.append(&request);
+            #[cfg(all(test, unix))]
+            mark_hook_ipc_ack_checkpoint_for_test(HOOK_IPC_ACK_APPEND_RETURN);
+            result
         })
         .await
     };
     #[cfg(all(test, unix))]
-    mark_hook_ipc_ack_checkpoint_for_test(HOOK_IPC_ACK_APPEND_RETURN);
+    mark_hook_ipc_ack_checkpoint_for_test(HOOK_IPC_ACK_APPEND_RESUMED);
     match append_result {
         Ok(Ok(_)) => {
             tracing::debug!(%kind, "fsynced hook IPC capture in ingress spool");

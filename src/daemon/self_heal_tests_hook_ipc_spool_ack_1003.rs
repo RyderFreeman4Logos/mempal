@@ -34,6 +34,7 @@ async fn test_hook_ipc_spools_before_ack_when_sqlite_locked() {
     super::wait_for_active_handler_count(1, "starting locked SQLite enqueue").await;
     let mut frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
     frame.push(b'\n');
+    super::reset_hook_ipc_ack_checkpoints_for_test();
     tokio::io::AsyncWriteExt::write_all(&mut client, &frame)
         .await
         .expect("write request");
@@ -99,4 +100,137 @@ async fn test_hook_ipc_spools_before_ack_when_sqlite_locked() {
         .expect("query pending after unlock");
     assert_eq!(count_after_unlock, 1);
     assert_eq!(stored_id, actual_id);
+}
+
+// Withhold the current-thread runtime's continuation after dispatch. A real
+// idempotent append takes the same spool mutex and confirms durable completion;
+// the observation must not mistake an unpolled JoinHandle for unfinished fsync.
+#[test]
+fn append_checkpoint_precedes_runtime_resumption() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("controlled fixture runtime");
+    runtime.block_on(async {
+        let _guard = super::lock_hook_ipc_tests().await;
+        let tmp = tempfile::tempdir().expect("fixture dir");
+        let store = AsyncPendingMessageStore::new_without_reclaim(tmp.path().join("palace.db"));
+        let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+        let spool = crate::ingress_spool::IngressSpool::new(tmp.path());
+        let request = crate::hook_ipc::HookIpcEnqueueRequest::new("fixture", "fixture");
+        let control = request.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(crate::hook_ipc::HOOK_IPC_READ_TIMEOUT);
+        });
+        entered_rx
+            .await
+            .expect("blocking worker owns the only slot");
+        let mut persist = Box::pin(super::persist_hook_ipc_request(
+            &store, &spool, &observer, request,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(
+                persist.as_mut().poll(cx).is_pending(),
+                "first poll dispatches append"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        drop(release_tx);
+        // Do not yield the async continuation. Bound only the fixture discovery;
+        // this is not a larger IPC deadline or a substitute for the 250ms ACK test.
+        let deadline = std::time::Instant::now() + crate::hook_ipc::HOOK_IPC_READ_TIMEOUT;
+        let directory = tmp.path().join(crate::ingress_spool::INGRESS_SPOOL_DIR);
+        let published = loop {
+            if std::fs::read_dir(&directory).is_ok_and(|entries| {
+                entries.filter_map(Result::ok).any(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                })
+            }) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        if published {
+            spool
+                .append(&control)
+                .expect("same-key durable completion control");
+        }
+        let before_resume = loop {
+            let report = super::hook_ipc_ack_checkpoint_report_for_test();
+            if !report.contains("append_return=none") || std::time::Instant::now() >= deadline {
+                break report;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        // Always await the owned append before asserting or removing its fixture.
+        let response = persist.await;
+        blocker.await.expect("release blocking worker");
+        assert!(published, "blocking append never published its record");
+        assert_eq!(response, crate::hook_ipc::HookIpcEnqueueResponse::Accepted);
+        assert!(
+            before_resume.contains("append_resumed=none"),
+            "{before_resume}"
+        );
+        assert!(
+            !before_resume.contains("append_return=none"),
+            "{before_resume}"
+        );
+    });
+}
+
+#[test]
+fn blocking_pool_queue_is_distinct_from_append_execution() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("controlled fixture runtime");
+    runtime.block_on(async {
+        let _guard = super::lock_hook_ipc_tests().await;
+        let tmp = tempfile::tempdir().expect("fixture dir");
+        let store = AsyncPendingMessageStore::new_without_reclaim(tmp.path().join("palace.db"));
+        let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+        let spool = crate::ingress_spool::IngressSpool::new(tmp.path());
+        let request = crate::hook_ipc::HookIpcEnqueueRequest::new("fixture", "fixture");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = entered_tx.send(());
+            // Sender drop also releases the owned worker during panic cleanup.
+            let _ = release_rx.recv_timeout(crate::hook_ipc::HOOK_IPC_READ_TIMEOUT);
+        });
+        entered_rx
+            .await
+            .expect("blocking worker owns the only slot");
+        super::reset_hook_ipc_ack_checkpoints_for_test();
+        let mut persist = Box::pin(super::persist_hook_ipc_request(
+            &store, &spool, &observer, request,
+        ));
+        let result = tokio::time::timeout(crate::hook_ipc::HOOK_IPC_TIMEOUT, &mut persist).await;
+        let queued = super::hook_ipc_ack_checkpoint_report_for_test();
+        drop(release_tx);
+        blocker.await.expect("release blocking worker");
+        let timed_out = result.is_err();
+        let response = match result {
+            Ok(response) => response,
+            Err(_) => persist.await,
+        };
+        assert!(timed_out, "queued work cannot ACK before it executes");
+        assert!(queued.contains("last=blocking_submit"), "{queued}");
+        assert!(queued.contains("blocking_closure_enter=none"), "{queued}");
+        assert!(queued.contains("append_return=none"), "{queued}");
+        assert_eq!(response, crate::hook_ipc::HookIpcEnqueueResponse::Accepted);
+    });
 }
