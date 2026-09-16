@@ -175,25 +175,30 @@ async fn send_hook_ipc_request(
     request: crate::hook_ipc::HookIpcEnqueueRequest,
 ) -> crate::hook_ipc::HookIpcEnqueueResponse {
     let (mut client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let handler = tokio::spawn(super::handle_hook_ipc_connection(
-        server, store, observer, spool,
-    ));
-    let mut frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
-    frame.push(b'\n');
-    tokio::io::AsyncWriteExt::write_all(&mut client, &frame)
-        .await
-        .expect("write request");
-    tokio::io::AsyncWriteExt::flush(&mut client)
-        .await
-        .expect("flush request");
-
-    let mut reader = tokio::io::BufReader::new(client);
-    let mut line = String::new();
-    tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
-        .await
-        .expect("read response");
-    handler.await.expect("handler task");
-    serde_json::from_str(line.trim()).expect("hook IPC response")
+    let handler = super::handle_hook_ipc_connection(server, store, observer, spool);
+    let exchange = async {
+        let mut frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
+        frame.push(b'\n');
+        tokio::io::AsyncWriteExt::write_all(&mut client, &frame)
+            .await
+            .expect("write request");
+        tokio::io::AsyncWriteExt::flush(&mut client)
+            .await
+            .expect("flush request");
+        let mut reader = tokio::io::BufReader::new(client);
+        let mut line = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        serde_json::from_str(line.trim()).expect("hook IPC response")
+    };
+    // This helper checks causal durability, not the separate 250ms ACK SLA.
+    // Join both owned futures; no spawned handler survives a failed assertion.
+    tokio::time::timeout(crate::hook_ipc::HOOK_IPC_READ_TIMEOUT, async {
+        tokio::join!(handler, exchange).1
+    })
+    .await
+    .expect("IPC fixture deadlock watchdog")
 }
 
 #[cfg(target_os = "linux")]
@@ -247,6 +252,9 @@ async fn test_hook_ipc_ack_replays_from_durable_spool() {
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
 
+    let lock = rusqlite::Connection::open(&db_path).expect("lock connection");
+    lock.execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold SQLite write lock");
     let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
     let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
     let request = crate::hook_ipc::HookIpcEnqueueRequest::new(
@@ -255,8 +263,19 @@ async fn test_hook_ipc_ack_replays_from_durable_spool() {
     );
 
     let spool = Arc::new(crate::ingress_spool::IngressSpool::new(tmp.path()));
-    let response = send_hook_ipc_request(store, observer, spool.clone(), request).await;
+    let response = send_hook_ipc_request(store, observer, spool.clone(), request.clone()).await;
     assert_eq!(response, crate::hook_ipc::HookIpcEnqueueResponse::Accepted);
+    let count: i64 = lock
+        .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
+            row.get(0)
+        })
+        .expect("count while locked");
+    assert_eq!(
+        count, 0,
+        "connected client observes ACK before SQLite replay"
+    );
+    lock.execute_batch("ROLLBACK;")
+        .expect("release SQLite write lock");
     assert_eq!(
         spool
             .drain_once(&AsyncPendingMessageStore::new_without_reclaim(&db_path))
@@ -264,14 +283,20 @@ async fn test_hook_ipc_ack_replays_from_durable_spool() {
             .expect("replay durable spool"),
         1
     );
-    let (kind, payload): (String, String) = rusqlite::Connection::open(&db_path)
-        .expect("open sqlite")
-        .query_row(
-            "SELECT kind, payload FROM pending_messages ORDER BY created_at DESC LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("query persisted IPC message");
+    let (count, id, kind, payload): (i64, String, String, String) =
+        rusqlite::Connection::open(&db_path)
+            .expect("open sqlite")
+            .query_row(
+                "SELECT COUNT(*), MIN(id), kind, payload FROM pending_messages",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("query persisted IPC message");
+    assert_eq!(count, 1);
+    assert_eq!(
+        id,
+        PendingMessageStore::idempotent_message_id(&request.kind, &request.idempotency_key)
+    );
     assert_eq!(kind, HookEvent::UserPromptSubmit.queue_kind());
     assert!(
         payload.contains("durable before ack"),

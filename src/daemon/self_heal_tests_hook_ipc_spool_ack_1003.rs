@@ -190,47 +190,152 @@ fn append_checkpoint_precedes_runtime_resumption() {
     });
 }
 
+// A real client times out while the append is queued; fallback and late replay
+// must use one identity, while a distinct intentional identical capture survives.
 #[test]
-fn blocking_pool_queue_is_distinct_from_append_execution() {
+fn hook_ipc_timeout_fallback_and_late_append_share_identity() {
+    use std::os::fd::AsRawFd;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(1)
         .build()
-        .expect("controlled fixture runtime");
-    runtime.block_on(async {
-        let _guard = super::lock_hook_ipc_tests().await;
-        let tmp = tempfile::tempdir().expect("fixture dir");
-        let store = AsyncPendingMessageStore::new_without_reclaim(tmp.path().join("palace.db"));
-        let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
-        let spool = crate::ingress_spool::IngressSpool::new(tmp.path());
-        let request = crate::hook_ipc::HookIpcEnqueueRequest::new("fixture", "fixture");
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let blocker = tokio::task::spawn_blocking(move || {
-            let _ = entered_tx.send(());
-            // Sender drop also releases the owned worker during panic cleanup.
-            let _ = release_rx.recv_timeout(crate::hook_ipc::HOOK_IPC_READ_TIMEOUT);
-        });
-        entered_rx
-            .await
-            .expect("blocking worker owns the only slot");
-        super::reset_hook_ipc_ack_checkpoints_for_test();
-        let mut persist = Box::pin(super::persist_hook_ipc_request(
-            &store, &spool, &observer, request,
-        ));
-        let result = tokio::time::timeout(crate::hook_ipc::HOOK_IPC_TIMEOUT, &mut persist).await;
-        let queued = super::hook_ipc_ack_checkpoint_report_for_test();
-        drop(release_tx);
-        blocker.await.expect("release blocking worker");
-        let timed_out = result.is_err();
-        let response = match result {
-            Ok(response) => response,
-            Err(_) => persist.await,
+        .expect("fixture runtime");
+    std::thread::scope(|scope| {
+        let scenario = async {
+            let _guard = super::lock_hook_ipc_tests().await;
+            let tmp = tempfile::tempdir().expect("fixture directory");
+            let db_path = tmp.path().join("palace.db");
+            Database::open(&db_path).expect("initialize fixture");
+            let fallback_store = PendingMessageStore::new(&db_path).expect("fallback store");
+            let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+            let spool = Arc::new(crate::ingress_spool::IngressSpool::new(tmp.path()));
+            let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+            let directory = std::fs::File::open(tmp.path()).expect("pin socket directory");
+            let home = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+            let (listener, _socket) = crate::hook_ipc::bind_listener(&home).expect("listener");
+            let request = crate::hook_ipc::HookIpcEnqueueRequest::new("fixture", "{}");
+            let control = request.clone();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv_timeout(crate::hook_ipc::HOOK_IPC_READ_TIMEOUT);
+            });
+            entered_rx.await.expect("own sole blocking slot");
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            super::reset_hook_ipc_ack_checkpoints_for_test();
+            let client = scope.spawn(move || {
+                let result = crate::hook_ipc::enqueue_with_default_timeout(&home, request);
+                let _ = done_tx.send(result);
+            });
+            let (stream, _) =
+                tokio::time::timeout(crate::hook_ipc::HOOK_IPC_READ_TIMEOUT, listener.accept())
+                    .await
+                    .expect("client connects")
+                    .expect("accept");
+            let handler = tokio::spawn(super::handle_hook_ipc_connection(
+                stream,
+                store.clone(),
+                observer,
+                spool.clone(),
+            ));
+            let outcome =
+                tokio::time::timeout(crate::hook_ipc::HOOK_IPC_READ_TIMEOUT, done_rx).await;
+            let queued = super::hook_ipc_ack_checkpoint_report_for_test();
+            // Match the actual hook's uncertain-delivery classification and write
+            // primitive. Perform the fallback BEFORE releasing the late append.
+            let fallback = match &outcome {
+                Ok(Ok(crate::hook_ipc::HookIpcClientOutcome::Fallback(reason)))
+                    if reason.may_have_reached_daemon() =>
+                {
+                    fallback_store.enqueue_idempotent_with_key(
+                        &control.kind,
+                        &control.payload,
+                        &control.idempotency_key,
+                    )
+                }
+                _ => fallback_store.enqueue(&control.kind, &control.payload),
+            };
+            let fallback_row: (i64, Option<String>) = rusqlite::Connection::open(&db_path)
+                .expect("inspect committed fallback")
+                .query_row(
+                    "SELECT COUNT(*), MIN(id) FROM pending_messages",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("fallback identity before append release");
+            drop(release_tx);
+            blocker.await.expect("reap blocking owner");
+            tokio::time::timeout(crate::hook_ipc::HOOK_IPC_READ_TIMEOUT, handler)
+                .await
+                .expect("handler cleanup")
+                .expect("handler task");
+            client.join().expect("reap client");
+            assert_eq!(
+                outcome.expect("client watchdog").expect("client result"),
+                crate::hook_ipc::HookIpcClientOutcome::Fallback(
+                    crate::hook_ipc::HookIpcFallbackReason::Timeout
+                )
+            );
+            assert!(queued.contains("last=blocking_submit"), "{queued}");
+            assert!(queued.contains("blocking_closure_enter=none"), "{queued}");
+            assert!(queued.contains("append_return=none"), "{queued}");
+            fallback.expect("fallback write");
+            assert_eq!(
+                fallback_row,
+                (
+                    1,
+                    Some(PendingMessageStore::idempotent_message_id(
+                        &control.kind,
+                        &control.idempotency_key,
+                    ))
+                ),
+                "original-key fallback must commit before late append runs"
+            );
+            // Confirm namespace durability through the existing same-key append,
+            // then replay with a fresh spool owner (not a response-attempt marker).
+            assert_eq!(
+                spool
+                    .append(&control)
+                    .expect("durable same-key confirmation"),
+                crate::ingress_spool::AppendOutcome::AlreadyPresent,
+                "confirmation must not create a missing daemon record"
+            );
+            let restarted = crate::ingress_spool::IngressSpool::new(tmp.path());
+            assert_eq!(restarted.drain_once(&store).await.expect("late replay"), 1);
+            let connection = rusqlite::Connection::open(&db_path).expect("verify database");
+            let (count, id): (i64, String) = connection
+                .query_row(
+                    "SELECT COUNT(*), MIN(id) FROM pending_messages",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("original identity");
+            assert_eq!(count, 1, "fallback plus daemon replay is one mutation");
+            assert_eq!(
+                id,
+                PendingMessageStore::idempotent_message_id(&control.kind, &control.idempotency_key)
+            );
+            let distinct =
+                crate::hook_ipc::HookIpcEnqueueRequest::new(&control.kind, &control.payload);
+            assert_ne!(distinct.idempotency_key, control.idempotency_key);
+            restarted
+                .append(&distinct)
+                .expect("separate identical intent");
+            assert_eq!(
+                restarted.drain_once(&store).await.expect("distinct replay"),
+                1
+            );
+            let count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
+                    row.get(0)
+                })
+                .expect("distinct count");
+            assert_eq!(count, 2);
+            eprintln!(
+                "hook_ipc_timeout_contract queued=[{queued}] fallback_plus_late=1 distinct_intent_total={count}"
+            );
         };
-        assert!(timed_out, "queued work cannot ACK before it executes");
-        assert!(queued.contains("last=blocking_submit"), "{queued}");
-        assert!(queued.contains("blocking_closure_enter=none"), "{queued}");
-        assert!(queued.contains("append_return=none"), "{queued}");
-        assert_eq!(response, crate::hook_ipc::HookIpcEnqueueResponse::Accepted);
+        runtime.block_on(scenario);
     });
 }

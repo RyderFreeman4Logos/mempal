@@ -34,7 +34,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Typed/redacted MCP admission and audit-write diagnostics (#879).
 - Daemon pidfile validates identity; scoped ingest release honors remaining retry budget (#885/#895).
 - Budget/suite locks; Busy non-budget; post-admission preflight (#893,#947,#1064–#1075,#934/#1077/#1078,#1161,#1173).
-- Readonly queue stats avoid 5s waits; sleep observer stays read-only (#911,#1157); lease DB reuse (#1175); request-relative ACK checkpoints distinguish fsync/resumption (#1171).
+- Readonly queue stats avoid 5s waits; read-only sleep observer (#911,#1157); lease DB reuse (#1175); request-relative ACK fsync/resume and deadline/fallback-key checks (#1171).
 
 - **Readiness**: lifecycle/poison tests; bounded watcher startup, owned timeout cleanup (#892,#1162).
 
