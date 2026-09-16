@@ -139,6 +139,8 @@ impl AsyncPendingMessageStore {
         let approved = tokio::select! {
             biased;
             _ = shutdown_rx.changed() => false,
+            // Empty/error results skip approval and drop ready_tx on task exit.
+            // Receiver closure also wakes this arm; result_rx carries the outcome.
             ready = ready_rx => ready.is_ok() && !*shutdown_rx.borrow(),
         };
         let _ = approval_tx.send(approved);

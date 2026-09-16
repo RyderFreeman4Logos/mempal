@@ -102,7 +102,9 @@ CONCLUDE_SCHEMA = {
         "type": "object",
         "properties": {
             "conclusion": {"type": "string", "description": "The fact to store."},
-            "operation_key": {"type": "string", "description": "Caller-owned opaque key (1-128 ASCII characters, no spaces). New intent: new key, even for identical text. Timeout/cancel/retry: reuse the original key."},
+            # Provider strict-schema subsets differ; keep exact constraints in
+            # prose and enforce them with valid_control_token at admission.
+            "operation_key": {"type": "string", "description": "Caller-owned opaque key: 1-128 printable ASCII characters (U+0021-U+007E), no whitespace or control characters. New intent: new key, even for identical text. Timeout/cancel/retry: reuse the original key."},
         },
         "required": ["conclusion", "operation_key"],
     },

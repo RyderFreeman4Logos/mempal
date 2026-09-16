@@ -193,6 +193,13 @@ pub(crate) fn enqueue_with_timeout(
         }
     };
 
+    // Opt in on this test thread only; exercise the real default wrapper's
+    // passed budget using virtual time without changing other socket tests.
+    #[cfg(test)]
+    if tests::CHECK_DEFAULT_TIMEOUT.replace(false) {
+        return runtime.block_on(tests::check_default_timeout(&path, request, timeout));
+    }
+
     runtime.block_on(enqueue_before_timeout(&path, request, timeout))
 }
 
@@ -447,19 +454,37 @@ fn new_idempotency_key() -> String {
 mod tests {
     use super::*;
 
-    #[tokio::test(start_paused = true)]
-    async fn hook_ipc_timeout_uses_the_default_250ms_budget() {
-        use std::task::Poll;
+    std::thread_local! {
+        pub(super) static CHECK_DEFAULT_TIMEOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    #[test]
+    fn hook_ipc_timeout_uses_the_default_250ms_budget() {
         assert_eq!(HOOK_IPC_TIMEOUT, Duration::from_millis(250));
         let tmp = tempfile::tempdir().expect("socket fixture");
-        // A bound, unanswered socket keeps the real exchange pending. Manual
-        // polling prevents idle-runtime auto-advance from hiding a longer timer.
-        let (_listener, socket) = bind_listener(tmp.path()).expect("bind fixture");
-        let mut request = Box::pin(enqueue_before_timeout(
-            socket.path(),
-            HookIpcEnqueueRequest::new("fixture", "{}"),
-            HOOK_IPC_TIMEOUT,
-        ));
+        let _listener = std::os::unix::net::UnixListener::bind(socket_path(tmp.path()))
+            .expect("bind unanswered socket");
+        CHECK_DEFAULT_TIMEOUT.set(true);
+        assert_eq!(
+            enqueue_with_default_timeout(tmp.path(), HookIpcEnqueueRequest::new("fixture", "{}")),
+            HookIpcClientOutcome::Fallback(HookIpcFallbackReason::Timeout)
+        );
+        assert!(
+            !CHECK_DEFAULT_TIMEOUT.get(),
+            "default wrapper must reach transport"
+        );
+    }
+
+    pub(super) async fn check_default_timeout(
+        path: &Path,
+        request: HookIpcEnqueueRequest,
+        timeout: Duration,
+    ) -> HookIpcClientOutcome {
+        use std::task::Poll;
+        tokio::time::pause();
+        // Manual polling prevents idle-runtime auto-advance from hiding a
+        // longer timer. The duration comes from the production default wrapper.
+        let mut request = Box::pin(enqueue_before_timeout(path, request, timeout));
         std::future::poll_fn(|cx| {
             assert!(request.as_mut().poll(cx).is_pending());
             Poll::Ready(())
@@ -487,6 +512,7 @@ mod tests {
             Poll::Ready(())
         })
         .await;
+        HookIpcClientOutcome::Fallback(HookIpcFallbackReason::Timeout)
     }
 
     #[cfg(unix)]

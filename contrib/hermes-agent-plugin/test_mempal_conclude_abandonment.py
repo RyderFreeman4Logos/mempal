@@ -6,6 +6,7 @@ import threading
 import unittest
 
 from mempal import CONCLUDE_SCHEMA
+from mempal._write_spool import valid_control_token
 from test_mempal_conclude import SharedConcludeBackend, SharedConcludeProvider
 
 
@@ -46,6 +47,25 @@ class ConcludeAbandonmentTests(unittest.TestCase):
 
     def test_schema_requires_identity_before_admission(self):
         self.assertIn("operation_key", CONCLUDE_SCHEMA["parameters"]["required"])
+
+    def test_operation_key_contract_exposes_exact_runtime_boundaries(self):
+        provider = self.provider(SharedConcludeBackend())
+        schema = next(item for item in provider.get_tool_schemas()
+                      if item["name"] == "mempal_conclude")
+        prop = json.loads(json.dumps(schema))["parameters"]["properties"]["operation_key"]
+        self.assertIn("1-128 printable ASCII characters (U+0021-U+007E)", prop["description"])
+        self.assertIn("no whitespace or control characters", prop["description"])
+        for codepoint in range(256):
+            char = chr(codepoint)
+            for value in (char, "key" + char, char + "key"):
+                with self.subTest(value=repr(value)):
+                    self.assertEqual(valid_control_token(value, allow_none=False),
+                                     0x21 <= codepoint <= 0x7e)
+        for value, accepted in (("", False), ("!", True), ("~" * 128, True),
+                                ("x" * 129, False), ("key\u2028", False),
+                                (None, False), (123, False)):
+            with self.subTest(value=repr(value)):
+                self.assertEqual(valid_control_token(value, allow_none=False), accepted)
 
     def test_missing_identity_is_rejected_without_spool_transport_or_breaker_effects(self):
         backend = SharedConcludeBackend()

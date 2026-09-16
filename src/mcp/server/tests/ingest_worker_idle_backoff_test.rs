@@ -76,21 +76,45 @@ async fn test_idle_claim_does_not_take_shutdown_ownership() {
     .with_claim_approved_for_test((Arc::clone(&approval), None));
     let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let claim = queue
-        .claim_next_by_kind_until_shutdown(
+    let claim = tokio::time::timeout(
+        Duration::from_secs(5),
+        queue.claim_next_by_kind_until_shutdown(
             "idle-owner-test".to_string(),
             INGEST_CLAIM_TTL_SECS,
             INGEST_ASYNC_KIND.to_string(),
             &mut shutdown_rx,
-        )
-        .await
-        .expect("idle claim");
+        ),
+    )
+    .await
+    .expect("empty queue must complete without approval or shutdown")
+    .expect("idle claim");
 
     assert!(claim.is_none());
     assert!(
         tokio::time::timeout(Duration::ZERO, approved).await.is_err(),
         "an idle poll must not cross the ownership fence that shutdown has to drain"
     );
+
+    // Use the same live shutdown channel and queue after the empty poll.
+    let operation_id = queue
+        .enqueue(INGEST_ASYNC_KIND.to_string(), "{}".to_string())
+        .await
+        .expect("enqueue after idle");
+    let claim = tokio::time::timeout(
+        Duration::from_secs(5),
+        queue.claim_next_by_kind_until_shutdown(
+            "idle-owner-test".to_string(),
+            INGEST_CLAIM_TTL_SECS,
+            INGEST_ASYNC_KIND.to_string(),
+            &mut shutdown_rx,
+        ),
+    )
+    .await
+    .expect("later enqueue must be claimable without shutdown")
+    .expect("claim after idle")
+    .expect("queued operation");
+    assert_eq!(claim.id, operation_id);
+    queue.release_claim(claim).await.expect("release claim");
 }
 
 #[tokio::test]
