@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import secrets
 import sqlite3
 import sys
 import tempfile
@@ -300,7 +301,7 @@ class DurableConcludeTests(unittest.TestCase):
         after = provider._backoff._read_state()
         self.assertEqual(after.failure_count, before.failure_count)
 
-    def test_default_confirmation_budget_covers_delayed_terminal_status(self) -> None:
+    def test_pending_probe_can_be_retried_after_delayed_terminal_status(self) -> None:
         provider = ControlledConcludeProvider("queued")
         provider.initialize("session-a", user_id="alice", profile="work")
         provider._start_write_worker = lambda: None
@@ -323,11 +324,15 @@ class DurableConcludeTests(unittest.TestCase):
         finally:
             _restore_virtual_clock(originals)
 
-        self.assertEqual(provider._conclude_wait_timeout, 240.0)
-        self.assertEqual(result.get("result"), "Fact stored.")
-        self.assertEqual(result.get("drawer_id"), "drawer-delayed")
-        self.assertGreater(clock.now, 5.0)
-        self.assertLessEqual(clock.now, 240.0)
+        self.assertEqual(provider._conclude_wait_timeout, 0.0)
+        self.assertNotIn("result", result)
+        self.assertEqual(clock.now, 0.0)
+        key = result["error_details"]["operation_key"]
+        clock.now = 241.0  # Slow model completion remains valid, beyond the old budget.
+        stored = self._conclude(provider, "delayed terminal fact", operation_key=key)
+        self.assertEqual(stored.get("result"), "Fact stored.")
+        self.assertEqual(stored.get("drawer_id"), "drawer-delayed")
+        self.assertEqual(stored.get("operation_key"), key)
 
     def test_forever_queued_status_expires_within_confirmation_budget(self) -> None:
         provider = ControlledConcludeProvider("queued")
@@ -346,8 +351,8 @@ class DurableConcludeTests(unittest.TestCase):
         self.assertEqual(details["error_class"], "status_queued")
         self.assertTrue(details["retry_safe"])
         self.assertNotIn("result", result)
-        self.assertGreaterEqual(clock.now, 240.0)
-        self.assertLessEqual(clock.now, 241.0)
+        self.assertEqual(clock.now, 0.0)
+        self.assertEqual(sum(path.startswith("/api/operations/") for path, _ in provider.gets), 1)
         self.assertNotIn("SECRET_FOREVER_QUEUED", json.dumps(result))
         provider.shutdown()
 
@@ -389,7 +394,7 @@ class DurableConcludeTests(unittest.TestCase):
         result = self._hermes_style_tool_dispatch(
             provider,
             "mempal_conclude",
-            {"conclusion": "SECRET_GATE_CONCLUSION"},
+            {"conclusion": "SECRET_GATE_CONCLUSION", "operation_key": "gate-conclusion"},
         )
 
         self.assertEqual(result["error"], "Memory is not yet confirmed stored.")
@@ -579,16 +584,8 @@ class DurableConcludeTests(unittest.TestCase):
         backend = SharedConcludeBackend()
         provider = SharedConcludeProvider(backend)
         provider.initialize("session-a", user_id="alice", profile="work")
-        generated = iter(("explicit-a", "explicit-b"))
-        original = conclude_module.secrets.token_urlsafe
-        conclude_module.secrets.token_urlsafe = lambda size: (
-            next(generated) if size == 32 else original(size)
-        )
-        try:
-            first = self._conclude(provider, "identical explicit conclusion")
-            second = self._conclude(provider, "identical explicit conclusion")
-        finally:
-            conclude_module.secrets.token_urlsafe = original
+        first = self._conclude(provider, "identical explicit conclusion", operation_key="explicit-a")
+        second = self._conclude(provider, "identical explicit conclusion", operation_key="explicit-b")
 
         self.assertEqual(first["operation_key"], "explicit-a")
         self.assertEqual(second["operation_key"], "explicit-b")
@@ -781,7 +778,7 @@ class DurableConcludeTests(unittest.TestCase):
         *,
         operation_key: Optional[str] = None,
     ) -> Dict[str, Any]:
-        args = {"conclusion": conclusion}
+        args = {"conclusion": conclusion, "operation_key": secrets.token_urlsafe(32)}
         if operation_key is not None:
             args["operation_key"] = operation_key
         return json.loads(provider.handle_tool_call(

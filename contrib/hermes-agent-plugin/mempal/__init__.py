@@ -48,9 +48,8 @@ _PREFETCH_TOP_K = 5
 _TURN_STORAGE_MODE_TTL = 60.0
 _WRITE_QUEUE_MAX = 1000
 _WRITE_DRAIN_TIMEOUT = 10.0
-# Client observation of queued/running REST ingest; not daemon admission.
-# User-tolerated model processing ceiling; forever-queued still expires here.
-_CONCLUDE_WAIT_TIMEOUT = 240.0
+# One status probe: Hermes does not forward the caller's remaining deadline.
+_CONCLUDE_WAIT_TIMEOUT = 0.0
 _WRITE_RETRY_MAX = 3
 _WRITE_RETRY_DELAY = 2.0
 _PINNED_FACTS_TTL = 300.0
@@ -103,9 +102,9 @@ CONCLUDE_SCHEMA = {
         "type": "object",
         "properties": {
             "conclusion": {"type": "string", "description": "The fact to store."},
-            "operation_key": {"type": "string", "description": "Stable retry key from a pending response."},
+            "operation_key": {"type": "string", "description": "Caller-owned opaque key (1-128 ASCII characters, no spaces). New intent: new key, even for identical text. Timeout/cancel/retry: reuse the original key."},
         },
-        "required": ["conclusion"],
+        "required": ["conclusion", "operation_key"],
     },
 }
 

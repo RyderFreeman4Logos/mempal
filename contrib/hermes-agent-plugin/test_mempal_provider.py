@@ -175,8 +175,8 @@ class MempalProviderScopeTests(unittest.TestCase):
         work.initialize("session-a", user_id="alice", profile="work")
         personal.initialize("session-b", user_id="alice", profile="personal")
 
-        work.handle_tool_call("mempal_conclude", {"conclusion": "likes vim"})
-        personal.handle_tool_call("mempal_conclude", {"conclusion": "likes emacs"})
+        work.handle_tool_call("mempal_conclude", {"operation_key": "fixture-178", "conclusion": "likes vim"})
+        personal.handle_tool_call("mempal_conclude", {"operation_key": "fixture-179", "conclusion": "likes emacs"})
 
         self.assertEqual(work.posts[-1][1]["request"]["wing"], "hermes-user/alice/work")
         self.assertEqual(personal.posts[-1][1]["request"]["wing"], "hermes-user/alice/personal")
@@ -187,8 +187,8 @@ class MempalProviderScopeTests(unittest.TestCase):
         chat_a.initialize("session-a", user_id="alice", profile="work", chat_id="chat-a")
         chat_b.initialize("session-b", user_id="alice", profile="work", chat_id="chat-b")
 
-        chat_a.handle_tool_call("mempal_conclude", {"conclusion": "prefers concise answers"})
-        chat_b.handle_tool_call("mempal_conclude", {"conclusion": "prefers citations"})
+        chat_a.handle_tool_call("mempal_conclude", {"operation_key": "fixture-190", "conclusion": "prefers concise answers"})
+        chat_b.handle_tool_call("mempal_conclude", {"operation_key": "fixture-191", "conclusion": "prefers citations"})
 
         self.assertEqual(
             chat_a.posts[-1][1]["request"]["wing"],
@@ -236,7 +236,7 @@ class MempalProviderScopeTests(unittest.TestCase):
         provider.responses["/api/timeline"] = [{"content": "fact"}]
         provider.handle_tool_call("mempal_profile", {"limit": 5})
         provider.handle_tool_call("mempal_search", {"query": "fact", "top_k": 3})
-        provider.handle_tool_call("mempal_conclude", {"conclusion": "durable fact"})
+        provider.handle_tool_call("mempal_conclude", {"operation_key": "fixture-239", "conclusion": "durable fact"})
         provider.sync_turn("hello", "hi")
         provider._drain_writes()
 
@@ -266,7 +266,7 @@ class MempalProviderScopeTests(unittest.TestCase):
         provider.responses["/api/timeline"] = [{"content": "fact"}]
         provider.handle_tool_call("mempal_profile", {"limit": 5})
         provider.handle_tool_call("mempal_search", {"query": "fact", "top_k": 3})
-        provider.handle_tool_call("mempal_conclude", {"conclusion": "durable fact"})
+        provider.handle_tool_call("mempal_conclude", {"operation_key": "fixture-269", "conclusion": "durable fact"})
 
         timeline_params = provider.gets[0][1]
         search_params = provider.gets[1][1]
@@ -351,7 +351,7 @@ class SearchResultTests(unittest.TestCase):
         provider = RecordingProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
 
-        result = json.loads(provider.handle_tool_call("mempal_conclude", {"conclusion": "test fact"}))
+        result = json.loads(provider.handle_tool_call("mempal_conclude", {"operation_key": "fixture-354", "conclusion": "test fact"}))
         self.assertIn("drawer_id", result)
 
     def test_conclude_http_500_returns_retry_safe_pending_handle(self) -> None:
@@ -366,7 +366,7 @@ class SearchResultTests(unittest.TestCase):
 
         result = json.loads(provider.handle_tool_call(
             "mempal_conclude",
-            {"conclusion": "synthetic harmless durable fact"},
+            {"operation_key": "fixture-369", "conclusion": "synthetic harmless durable fact"},
         ))
 
         self.assertEqual(result["error"], "Memory is not yet confirmed stored.")
@@ -1009,7 +1009,7 @@ class ReadinessDurableMemoryTests(unittest.TestCase):
     def test_conclude_stores_verbatim(self) -> None:
         provider = RecordingProvider()
         provider.initialize("session-a", user_id="alice", profile="work")
-        result = json.loads(provider.handle_tool_call("mempal_conclude", {"conclusion": "exact text"}))
+        result = json.loads(provider.handle_tool_call("mempal_conclude", {"operation_key": "fixture-1012", "conclusion": "exact text"}))
         self.assertEqual(provider.posts[-1][1]["request"]["content"], "exact text")
         self.assertIn("drawer_id", result)
 
