@@ -243,6 +243,97 @@ fn cargo_test_wrapper_owns_and_cleans_real_fixture_root() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cargo_test_wrapper_accepts_symlinked_tmpdir() {
+    let base = tempfile::tempdir().expect("symlink fixture base");
+    let target = base.path().join("target");
+    let alias = base.path().join("alias");
+    fs::create_dir(&target).expect("create target tmpdir");
+    std::os::unix::fs::symlink(&target, &alias).expect("create tmpdir symlink");
+
+    let output = Command::new("python3")
+        .arg(repo_root().join("scripts/gates/cargo-test-with-timeout.py"))
+        .args(["python3", "-c", "raise SystemExit(0)"])
+        .env("TMPDIR", &alias)
+        .env("TMP", &alias)
+        .env("TEMP", &alias)
+        .output()
+        .expect("run wrapper with symlinked tmpdir");
+
+    assert!(
+        output.status.success(),
+        "symlinked TMPDIR rejected: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(alias.is_symlink(), "configured TMPDIR symlink must survive");
+    assert_eq!(
+        fs::read_dir(&target).expect("read target tmpdir").count(),
+        0,
+        "owned fixture root must be removed from the symlink target"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cargo_test_wrapper_preserves_same_filesystem_bind_mount_contents() {
+    let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
+    let harness = r#"
+import importlib.util
+import os
+import subprocess
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("timeout_wrapper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as base:
+    root = os.path.join(base, "owned")
+    child = os.path.join(root, "child")
+    source = os.path.join(base, "external")
+    sentinel = os.path.join(source, "sentinel")
+    os.mkdir(root, 0o700)
+    os.mkdir(child, 0o700)
+    os.mkdir(source, 0o700)
+    with open(sentinel, "w", encoding="utf-8") as handle:
+        handle.write("keep")
+    identity = module.capture_fixture_identity(root)
+    subprocess.run(["mount", "--bind", source, child], check=True)
+    try:
+        assert os.stat(child).st_dev == os.stat(root).st_dev
+        assert not module.remove_owned_root(identity)
+        assert os.path.exists(sentinel), "cleanup crossed the bind mount"
+    finally:
+        subprocess.run(["umount", child], check=True)
+"#;
+    let output = Command::new("unshare")
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "python3",
+            "-c",
+            harness,
+        ])
+        .arg(script)
+        .env("TMPDIR", std::env::temp_dir())
+        .env("TMP", std::env::temp_dir())
+        .env("TEMP", std::env::temp_dir())
+        .output()
+        .expect("run isolated bind-mount harness");
+
+    assert!(
+        output.status.success(),
+        "bind-mount harness failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cargo_test_wrapper_preserves_exchanged_fixture_trees() {
     let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
     let harness = r#"
@@ -273,7 +364,7 @@ def run_case(exchange_descendant):
                 handle.write("owned")
         populated(victim, "victim-content")
         identity = module.capture_fixture_identity(root)
-        real_check = module.fixture_tree_stays_on_device
+        real_check = module.fixture_tree_stays_on_mount
         exchanged = False
 
         def check_then_exchange(path, dev):
@@ -288,11 +379,11 @@ def run_case(exchange_descendant):
             exchanged = True
             return result
 
-        module.fixture_tree_stays_on_device = check_then_exchange
+        module.fixture_tree_stays_on_mount = check_then_exchange
         try:
             removed = module.remove_owned_root(identity)
         finally:
-            module.fixture_tree_stays_on_device = real_check
+            module.fixture_tree_stays_on_mount = real_check
 
         substitute = os.path.join(root, "child") if exchange_descendant else root
         return (

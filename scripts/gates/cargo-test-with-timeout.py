@@ -23,6 +23,18 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fixture_cleanup_identity import (  # noqa: E402
+    FixtureIdentity,
+    TreeSnapshot,
+    capture_fixture_identity,
+    entry_identity as _entry_identity,
+    fixture_identity_matches,
+    fixture_tree_stays_on_mount,
+    mount_id as _mount_id,
+    parent_path as _parent_path,
+)
+
 
 PR_SET_CHILD_SUBREAPER = 36
 SYS_PIDFD_SEND_SIGNAL = 424
@@ -548,90 +560,6 @@ def parse_positive_seconds(name: str, default: str) -> float:
     return float(int(value))
 
 
-@dataclass(frozen=True)
-class FixtureIdentity:
-    path: str
-    dev: int
-    ino: int
-    uid: int
-    mode: int
-    parent: tuple[int, int]
-
-
-def _parent_path(path: str) -> str:
-    parent = os.path.dirname(path.rstrip("/"))
-    return parent if parent else "/"
-
-
-def capture_fixture_identity(path: str) -> FixtureIdentity:
-    st = os.lstat(path)
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-        raise OSError("fixture root is not a directory")
-    if stat.S_IMODE(st.st_mode) != 0o700:
-        raise OSError("fixture root mode is not 0700")
-    parent_st = os.lstat(_parent_path(path))
-    if st.st_dev != parent_st.st_dev:
-        raise OSError("fixture root is a mount point")
-    return FixtureIdentity(path, st.st_dev, st.st_ino, st.st_uid, stat.S_IMODE(st.st_mode),
-                           (parent_st.st_dev, parent_st.st_ino))
-
-
-def fixture_identity_matches(path: str, expected: FixtureIdentity) -> bool:
-    if path != expected.path:
-        return False
-    try:
-        st = os.lstat(path)
-        parent_st = os.lstat(_parent_path(path))
-    except OSError:
-        return False
-    return (
-        not stat.S_ISLNK(st.st_mode)
-        and stat.S_ISDIR(st.st_mode)
-        and stat.S_IMODE(st.st_mode) == 0o700
-        and st.st_dev == expected.dev
-        and st.st_ino == expected.ino
-        and st.st_uid == expected.uid
-        and (parent_st.st_dev, parent_st.st_ino) == expected.parent
-    )
-
-
-def _entry_identity(st: os.stat_result) -> tuple[int, int, int, int]:
-    return st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode), st.st_nlink
-
-TreeSnapshot = dict[tuple[str, ...], dict[str, tuple[int, int, int, int]]]
-
-def fixture_tree_stays_on_device(root_fd: int, dev: int) -> TreeSnapshot | None:
-    snapshot: TreeSnapshot = {}
-
-    def capture(directory_fd: int, relative: tuple[str, ...]) -> bool:
-        children: dict[str, tuple[int, int, int, int]] = {}
-        snapshot[relative] = children
-        try:
-            names = os.listdir(directory_fd)
-        except OSError:
-            return False
-        for name in names:
-            try:
-                st = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                if st.st_dev != dev:
-                    return False
-                children[name] = _entry_identity(st)
-                if stat.S_ISDIR(st.st_mode):
-                    child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW |
-                                       os.O_CLOEXEC, dir_fd=directory_fd)
-                    try:
-                        same = _entry_identity(os.fstat(child_fd)) == children[name]
-                        if not same or not capture(child_fd, relative + (name,)):
-                            return False
-                    finally:
-                        os.close(child_fd)
-            except OSError:
-                return False
-        return True
-
-    return snapshot if capture(root_fd, ()) else None
-
-
 def _remove_snapshot(directory_fd: int, relative: tuple[str, ...], snapshot: TreeSnapshot) -> None:
     expected = snapshot[relative]
     names = os.listdir(directory_fd)
@@ -691,10 +619,13 @@ def remove_owned_root(identity: FixtureIdentity) -> bool:
     parent_fd = root_fd = None
     try:
         parent_fd = os.open(
-            _parent_path(identity.path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            _parent_path(identity.path), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
         )
         parent_st = os.fstat(parent_fd)
-        if (parent_st.st_dev, parent_st.st_ino) != identity.parent:
+        if (
+            (parent_st.st_dev, parent_st.st_ino) != identity.parent
+            or _mount_id(parent_fd) != identity.mount_id
+        ):
             raise OSError(errno.EBUSY, "fixture parent identity changed")
         name = os.path.basename(identity.path.rstrip("/"))
         root_fd = os.open(
@@ -709,7 +640,9 @@ def remove_owned_root(identity: FixtureIdentity) -> bool:
             stat.S_IMODE(root_st.st_mode),
         ) != (identity.dev, identity.ino, identity.uid, identity.mode):
             raise OSError(errno.EBUSY, "fixture root identity changed")
-        snapshot = fixture_tree_stays_on_device(root_fd, identity.dev)
+        if _mount_id(root_fd) != identity.mount_id:
+            raise OSError(errno.EBUSY, "fixture root mount identity changed")
+        snapshot = fixture_tree_stays_on_mount(root_fd, identity.mount_id)
         if snapshot is None:
             raise OSError(errno.EBUSY, "fixture root contains a mount or unreadable entry")
         if not fixture_identity_matches(identity.path, identity):
