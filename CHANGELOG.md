@@ -34,9 +34,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Typed/redacted MCP admission and audit-write diagnostics (#879).
 - Daemon pidfile validates identity; scoped ingest release honors remaining retry budget (#885/#895).
 - Budget/suite locks; Busy non-budget; post-admission preflight (#893,#947,#1064–#1075,#934/#1077/#1078,#1161,#1173).
-- Readonly queue stats skip SQLite's 5s busy wait; held-lock `queue_stats_readonly` returns a bounded lock diagnostic, not a stall; sleep observer is read-only (#911,#1157).
+- Readonly `queue_stats_readonly` reports held locks without SQLite's 5s wait; sleep observer stays read-only (#911,#1157).
 
-- **Daemon readiness**: bounded lifecycle and poison-recovery tests (#892,#1162).
+- **Readiness**: lifecycle/poison tests; bounded watcher startup, owned timeout cleanup (#892,#1162).
 
 - **Hermes receipts**: scoped smoke ingest; live-daemon polls `created_drawer_ids`; `chunk_count` retains IDs; same-op partial retry; followable updates skip REST retry; soft-deleted `mempal_delete` succeeds; cleanup IDs survive CLI/MCP/REST; breaker-open conclude replays pending success, not tool error; keyed FIFO; corrupt-head quarantine keeps worker alive; exact GET identity; GET-only no POST-breaker reset; open-breaker ≤1 probe; open REST/Hermes breakers admit typed/redacted `mempal_search`/`mempal_profile`; daemon down ≥100 pending elevates `doctor`/`status`/MCP high-severity; unreadable config/queue/PIDs yield privacy-safe `unavailable`; drain/terminal failures make no DB edits; saturated MCP holder-budget yields no-write receipts and owner-bound cleanup IDs, preventing false/cross-op IDs; empty/invalid/failed MCP roots yield no project (#871,#876,#888,#918,#921,#923,#924,#927,#936,#1096,#1101,#1000).
 

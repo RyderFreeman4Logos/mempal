@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -7,8 +8,8 @@ use tempfile::TempDir;
 
 use super::config::ConfigHandle;
 use super::hot_reload_watch_gate::{
-    ENTERED_NAME, GATE_ENV, POLL_ENTERED_NAME, POLL_GATE_ENV, POLL_RELEASE_NAME, RELEASE_NAME,
-    WATCHED_NAME,
+    ENTERED_NAME, GATE_ENV, NON_COOPERATIVE_ENV, POLL_ENTERED_NAME, POLL_GATE_ENV,
+    POLL_RELEASE_NAME, RELEASE_NAME, WATCHED_NAME,
 };
 
 struct FileGate {
@@ -16,6 +17,8 @@ struct FileGate {
     env: &'static str,
     entered: &'static str,
     release: &'static str,
+    non_cooperative: bool,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl FileGate {
@@ -30,7 +33,19 @@ impl FileGate {
             env,
             entered,
             release,
+            non_cooperative: false,
+            worker: None,
         }
+    }
+
+    fn arm_non_cooperative() -> Self {
+        let mut gate = Self::arm(GATE_ENV, ENTERED_NAME, RELEASE_NAME);
+        // SAFETY: callers hold global_config_test_lock for the singleton watcher.
+        unsafe {
+            std::env::set_var(NON_COOPERATIVE_ENV, "1");
+        }
+        gate.non_cooperative = true;
+        gate
     }
 
     fn entered(&self) -> bool {
@@ -49,11 +64,17 @@ impl FileGate {
 impl Drop for FileGate {
     fn drop(&mut self) {
         self.release();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        ConfigHandle::harness_reset();
         // SAFETY: same lock scope as arm(); always clear so later tests are not gated.
         unsafe {
             std::env::remove_var(self.env);
+            if self.non_cooperative {
+                std::env::remove_var(NON_COOPERATIVE_ENV);
+            }
         }
-        ConfigHandle::harness_reset();
     }
 }
 
@@ -173,7 +194,21 @@ strict_project_isolation = true
 async fn blocked_watcher_registration_returns_bounded_error_without_runtime() {
     let lock = super::config::global_config_test_lock();
     let _lock = lock.lock().await;
-    let gate = FileGate::arm(GATE_ENV, ENTERED_NAME, RELEASE_NAME);
+    assert_blocked_bootstrap(FileGate::arm_non_cooperative());
+}
+
+#[tokio::test]
+async fn blocked_initial_baseline_returns_bounded_error_without_runtime() {
+    let lock = super::config::global_config_test_lock();
+    let _lock = lock.lock().await;
+    assert_blocked_bootstrap(FileGate::arm(
+        POLL_GATE_ENV,
+        POLL_ENTERED_NAME,
+        POLL_RELEASE_NAME,
+    ));
+}
+
+fn assert_blocked_bootstrap(mut gate: FileGate) {
     let tmp = TempDir::new().expect("config tempdir");
     let config_path = tmp.path().join("config.toml");
     fs::write(
@@ -183,30 +218,67 @@ async fn blocked_watcher_registration_returns_bounded_error_without_runtime() {
 enabled = true
 debounce_ms = 10
 poll_fallback_secs = 1
+[search]
+strict_project_isolation = false
 "#,
     )
     .expect("write config");
 
     let (done_tx, done_rx) = mpsc::channel();
     let bootstrap_path = config_path.clone();
+    let reloads = ConfigHandle::harness_reload_counter();
+    let previous_reloads = reloads.load(Ordering::SeqCst);
     let started = Instant::now();
-    let worker = thread::spawn(move || {
+    gate.worker = Some(thread::spawn(move || {
         let result = ConfigHandle::bootstrap(&bootstrap_path);
         let _ = done_tx.send(result.is_err());
-        result
-    });
+    }));
     assert!(
         wait_until(Duration::from_secs(2), || gate.entered()),
-        "coordinator never reached the watch gate"
+        "coordinator never reached the IO gate"
     );
     let bounded_result = done_rx.recv_timeout(Duration::from_millis(1500));
+    let elapsed = started.elapsed();
+    if bounded_result == Ok(true) {
+        assert!(!ConfigHandle::harness_runtime_active());
+        // A blocked registration must retain ownership and refuse further workers.
+        for _ in 0..3 {
+            let retry = Instant::now();
+            let error = ConfigHandle::bootstrap(&config_path).expect_err("cleanup pending");
+            assert!(error.to_string().contains("cleanup still pending"));
+            assert!(retry.elapsed() < Duration::from_millis(250));
+        }
+    }
+    let config = fs::read_to_string(&config_path).expect("fixture config");
+    fs::write(
+        &config_path,
+        config.replace("isolation = false", "isolation = true"),
+    )
+    .expect("change config before releasing abandoned IO");
     gate.release();
-    let result = worker.join().expect("bootstrap thread");
-
+    gate.worker
+        .take()
+        .expect("bootstrap worker")
+        .join()
+        .expect("bootstrap thread");
+    // Independent release precedes both joins, including the deferred reaper.
+    ConfigHandle::harness_reset();
+    assert_eq!(
+        reloads.load(Ordering::SeqCst),
+        previous_reloads,
+        "abandoned IO published a reload"
+    );
     assert_eq!(bounded_result, Ok(true), "bootstrap did not fail boundedly");
-    assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(result.is_err());
+    assert!(elapsed < Duration::from_secs(2));
     assert!(!ConfigHandle::harness_runtime_active());
+    if gate.env == GATE_ENV {
+        assert!(
+            !gate.exists(WATCHED_NAME),
+            "timed-out worker registered a watch"
+        );
+    }
+    ConfigHandle::bootstrap(&config_path).expect("retry after cleanup");
+    assert!(ConfigHandle::harness_runtime_active());
 }
 
 #[tokio::test]
@@ -252,4 +324,43 @@ poll_fallback_secs = 1
         .expect("bootstrap thread")
         .expect("bootstrap config");
     assert!(ConfigHandle::harness_runtime_active());
+}
+
+#[tokio::test]
+async fn fallback_detects_return_to_original_file_after_notify_reload() {
+    let lock = super::config::global_config_test_lock();
+    let _lock = lock.lock().await;
+    let gate = FileGate::arm(GATE_ENV, ENTERED_NAME, RELEASE_NAME);
+    gate.release();
+    let tmp = TempDir::new().expect("config tempdir");
+    let path = tmp.path().join("config.toml");
+    let original = tmp.path().join("original.toml");
+    let replacement = tmp.path().join("replacement.toml");
+    let config = "[config_hot_reload]\nenabled = true\ndebounce_ms = 10\npoll_fallback_secs = 1\n[search]\nstrict_project_isolation = false\n";
+    fs::write(&path, config).expect("initial config");
+    // Preserve the exact original signature, including inode and mtime.
+    fs::hard_link(&path, &original).expect("retain original inode");
+    ConfigHandle::bootstrap(&path).expect("bootstrap config");
+    fs::write(
+        &replacement,
+        config.replace("isolation = false", "isolation = true"),
+    )
+    .expect("replacement config");
+    fs::rename(&replacement, &path).expect("replace config");
+    assert!(wait_until(Duration::from_secs(2), || {
+        ConfigHandle::current().search.strict_project_isolation
+    }));
+    ConfigHandle::simulate_notify_failure();
+    assert!(wait_until(Duration::from_secs(2), || {
+        ConfigHandle::recent_events()
+            .iter()
+            .any(|event| event.contains("notify watcher crashed, falling back to poll"))
+    }));
+    fs::rename(&original, &path).expect("restore original inode");
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            !ConfigHandle::current().search.strict_project_isolation
+        }),
+        "poll fallback missed the original file after a notify reload"
+    );
 }
