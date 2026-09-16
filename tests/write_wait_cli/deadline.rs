@@ -31,7 +31,7 @@ pub(super) fn wait_output(
     child: DeadlineChild,
     deadline: Instant,
     started: Instant,
-    role: &'static str,
+    role: &str,
 ) -> Output {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -47,6 +47,33 @@ pub(super) fn wait_output(
         ),
         Err(error) => panic_supervision(role, error),
     }
+}
+
+#[rustfmt::skip]
+pub(super) fn timeout_role(started: Instant, spawn_us: u128, stdin_us: u128, queue_us: u128) -> String {
+    format!(
+        "ingest wait receipt spawn_us={spawn_us} stdin_us={stdin_us} queue_us={queue_us} wait_entry_us={}",
+        started.elapsed().as_micros()
+    )
+}
+
+#[test]
+fn wait_timeout_formatter_includes_numeric_phase_fields() {
+    let role = timeout_role(Instant::now(), 11, 22, 33);
+    let message = format!(
+        "{role} timed out after {:?}; kill_fence=true cleanup_errors=0; content omitted",
+        Duration::from_millis(8722)
+    );
+    assert!(
+        role.contains("spawn_us=11")
+            && role.contains("stdin_us=22")
+            && role.contains("queue_us=33")
+            && role.contains("wait_entry_us=")
+            && message.contains("ingest wait receipt")
+            && message.contains("timed out")
+            && message.contains("kill_fence=true"),
+        "timeout formatter must emit numeric phase fields: {message}"
+    );
 }
 
 fn checked_output(output: DeadlineOutput, role: &str) -> Output {

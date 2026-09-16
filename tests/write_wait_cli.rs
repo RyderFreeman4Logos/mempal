@@ -19,7 +19,7 @@ use common::SocketTempDir as TempDir;
 use common::harness::embed_mock::start as start_embed_mock;
 use deadline::{
     LeaderResourceState, StdioMode, cleanup_and_panic as panic_after_child_cleanup, spawn_cli,
-    wait_output as wait_child_output_timeout,
+    timeout_role as tr, wait_output as wait_child_output_timeout,
 };
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
@@ -1273,6 +1273,7 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
         StdioMode::CaptureWithInput,
         "ingest wait receipt",
     );
+    let a = started.elapsed().as_micros();
     if child
         .write_stdin(
             payload.as_bytes(),
@@ -1283,6 +1284,7 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
         panic_after_child_cleanup(child, started, "ingest wait stdin");
     }
     child.close_stdin();
+    let b = started.elapsed().as_micros();
     let (operation_id, initial_state, child_or_output) = loop {
         if let Some((operation_id, op_state)) = first_ingest_async_operation(&db_path) {
             break (operation_id, op_state, Ok(child));
@@ -1315,13 +1317,14 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued()
         }
         tokio::time::sleep(Duration::from_millis(25).min(remaining)).await;
     };
+    let q = started.elapsed().as_micros();
     assert!(
         matches!(initial_state.as_str(), "queued" | "running"),
         "unexpected initial state: {}",
         initial_state
     );
     let output = match child_or_output {
-        Ok(child) => wait_child_output_timeout(child, deadline, started, "ingest wait receipt"),
+        Ok(child) => wait_child_output_timeout(child, deadline, started, &tr(started, a, b, q)),
         Err(output) => output,
     };
     assert!(
