@@ -285,7 +285,32 @@ mod tests {
     }
 
     #[test]
+    fn vector_scan_reset_read_window_holds_existing_observability_lock() {
+        let _lock = crate::observability::test_support::global_observability_test_lock()
+            .blocking_lock_owned();
+        crate::observability::reset_vector_scan_for_tests();
+        crate::observability::record_vector_scan(VectorScanSnapshot {
+            mode: Some(VectorScanMode::Bounded),
+            candidate_count: 0,
+            candidate_cap: 10_000,
+            last_fail_open_reason: None,
+        });
+        assert!(
+            crate::observability::test_support::global_observability_test_lock()
+                .try_lock()
+                .is_err(),
+            "reset/write/read must hold global_observability_test_lock so a sibling novelty write cannot replace candidate_count"
+        );
+        assert_eq!(
+            crate::observability::vector_scan_snapshot().candidate_count,
+            0
+        );
+    }
+
+    #[test]
     fn evaluate_records_fail_open_reason_when_exact_search_bails_out() {
+        let _lock = crate::observability::test_support::global_observability_test_lock()
+            .blocking_lock_owned();
         crate::observability::reset_vector_scan_for_tests();
         let tmp = TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("test.db")).expect("open db");
@@ -326,6 +351,8 @@ mod tests {
 
     #[test]
     fn evaluate_records_fail_open_reason_when_novelty_search_errors() {
+        let _lock = crate::observability::test_support::global_observability_test_lock()
+            .blocking_lock_owned();
         crate::observability::reset_vector_scan_for_tests();
         let tmp = TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("test.db")).expect("open db");

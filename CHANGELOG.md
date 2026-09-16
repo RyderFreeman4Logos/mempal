@@ -29,10 +29,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - #1105 contention telemetry/idle-poll elision; #945/#1103/#986/#1000/#987/#1106/#1107 spool/pattern/lease/hook; #1119 LLM 404/admission.
 - Cited-recall latest-decision walks the full successor chain, filters context the same way, and requires a live correction/continuation citation (#898).
 - Codex snapshots atomically remove superseded turns/vectors and fail closed on ambiguity (#896).
-- MCP search shares a deadline and releases reads before responding (#881).
+- MCP search shares a deadline; reads released (#881).
 - Typed/redacted MCP admission and audit-write diagnostics (#879).
 - Daemon pidfile validates identity; scoped ingest release honors remaining retry budget (#885/#895).
-- Budget/suite locks; Busy non-budget; post-admission preflight (#893,#947,#1064–#1075,#934/#1077/#1078,#1161).
+- Budget/suite locks; Busy non-budget; post-admission preflight (#893,#947,#1064–#1075,#934/#1077/#1078,#1161,#1173).
 - Diagnostic readonly queue stats skip SQLite 5s busy wait: `queue_stats_readonly` under held writer lock returns a bounded lock diagnostic not stall (#911); sleep observer is read-only (#1157).
 
 - **Daemon readiness tests**: bounded lifecycle and poison recovery (#892, #1162).
