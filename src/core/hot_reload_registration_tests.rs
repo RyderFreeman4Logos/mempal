@@ -98,7 +98,7 @@ poll_fallback_secs = 1
         wait_until(Duration::from_secs(2), || gate.entered()),
         "coordinator never reached the watch gate"
     );
-    if done_rx.recv_timeout(Duration::from_millis(1500)).is_ok() {
+    if done_rx.recv_timeout(Duration::from_millis(150)).is_ok() {
         panic!("bootstrap returned before watcher registration completed");
     }
 
@@ -115,6 +115,98 @@ poll_fallback_secs = 1
         "bootstrap returned before parent-directory watch() was attempted"
     );
     assert!(ConfigHandle::harness_runtime_active());
+}
+
+#[tokio::test]
+async fn bootstrap_applies_change_from_watcher_registration_window() {
+    let lock = super::config::global_config_test_lock();
+    let _lock = lock.lock().await;
+    let gate = FileGate::arm(GATE_ENV, ENTERED_NAME, RELEASE_NAME);
+    let tmp = TempDir::new().expect("config tempdir");
+    let config_path = tmp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[config_hot_reload]
+enabled = true
+debounce_ms = 10
+poll_fallback_secs = 1
+
+[search]
+strict_project_isolation = false
+"#,
+    )
+    .expect("write initial config");
+
+    let bootstrap_path = config_path.clone();
+    let worker = thread::spawn(move || ConfigHandle::bootstrap(&bootstrap_path));
+    assert!(
+        wait_until(Duration::from_secs(2), || gate.entered()),
+        "coordinator never reached the watch gate"
+    );
+    fs::write(
+        &config_path,
+        r#"
+[config_hot_reload]
+enabled = true
+debounce_ms = 10
+poll_fallback_secs = 1
+
+[search]
+strict_project_isolation = true
+"#,
+    )
+    .expect("write config during registration");
+    gate.release();
+    worker
+        .join()
+        .expect("bootstrap thread")
+        .expect("bootstrap config");
+
+    assert!(
+        ConfigHandle::current().search.strict_project_isolation,
+        "registration-window update was not applied before bootstrap returned"
+    );
+}
+
+#[tokio::test]
+async fn blocked_watcher_registration_returns_bounded_error_without_runtime() {
+    let lock = super::config::global_config_test_lock();
+    let _lock = lock.lock().await;
+    let gate = FileGate::arm(GATE_ENV, ENTERED_NAME, RELEASE_NAME);
+    let tmp = TempDir::new().expect("config tempdir");
+    let config_path = tmp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[config_hot_reload]
+enabled = true
+debounce_ms = 10
+poll_fallback_secs = 1
+"#,
+    )
+    .expect("write config");
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let bootstrap_path = config_path.clone();
+    let started = Instant::now();
+    let worker = thread::spawn(move || {
+        let result = ConfigHandle::bootstrap(&bootstrap_path);
+        let _ = done_tx.send(result.is_err());
+        result
+    });
+    assert!(
+        wait_until(Duration::from_secs(2), || gate.entered()),
+        "coordinator never reached the watch gate"
+    );
+    let bounded_result = done_rx.recv_timeout(Duration::from_millis(1500));
+    gate.release();
+    let result = worker.join().expect("bootstrap thread");
+
+    assert_eq!(bounded_result, Ok(true), "bootstrap did not fail boundedly");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(result.is_err());
+    assert!(!ConfigHandle::harness_runtime_active());
 }
 
 #[tokio::test]
@@ -147,7 +239,7 @@ poll_fallback_secs = 1
         wait_until(Duration::from_secs(2), || gate.entered()),
         "poller never reached the baseline gate"
     );
-    if done_rx.recv_timeout(Duration::from_millis(1500)).is_ok() {
+    if done_rx.recv_timeout(Duration::from_millis(150)).is_ok() {
         panic!("bootstrap returned before poll fallback baseline completed");
     }
 

@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -9,15 +8,16 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 
 use super::config::{CompiledPrivacyConfig, Config, ConfigError, ConfigSnapshotMeta};
+use super::hot_reload_linux::{HotReloadWatcher, file_signature};
 
 const MAX_EVENT_LOG: usize = 64;
 const MAX_PERSISTED_EVENT_LOG_BYTES: u64 = 64 * 1024;
 const HOT_RELOAD_EVENT_LOG_FILE: &str = "hot-reload-events.log";
 const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const WATCH_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(1);
 const HOT_RELOAD_EVENT_KIND_RESTART_REQUIRED: &str = "restart_required";
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -194,7 +194,7 @@ impl HotReloadState {
                 path.to_path_buf(),
                 config.config_hot_reload.debounce_ms,
                 config.config_hot_reload.poll_fallback_secs,
-            ));
+            )?);
         }
 
         Ok(())
@@ -358,11 +358,10 @@ impl HotReloadState {
         path: PathBuf,
         debounce_ms: u64,
         poll_fallback_secs: u64,
-    ) -> RuntimeControl {
+    ) -> Result<RuntimeControl, ConfigError> {
         let stop = Arc::new(AtomicBool::new(false));
         let fallback_poll_enabled = Arc::new(AtomicBool::new(false));
         let (control_tx, control_rx) = mpsc::channel::<WatchMessage>();
-        let notify_tx = control_tx.clone();
         let poll_tx = control_tx.clone();
         let start_failure_tx = control_tx.clone();
         let stop_for_coordinator = Arc::clone(&stop);
@@ -376,26 +375,46 @@ impl HotReloadState {
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         #[cfg(test)]
         super::hot_reload_watch_gate::wait_before_poll_baseline();
-        let mut previous = file_signature(&poll_path);
+        let initial_signature = file_signature(&poll_path);
+        let mut previous = initial_signature;
 
         let coordinator = thread::spawn(move || {
-            let file_name = watch_path.file_name().map(OsStr::to_os_string);
+            #[cfg(test)]
+            if !super::hot_reload_watch_gate::wait_before_watch(&stop_for_coordinator) {
+                return;
+            }
             let watch_dir = watch_path
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."));
-            let mut watcher = create_watcher(notify_tx, file_name.clone());
-            if let Some(active_watcher) = watcher.as_mut() {
-                if let Err(error) = active_watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
+            let file_name = watch_path.file_name().map(|name| name.to_os_string());
+            let mut watcher = match HotReloadWatcher::register(&watch_dir, file_name) {
+                Ok(watcher) => Some(watcher),
+                Err(error) => {
                     state.push_event(format!(
                         "config hot-reload: notify watch failed for {}: {error}",
                         watch_dir.display()
                     ));
                     fallback_poll_enabled.store(true, Ordering::SeqCst);
-                    drop(watcher.take());
+                    None
                 }
-            } else {
-                fallback_poll_enabled.store(true, Ordering::SeqCst);
+            };
+            #[cfg(test)]
+            super::hot_reload_watch_gate::mark_watch_registered();
+            let registration_event = match watcher.as_ref().map(HotReloadWatcher::changed) {
+                Some(Ok(changed)) => changed,
+                Some(Err(error)) => {
+                    drop(watcher.take());
+                    fallback_poll_enabled.store(true, Ordering::SeqCst);
+                    state.push_event(format!(
+                        "config hot-reload: notify watcher crashed, falling back to poll: {error}"
+                    ));
+                    false
+                }
+                None => false,
+            };
+            if registration_event || file_signature(&watch_path) != initial_signature {
+                state.reload_from_disk(&watch_path);
             }
             let _ = ready_tx.send(());
 
@@ -407,14 +426,29 @@ impl HotReloadState {
                 let message = match control_rx.recv_timeout(SIGNAL_POLL_INTERVAL) {
                     Ok(message) => message,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let notify_changed = match watcher.as_ref().map(HotReloadWatcher::changed) {
+                            Some(Ok(changed)) => changed,
+                            Some(Err(error)) => {
+                                drop(watcher.take());
+                                if !fallback_poll_enabled.swap(true, Ordering::SeqCst) {
+                                    state.push_event(format!(
+                                        "config hot-reload: notify watcher crashed, falling back to poll: {error}"
+                                    ));
+                                }
+                                false
+                            }
+                            None => false,
+                        };
                         #[cfg(unix)]
-                        if SIGHUP_PENDING.swap(false, Ordering::SeqCst) {
+                        if notify_changed || SIGHUP_PENDING.swap(false, Ordering::SeqCst) {
                             WatchMessage::FileChanged
                         } else {
                             continue;
                         }
                         #[cfg(not(unix))]
-                        {
+                        if notify_changed {
+                            WatchMessage::FileChanged
+                        } else {
                             continue;
                         }
                     }
@@ -473,15 +507,20 @@ impl HotReloadState {
         });
         let poller_thread = poller.thread().clone();
 
-        ready_rx.recv().expect("watcher registration aborted");
-
-        RuntimeControl {
+        let runtime = RuntimeControl {
             stop,
             control_tx,
             coordinator,
             poller,
             poller_thread,
+        };
+        if ready_rx.recv_timeout(WATCH_REGISTRATION_TIMEOUT).is_err() {
+            runtime.stop();
+            return Err(ConfigError::InvalidConfig(
+                "hot-reload watcher registration timed out".to_string(),
+            ));
         }
+        Ok(runtime)
     }
 
     fn reload_from_disk(&self, path: &Path) {
@@ -749,45 +788,6 @@ fn process_is_running(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn process_is_running(pid: u32) -> bool {
     pid == std::process::id()
-}
-
-fn create_watcher(
-    tx: mpsc::Sender<WatchMessage>,
-    file_name: Option<OsString>,
-) -> Option<RecommendedWatcher> {
-    #[cfg(test)]
-    super::hot_reload_watch_gate::wait_before_watch();
-    notify::recommended_watcher(move |result: notify::Result<Event>| match result {
-        Ok(event) if should_reload_event(&event, file_name.as_deref()) => {
-            let _ = tx.send(WatchMessage::FileChanged);
-        }
-        Ok(_) => {}
-        Err(_) => {
-            let _ = tx.send(WatchMessage::NotifyFailed);
-        }
-    })
-    .ok()
-}
-
-fn should_reload_event(event: &Event, file_name: Option<&OsStr>) -> bool {
-    if !matches!(
-        event.kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any
-    ) {
-        return false;
-    }
-
-    event.paths.iter().any(|path| match file_name {
-        Some(name) => path.file_name() == Some(name),
-        None => true,
-    })
-}
-
-fn file_signature(path: &Path) -> Option<(u64, u64)> {
-    let metadata = std::fs::metadata(path).ok()?;
-    let modified = metadata.modified().ok()?;
-    let millis = modified.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
-    Some((millis, metadata.len()))
 }
 
 fn now_unix_ms() -> u64 {
