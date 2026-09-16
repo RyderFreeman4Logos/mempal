@@ -24,6 +24,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- Hermes `mempal_conclude` observes queued/running REST ingest for 240s before pending expiry; delayed terminals confirm, forever-queued does not claim storage (#1135).
 - Context isolate embed env HTTP CL (#1080,#1082).
 - Daemon lease survives maintenance cap/no exit 75; rejects incompatible MCP-ingest holders (#916,#849).
 - #1105 contention telemetry/idle-poll elision; #945/#1103/#986/#1000/#987/#1106/#1107 spool/pattern/lease/hook; #1119 LLM 404/admission.

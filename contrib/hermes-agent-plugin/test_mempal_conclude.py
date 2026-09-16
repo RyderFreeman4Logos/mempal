@@ -14,6 +14,9 @@ if PLUGIN_DIR not in sys.path:
     sys.path.insert(0, PLUGIN_DIR)
 
 import mempal._conclude as conclude_module  # noqa: E402
+import mempal._write_spool as spool_module  # noqa: E402
+import mempal._write_spool_claims as claims_module  # noqa: E402
+import mempal._write_spool_replay as replay_module  # noqa: E402
 from test_mempal_authoritative_write import FailingStatusProvider  # noqa: E402
 from test_mempal_provider import RecordingProvider  # noqa: E402
 
@@ -112,6 +115,44 @@ class SharedConcludeProvider(RecordingProvider):
 class BrokenSpool:
     def admit(self, *_args: Any, **_kwargs: Any) -> None:
         raise OSError("SECRET_LOCAL_SPOOL_BODY")
+
+
+class _VirtualClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        # Production polls every 50ms; tests only need the deadline to advance.
+        self.now += max(seconds, 1.0)
+
+
+def _install_virtual_clock(clock: _VirtualClock):
+    originals = (
+        conclude_module.time,
+        replay_module.time,
+        spool_module.time,
+        claims_module.time,
+    )
+    conclude_module.time = clock
+    replay_module.time = clock
+    spool_module.time = clock
+    claims_module.time = clock
+    return originals
+
+
+def _restore_virtual_clock(originals) -> None:
+    (
+        conclude_module.time,
+        replay_module.time,
+        spool_module.time,
+        claims_module.time,
+    ) = originals
 
 
 class TransitioningBreakerProvider(RecordingProvider):
@@ -258,6 +299,57 @@ class DurableConcludeTests(unittest.TestCase):
 
         after = provider._backoff._read_state()
         self.assertEqual(after.failure_count, before.failure_count)
+
+    def test_default_confirmation_budget_covers_delayed_terminal_status(self) -> None:
+        provider = ControlledConcludeProvider("queued")
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
+        original_get = provider._get
+        clock = _VirtualClock()
+
+        def delayed_get(path: str, params=None):
+            if path.startswith("/api/operations/") and clock.now > 5.0:
+                return {
+                    "operation_id": path.rsplit("/", 1)[-1],
+                    "state": "completed",
+                    "drawer_id": "drawer-delayed",
+                }
+            return original_get(path, params)
+
+        provider._get = delayed_get
+        originals = _install_virtual_clock(clock)
+        try:
+            result = self._conclude(provider, "delayed terminal fact")
+        finally:
+            _restore_virtual_clock(originals)
+
+        self.assertEqual(provider._conclude_wait_timeout, 240.0)
+        self.assertEqual(result.get("result"), "Fact stored.")
+        self.assertEqual(result.get("drawer_id"), "drawer-delayed")
+        self.assertGreater(clock.now, 5.0)
+        self.assertLessEqual(clock.now, 240.0)
+
+    def test_forever_queued_status_expires_within_confirmation_budget(self) -> None:
+        provider = ControlledConcludeProvider("queued")
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._start_write_worker = lambda: None
+        clock = _VirtualClock()
+        originals = _install_virtual_clock(clock)
+        try:
+            result = self._conclude(provider, "SECRET_FOREVER_QUEUED")
+        finally:
+            _restore_virtual_clock(originals)
+
+        details = result["error_details"]
+        self.assertEqual(details["kind"], "durable_operation_pending")
+        self.assertEqual(details["state"], "queued")
+        self.assertEqual(details["error_class"], "status_queued")
+        self.assertTrue(details["retry_safe"])
+        self.assertNotIn("result", result)
+        self.assertGreaterEqual(clock.now, 240.0)
+        self.assertLessEqual(clock.now, 241.0)
+        self.assertNotIn("SECRET_FOREVER_QUEUED", json.dumps(result))
+        provider.shutdown()
 
     def test_admission_503_never_claims_storage_and_redacts_payload(self) -> None:
         provider = AdmissionFailureProvider()

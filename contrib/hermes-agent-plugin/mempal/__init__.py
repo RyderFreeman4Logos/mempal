@@ -48,6 +48,9 @@ _PREFETCH_TOP_K = 5
 _TURN_STORAGE_MODE_TTL = 60.0
 _WRITE_QUEUE_MAX = 1000
 _WRITE_DRAIN_TIMEOUT = 10.0
+# Client observation of queued/running REST ingest; not daemon admission.
+# User-tolerated model processing ceiling; forever-queued still expires here.
+_CONCLUDE_WAIT_TIMEOUT = 240.0
 _WRITE_RETRY_MAX = 3
 _WRITE_RETRY_DELAY = 2.0
 _PINNED_FACTS_TTL = 300.0
@@ -185,7 +188,7 @@ class MempalMemoryProvider:
         self._write_worker: Optional[threading.Thread] = None
         self._write_stop = threading.Event()
         self._write_drain_timeout = _WRITE_DRAIN_TIMEOUT
-        self._conclude_wait_timeout = 5.0
+        self._conclude_wait_timeout = _CONCLUDE_WAIT_TIMEOUT
         self._write_spool: Optional[WriteSpool] = None
         self._pinned_facts_cache: List[Dict[str, Any]] = []
         self._pinned_facts_fetched_at: float = 0.0
