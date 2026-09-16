@@ -61,10 +61,7 @@ async fn test_mcp_ingest_admission_warning_uses_request_budget_and_returns_recei
             ..IngestRequest::default()
         })),
     )
-    .await
-    .expect("MCP ingest should return before client timeout")
-    .expect("stale-index warning snapshot must preserve a durable queue receipt")
-    .0;
+    .await;
     let client_elapsed = client_started.elapsed();
     let stages: Vec<_> = stage_rx.try_iter().collect();
     let stage_names: Vec<_> = stages.iter().map(|(stage, _)| *stage).collect();
@@ -76,6 +73,10 @@ async fn test_mcp_ingest_admission_warning_uses_request_budget_and_returns_recei
         "admission_stage_measurement client_elapsed_ms={} stages={relative_ms:?}",
         client_elapsed.as_millis()
     );
+    let result = result
+        .expect("MCP ingest should return before client timeout")
+        .expect("stale-index warning snapshot must preserve a durable queue receipt")
+        .0;
 
     assert_eq!(result.state, Some(IngestOperationState::Queued));
     assert!(result.operation_id.is_some());
