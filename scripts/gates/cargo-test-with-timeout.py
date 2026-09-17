@@ -560,22 +560,31 @@ def parse_positive_seconds(name: str, default: str) -> float:
     return float(int(value))
 
 
-def _remove_snapshot(directory_fd: int, relative: tuple[str, ...], snapshot: TreeSnapshot) -> None:
+def _remove_snapshot(
+    directory_fd: int,
+    relative: tuple[str, ...],
+    snapshot: TreeSnapshot,
+    removed_links: dict[tuple[int, int, int], int],
+) -> None:
     expected = snapshot[relative]
     names = os.listdir(directory_fd)
     if set(names) != set(expected):
         raise OSError(errno.EBUSY, "fixture tree entries changed during cleanup")
     for name in sorted(names):
+        captured = expected[name]
+        inode = captured[:3]
+        removed = removed_links.get(inode, 0)
+        expected_live = (*inode, captured[3] - removed)
         current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if _entry_identity(current) != expected[name]:
+        if _entry_identity(current) != expected_live:
             raise OSError(errno.EBUSY, "fixture tree entry identity changed during cleanup")
         if stat.S_ISDIR(current.st_mode):
             child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW |
                                os.O_CLOEXEC, dir_fd=directory_fd)
             try:
-                if _entry_identity(os.fstat(child_fd)) != expected[name]:
+                if _entry_identity(os.fstat(child_fd)) != expected_live:
                     raise OSError(errno.EBUSY, "fixture directory changed while opening")
-                _remove_snapshot(child_fd, relative + (name,), snapshot)
+                _remove_snapshot(child_fd, relative + (name,), snapshot, removed_links)
                 if _entry_identity(
                     os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 ) != _entry_identity(os.fstat(child_fd)):
@@ -587,11 +596,12 @@ def _remove_snapshot(directory_fd: int, relative: tuple[str, ...], snapshot: Tre
             leaf_fd = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
                               dir_fd=directory_fd)
             try:
-                if _entry_identity(os.fstat(leaf_fd)) != expected[name]:
+                if _entry_identity(os.fstat(leaf_fd)) != expected_live:
                     raise OSError(errno.EBUSY, "fixture entry changed while opening")
                 os.unlink(name, dir_fd=directory_fd)
-                if os.fstat(leaf_fd).st_nlink != expected[name][3] - 1:
+                if os.fstat(leaf_fd).st_nlink != expected_live[3] - 1:
                     raise OSError(errno.EBUSY, "fixture entry changed during final removal")
+                removed_links[inode] = removed + 1
             finally:
                 os.close(leaf_fd)
 
@@ -647,7 +657,7 @@ def remove_owned_root(identity: FixtureIdentity) -> bool:
             raise OSError(errno.EBUSY, "fixture root contains a mount or unreadable entry")
         if not fixture_identity_matches(identity.path, identity):
             raise OSError(errno.EBUSY, "fixture root identity changed before removal")
-        _remove_snapshot(root_fd, (), snapshot)
+        _remove_snapshot(root_fd, (), snapshot, {})
         if _entry_identity(
             os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         ) != _entry_identity(os.fstat(root_fd)):

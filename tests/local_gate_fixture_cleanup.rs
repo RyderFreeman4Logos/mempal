@@ -275,6 +275,133 @@ fn cargo_test_wrapper_accepts_symlinked_tmpdir() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cargo_test_wrapper_cleans_intra_tree_hardlinks_and_preserves_external_alias() {
+    let base = tempfile::tempdir().expect("hardlink wrapper base");
+    let external = base.path().join("external");
+    fs::create_dir(&external).expect("create external directory");
+    let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
+    let child = r#"
+import os
+import sys
+
+root = os.environ["TMPDIR"]
+source = os.environ["MEMPAL_HARDLINK_SOURCE"]
+marker = os.environ["MEMPAL_FIXTURE_MARKER"]
+with open(source, "wb") as handle:
+    handle.write(b"external survives")
+if sys.argv[1] == "same-directory":
+    os.link(source, os.path.join(root, "alias-a"))
+    os.link(source, os.path.join(root, "alias-b"))
+else:
+    nested = os.path.join(root, "nested")
+    os.mkdir(nested, 0o700)
+    os.link(source, os.path.join(root, "alias-a"))
+    os.link(source, os.path.join(nested, "alias-b"))
+with open(marker, "w", encoding="utf-8") as handle:
+    handle.write(root)
+    handle.flush()
+    os.fsync(handle.fileno())
+"#;
+
+    for mode in ["same-directory", "cross-directory"] {
+        let source = external.join(mode);
+        let marker = base.path().join(format!("{mode}.marker"));
+        let output = Command::new("python3")
+            .arg(&script)
+            .args(["python3", "-c", child, mode])
+            .env("TMPDIR", base.path())
+            .env("TMP", base.path())
+            .env("TEMP", base.path())
+            .env("MEMPAL_HARDLINK_SOURCE", &source)
+            .env("MEMPAL_FIXTURE_MARKER", &marker)
+            .output()
+            .expect("run hardlink cleanup case");
+
+        let owned_root = PathBuf::from(fs::read_to_string(&marker).expect("read root marker"));
+        assert!(
+            output.status.success(),
+            "{mode} cleanup failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!owned_root.exists(), "{mode} owned root must be removed");
+        assert_eq!(
+            fs::read(&source).expect("read external hardlink"),
+            b"external survives",
+            "{mode} external alias contents"
+        );
+        assert_eq!(
+            fs::metadata(&source)
+                .expect("stat external hardlink")
+                .nlink(),
+            1,
+            "{mode} cleanup must remove only in-tree aliases"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cargo_test_wrapper_rejects_external_link_count_drift() {
+    let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
+    let harness = r#"
+import importlib.util
+import os
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("timeout_wrapper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as base:
+    root = os.path.join(base, "owned")
+    leaf = os.path.join(root, "leaf")
+    external = os.path.join(base, "external")
+    os.mkdir(root, 0o700)
+    with open(leaf, "wb") as handle:
+        handle.write(b"preserve both aliases")
+    identity = module.capture_fixture_identity(root)
+    real_check = module.fixture_tree_stays_on_mount
+
+    def check_then_link(root_fd, mount_id):
+        snapshot = real_check(root_fd, mount_id)
+        os.link(leaf, external)
+        return snapshot
+
+    module.fixture_tree_stays_on_mount = check_then_link
+    try:
+        removed = module.remove_owned_root(identity)
+    finally:
+        module.fixture_tree_stays_on_mount = real_check
+
+    assert not removed
+    assert os.path.exists(leaf)
+    assert os.path.exists(external)
+    assert os.stat(leaf).st_nlink == 2
+    with open(external, "rb") as handle:
+        assert handle.read() == b"preserve both aliases"
+"#;
+    let output = Command::new("python3")
+        .args(["-c", harness])
+        .arg(script)
+        .env("TMPDIR", std::env::temp_dir())
+        .env("TMP", std::env::temp_dir())
+        .env("TEMP", std::env::temp_dir())
+        .output()
+        .expect("run external hardlink drift harness");
+
+    assert!(
+        output.status.success(),
+        "external hardlink drift was not rejected: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cargo_test_wrapper_preserves_same_filesystem_bind_mount_contents() {
     let script = repo_root().join("scripts/gates/cargo-test-with-timeout.py");
     let harness = r#"
