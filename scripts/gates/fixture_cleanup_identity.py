@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import os
 import stat
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -123,19 +124,35 @@ def entry_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
 
 
 TreeSnapshot = dict[tuple[str, ...], dict[str, tuple[int, int, int, int]]]
+MAX_FIXTURE_DEPTH = 512
+MAX_FIXTURE_ENTRIES = 100_000
 
 
-def fixture_tree_stays_on_mount(root_fd: int, expected_mount_id: int) -> TreeSnapshot | None:
+def fixture_tree_stays_on_mount(
+    root_fd: int,
+    expected_mount_id: int,
+    check_cleanup: Callable[[], None],
+) -> TreeSnapshot | None:
     snapshot: TreeSnapshot = {}
+    entry_count = 0
 
-    def capture(directory_fd: int, relative: tuple[str, ...]) -> bool:
+    def capture(directory_fd: int, relative: tuple[str, ...], depth: int) -> bool:
+        nonlocal entry_count
+        check_cleanup()
+        if depth > MAX_FIXTURE_DEPTH:
+            return False
         children: dict[str, tuple[int, int, int, int]] = {}
         snapshot[relative] = children
         try:
             names = os.listdir(directory_fd)
         except OSError:
             return False
+        check_cleanup()
+        entry_count += len(names)
+        if entry_count > MAX_FIXTURE_ENTRIES:
+            return False
         for name in names:
+            check_cleanup()
             entry_fd = None
             try:
                 metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -148,7 +165,9 @@ def fixture_tree_stays_on_mount(root_fd: int, expected_mount_id: int) -> TreeSna
                 children[name] = entry_identity(metadata)
                 if mount_id(entry_fd) != expected_mount_id:
                     return False
-                if stat.S_ISDIR(metadata.st_mode) and not capture(entry_fd, relative + (name,)):
+                if stat.S_ISDIR(metadata.st_mode) and not capture(
+                    entry_fd, relative + (name,), depth + 1
+                ):
                     return False
             except OSError:
                 return False
@@ -157,4 +176,7 @@ def fixture_tree_stays_on_mount(root_fd: int, expected_mount_id: int) -> TreeSna
                     os.close(entry_fd)
         return True
 
-    return snapshot if capture(root_fd, ()) else None
+    try:
+        return snapshot if capture(root_fd, (), 0) else None
+    except RecursionError:
+        return None

@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +42,7 @@ SYS_PIDFD_SEND_SIGNAL = 424
 POLL_INTERVAL = 0.01
 DISCOVERY_INTERVAL = 0.25
 _pending_signal: int | None = None
+_signal_generation = 0
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,7 @@ class Supervisor:
         self.seen_identities: dict[int, Identity] = {}
         self.ownership_uncertain = False
         self.cleanup_proved = False
+        self.cleanup_deadline: float | None = None
         self._libc = ctypes.CDLL(None, use_errno=True)
         self._libc.syscall.restype = ctypes.c_long
         self._libc.syscall.argtypes = [
@@ -351,9 +354,10 @@ class Supervisor:
         return live, unknown
 
     def cleanup(self) -> bool:
+        self.cleanup_deadline = time.monotonic() + (2 * self.grace)
         snapshots = self.discover()
         term_proved = self.signal_owned(signal.SIGTERM, snapshots)
-        term_deadline = time.monotonic() + self.grace
+        term_deadline = min(time.monotonic() + self.grace, self.cleanup_deadline)
         next_discovery = time.monotonic() + DISCOVERY_INTERVAL
         while time.monotonic() < term_deadline:
             if time.monotonic() >= next_discovery:
@@ -367,7 +371,7 @@ class Supervisor:
 
         snapshots = self.discover()
         kill_proved = self.signal_owned(signal.SIGKILL, snapshots)
-        kill_deadline = time.monotonic() + self.grace
+        kill_deadline = self.cleanup_deadline
         next_discovery = time.monotonic() + DISCOVERY_INTERVAL
         while time.monotonic() < kill_deadline:
             if time.monotonic() >= next_discovery:
@@ -504,8 +508,9 @@ def open_pidfd(identity: Identity) -> int | None:
 
 def install_signal_handlers() -> None:
     def request_cleanup(signum: int, _frame: object) -> None:
-        global _pending_signal
+        global _pending_signal, _signal_generation
         _pending_signal = signum
+        _signal_generation += 1
 
     for signum in (signal.SIGHUP, signal.SIGQUIT, signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, request_cleanup)
@@ -567,12 +572,16 @@ def _remove_snapshot(
     relative: tuple[str, ...],
     snapshot: TreeSnapshot,
     removed_links: dict[tuple[int, int, int], int],
+    check_cleanup: Callable[[], None],
 ) -> None:
+    check_cleanup()
     expected = snapshot[relative]
     names = os.listdir(directory_fd)
+    check_cleanup()
     if set(names) != set(expected):
         raise OSError(errno.EBUSY, "fixture tree entries changed during cleanup")
     for name in sorted(names):
+        check_cleanup()
         captured = expected[name]
         inode = captured[:3]
         removed = removed_links.get(inode, 0)
@@ -586,7 +595,9 @@ def _remove_snapshot(
             try:
                 if _entry_identity(os.fstat(child_fd)) != expected_live:
                     raise OSError(errno.EBUSY, "fixture directory changed while opening")
-                _remove_snapshot(child_fd, relative + (name,), snapshot, removed_links)
+                _remove_snapshot(
+                    child_fd, relative + (name,), snapshot, removed_links, check_cleanup
+                )
                 if _entry_identity(
                     os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 ) != _entry_identity(os.fstat(child_fd)):
@@ -624,12 +635,24 @@ def allocate_fixture_root() -> FixtureIdentity:
         raise
 
 
-def remove_owned_root(identity: FixtureIdentity) -> bool:
+def remove_owned_root(
+    identity: FixtureIdentity,
+    deadline: float,
+    signal_generation: int,
+) -> bool:
     # ponytail: Unix UID is the trust boundary; callers must quiesce same-UID fixture
     # mutation. These checks fail closed on observed drift, but only a kernel-enforced
     # credential/LSM/private-backing boundary can prevent a final pathname exchange.
     parent_fd = root_fd = None
+
+    def check_cleanup() -> None:
+        if _signal_generation != signal_generation:
+            raise OSError(errno.EINTR, "fixture cleanup cancelled")
+        if time.monotonic() >= deadline:
+            raise OSError(errno.ETIMEDOUT, "fixture cleanup deadline exceeded")
+
     try:
+        check_cleanup()
         parent_fd = os.open(
             _parent_path(identity.path), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
         )
@@ -654,12 +677,14 @@ def remove_owned_root(identity: FixtureIdentity) -> bool:
             raise OSError(errno.EBUSY, "fixture root identity changed")
         if _mount_id(root_fd) != identity.mount_id:
             raise OSError(errno.EBUSY, "fixture root mount identity changed")
-        snapshot = fixture_tree_stays_on_mount(root_fd, identity.mount_id)
+        snapshot = fixture_tree_stays_on_mount(root_fd, identity.mount_id, check_cleanup)
         if snapshot is None:
             raise OSError(errno.EBUSY, "fixture root contains a mount or unreadable entry")
         if not fixture_identity_matches(identity.path, identity):
             raise OSError(errno.EBUSY, "fixture root identity changed before removal")
-        _remove_snapshot(root_fd, (), snapshot, {})
+        check_cleanup()
+        _remove_snapshot(root_fd, (), snapshot, {}, check_cleanup)
+        check_cleanup()
         if _entry_identity(
             os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         ) != _entry_identity(os.fstat(root_fd)):
@@ -667,7 +692,7 @@ def remove_owned_root(identity: FixtureIdentity) -> bool:
         os.rmdir(name, dir_fd=parent_fd)
         if os.fstat(root_fd).st_nlink != 0:
             raise OSError(errno.EBUSY, "fixture root changed during final removal")
-    except OSError as error:
+    except (OSError, RecursionError) as error:
         print(f"failed to remove fixture root {identity.path}: {error}", file=sys.stderr)
         return False
     finally:
@@ -710,8 +735,15 @@ def main(argv: list[str]) -> int:
 
     if _pending_signal is not None:
         signum = _pending_signal
-        if not remove_owned_root(fixture):
-            return retain_fixture_root(fixture, "failed to remove empty fixture root after signal")
+        cleanup_generation = _signal_generation
+        cleanup_deadline = time.monotonic() + (2 * grace)
+        if not remove_owned_root(fixture, cleanup_deadline, cleanup_generation):
+            retained = retain_fixture_root(
+                fixture, "failed to remove empty fixture root after signal"
+            )
+            if _pending_signal is not None:
+                return 128 + _pending_signal
+            return retained
         return 128 + signum
 
     child_env = os.environ.copy()
@@ -722,8 +754,17 @@ def main(argv: list[str]) -> int:
         child = subprocess.Popen(argv, start_new_session=True, env=child_env)
     except OSError as error:
         print(f"failed to launch {shlex.join(argv)}: {error}", file=sys.stderr)
-        if not remove_owned_root(fixture):
-            return retain_fixture_root(fixture, "failed to remove empty fixture root after spawn failure")
+        cleanup_generation = _signal_generation
+        cleanup_deadline = time.monotonic() + (2 * grace)
+        if not remove_owned_root(fixture, cleanup_deadline, cleanup_generation):
+            retained = retain_fixture_root(
+                fixture, "failed to remove empty fixture root after spawn failure"
+            )
+            if _pending_signal is not None:
+                return 128 + _pending_signal
+            return retained
+        if _pending_signal is not None:
+            return 128 + _pending_signal
         return 127
 
     supervisor = Supervisor(child, grace)
@@ -733,11 +774,19 @@ def main(argv: list[str]) -> int:
             fixture,
             f"owned process cleanup was not proved (child status {status})",
         )
-    if not remove_owned_root(fixture):
-        return retain_fixture_root(
+    if supervisor.cleanup_deadline is None:
+        return retain_fixture_root(fixture, "fixture cleanup deadline was not established")
+    cleanup_generation = _signal_generation
+    if not remove_owned_root(fixture, supervisor.cleanup_deadline, cleanup_generation):
+        retained = retain_fixture_root(
             fixture,
             f"fixture root cleanup failed (child status {status})",
         )
+        if _pending_signal is not None:
+            return 128 + _pending_signal
+        return retained
+    if _pending_signal is not None:
+        return 128 + _pending_signal
     return status
 
 

@@ -35,6 +35,30 @@ impl ChildGuard {
             thread::sleep(Duration::from_millis(20));
         }
     }
+
+    fn wait_with_output_timeout(
+        &mut self,
+        timeout: Duration,
+        description: &str,
+    ) -> std::process::Output {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let child = self.0.as_mut().expect("wrapper still owned");
+            if child.try_wait().expect("poll wrapper").is_some() {
+                return self
+                    .0
+                    .take()
+                    .expect("completed wrapper")
+                    .wait_with_output()
+                    .expect("collect wrapper output");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{description} did not exit in time"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 impl Drop for ChildGuard {
@@ -365,14 +389,14 @@ with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as base:
     identity = module.capture_fixture_identity(root)
     real_check = module.fixture_tree_stays_on_mount
 
-    def check_then_link(root_fd, mount_id):
-        snapshot = real_check(root_fd, mount_id)
+    def check_then_link(root_fd, mount_id, check_cleanup):
+        snapshot = real_check(root_fd, mount_id, check_cleanup)
         os.link(leaf, external)
         return snapshot
 
     module.fixture_tree_stays_on_mount = check_then_link
     try:
-        removed = module.remove_owned_root(identity)
+        removed = module.remove_owned_root(identity, module.time.monotonic() + 5, 0)
     finally:
         module.fixture_tree_stays_on_mount = real_check
 
@@ -430,7 +454,7 @@ with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as base:
     subprocess.run(["mount", "--bind", source, child], check=True)
     try:
         assert os.stat(child).st_dev == os.stat(root).st_dev
-        assert not module.remove_owned_root(identity)
+        assert not module.remove_owned_root(identity, module.time.monotonic() + 5, 0)
         assert os.path.exists(sentinel), "cleanup crossed the bind mount"
     finally:
         subprocess.run(["umount", child], check=True)
@@ -494,9 +518,9 @@ def run_case(exchange_descendant):
         real_check = module.fixture_tree_stays_on_mount
         exchanged = False
 
-        def check_then_exchange(path, dev):
+        def check_then_exchange(path, dev, check_cleanup):
             nonlocal exchanged
-            result = real_check(path, dev)
+            result = real_check(path, dev, check_cleanup)
             if exchange_descendant:
                 os.rename(os.path.join(root, "child"), held)
                 os.rename(victim, os.path.join(root, "child"))
@@ -508,7 +532,7 @@ def run_case(exchange_descendant):
 
         module.fixture_tree_stays_on_mount = check_then_exchange
         try:
-            removed = module.remove_owned_root(identity)
+            removed = module.remove_owned_root(identity, module.time.monotonic() + 5, 0)
         finally:
             module.fixture_tree_stays_on_mount = real_check
 
@@ -606,7 +630,7 @@ def run_case(kind):
             module.os.rmdir = exchange_then_remove
 
         try:
-            removed = module.remove_owned_root(identity)
+            removed = module.remove_owned_root(identity, module.time.monotonic() + 5, 0)
             owned_links = os.fstat(owned_fd).st_nlink
             victim_links = os.fstat(victim_fd).st_nlink
         finally:
@@ -642,4 +666,109 @@ for kind, expected_removed in (("file", False), ("child", True), ("root", False)
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cargo_test_wrapper_bounds_fixture_cleanup_depth_entries_deadline_and_signal() {
+    const HARNESS: &str = r#"
+import importlib.util
+import os
+import signal
+import sys
+import threading
+import time
+
+spec = importlib.util.spec_from_file_location("timeout_wrapper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+mode = sys.argv[2]
+base = os.environ["TMPDIR"]
+root_marker = os.path.join(base, "root-marker")
+ready = os.path.join(base, "cleanup-ready")
+release = os.path.join(base, "cleanup-release")
+
+child = r'''
+import os
+root = os.environ["TMPDIR"]
+with open(os.environ["ROOT_MARKER"], "w", encoding="utf-8") as marker:
+    marker.write(root)
+mode = os.environ["CLEANUP_CASE"]
+if mode == "deep":
+    os.chdir(root)
+    for _ in range(1100):
+        os.mkdir("d", 0o700)
+        os.chdir("d")
+elif mode == "wide":
+    for index in range(9):
+        open(os.path.join(root, str(index)), "wb").close()
+else:
+    open(os.path.join(root, "leaf"), "wb").close()
+'''
+
+identity_module = sys.modules["fixture_cleanup_identity"]
+if mode == "wide":
+    identity_module.MAX_FIXTURE_ENTRIES = 8
+elif mode == "deadline":
+    real_snapshot = module.fixture_tree_stays_on_mount
+    def delayed_snapshot(*args):
+        time.sleep(2.1)
+        return real_snapshot(*args)
+    module.fixture_tree_stays_on_mount = delayed_snapshot
+elif mode == "signal":
+    real_remove = module._remove_snapshot
+    def blocked_remove(*args):
+        open(ready, "wb").close()
+        while not os.path.exists(release):
+            time.sleep(0.01)
+        return real_remove(*args)
+    module._remove_snapshot = blocked_remove
+    def interrupt_cleanup():
+        deadline = time.monotonic() + 5
+        while not os.path.exists(ready) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert os.path.exists(ready), "fixture removal did not reach barrier"
+        os.kill(os.getpid(), signal.SIGTERM)
+        open(release, "wb").close()
+    controller = threading.Thread(target=interrupt_cleanup)
+    controller.start()
+
+os.environ["ROOT_MARKER"] = root_marker
+os.environ["CLEANUP_CASE"] = mode
+os.environ["MEMPAL_CARGO_TEST_KILL_GRACE_SECS"] = "1"
+result = module.main(["python3", "-c", child])
+if mode == "signal":
+    controller.join(5)
+    assert not controller.is_alive(), "signal controller did not stop"
+expected = 143 if mode == "signal" else 125
+assert result == expected, (mode, result)
+root = open(root_marker, encoding="utf-8").read()
+assert os.path.isdir(root), (mode, root)
+before = os.listdir(root)
+time.sleep(0.05)
+assert os.listdir(root) == before, "cleanup continued after returning"
+"#;
+
+    for mode in ["deep", "wide", "deadline", "signal"] {
+        let base = tempfile::tempdir().expect("bounded cleanup harness base");
+        let mut command = Command::new("python3");
+        command
+            .args(["-c", HARNESS])
+            .arg(repo_root().join("scripts/gates/cargo-test-with-timeout.py"))
+            .arg(mode)
+            .env("TMPDIR", base.path())
+            .env("TMP", base.path())
+            .env("TEMP", base.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = ChildGuard::new(command.spawn().expect("spawn cleanup harness"));
+        let output = child.wait_with_output_timeout(Duration::from_secs(15), mode);
+        assert!(
+            output.status.success(),
+            "{mode} cleanup harness failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
