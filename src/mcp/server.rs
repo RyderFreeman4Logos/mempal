@@ -15000,7 +15000,7 @@ quality_policy = "llm_required_for_keep"
         let (tempdir, db_path, server) = setup_server();
         let (listener, _socket_guard) =
             crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
-        let daemon = tokio::spawn(async move {
+        let daemon = async move {
             let (mut stream, _) = listener.accept().await.expect("accept daemon IPC");
             let request = crate::hook_ipc::read_enqueue_request(&mut stream)
                 .await
@@ -15012,28 +15012,36 @@ quality_policy = "llm_required_for_keep"
             .await
             .expect("write daemon IPC response");
             request
-        });
+        };
 
-        let response = server
-            .mempal_ingest_with_controls(
-                IngestRequest {
-                    content: "daemon ACK precedes queue visibility".to_string(),
-                    wing: "mcp".to_string(),
-                    room: Some("receipt".to_string()),
-                    wait: Some(true),
-                    wait_timeout_secs: Some(1),
-                    ..IngestRequest::default()
-                },
-                IngestControls {
-                    no_gate: true,
-                    bypass_novelty: true,
-                },
+        let scenario = async {
+            let (response, request) = tokio::join!(
+                server.mempal_ingest_with_controls(
+                    IngestRequest {
+                        content: "daemon ACK precedes queue visibility".to_string(),
+                        wing: "mcp".to_string(),
+                        room: Some("receipt".to_string()),
+                        wait: Some(true),
+                        wait_timeout_secs: Some(1),
+                        ..IngestRequest::default()
+                    },
+                    IngestControls {
+                        no_gate: true,
+                        bypass_novelty: true,
+                    },
+                ),
+                daemon,
+            );
+            (
+                response
+                    .expect("durable ACK should return a followable receipt")
+                    .0,
+                request,
             )
+        };
+        let (response, request) = tokio::time::timeout(Duration::from_secs(5), scenario)
             .await
-            .expect("durable ACK should return a followable receipt")
-            .0;
-
-        let request = daemon.await.expect("daemon IPC task");
+            .expect("daemon ACK visibility scenario must terminate within its fixture budget");
         let operation_id = response.operation_id.as_deref().expect("operation id");
         assert_eq!(
             operation_id,
