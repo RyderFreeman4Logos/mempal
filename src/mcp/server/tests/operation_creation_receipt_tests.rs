@@ -73,6 +73,61 @@ async fn test_partial_multi_chunk_distinct_operation_excludes_prior_created_id()
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_multi_chunk_conclusion_attributes_delayed_kg_post_work() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
+    let tempdir = tempfile::tempdir().expect("short tempdir");
+    let db_path = tempdir.path().join("palace.db");
+    Database::open(&db_path).expect("open database");
+    let _config_guard =
+        ConfigOverrideGuard::install(&mcp_ingest_side_effect_config(&db_path, false, false)).await;
+    let conclusion_kg_delay = Duration::from_millis(60);
+    let server = MempalMcpServer::new_with_factory(
+        db_path,
+        Arc::new(StubEmbedderFactory {
+            vector: vec![0.1, 0.2, 0.3],
+        }),
+    )
+    .expect("create server")
+    .with_mcp_ingest_side_effect_hook_for_test(Arc::new(move |stage| {
+        if stage == McpIngestSideEffectStage::ConclusionKg {
+            std::thread::sleep(conclusion_kg_delay);
+        }
+    }));
+    let response = server
+        .mempal_ingest_sync(
+            IngestRequest {
+                content: (0..2_000)
+                    .map(|index| format!("timing token-{index:04}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                wing: "mcp".into(),
+                room: Some("timing".into()),
+                source: Some("hermes-session-conclusion".into()),
+                ..IngestRequest::default()
+            },
+            side_effect_controls(),
+            None,
+        )
+        .await
+        .expect("multi-chunk ingest")
+        .0;
+
+    assert!(response.chunk_count > 1, "fixture must be multi-chunk");
+    assert!(
+        response.timings["conclusion_kg_ms"] >= conclusion_kg_delay.as_millis() as u64,
+        "the blocked optional conclusion KG stage must be attributed"
+    );
+    assert!(
+        response.timings["post_write_ms"] >= response.timings["conclusion_kg_ms"],
+        "the aggregate post-write boundary must include conclusion KG work"
+    );
+    assert!(
+        response.timings["pipeline_ms"] >= response.timings["post_write_ms"],
+        "the full pipeline boundary must include post-write work"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_same_operation_retry_recovers_created_ids_after_completion_failure() {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, server) = setup_server();

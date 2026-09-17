@@ -394,6 +394,7 @@ pub struct MempalMcpServer {
 pub(crate) enum McpIngestSideEffectStage {
     AfterInsertDrawer,
     AfterInsertFallbackDrawer,
+    ConclusionKg,
     Repair,
     Pattern,
 }
@@ -8231,6 +8232,7 @@ impl MempalMcpServer {
         creation_operation_id: Option<&str>,
         pre_resolved_superseded_drawer_id: Option<String>,
     ) -> std::result::Result<Json<IngestResponse>, McpQueuedIngestError> {
+        let pipeline_started = Instant::now();
         let dry_run = request.dry_run.unwrap_or(false);
         let controls = resolve_mcp_ingest_controls(&request, controls)?;
         if !dry_run && global_embed_status().should_block_writes() {
@@ -8310,6 +8312,9 @@ impl MempalMcpServer {
         )
         .unwrap_or_else(|| request.importance.unwrap_or(0));
         let mut timings = BTreeMap::new();
+        let record_timing = |timings: &mut BTreeMap<String, u64>, stage: &str, started: Instant| {
+            timings.insert(stage.to_string(), started.elapsed().as_millis() as u64);
+        };
 
         let embedder = self
             .embedder_factory
@@ -8342,8 +8347,6 @@ impl MempalMcpServer {
         let superseded_drawer_id_ref = superseded_drawer_id.as_deref();
         let mut superseded_response_id: Option<String> = None;
 
-        // CLI bypass_novelty matches stdin exact-content no-op, including queue-first
-        // waits after a direct stdin write of the same drawer.
         let direct_exact_duplicate = if bypass_novelty {
             exact_content_duplicate_drawer_id(
                 &db,
@@ -8391,7 +8394,6 @@ impl MempalMcpServer {
             .first()
             .map(|(_, id, _)| id.clone())
             .unwrap_or_default();
-
         if dry_run {
             let all_ids: Vec<String> = chunk_drawer_ids
                 .iter()
@@ -8695,10 +8697,7 @@ impl MempalMcpServer {
                 }));
             }
         }
-        timings.insert(
-            "gating_ms".to_string(),
-            gating_started.elapsed().as_millis() as u64,
-        );
+        record_timing(&mut timings, "gating_ms", gating_started);
 
         let embedding_started = Instant::now();
         let chunk_refs: Vec<&str> = chunks.iter().map(|c| c.as_str()).collect();
@@ -8742,10 +8741,7 @@ impl MempalMcpServer {
         if let Some(v) = vectors.first() {
             ensure_vector_dim_matches(&db, v.len())?;
         }
-        timings.insert(
-            "embedding_ms".to_string(),
-            embedding_started.elapsed().as_millis() as u64,
-        );
+        record_timing(&mut timings, "embedding_ms", embedding_started);
 
         let first_vector_ref = &vectors[0];
         let novelty_started = Instant::now();
@@ -8785,16 +8781,11 @@ impl MempalMcpServer {
                 &config.ingest_gating.novelty,
             )
         };
-        timings.insert(
-            "novelty_ms".to_string(),
-            novelty_started.elapsed().as_millis() as u64,
-        );
+        record_timing(&mut timings, "novelty_ms", novelty_started);
         let mut response_drawer_id = drawer_id.clone();
         let (novelty_action, near_drawer_id);
 
         let mut inserted_drawer_ids: Vec<String> = Vec::new();
-        // Tracks only drawers freshly created in this request — dedup-resolved IDs (pre-existing
-        // drawers found by hash) must NOT appear here, so LLM reject cannot soft-delete them.
         let mut newly_created_drawer_ids: Vec<String> = Vec::new();
 
         let db_write_started = Instant::now();
@@ -9091,10 +9082,8 @@ impl MempalMcpServer {
             }
         }
 
-        timings.insert(
-            "db_write_ms".to_string(),
-            db_write_started.elapsed().as_millis() as u64,
-        );
+        record_timing(&mut timings, "db_write_ms", db_write_started);
+        let post_write_started = Instant::now();
 
         if let Some(old_id) = superseded_drawer_id.as_deref()
             && let Some(replacement_id) = inserted_drawer_ids.first()
@@ -9155,6 +9144,9 @@ impl MempalMcpServer {
         if crate::conclusion_kg::is_session_conclusion(request.source.as_deref())
             && !response_drawer_id.is_empty()
         {
+            let conclusion_kg_started = Instant::now();
+            #[cfg(test)]
+            self.run_mcp_ingest_side_effect_hook_for_test(McpIngestSideEffectStage::ConclusionKg);
             crate::conclusion_kg::populate_from_conclusion(
                 &self.db_path,
                 config.as_ref(),
@@ -9164,10 +9156,9 @@ impl MempalMcpServer {
             )
             .await
             .map_err(db_error)?;
+            record_timing(&mut timings, "conclusion_kg_ms", conclusion_kg_started);
         }
 
-        // Tier 3 LLM judge after store; enqueue only newly created IDs so reject
-        // cannot delete a pre-existing hash-dedup drawer.
         if should_enqueue_llm_task && !newly_created_drawer_ids.is_empty() {
             let system_prompt = config
                 .ingest_gating
@@ -9211,7 +9202,6 @@ impl MempalMcpServer {
             }
         }
 
-        // Failure detection (P14) — generation-fenced for each inserted drawer.
         if config.repair.enabled && !inserted_drawer_ids.is_empty() {
             #[cfg(test)]
             self.run_mcp_ingest_side_effect_hook_for_test(McpIngestSideEffectStage::Repair);
@@ -9236,8 +9226,6 @@ impl MempalMcpServer {
             )?;
         }
 
-        // Pattern detection (P13) is best-effort, but lease loss still aborts
-        // ingest so a replaced writer generation cannot mutate the database.
         if config.patterns.enabled && !inserted_drawer_ids.is_empty() {
             #[cfg(test)]
             self.run_mcp_ingest_side_effect_hook_for_test(McpIngestSideEffectStage::Pattern);
@@ -9291,6 +9279,8 @@ impl MempalMcpServer {
                 .map_err(db_error)?,
             None => newly_created_drawer_ids,
         };
+        record_timing(&mut timings, "post_write_ms", post_write_started);
+        record_timing(&mut timings, "pipeline_ms", pipeline_started);
         Ok(Json(IngestResponse {
             drawer_id: response_drawer_id,
             drawer_ids: inserted_drawer_ids,
