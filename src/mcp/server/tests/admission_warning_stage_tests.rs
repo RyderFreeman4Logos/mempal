@@ -112,6 +112,7 @@ async fn fork_fence_contention_refuses_ingest_within_admission_budget() {
         return;
     }
 
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let fixture = tempfile::tempdir().expect("fixture marker directory");
     let ready = fixture.path().join("ready");
     let busy = fixture.path().join("busy");
