@@ -288,29 +288,20 @@ mod regression_tests {
     }
 
     fn spawn_non_utf8_comm_process(ready_file: &Path) -> OwnedGateChild {
-        let mut command = Command::new("/usr/bin/python3");
+        let mut command = Command::new("/bin/bash");
         command
             .args([
                 "-c",
                 r#"
-import ctypes
-import os
-import time
-
-if ctypes.CDLL(None, use_errno=True).prctl(15, b"\xff", 0, 0, 0) != 0:
-    raise OSError(ctypes.get_errno(), "prctl(PR_SET_NAME) failed")
-pid = os.getpid()
-comm = open("/proc/self/comm", "rb").read()
-if comm != b"\xff\n":
-    raise RuntimeError(f"non-UTF-8 comm was not established: {comm!r}")
-fields = open(f"/proc/{pid}/stat", "rb").read().rpartition(b") ")[2].split()
-ready = os.environ["READY_FILE"]
-temporary = ready + ".tmp"
-with open(temporary, "xb") as marker:
-    marker.write(str(pid).encode() + b" " + fields[19] + b"\n")
-os.replace(temporary, ready)
-while True:
-    time.sleep(60)
+                    pid="${BASHPID}"
+                    stat="$(<"/proc/${pid}/stat")"
+                    fields="${stat##*) }"
+                    set -- ${fields}
+                    printf '\377' >"/proc/${pid}/comm"
+                    temporary="${READY_FILE:?}.tmp"
+                    printf '%s %s\n' "${pid}" "${20}" >"${temporary}"
+                    /bin/mv -- "${temporary}" "${READY_FILE}"
+                    kill -STOP "${pid}"
                 "#,
             ])
             .env("READY_FILE", ready_file)
