@@ -34,7 +34,7 @@ async fn test_hook_ipc_spools_before_ack_when_sqlite_locked() {
     super::wait_for_active_handler_count(1, "starting locked SQLite enqueue").await;
     let mut frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
     frame.push(b'\n');
-    super::reset_hook_ipc_ack_checkpoints_for_test();
+    super::reset_hook_ipc_ack_checkpoints_for_test(&request.idempotency_key);
     tokio::io::AsyncWriteExt::write_all(&mut client, &frame)
         .await
         .expect("write request");
@@ -119,6 +119,7 @@ fn append_checkpoint_precedes_runtime_resumption() {
         let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
         let spool = crate::ingress_spool::IngressSpool::new(tmp.path());
         let request = crate::hook_ipc::HookIpcEnqueueRequest::new("fixture", "fixture");
+        super::reset_hook_ipc_ack_checkpoints_for_test(&request.idempotency_key);
         let control = request.clone();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -223,7 +224,7 @@ fn hook_ipc_timeout_fallback_and_late_append_share_identity() {
             });
             entered_rx.await.expect("own sole blocking slot");
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-            super::reset_hook_ipc_ack_checkpoints_for_test();
+            super::reset_hook_ipc_ack_checkpoints_for_test(&request.idempotency_key);
             let client = scope.spawn(move || {
                 let result = crate::hook_ipc::enqueue_with_default_timeout(&home, request);
                 let _ = done_tx.send(result);
@@ -241,6 +242,28 @@ fn hook_ipc_timeout_fallback_and_late_append_share_identity() {
             ));
             let outcome =
                 tokio::time::timeout(crate::hook_ipc::HOOK_IPC_READ_TIMEOUT, done_rx).await;
+            let checkpoint_noise = scope.spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("unrelated fixture runtime");
+                runtime.block_on(async {
+                    let tmp = tempfile::tempdir().expect("unrelated fixture directory");
+                    let store = AsyncPendingMessageStore::new_without_reclaim(
+                        tmp.path().join("unrelated.db"),
+                    );
+                    let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+                    let spool = crate::ingress_spool::IngressSpool::new(tmp.path());
+                    let request = crate::hook_ipc::HookIpcEnqueueRequest::new("unrelated", "{}");
+                    assert_eq!(
+                        super::persist_hook_ipc_request(&store, &spool, &observer, request).await,
+                        crate::hook_ipc::HookIpcEnqueueResponse::Accepted
+                    );
+                });
+            });
+            checkpoint_noise
+                .join()
+                .expect("unrelated checkpoint fixture");
             let queued = super::hook_ipc_ack_checkpoint_report_for_test();
             // Match the actual hook's uncertain-delivery classification and write
             // primitive. Perform the fallback BEFORE releasing the late append.
