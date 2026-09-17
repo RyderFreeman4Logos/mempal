@@ -139,31 +139,60 @@ async fn call_status(client: &mut McpStdio) -> Result<Value> {
     .context("mempal_status timed out")?
 }
 
+fn wait_for_fixture_marker(path: &Path, description: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !path.exists() {
+        if Instant::now() >= deadline {
+            bail!("{description} did not become ready");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
 fn spawn_hostile_mcp(respond_to_initialize: bool, descendant_pid_path: &Path) -> Result<McpStdio> {
-    let script = if respond_to_initialize {
-        r#"trap '' TERM
-sleep 60 &
-descendant_pid="$!"
-descendant_start="$(awk '{print $22}' "/proc/${descendant_pid}/stat")"
-printf '%s %s\n' "${descendant_pid}" "${descendant_start}" > "$MEMPAL_DESCENDANT_PID_FILE"
-printf 'hostile shutdown fixture\n' >&2
-IFS= read -r _
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"hostile-fixture","version":"0.0.0"}}}'
-while IFS= read -r _; do :; done"#
-    } else {
-        r#"trap '' TERM
-sleep 60 &
-descendant_pid="$!"
-descendant_start="$(awk '{print $22}' "/proc/${descendant_pid}/stat")"
-printf '%s %s\n' "${descendant_pid}" "${descendant_start}" > "$MEMPAL_DESCENDANT_PID_FILE"
-printf 'hostile initialize fixture\n' >&2
-while IFS= read -r _; do :; done"#
-    };
-    let mut command = tokio::process::Command::new("/bin/sh");
+    let script = r#"trap '' TERM
+escape() {
+    pid="${BASHPID}"
+    start="$(awk '{print $22}' "/proc/${pid}/stat")"
+    temporary="${MEMPAL_DESCENDANT_PID_FILE:?}.tmp"
+    printf '%s %s\n' "${pid}" "${start}" > "${temporary}"
+    /bin/mv -- "${temporary}" "${MEMPAL_DESCENDANT_PID_FILE}"
+    while [[ ! -e "${MEMPAL_DESCENDANT_RELEASE_FILE:?}" ]]; do /bin/sleep 0.01; done
+    exec /usr/bin/setsid /bin/bash -c '
+        : >"${MEMPAL_DESCENDANT_ESCAPED_FILE:?}"
+        trap "" TERM
+        while :; do /bin/sleep 60; done
+    '
+}
+escape &
+if [[ -n "${MEMPAL_RESPOND_TO_INITIALIZE:-}" ]]; then
+    printf 'hostile shutdown fixture\n' >&2
+    IFS= read -r _
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"hostile-fixture","version":"0.0.0"}}}'
+else
+    printf 'hostile initialize fixture\n' >&2
+fi
+while IFS= read -r _; do :; done"#;
+    let release_path = descendant_pid_path.with_extension("release");
+    let escaped_path = descendant_pid_path.with_extension("escaped");
+    let mut command = tokio::process::Command::new("/bin/bash");
     command
         .args(["-c", script])
-        .env("MEMPAL_DESCENDANT_PID_FILE", descendant_pid_path);
-    McpStdio::spawn_command(&mut command)
+        .env("MEMPAL_DESCENDANT_PID_FILE", descendant_pid_path)
+        .env("MEMPAL_DESCENDANT_RELEASE_FILE", &release_path)
+        .env("MEMPAL_DESCENDANT_ESCAPED_FILE", &escaped_path)
+        .env(
+            "MEMPAL_RESPOND_TO_INITIALIZE",
+            if respond_to_initialize { "1" } else { "" },
+        );
+    let mut client = McpStdio::spawn_command(&mut command)?;
+    wait_for_fixture_marker(descendant_pid_path, "hostile MCP descendant identity")?;
+    let identity = read_recorded_process_identity(descendant_pid_path)?;
+    client.track_process(identity.pid, identity.start_time_ticks)?;
+    fs::write(&release_path, b"").context("release hostile MCP descendant")?;
+    wait_for_fixture_marker(&escaped_path, "hostile MCP descendant escape")?;
+    Ok(client)
 }
 
 fn spawn_malformed_initialize_mcp(descendant_pid_path: &Path) -> Result<McpStdio> {

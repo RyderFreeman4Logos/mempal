@@ -1,7 +1,9 @@
 //! JSON-RPC 2.0 client for `mempal serve --mcp` over stdio.
 
 use std::collections::HashMap;
+use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -30,6 +32,52 @@ pub struct McpStdio {
     roots: Vec<String>,
     pid: u32,
     reaped: bool,
+    tracked_processes: Vec<TrackedProcess>,
+}
+
+struct TrackedProcess {
+    pid: i32,
+    start_time_ticks: u64,
+    pidfd: OwnedFd,
+}
+
+impl TrackedProcess {
+    fn capture(pid: i32, start_time_ticks: u64) -> io::Result<Self> {
+        if !process_matches(pid, start_time_ticks)? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "recorded MCP descendant identity is no longer live",
+            ));
+        }
+        let pidfd = open_pidfd(pid)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "pidfd is required to track an MCP descendant safely",
+            )
+        })?;
+        if !process_matches(pid, start_time_ticks)? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "recorded MCP descendant changed while opening pidfd",
+            ));
+        }
+        Ok(Self {
+            pid,
+            start_time_ticks,
+            pidfd,
+        })
+    }
+
+    fn is_running(&self) -> io::Result<bool> {
+        process_matches(self.pid, self.start_time_ticks)
+    }
+
+    fn send_signal(&self, signal: i32) -> io::Result<()> {
+        if !self.is_running()? {
+            return Ok(());
+        }
+        send_pidfd_signal(&self.pidfd, signal)
+    }
 }
 
 impl McpStdio {
@@ -156,6 +204,7 @@ log_path = "{}"
             roots: Vec::new(),
             pid,
             reaped: false,
+            tracked_processes: Vec::new(),
         })
     }
 
@@ -165,6 +214,12 @@ log_path = "{}"
 
     pub fn is_reaped(&self) -> bool {
         self.reaped
+    }
+
+    pub fn track_process(&mut self, pid: i32, start_time_ticks: u64) -> Result<()> {
+        self.tracked_processes
+            .push(TrackedProcess::capture(pid, start_time_ticks)?);
+        Ok(())
     }
 
     pub async fn initialize(&mut self) -> Result<ServerInfo> {
@@ -305,37 +360,49 @@ log_path = "{}"
             }
             None => (false, None),
         };
-        let term_error = if leader_exited {
+        let group_term_error = if leader_exited {
             None
         } else {
-            let error = self.signal_process_group(libc::SIGTERM).err();
-            let term_deadline = (Instant::now() + TERM_GRACE).min(deadline);
-            match self.wait_for_leader_exit_unreaped(term_deadline).await {
-                Ok(exited) => leader_exited = exited,
-                Err(error) => observe_error = Some(error),
-            }
-            error
+            self.signal_process_group(libc::SIGTERM).err()
         };
+        let tracked_term_error = self.signal_tracked_processes(libc::SIGTERM).err();
+        let term_deadline = (Instant::now() + TERM_GRACE).min(deadline);
+        match self
+            .wait_for_cleanup_targets(leader_exited, term_deadline)
+            .await
+        {
+            Ok((leader, _)) => leader_exited = leader,
+            Err(error) => observe_error = Some(error),
+        }
 
         // The unreaped leader still owns its numeric PID, so its dedicated PGID cannot be reused
-        // between this final fence and the one-and-only reap below.
-        let kill_error = self.signal_process_group(libc::SIGKILL).err();
+        // between this final fence and the one-and-only reap below. Escaped descendants are fenced
+        // separately through pidfds captured from the fixture's published PID/start-time identity.
+        let group_kill_error = self.signal_process_group(libc::SIGKILL).err();
+        let tracked_kill_error = self.signal_tracked_processes(libc::SIGKILL).err();
         let reap_error = match tokio::time::timeout_at(deadline, self.child.wait()).await {
             Ok(Ok(_)) => {
                 self.reaped = true;
-                kill_error.map(|error| {
-                    format!(
-                        "kill MCP process group {}: {error}; leader_exited={leader_exited}; term={term_error:?}; observe={observe_error:?}",
-                        self.pid
-                    )
-                })
+                match self.wait_for_tracked_processes(deadline).await {
+                    Ok(true) => group_kill_error.or(tracked_kill_error).map(|error| {
+                        format!(
+                            "kill MCP lifecycle process: {error}; leader_exited={leader_exited}; group_term={group_term_error:?}; tracked_term={tracked_term_error:?}; observe={observe_error:?}"
+                        )
+                    }),
+                    Ok(false) => Some(format!(
+                        "tracked MCP descendant survived lifecycle cleanup; leader_exited={leader_exited}; group_term={group_term_error:?}; tracked_term={tracked_term_error:?}; group_kill={group_kill_error:?}; tracked_kill={tracked_kill_error:?}; observe={observe_error:?}"
+                    )),
+                    Err(error) => Some(format!(
+                        "inspect tracked MCP descendant after cleanup: {error}; leader_exited={leader_exited}; group_term={group_term_error:?}; tracked_term={tracked_term_error:?}; group_kill={group_kill_error:?}; tracked_kill={tracked_kill_error:?}; observe={observe_error:?}"
+                    )),
+                }
             }
             Ok(Err(error)) => Some(format!(
-                "reap MCP child {} after group kill: {error}; leader_exited={leader_exited}; term={term_error:?}; kill={kill_error:?}; observe={observe_error:?}",
+                "reap MCP child {} after group kill: {error}; leader_exited={leader_exited}; group_term={group_term_error:?}; tracked_term={tracked_term_error:?}; group_kill={group_kill_error:?}; tracked_kill={tracked_kill_error:?}; observe={observe_error:?}",
                 self.pid
             )),
             Err(_) => Some(format!(
-                "reap MCP child {} after group kill timed out; leader_exited={leader_exited}; term={term_error:?}; kill={kill_error:?}; observe={observe_error:?}",
+                "reap MCP child {} after group kill timed out; leader_exited={leader_exited}; group_term={group_term_error:?}; tracked_term={tracked_term_error:?}; group_kill={group_kill_error:?}; tracked_kill={tracked_kill_error:?}; observe={observe_error:?}",
                 self.pid
             )),
         };
@@ -344,6 +411,61 @@ log_path = "{}"
             bail!(error);
         }
         Ok(())
+    }
+
+    fn signal_tracked_processes(&self, signal: i32) -> io::Result<()> {
+        let mut first_error = None;
+        for process in &self.tracked_processes {
+            if let Err(error) = process.send_signal(signal)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn tracked_processes_exited(&self) -> io::Result<bool> {
+        for process in &self.tracked_processes {
+            if process.is_running()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn wait_for_cleanup_targets(
+        &self,
+        mut leader_exited: bool,
+        deadline: Instant,
+    ) -> io::Result<(bool, bool)> {
+        loop {
+            if !leader_exited {
+                leader_exited = self.leader_exited_unreaped()?;
+            }
+            let tracked_exited = self.tracked_processes_exited()?;
+            if leader_exited && tracked_exited {
+                return Ok((true, true));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok((leader_exited, tracked_exited));
+            }
+            tokio::time::sleep(Duration::from_millis(10).min(remaining)).await;
+        }
+    }
+
+    async fn wait_for_tracked_processes(&self, deadline: Instant) -> io::Result<bool> {
+        loop {
+            if self.tracked_processes_exited()? {
+                return Ok(true);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(10).min(remaining)).await;
+        }
     }
 
     async fn wait_for_leader_exit_unreaped(&self, deadline: Instant) -> io::Result<bool> {
@@ -482,12 +604,86 @@ log_path = "{}"
     }
 }
 
+fn process_matches(pid: i32, start_time_ticks: u64) -> io::Result<bool> {
+    let stat = match fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let fields = stat.rsplit(|byte| *byte == b')').next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Linux proc stat was missing the command name terminator",
+        )
+    })?;
+    let mut fields = fields
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty());
+    let state = fields
+        .next()
+        .and_then(|field| field.first().copied())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process state"))?;
+    fields
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing parent PID"))?;
+    let current_start = std::str::from_utf8(
+        fields
+            .nth(17)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing start time"))?,
+    )
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-numeric start time"))?
+    .parse::<u64>()
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-numeric start time"))?;
+    Ok(state != b'Z' && current_start == start_time_ticks)
+}
+
+fn open_pidfd(pid: i32) -> io::Result<Option<OwnedFd>> {
+    // SAFETY: `pidfd_open` receives a validated signed PID and no pointers.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) };
+    if raw == -1 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) | Some(libc::ENOSYS) | Some(libc::EINVAL) => Ok(None),
+            _ => Err(error),
+        };
+    }
+    let raw = i32::try_from(raw).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pidfd_open returned an invalid descriptor",
+        )
+    })?;
+    // SAFETY: `pidfd_open` returned this fresh descriptor exactly once.
+    Ok(Some(unsafe { OwnedFd::from_raw_fd(raw) }))
+}
+
+fn send_pidfd_signal(pidfd: &OwnedFd, signal: i32) -> io::Result<()> {
+    // SAFETY: `pidfd` is owned; null siginfo and flags 0 request ordinary delivery.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0_u32,
+        )
+    };
+    if result == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 impl Drop for McpStdio {
     fn drop(&mut self) {
         // Fence descendants before `Child::drop` can kill the leader; an unreaped leader pins
         // its PGID so the group number cannot be reused for an unrelated process.
         if !self.reaped {
             let _ = self.signal_process_group(libc::SIGKILL);
+            let _ = self.signal_tracked_processes(libc::SIGKILL);
         }
         if let Some(task) = self.stderr_task.take() {
             task.abort();
