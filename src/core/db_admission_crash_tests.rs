@@ -58,6 +58,7 @@ fn admission_crash_fixture() {
 
 #[test]
 fn waiting_fork_writer_blocks_new_admission_readers() {
+    let _fixture_guard = super::db::db_open_busy_fixture_lock().blocking_lock();
     let executable = std::env::current_exe().expect("current unit-test executable");
     let mut spec = SpawnSpec::new(executable).expect("absolute unit-test executable");
     spec.args(["--exact", FIXTURE_TEST, "--nocapture", "--test-threads=1"])
@@ -129,6 +130,7 @@ fn run_fork_barging_fixture() {
 
 #[test]
 fn fork_waits_for_admission_state_unlock_before_starting_child() {
+    let _fixture_guard = super::db::db_open_busy_fixture_lock().blocking_lock();
     let temp = tempfile::tempdir().expect("temp dir");
     let lock_path = temp.path().join(".palace.db.admission.lock");
     let state_lock = super::db_admission_state::lock_state(&lock_path)
@@ -182,6 +184,7 @@ fn fork_waits_for_admission_state_unlock_before_starting_child() {
 
 #[test]
 fn fork_fence_wait_honors_launch_deadline_without_starting_child() {
+    let _fixture_guard = super::db::db_open_busy_fixture_lock().blocking_lock();
     let temp = tempfile::tempdir().expect("temp dir");
     let lock_path = temp.path().join(".palace.db.admission.lock");
     let state_lock = super::db_admission_state::lock_state(&lock_path)
