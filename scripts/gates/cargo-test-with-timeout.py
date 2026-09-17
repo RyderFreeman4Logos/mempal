@@ -486,7 +486,9 @@ def open_pidfd(identity: Identity) -> int | None:
     try:
         pidfd = os.pidfd_open(identity.pid, 0)
     except OSError as error:
-        if error.errno in (errno.ESRCH, errno.ENOSYS, errno.EINVAL, errno.EPERM):
+        if error.errno == errno.ESRCH:
+            raise ValueError("pid exited while opening pidfd") from error
+        if error.errno in (errno.ENOSYS, errno.EINVAL, errno.EPERM):
             return None
         return None
     try:
