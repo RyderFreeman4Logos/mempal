@@ -5,10 +5,10 @@
 [[files]]
 path = "CHANGELOG.md"
 kind = "doc"
-baseline_tokens = 9335
-baseline_lines = 612
-issue = "1051"
-rationale = "#1051 adds the Unreleased rest_readiness writer-lease-lost isolation note; changelog growth is unavoidable, exact no-growth ratchet."
+baseline_tokens = 9358
+baseline_lines = 594
+issue = "1184"
+rationale = "#1184 adds the Unreleased write-spool FIFO-head status_running stall fail-closed note; changelog growth is unavoidable, exact no-growth ratchet."
 [[files]]
 path = "contrib/hermes-agent-plugin/mempal/__init__.py"
 kind = "source"
