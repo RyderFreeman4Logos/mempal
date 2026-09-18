@@ -18,6 +18,7 @@ impl PendingMessageStore {
         let now = now_secs();
         let stale_cutoff = saturating_cutoff(now, claim_ttl_secs);
         if !self.with_query_connection(|conn| {
+            self.require_lifecycle_writer_lease(conn, "claim queued message")?;
             Ok(claim_work_available(
                 conn,
                 stale_cutoff,
