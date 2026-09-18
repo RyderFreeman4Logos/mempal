@@ -78,6 +78,21 @@ def classify_write_error(exc: Exception) -> str:
     return "network_or_protocol_error"
 
 
+def classify_replay_progress(
+    error_class: Optional[str], attempt_count: int = 0
+) -> str:
+    """Return in_flight, stalled, or fifo_blocked for a replay status class."""
+    if error_class == "fifo_blocked":
+        return "fifo_blocked"
+    if error_class == "status_stalled" or (
+        error_class == "status_running" and attempt_count >= _MAX_REPLAY_ATTEMPTS
+    ):
+        return "stalled"
+    if error_class in {"status_queued", "status_running"}:
+        return "in_flight"
+    return "stalled" if error_class else "in_flight"
+
+
 def classify_replay_error(error_class: Optional[str]) -> ReplayClassification:
     """Classify replay outcomes once for direct and background callers."""
     if not error_class:
@@ -480,6 +495,14 @@ class WriteSpoolReplay:
             elif state in _RETRYABLE_STATES:
                 error_class = f"status_{state}"
                 retryable = True
+                if (
+                    classify_replay_progress(
+                        error_class, attempt_count=operation.attempt_count + 1
+                    )
+                    == "stalled"
+                ):
+                    error_class = "status_stalled"
+                    retryable = False
             else:
                 error_class = "status_invalid"
                 retryable = False

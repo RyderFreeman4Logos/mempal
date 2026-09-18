@@ -24,6 +24,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- Hermes write-spool fail-closes a FIFO-head `status_running` receipt after bounded polls (`status_stalled`) so later concludes are not blocked forever (#1184).
 - Hermes conclude requires caller-owned retry keys; one status probe, durable replay; pending never claims storage (#1135; outer deadline integration pending).
 - Context isolate embed env HTTP CL (#1080,#1082).
 - Daemon lease survives maintenance cap/no exit 75; rejects incompatible MCP-ingest holders (#916,#849).
