@@ -97,6 +97,7 @@ def _remove_snapshot(
 def _remove_owned_root(
     identity: FixtureIdentity,
     deadline: float,
+    cancelled: Callable[[], bool],
     capture_tree: Callable[[int, int, Callable[[], None]], TreeSnapshot | None],
 ) -> bool:
     # ponytail: Unix UID is the trust boundary; callers must quiesce same-UID fixture
@@ -105,6 +106,8 @@ def _remove_owned_root(
     parent_fd = root_fd = None
 
     def check_cleanup() -> None:
+        if cancelled():
+            raise OSError(errno.EINTR, "fixture cleanup cancelled")
         if time.monotonic() >= deadline:
             raise OSError(errno.ETIMEDOUT, "fixture cleanup deadline exceeded")
 
@@ -223,7 +226,7 @@ def remove_owned_root(
     if worker_pid == 0:
         for signum in (signal.SIGHUP, signal.SIGQUIT, signal.SIGINT, signal.SIGTERM):
             signal.signal(signum, signal.SIG_DFL)
-        succeeded = _remove_owned_root(identity, deadline, capture_tree)
+        succeeded = _remove_owned_root(identity, deadline, cancelled, capture_tree)
         sys.stderr.flush()
         os._exit(0 if succeeded else 1)
 

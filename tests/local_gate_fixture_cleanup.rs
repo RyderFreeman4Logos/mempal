@@ -733,23 +733,32 @@ elif mode == "deadline":
         return real_snapshot(*args)
     module.fixture_tree_stays_on_mount = delayed_snapshot
 elif mode == "signal":
-    real_remove = cleanup_worker_module._remove_snapshot
+    real_remove, real_cleanup, real_waitpid = cleanup_worker_module._remove_snapshot, cleanup_worker_module._remove_owned_root, os.waitpid
+    def wait_for(predicate):
+        deadline = time.monotonic() + 5
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert predicate(), "cleanup phase did not reach barrier"
     def blocked_remove(*args):
         open(ready, "wb").close()
-        while not os.path.exists(release):
-            time.sleep(0.01)
+        wait_for(lambda: os.path.exists(release))
         return real_remove(*args)
-    cleanup_worker_module._remove_snapshot = blocked_remove
+    def tracked_cleanup(*args):
+        try: return real_cleanup(*args)
+        finally: open(release, "ab").write(b"done")
+    def controlled_waitpid(pid, options):
+        if os.path.exists(ready) and not os.path.exists(release):
+            open(ready, "ab").write(b"parent")
+            wait_for(lambda: os.path.exists(release) and os.path.getsize(release) > 0)
+        return real_waitpid(pid, options)
+    cleanup_worker_module._remove_snapshot, cleanup_worker_module._remove_owned_root, os.waitpid = blocked_remove, tracked_cleanup, controlled_waitpid
     def interrupt_cleanup():
-        deadline = time.monotonic() + 5
-        while not os.path.exists(ready) and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert os.path.exists(ready), "fixture removal did not reach barrier"
+        wait_for(lambda: os.path.exists(ready) and os.path.getsize(ready) > 0)
+        generation = module._signal_generation
         os.kill(os.getpid(), signal.SIGTERM)
+        wait_for(lambda: module._signal_generation != generation)
         open(release, "wb").close()
-    controller = threading.Thread(target=interrupt_cleanup)
-    controller.start()
-
+    controller = threading.Thread(target=interrupt_cleanup); controller.start()
 os.environ["ROOT_MARKER"] = root_marker
 os.environ["CLEANUP_CASE"] = mode
 os.environ["MEMPAL_CARGO_TEST_KILL_GRACE_SECS"] = "1"

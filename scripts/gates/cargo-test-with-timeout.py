@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import mmap
 import os
 import select
 import shlex
@@ -37,6 +38,7 @@ POLL_INTERVAL = 0.01
 DISCOVERY_INTERVAL = 0.25
 _pending_signal: int | None = None
 _signal_generation = 0
+_active_cleanup_cancel: mmap.mmap | None = None
 
 
 @dataclass(frozen=True)
@@ -505,6 +507,8 @@ def install_signal_handlers() -> None:
         global _pending_signal, _signal_generation
         _pending_signal = signum
         _signal_generation += 1
+        if _active_cleanup_cancel is not None:
+            _active_cleanup_cancel[0] = 1
 
     for signum in (signal.SIGHUP, signal.SIGQUIT, signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, request_cleanup)
@@ -582,13 +586,30 @@ def remove_owned_root(
     deadline: float,
     signal_generation: int,
 ) -> bool:
-    return run_cleanup_worker(
-        identity,
-        deadline,
-        lambda: _signal_generation != signal_generation,
-        POLL_INTERVAL,
-        fixture_tree_stays_on_mount,
-    )
+    global _active_cleanup_cancel
+    try:
+        cancellation = mmap.mmap(-1, 1)
+    except OSError as error:
+        print(
+            f"failed to create fixture cleanup cancellation flag: {error}",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        _active_cleanup_cancel = cancellation
+        # Publication plus this recheck covers signals on either side of publication.
+        if _signal_generation != signal_generation:
+            cancellation[0] = 1
+        return run_cleanup_worker(
+            identity,
+            deadline,
+            lambda: cancellation[0] != 0,
+            POLL_INTERVAL,
+            fixture_tree_stays_on_mount,
+        )
+    finally:
+        _active_cleanup_cancel = None
+        cancellation.close()
 
 
 def retain_fixture_root(identity: FixtureIdentity, reason: str) -> int:
