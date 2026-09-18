@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::adoption_analytics::build_runtime_adoption_analytics;
 use crate::brief::{
@@ -118,6 +118,10 @@ use super::ingest_payload::{
     run_durable_delete,
 };
 use super::resource_usage;
+
+#[path = "server_ingest_idempotency.rs"]
+mod ingest_idempotency;
+use ingest_idempotency::mcp_ingest_idempotency_key;
 
 #[path = "server_operation_receipt.rs"]
 mod operation_receipt;
@@ -295,22 +299,6 @@ fn ingest_retry_deadline(request_deadline: Option<Instant>, cap: Duration) -> In
     request_deadline
         .map(|deadline| deadline.min(cap_deadline))
         .unwrap_or(cap_deadline)
-}
-
-fn mcp_ingest_idempotency_key(payload: &str) -> String {
-    let now_ns = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_nanos(),
-        Err(_) => 0,
-    };
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"mempal mcp ingest admission v1");
-    hasher.update(&[0]);
-    hasher.update(&now_ns.to_le_bytes());
-    hasher.update(&[0]);
-    hasher.update(&std::process::id().to_le_bytes());
-    hasher.update(&[0]);
-    hasher.update(payload.as_bytes());
-    format!("mcp-ingest-{}", hasher.finalize().to_hex())
 }
 
 #[derive(Clone)]
@@ -7708,7 +7696,8 @@ impl MempalMcpServer {
         request_deadline: Instant,
         allow_daemon_rest_fallback: bool,
     ) -> std::result::Result<IngestAdmissionOutcome, IngestAdmissionError> {
-        let idempotency_key = mcp_ingest_idempotency_key(&payload);
+        let idempotency_key =
+            mcp_ingest_idempotency_key(&payload, daemon_rest_request.operation_key.as_deref())?;
         let daemon_enqueue = self
             .try_enqueue_ingest_operation_via_daemon(
                 payload.clone(),
@@ -22915,6 +22904,7 @@ reject_on_contradiction = true
                     project_id: None,
                     wait: None,
                     wait_timeout_secs: None,
+                    operation_key: None,
                 })
                 .expect("serialize ingest request"),
             )

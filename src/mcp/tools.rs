@@ -1765,6 +1765,10 @@ pub struct IngestRequest {
     /// the queued receipt with `timed_out=true`. Defaults to 30.
     pub wait_timeout_secs: Option<u64>,
 
+    /// Caller-owned 1–128 printable ASCII key; reuse after a lost receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_key: Option<String>,
+
     /// If true, append this entry to one agent-diary drawer for the current
     /// UTC day. Requires wing="agent-diary" and an explicit room.
     pub diary_rollup: Option<bool>,

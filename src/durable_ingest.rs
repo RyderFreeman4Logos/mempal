@@ -140,7 +140,7 @@ fn status_with_store(
     Ok(receipt_from_record(record))
 }
 
-fn validate_idempotency_key(key: &str) -> Result<(), DurableAdmissionError> {
+pub(crate) fn validate_idempotency_key(key: &str) -> Result<(), DurableAdmissionError> {
     let valid = !key.is_empty()
         && key.len() <= MAX_IDEMPOTENCY_KEY_BYTES
         && key.bytes().all(|byte| byte.is_ascii_graphic());

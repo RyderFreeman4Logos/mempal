@@ -88,6 +88,9 @@ pub(super) fn unsupported_fields(request: &IngestRequest) -> Vec<&'static str> {
     if request.cwd.is_some() {
         fields.push("cwd");
     }
+    if request.operation_key.is_some() {
+        fields.push("operation_key");
+    }
     fields
 }
 

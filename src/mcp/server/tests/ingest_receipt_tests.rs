@@ -295,7 +295,8 @@ async fn test_fsynced_daemon_ack_returns_receipt_before_queue_visibility() {
         .await
         .expect("prepare queued ingest");
     let payload = serde_json::to_string(&prepared).expect("serialize queued ingest");
-    let idempotency_key = mcp_ingest_idempotency_key(&payload);
+    let idempotency_key = mcp_ingest_idempotency_key(&payload, None)
+        .unwrap_or_else(|_| panic!("legacy admission key"));
 
     let (listener, _socket_guard) =
         crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
@@ -503,5 +504,69 @@ async fn test_mcp_ingest_scoped_zero_wait_skips_status_refresh_after_budget() {
             .load(Ordering::Relaxed),
         1,
         "positive-budget status probe must increment its observer"
+    );
+}
+
+#[tokio::test]
+async fn test_transport_lost_before_operation_id_retry_reuses_same_operation() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
+    let (_tempdir, db_path, server) = setup_server();
+    let request = serde_json::from_value::<IngestRequest>(serde_json::json!({
+        "content": "C-P01 transport-lost-before-operation-id retry",
+        "wing": "mcp",
+        "room": "idempotency",
+        "dry_run": false,
+        "wait": false,
+        "operation_key": "cp01-caller-stable-operation-key"
+    }))
+    .expect("caller-stable ingest fixture");
+
+    let first = server
+        .mempal_ingest(Parameters(request.clone()))
+        .await
+        .expect("first admission returns a receipt")
+        .0;
+    let first_id = first
+        .operation_id
+        .clone()
+        .expect("first receipt must include operation id");
+
+    let retry = server
+        .mempal_ingest(Parameters(request))
+        .await
+        .expect("lost-before-id retry returns a receipt")
+        .0;
+    let retry_id = retry
+        .operation_id
+        .clone()
+        .expect("retry receipt must include operation id");
+
+    assert_eq!(
+        retry_id, first_id,
+        "same caller-stable key retry must not mint a second operation"
+    );
+    let store = PendingMessageStore::new_without_reclaim(&db_path);
+    assert!(
+        store
+            .operation_status(&first_id)
+            .expect("query first operation")
+            .is_some(),
+        "retried admission must keep the original durable row"
+    );
+    let conn = rusqlite::Connection::open(&db_path).expect("open verification connection");
+    let operation_count: i64 = conn
+        .query_row(
+            "SELECT (
+                SELECT COUNT(*) FROM pending_messages WHERE kind = ?1
+            ) + (
+                SELECT COUNT(*) FROM pending_message_completions WHERE kind = ?1
+            )",
+            [INGEST_ASYNC_KIND],
+            |row| row.get(0),
+        )
+        .expect("count ingest operations");
+    assert_eq!(
+        operation_count, 1,
+        "ns/PID recast of the admission key must not enqueue a second ingest_async row"
     );
 }
