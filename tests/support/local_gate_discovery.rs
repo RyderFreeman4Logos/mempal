@@ -184,7 +184,7 @@ pub(super) fn refresh_owned_processes_with_token(
         track_ownership_token_holders(token, tracked_processes, deadline)?;
     }
     if Instant::now() < deadline {
-        track_output_pipe_holders(child, tracked_processes, deadline)?;
+        track_output_pipe_holders(child, root, tracked_processes, deadline)?;
     }
     let mut pending = Vec::new();
     for process in tracked_processes.iter() {
@@ -306,6 +306,7 @@ fn discover_live_descendants(
 
 fn track_output_pipe_holders(
     child: &Child,
+    root: &ProcessHandle,
     tracked_processes: &mut Vec<TrackedProcess>,
     deadline: Instant,
 ) -> io::Result<()> {
@@ -337,6 +338,10 @@ fn track_output_pipe_holders(
             Err(error) if process_scan_error(&error) => continue,
             Err(error) => return Err(error),
         };
+        // The direct child already has identity-bound cleanup authority, even after EOF.
+        if process.identity == root.identity {
+            continue;
+        }
         let holds_pipe = match process_holds_writable_pipe(&process, &pipe_targets, deadline) {
             Ok(holds_pipe) => holds_pipe,
             Err(error) if process_scan_error(&error) => continue,

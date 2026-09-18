@@ -46,7 +46,31 @@ fn wait_for_deadline_output(
     label: &str,
 ) -> Result<DeadlineOutput, String> {
     let started = Instant::now();
-    let output = match DeadlineChild::output(spec, timeout) {
+    collect_deadline_output(DeadlineChild::output(spec, timeout), started, label)
+}
+
+/// Output-wait contract for a child that has already completed launch.
+fn wait_launched_child_output(
+    spec: SpawnSpec,
+    output_timeout: Duration,
+    label: &str,
+) -> Result<DeadlineOutput, String> {
+    let child = DeadlineChild::spawn(spec, Duration::from_secs(2))
+        .map_err(|error| format!("{label} failed to launch before output wait: {error}"))?;
+    assert!(
+        child.identity().still_refers_to_original_process(),
+        "{label} must start a live child before the output wait"
+    );
+    let started = Instant::now();
+    collect_deadline_output(child.wait_output(output_timeout), started, label)
+}
+
+fn collect_deadline_output(
+    result: Result<DeadlineOutput, SupervisionError>,
+    started: Instant,
+    label: &str,
+) -> Result<DeadlineOutput, String> {
+    let output = match result {
         Ok(output) => output,
         Err(SupervisionError::CleanupIncomplete(incomplete)) => {
             match incomplete.finish_output(CLEANUP_RETRY) {
@@ -118,7 +142,7 @@ fn bounded_output_wait_returns_contextual_timeout_and_reaps() {
         "-c",
         "trap '' TERM; printf started; while :; do sleep 60; done",
     ]);
-    let err = wait_for_deadline_output(command, Duration::from_millis(150), "hanging fixture")
+    let err = wait_launched_child_output(command, Duration::from_millis(150), "hanging fixture")
         .expect_err("hanging fixture must time out");
     assert!(
         err.contains("hanging fixture"),
@@ -127,6 +151,10 @@ fn bounded_output_wait_returns_contextual_timeout_and_reaps() {
     assert!(
         err.contains("timed out"),
         "timeout must be a contextual failure, not a bare Timeout panic: {err}"
+    );
+    assert!(
+        !err.contains("fork fence exceeded launch deadline"),
+        "output wait must not fail at launch: {err}"
     );
     assert!(
         err.contains("kill_fence") || err.contains("cleanup"),
@@ -139,7 +167,7 @@ fn bounded_output_wait_returns_contextual_timeout_and_reaps() {
 fn bounded_output_wait_rejects_term_trap_exit_zero_after_deadline() {
     let mut command = SpawnSpec::new("/bin/sh").expect("absolute shell");
     command.args(["-c", "trap 'exit 0' TERM; while :; do sleep 60; done"]);
-    let err = wait_for_deadline_output(command, Duration::from_millis(150), "term-trap fixture")
+    let err = wait_launched_child_output(command, Duration::from_millis(150), "term-trap fixture")
         .expect_err("term-trap exit 0 after deadline must be Err");
     assert!(
         err.contains("term-trap fixture"),

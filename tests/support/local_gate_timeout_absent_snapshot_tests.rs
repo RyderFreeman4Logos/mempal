@@ -110,6 +110,48 @@ finally:
 }
 
 #[test]
+fn cargo_test_wrapper_proves_cleanup_when_pidfd_open_reports_esrch() {
+    run_harness(
+        r#"
+import errno
+import importlib.util
+import subprocess
+import sys
+
+spec = importlib.util.spec_from_file_location("timeout_wrapper", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+child = subprocess.Popen(["/bin/sleep", "10"], start_new_session=True)
+supervisor = module.Supervisor(child, 0.01)
+candidate = module.Snapshot(
+    module.Identity(424242, 1),
+    child.pid,
+    424242,
+    424242,
+    "R",
+    "vanished",
+)
+original_pidfd_open = module.os.pidfd_open
+try:
+    module.os.pidfd_open = lambda pid, flags: (_ for _ in ()).throw(
+        OSError(errno.ESRCH, "No such process")
+    )
+    supervisor._adopt(candidate)
+    assert candidate.identity.pid not in supervisor.owned
+    assert not supervisor.ownership_uncertain
+finally:
+    module.os.pidfd_open = original_pidfd_open
+    supervisor.close()
+    child.terminate()
+    child.wait()
+"#,
+        "ESRCH while opening a pidfd must prove the adoption candidate vanished",
+    );
+}
+
+#[test]
 fn cargo_test_wrapper_omits_absent_owned_identities_from_cleanup_dump() {
     run_harness(
         r#"

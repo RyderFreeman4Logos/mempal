@@ -1,5 +1,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -282,6 +284,54 @@ fn setup_gate_release_completes_the_same_owned_launch() {
             .expect("released setup output");
         assert!(output.success());
         assert!(!output.timed_out);
+    });
+}
+
+#[test]
+fn setup_gate_does_not_retain_unrelated_parent_flock() {
+    let temp = tempfile::tempdir().expect("lock tempdir");
+    let lock_path = temp.path().join("admission.lock");
+    let inherited = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open inherited lock");
+    let lock_metadata = inherited.metadata().expect("lock metadata");
+    // SAFETY: the descriptor is owned by a live File for this flock call.
+    assert_eq!(
+        unsafe { libc::flock(inherited.as_raw_fd(), libc::LOCK_EX) },
+        0
+    );
+
+    let (gate, child_gate) = TestSetupGate::new().expect("create setup gate");
+    let mut spec = SpawnSpec::new("/bin/true").expect("absolute true executable");
+    spec.setup_gate(child_gate);
+
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || DeadlineChild::output(spec, Duration::from_secs(2)));
+        let ready_pid = gate
+            .wait_ready(Instant::now() + Duration::from_secs(1))
+            .expect("child reached setup gate");
+        let inherited_lock_fds = std::fs::read_dir(format!("/proc/{ready_pid}/fd"))
+            .expect("read child descriptors")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| {
+                metadata.dev() == lock_metadata.dev() && metadata.ino() == lock_metadata.ino()
+            })
+            .count();
+        gate.release().expect("release setup gate");
+        let output = worker
+            .join()
+            .expect("owned setup worker")
+            .expect("released setup output");
+        assert!(output.success());
+        assert_eq!(
+            inherited_lock_fds, 0,
+            "pre-exec child {ready_pid} retained an unrelated parent lock"
+        );
     });
 }
 

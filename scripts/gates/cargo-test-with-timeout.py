@@ -1,19 +1,35 @@
 #!/usr/bin/env python3
-"""Run one command with Linux process-tree ownership and bounded cleanup."""
+"""Run one command with Linux process-tree ownership and bounded cleanup.
+
+This supervisor also owns one mkdtemp fixture root for the child. SIGKILL of
+the supervisor itself or a host crash cannot run that cleanup; the exact root
+may remain for later identity-validated removal. This script does not claim
+to clean up after its own SIGKILL.
+"""
 
 from __future__ import annotations
 
 import ctypes
 import errno
+import mmap
 import os
 import select
 import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fixture_cleanup_identity import (  # noqa: E402
+    FixtureIdentity,
+    capture_fixture_identity,
+    fixture_tree_stays_on_mount,
+)
+from fixture_cleanup_worker import remove_owned_root as run_cleanup_worker  # noqa: E402
 
 
 PR_SET_CHILD_SUBREAPER = 36
@@ -21,6 +37,8 @@ SYS_PIDFD_SEND_SIGNAL = 424
 POLL_INTERVAL = 0.01
 DISCOVERY_INTERVAL = 0.25
 _pending_signal: int | None = None
+_signal_generation = 0
+_active_cleanup_cancel: mmap.mmap | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +72,8 @@ class Supervisor:
         self.owned: dict[int, OwnedProcess] = {}
         self.seen_identities: dict[int, Identity] = {}
         self.ownership_uncertain = False
+        self.cleanup_proved = False
+        self.cleanup_deadline: float | None = None
         self._libc = ctypes.CDLL(None, use_errno=True)
         self._libc.syscall.restype = ctypes.c_long
         self._libc.syscall.argtypes = [
@@ -329,10 +349,17 @@ class Supervisor:
             unknown = True
         return live, unknown
 
+    def _cleanup_cleared(self, proved: bool) -> bool:
+        snapshots = self.discover()
+        self.reap_owned_children()
+        live, unknown = self.live_status(snapshots)
+        return not live and not unknown and proved
+
     def cleanup(self) -> bool:
+        self.cleanup_deadline = time.monotonic() + (2 * self.grace)
         snapshots = self.discover()
         term_proved = self.signal_owned(signal.SIGTERM, snapshots)
-        term_deadline = time.monotonic() + self.grace
+        term_deadline = min(time.monotonic() + self.grace, self.cleanup_deadline)
         next_discovery = time.monotonic() + DISCOVERY_INTERVAL
         while time.monotonic() < term_deadline:
             if time.monotonic() >= next_discovery:
@@ -341,12 +368,12 @@ class Supervisor:
             self.reap_owned_children()
             live, unknown = self.live_status(snapshots)
             if not live and not unknown and term_proved:
-                return True
+                return self._cleanup_cleared(term_proved)
             time.sleep(min(POLL_INTERVAL, max(0.0, term_deadline - time.monotonic())))
 
         snapshots = self.discover()
         kill_proved = self.signal_owned(signal.SIGKILL, snapshots)
-        kill_deadline = time.monotonic() + self.grace
+        kill_deadline = self.cleanup_deadline
         next_discovery = time.monotonic() + DISCOVERY_INTERVAL
         while time.monotonic() < kill_deadline:
             if time.monotonic() >= next_discovery:
@@ -355,13 +382,10 @@ class Supervisor:
             self.reap_owned_children()
             live, unknown = self.live_status(snapshots)
             if not live and not unknown and kill_proved:
-                return True
+                return self._cleanup_cleared(kill_proved)
             time.sleep(min(POLL_INTERVAL, max(0.0, kill_deadline - time.monotonic())))
 
-        snapshots = self.discover()
-        self.reap_owned_children()
-        live, unknown = self.live_status(snapshots)
-        return not live and not unknown and kill_proved
+        return self._cleanup_cleared(kill_proved)
 
     def process_context(self, snapshots: dict[int, Snapshot]) -> None:
         print("process tree:", file=sys.stderr)
@@ -404,11 +428,13 @@ class Supervisor:
         deadline = time.monotonic() + timeout
         next_discovery = time.monotonic()
         snapshots: dict[int, Snapshot] = {}
+        self.cleanup_proved = False
         try:
             while True:
                 if _pending_signal is not None:
                     signum = _pending_signal
                     clean = self.cleanup()
+                    self.cleanup_proved = clean
                     if not clean:
                         print("failed to prove owned process cleanup", file=sys.stderr)
                         self.process_cleanup_failure()
@@ -417,6 +443,7 @@ class Supervisor:
                 status = self.child.poll()
                 if status is not None:
                     clean = self.cleanup()
+                    self.cleanup_proved = clean
                     if not clean:
                         print("failed to prove owned process cleanup", file=sys.stderr)
                         self.process_cleanup_failure()
@@ -424,11 +451,11 @@ class Supervisor:
                     return shell_status(status)
                 if time.monotonic() >= deadline:
                     snapshots = self.discover()
-                    timed_out = True
                     print(f"cargo test command timed out after {timeout:g}s", file=sys.stderr)
                     print(f"active command: {shlex.join(self.child.args)}", file=sys.stderr)
                     self.process_context(snapshots)
                     clean = self.cleanup()
+                    self.cleanup_proved = clean
                     if not clean:
                         print("failed to prove owned process cleanup", file=sys.stderr)
                         self.process_cleanup_failure()
@@ -462,7 +489,9 @@ def open_pidfd(identity: Identity) -> int | None:
     try:
         pidfd = os.pidfd_open(identity.pid, 0)
     except OSError as error:
-        if error.errno in (errno.ESRCH, errno.ENOSYS, errno.EINVAL, errno.EPERM):
+        if error.errno == errno.ESRCH:
+            raise ValueError("pid exited while opening pidfd") from error
+        if error.errno in (errno.ENOSYS, errno.EINVAL, errno.EPERM):
             return None
         return None
     try:
@@ -478,8 +507,11 @@ def open_pidfd(identity: Identity) -> int | None:
 
 def install_signal_handlers() -> None:
     def request_cleanup(signum: int, _frame: object) -> None:
-        global _pending_signal
+        global _pending_signal, _signal_generation
         _pending_signal = signum
+        _signal_generation += 1
+        if _active_cleanup_cancel is not None:
+            _active_cleanup_cancel[0] = 1
 
     for signum in (signal.SIGHUP, signal.SIGQUIT, signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, request_cleanup)
@@ -536,6 +568,58 @@ def parse_positive_seconds(name: str, default: str) -> float:
     return float(int(value))
 
 
+def allocate_fixture_root() -> FixtureIdentity:
+    parent = os.environ.get("TMPDIR") or os.environ.get("TMP") or os.environ.get("TEMP")
+    if not parent:
+        parent = tempfile.gettempdir()
+    root = tempfile.mkdtemp(dir=parent)
+    os.chmod(root, 0o700)
+    try:
+        return capture_fixture_identity(root)
+    except OSError:
+        try:
+            os.rmdir(root)
+        except OSError:
+            pass
+        raise
+
+
+def remove_owned_root(
+    identity: FixtureIdentity,
+    deadline: float,
+    signal_generation: int,
+) -> bool:
+    global _active_cleanup_cancel
+    try:
+        cancellation = mmap.mmap(-1, 1)
+    except OSError as error:
+        print(
+            f"failed to create fixture cleanup cancellation flag: {error}",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        _active_cleanup_cancel = cancellation
+        # Publication plus this recheck covers signals on either side of publication.
+        if _signal_generation != signal_generation:
+            cancellation[0] = 1
+        return run_cleanup_worker(
+            identity,
+            deadline,
+            lambda: cancellation[0] != 0,
+            POLL_INTERVAL,
+            fixture_tree_stays_on_mount,
+        )
+    finally:
+        _active_cleanup_cancel = None
+        cancellation.close()
+
+
+def retain_fixture_root(identity: FixtureIdentity, reason: str) -> int:
+    print(f"{reason}; retaining fixture root {identity.path}", file=sys.stderr)
+    return 125
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         print(f"usage: {sys.argv[0]} <cargo-test-command> [args...]", file=sys.stderr)
@@ -553,13 +637,66 @@ def main(argv: list[str]) -> int:
         return 128 + _pending_signal
 
     try:
-        child = subprocess.Popen(argv, start_new_session=True)
+        fixture = allocate_fixture_root()
+    except OSError as error:
+        print(f"failed to allocate fixture root: {error}", file=sys.stderr)
+        return 125
+
+    if _pending_signal is not None:
+        signum = _pending_signal
+        cleanup_generation = _signal_generation
+        cleanup_deadline = time.monotonic() + (2 * grace)
+        if not remove_owned_root(fixture, cleanup_deadline, cleanup_generation):
+            retained = retain_fixture_root(
+                fixture, "failed to remove empty fixture root after signal"
+            )
+            if _pending_signal is not None:
+                return 128 + _pending_signal
+            return retained
+        return 128 + signum
+
+    child_env = os.environ.copy()
+    child_env["TMPDIR"] = fixture.path
+    child_env["TMP"] = fixture.path
+    child_env["TEMP"] = fixture.path
+    try:
+        child = subprocess.Popen(argv, start_new_session=True, env=child_env)
     except OSError as error:
         print(f"failed to launch {shlex.join(argv)}: {error}", file=sys.stderr)
+        cleanup_generation = _signal_generation
+        cleanup_deadline = time.monotonic() + (2 * grace)
+        if not remove_owned_root(fixture, cleanup_deadline, cleanup_generation):
+            retained = retain_fixture_root(
+                fixture, "failed to remove empty fixture root after spawn failure"
+            )
+            if _pending_signal is not None:
+                return 128 + _pending_signal
+            return retained
+        if _pending_signal is not None:
+            return 128 + _pending_signal
         return 127
 
     supervisor = Supervisor(child, grace)
-    return supervisor.run(timeout)
+    status = supervisor.run(timeout)
+    if not supervisor.cleanup_proved:
+        return retain_fixture_root(
+            fixture,
+            f"owned process cleanup was not proved (child status {status})",
+        )
+    if supervisor.cleanup_deadline is None:
+        return retain_fixture_root(fixture, "fixture cleanup deadline was not established")
+    cleanup_generation = _signal_generation
+    if not remove_owned_root(fixture, supervisor.cleanup_deadline, cleanup_generation):
+        retained = retain_fixture_root(
+            fixture,
+            f"fixture root cleanup failed (child status {status})",
+        )
+        if _pending_signal is not None:
+            return 128 + _pending_signal
+        return retained
+    if _pending_signal is not None:
+        return 128 + _pending_signal
+    return status
 
 
 if __name__ == "__main__":

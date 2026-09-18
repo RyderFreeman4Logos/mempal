@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::adoption_analytics::build_runtime_adoption_analytics;
 use crate::brief::{
@@ -119,6 +119,10 @@ use super::ingest_payload::{
 };
 use super::resource_usage;
 
+#[path = "server_ingest_idempotency.rs"]
+mod ingest_idempotency;
+use ingest_idempotency::mcp_ingest_idempotency_key;
+
 #[path = "server_operation_receipt.rs"]
 mod operation_receipt;
 use operation_receipt::{OperationLookup, spool_pending_operation_response};
@@ -132,6 +136,10 @@ use transient_admission::{
 #[path = "server_ingest_claim_shutdown.rs"]
 mod ingest_claim_shutdown;
 use ingest_claim_shutdown::claim_next_ingest_with_io;
+
+#[path = "server_ingest_claim_lifecycle.rs"]
+mod ingest_claim_lifecycle;
+use ingest_claim_lifecycle::{ScopedIngestClaimPolicy, scoped_ingest_claim_policy};
 
 #[cfg(test)]
 #[path = "server_operation_receipt_tests.rs"]
@@ -293,22 +301,6 @@ fn ingest_retry_deadline(request_deadline: Option<Instant>, cap: Duration) -> In
         .unwrap_or(cap_deadline)
 }
 
-fn mcp_ingest_idempotency_key(payload: &str) -> String {
-    let now_ns = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_nanos(),
-        Err(_) => 0,
-    };
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"mempal mcp ingest admission v1");
-    hasher.update(&[0]);
-    hasher.update(&now_ns.to_le_bytes());
-    hasher.update(&[0]);
-    hasher.update(&std::process::id().to_le_bytes());
-    hasher.update(&[0]);
-    hasher.update(payload.as_bytes());
-    format!("mcp-ingest-{}", hasher.finalize().to_hex())
-}
-
 #[derive(Clone)]
 pub struct MempalMcpServer {
     db_path: PathBuf,
@@ -375,6 +367,13 @@ pub struct MempalMcpServer {
     #[cfg(test)]
     ingest_writer_lease_open_hook: Option<IngestWriterLeaseOpenHook>,
     #[cfg(test)]
+    ingest_source_lock_contention_observer: Option<std::sync::mpsc::Sender<()>>,
+    #[cfg(test)]
+    ingest_wait_lease_check_budget_observer: Option<std::sync::mpsc::Sender<Duration>>,
+    #[cfg(test)]
+    ingest_admission_stage_observer:
+        Option<std::sync::mpsc::Sender<(IngestAdmissionStage, Instant)>>,
+    #[cfg(test)]
     operation_status_json_within_probe_attempts: Arc<AtomicUsize>,
 }
 
@@ -383,8 +382,22 @@ pub struct MempalMcpServer {
 pub(crate) enum McpIngestSideEffectStage {
     AfterInsertDrawer,
     AfterInsertFallbackDrawer,
+    ConclusionKg,
     Repair,
     Pattern,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IngestAdmissionStage {
+    PoolOpenEnter,
+    PoolOpenReturn,
+    WarningBlockingEnter,
+    WarningBlockingReturn,
+    PreparationReturn,
+    DurableQueueEnter,
+    DurableQueueReturn,
+    LeaseCheckEnter,
 }
 
 #[cfg(test)]
@@ -396,6 +409,18 @@ type IngestWriterLeaseAcquiredHook = Arc<dyn Fn(&RuntimeWriterLease) + Send + Sy
 #[cfg(test)]
 type IngestWriterLeaseOpenHook =
     Arc<dyn Fn(&Path) -> Result<(), crate::core::db_admission::DbAdmissionError> + Send + Sync>;
+
+#[cfg(test)]
+static INGEST_WRITER_LEASE_RELEASE_LOCK_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn consume_ingest_writer_lease_release_lock_failure() -> bool {
+    INGEST_WRITER_LEASE_RELEASE_LOCK_FAILURES
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+}
 
 /// Holds a lease while its blocking acquisition crosses an async cancellation boundary.
 struct AcquiredMcpIngestWriterLease {
@@ -461,6 +486,16 @@ impl McpIngestWriterLeaseGuard {
         }
         let db_path = self.db_path.clone();
         let lease = self.lease.clone();
+        #[cfg(test)]
+        if consume_ingest_writer_lease_release_lock_failure() {
+            return Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::DatabaseBusy,
+                    extended_code: rusqlite::ffi::SQLITE_BUSY,
+                },
+                Some("forced writer lease release lock".to_string()),
+            )));
+        }
         tokio::task::spawn_blocking(move || {
             let db = Database::open_lease_control(&db_path).with_context(|| {
                 format!(
@@ -487,7 +522,12 @@ impl Drop for McpIngestWriterLeaseGuard {
         if let Some(heartbeat) = self.heartbeat.take() {
             heartbeat.abort();
         }
+        #[cfg(test)]
+        let release_locked = consume_ingest_writer_lease_release_lock_failure();
+        #[cfg(not(test))]
+        let release_locked = false;
         if !self.released
+            && !release_locked
             && let Ok(db) = Database::open_lease_control(&self.db_path)
         {
             let _ = db.runtime_writer_lease_release(&self.lease);
@@ -732,6 +772,12 @@ impl MempalMcpServer {
             #[cfg(test)]
             ingest_writer_lease_open_hook: None,
             #[cfg(test)]
+            ingest_source_lock_contention_observer: None,
+            #[cfg(test)]
+            ingest_wait_lease_check_budget_observer: None,
+            #[cfg(test)]
+            ingest_admission_stage_observer: None,
+            #[cfg(test)]
             operation_status_json_within_probe_attempts: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -870,6 +916,22 @@ impl MempalMcpServer {
     pub fn with_stale_penalty_delay_for_test(mut self, delay: Duration) -> Self {
         self.stale_penalty_delay = Some(delay);
         self
+    }
+
+    #[cfg(test)]
+    fn with_ingest_admission_stage_observer_for_test(
+        mut self,
+        observer: std::sync::mpsc::Sender<(IngestAdmissionStage, Instant)>,
+    ) -> Self {
+        self.ingest_admission_stage_observer = Some(observer);
+        self
+    }
+
+    #[cfg(test)]
+    fn observe_ingest_admission_stage(&self, stage: IngestAdmissionStage) {
+        if let Some(observer) = &self.ingest_admission_stage_observer {
+            let _ = observer.send((stage, Instant::now()));
+        }
     }
 
     #[cfg(test)]
@@ -1924,34 +1986,6 @@ impl MempalMcpServer {
         Ok(ScopedIngestProcessResult::Processed)
     }
 
-    async fn process_ingest_claim_with_owned_task_budget(
-        &self,
-        queue: &AsyncPendingMessageStore,
-        worker_id: &str,
-        claim: ClaimedMessage,
-        budget: Duration,
-    ) -> anyhow::Result<ScopedIngestProcessResult> {
-        let scoped_worker = self.clone();
-        let scoped_queue = queue.clone();
-        let scoped_worker_id = worker_id.to_string();
-        let processing = tokio::spawn(async move {
-            scoped_worker
-                .process_ingest_claim_inline(&scoped_queue, &scoped_worker_id, claim)
-                .await
-        });
-
-        match tokio::time::timeout(budget, processing).await {
-            Ok(Ok(Ok(()))) => Ok(ScopedIngestProcessResult::Processed),
-            Ok(Ok(Err(error))) => Err(error),
-            Ok(Err(error)) => {
-                Err(anyhow::Error::new(error).context("scoped ingest claim task failed"))
-            }
-            // Dropping a JoinHandle detaches the task. That task owns the claim,
-            // heartbeat, and writer lease until it records the terminal receipt.
-            Err(_) => Ok(ScopedIngestProcessResult::TimedOut),
-        }
-    }
-
     async fn complete_ingest_claim_outcome(
         &self,
         queue: &AsyncPendingMessageStore,
@@ -2151,7 +2185,10 @@ impl MempalMcpServer {
             if let Some(hook) = open_hook {
                 hook(&db_path).context("failed to open database for MCP ingest writer lease")?;
             }
-            let db = Database::open(&db_path).with_context(|| {
+            let db_path =
+                crate::core::db_admission::ProfileDbAdmission::resolve_database_path(&db_path)
+                    .context("failed to resolve database path for MCP ingest writer lease")?;
+            let db = Database::open_lease_control(&db_path).with_context(|| {
                 format!(
                     "failed to open database for MCP ingest writer lease: {}",
                     db_path.display()
@@ -2318,9 +2355,15 @@ impl MempalMcpServer {
         let worker = self.clone();
         #[cfg(any(test, feature = "db-test-seam"))]
         let ingest_processing_delay = self.ingest_processing_delay;
+        #[cfg(test)]
+        let source_lock_contention_observer = self.ingest_source_lock_contention_observer.clone();
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
         tokio::task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatcher, || {
+                #[cfg(test)]
+                if let Some(observer) = source_lock_contention_observer {
+                    crate::ingest::lock::set_contention_observer_for_test(observer);
+                }
                 #[cfg(any(test, feature = "db-test-seam"))]
                 if let Some(delay) = ingest_processing_delay {
                     std::thread::sleep(delay);
@@ -2594,6 +2637,11 @@ impl MempalMcpServer {
             .map_err(|error| error.context(format!("{stage} failed to open database")))?;
         let sqlite_deadline = Instant::now() + deadline;
 
+        #[cfg(test)]
+        if stage == "stale vector index check" {
+            self.observe_ingest_admission_stage(IngestAdmissionStage::WarningBlockingEnter);
+        }
+
         // #840: query-only reads previously had no application-level retry on
         // transient SQLite BUSY/LOCKED errors, so under daemon/ingest contention
         // a read surfaced as an opaque JSON-RPC -32603. Wrap the read in the
@@ -2622,6 +2670,11 @@ impl MempalMcpServer {
         )
         .await;
 
+        #[cfg(test)]
+        if stage == "stale vector index check" {
+            self.observe_ingest_admission_stage(IngestAdmissionStage::WarningBlockingReturn);
+        }
+
         match read {
             Ok(_) if Instant::now() >= sqlite_deadline => Ok(None),
             Ok(result) => Ok(Some(result)),
@@ -2643,6 +2696,12 @@ impl MempalMcpServer {
         remaining: Duration,
         fail_closed: bool,
     ) -> bool {
+        #[cfg(test)]
+        self.observe_ingest_admission_stage(IngestAdmissionStage::LeaseCheckEnter);
+        #[cfg(test)]
+        if let Some(observer) = self.ingest_wait_lease_check_budget_observer.as_ref() {
+            let _ = observer.send(remaining);
+        }
         #[cfg(any(test, feature = "db-test-seam"))]
         if let Some(error) = self.daemon_writer_lease_check_error.as_deref() {
             tracing::warn!(
@@ -2677,6 +2736,8 @@ impl MempalMcpServer {
     }
 
     async fn reader_db(&self) -> anyhow::Result<QueryOnlyAsyncDb> {
+        #[cfg(test)]
+        self.observe_ingest_admission_stage(IngestAdmissionStage::PoolOpenEnter);
         #[cfg(any(test, feature = "db-test-seam"))]
         if let Some(error) = self.query_only_async_db_open_error.as_deref() {
             anyhow::bail!("{error}");
@@ -2702,6 +2763,8 @@ impl MempalMcpServer {
                 .context("blocking MCP query-only async database pool open failed")?
             })
             .await?;
+        #[cfg(test)]
+        self.observe_ingest_admission_stage(IngestAdmissionStage::PoolOpenReturn);
         Ok(async_db.clone())
     }
 
@@ -3591,6 +3654,13 @@ impl MempalMcpServer {
                 });
                 Ok(warnings)
             }
+            Err(error) if anyhow_chain_has_transient_admission(&error) => {
+                Err(database_write_refused_error(
+                    &self.db_path,
+                    "stale vector index check",
+                    error.as_ref(),
+                ))
+            }
             Err(error) => Ok(database_warning_snapshot(
                 current_system_warnings(),
                 &self.db_path,
@@ -4285,33 +4355,6 @@ enum IngestWaitWorkerMode {
     Background,
     Scoped,
     ScopedReleasing,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ScopedIngestClaimPolicy {
-    PollOnly,
-    InlineWithinDeadline,
-    InlineOwnedWithinDeadline,
-    InlineSmokeWithinDeadline,
-    InlineUntilTerminal,
-}
-
-fn scoped_ingest_claim_policy(
-    wait_timeout_secs: u64,
-    smoke: bool,
-    worker_mode: IngestWaitWorkerMode,
-) -> ScopedIngestClaimPolicy {
-    if wait_timeout_secs == u64::MAX {
-        ScopedIngestClaimPolicy::InlineUntilTerminal
-    } else if wait_timeout_secs == 0 {
-        ScopedIngestClaimPolicy::PollOnly
-    } else if smoke {
-        ScopedIngestClaimPolicy::InlineSmokeWithinDeadline
-    } else if matches!(worker_mode, IngestWaitWorkerMode::ScopedReleasing) {
-        ScopedIngestClaimPolicy::InlineWithinDeadline
-    } else {
-        ScopedIngestClaimPolicy::InlineOwnedWithinDeadline
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7428,7 +7471,11 @@ impl MempalMcpServer {
         )
         .await
         {
-            Ok(Ok(prepared)) => prepared,
+            Ok(Ok(prepared)) => {
+                #[cfg(test)]
+                self.observe_ingest_admission_stage(IngestAdmissionStage::PreparationReturn);
+                prepared
+            }
             Ok(Err(error)) => return Err(error),
             Err(_) => {
                 return Err(mcp_stage_timeout_error(
@@ -7649,7 +7696,8 @@ impl MempalMcpServer {
         request_deadline: Instant,
         allow_daemon_rest_fallback: bool,
     ) -> std::result::Result<IngestAdmissionOutcome, IngestAdmissionError> {
-        let idempotency_key = mcp_ingest_idempotency_key(&payload);
+        let idempotency_key =
+            mcp_ingest_idempotency_key(&payload, daemon_rest_request.operation_key.as_deref())?;
         let daemon_enqueue = self
             .try_enqueue_ingest_operation_via_daemon(
                 payload.clone(),
@@ -7855,15 +7903,19 @@ impl MempalMcpServer {
         deadline: Instant,
     ) -> std::result::Result<String, crate::core::queue::QueueError> {
         loop {
-            match self
+            #[cfg(test)]
+            self.observe_ingest_admission_stage(IngestAdmissionStage::DurableQueueEnter);
+            let enqueue = self
                 .async_queue
                 .enqueue_idempotent_with_key_fail_fast(
                     INGEST_ASYNC_KIND.to_string(),
                     payload.clone(),
                     idempotency_key.clone(),
                 )
-                .await
-            {
+                .await;
+            #[cfg(test)]
+            self.observe_ingest_admission_stage(IngestAdmissionStage::DurableQueueReturn);
+            match enqueue {
                 Ok(operation_id) => return Ok(operation_id),
                 Err(error) if error.is_sqlite_lock() => {
                     if self.ingest_admission_current_mcp_server_holder_visible() {
@@ -8169,6 +8221,7 @@ impl MempalMcpServer {
         creation_operation_id: Option<&str>,
         pre_resolved_superseded_drawer_id: Option<String>,
     ) -> std::result::Result<Json<IngestResponse>, McpQueuedIngestError> {
+        let pipeline_started = Instant::now();
         let dry_run = request.dry_run.unwrap_or(false);
         let controls = resolve_mcp_ingest_controls(&request, controls)?;
         if !dry_run && global_embed_status().should_block_writes() {
@@ -8248,6 +8301,9 @@ impl MempalMcpServer {
         )
         .unwrap_or_else(|| request.importance.unwrap_or(0));
         let mut timings = BTreeMap::new();
+        let record_timing = |timings: &mut BTreeMap<String, u64>, stage: &str, started: Instant| {
+            timings.insert(stage.to_string(), started.elapsed().as_millis() as u64);
+        };
 
         let embedder = self
             .embedder_factory
@@ -8280,8 +8336,6 @@ impl MempalMcpServer {
         let superseded_drawer_id_ref = superseded_drawer_id.as_deref();
         let mut superseded_response_id: Option<String> = None;
 
-        // CLI bypass_novelty matches stdin exact-content no-op, including queue-first
-        // waits after a direct stdin write of the same drawer.
         let direct_exact_duplicate = if bypass_novelty {
             exact_content_duplicate_drawer_id(
                 &db,
@@ -8329,7 +8383,6 @@ impl MempalMcpServer {
             .first()
             .map(|(_, id, _)| id.clone())
             .unwrap_or_default();
-
         if dry_run {
             let all_ids: Vec<String> = chunk_drawer_ids
                 .iter()
@@ -8633,10 +8686,7 @@ impl MempalMcpServer {
                 }));
             }
         }
-        timings.insert(
-            "gating_ms".to_string(),
-            gating_started.elapsed().as_millis() as u64,
-        );
+        record_timing(&mut timings, "gating_ms", gating_started);
 
         let embedding_started = Instant::now();
         let chunk_refs: Vec<&str> = chunks.iter().map(|c| c.as_str()).collect();
@@ -8680,10 +8730,7 @@ impl MempalMcpServer {
         if let Some(v) = vectors.first() {
             ensure_vector_dim_matches(&db, v.len())?;
         }
-        timings.insert(
-            "embedding_ms".to_string(),
-            embedding_started.elapsed().as_millis() as u64,
-        );
+        record_timing(&mut timings, "embedding_ms", embedding_started);
 
         let first_vector_ref = &vectors[0];
         let novelty_started = Instant::now();
@@ -8723,16 +8770,11 @@ impl MempalMcpServer {
                 &config.ingest_gating.novelty,
             )
         };
-        timings.insert(
-            "novelty_ms".to_string(),
-            novelty_started.elapsed().as_millis() as u64,
-        );
+        record_timing(&mut timings, "novelty_ms", novelty_started);
         let mut response_drawer_id = drawer_id.clone();
         let (novelty_action, near_drawer_id);
 
         let mut inserted_drawer_ids: Vec<String> = Vec::new();
-        // Tracks only drawers freshly created in this request — dedup-resolved IDs (pre-existing
-        // drawers found by hash) must NOT appear here, so LLM reject cannot soft-delete them.
         let mut newly_created_drawer_ids: Vec<String> = Vec::new();
 
         let db_write_started = Instant::now();
@@ -9029,10 +9071,8 @@ impl MempalMcpServer {
             }
         }
 
-        timings.insert(
-            "db_write_ms".to_string(),
-            db_write_started.elapsed().as_millis() as u64,
-        );
+        record_timing(&mut timings, "db_write_ms", db_write_started);
+        let post_write_started = Instant::now();
 
         if let Some(old_id) = superseded_drawer_id.as_deref()
             && let Some(replacement_id) = inserted_drawer_ids.first()
@@ -9093,6 +9133,9 @@ impl MempalMcpServer {
         if crate::conclusion_kg::is_session_conclusion(request.source.as_deref())
             && !response_drawer_id.is_empty()
         {
+            let conclusion_kg_started = Instant::now();
+            #[cfg(test)]
+            self.run_mcp_ingest_side_effect_hook_for_test(McpIngestSideEffectStage::ConclusionKg);
             crate::conclusion_kg::populate_from_conclusion(
                 &self.db_path,
                 config.as_ref(),
@@ -9102,10 +9145,9 @@ impl MempalMcpServer {
             )
             .await
             .map_err(db_error)?;
+            record_timing(&mut timings, "conclusion_kg_ms", conclusion_kg_started);
         }
 
-        // Tier 3 LLM judge after store; enqueue only newly created IDs so reject
-        // cannot delete a pre-existing hash-dedup drawer.
         if should_enqueue_llm_task && !newly_created_drawer_ids.is_empty() {
             let system_prompt = config
                 .ingest_gating
@@ -9149,7 +9191,6 @@ impl MempalMcpServer {
             }
         }
 
-        // Failure detection (P14) — generation-fenced for each inserted drawer.
         if config.repair.enabled && !inserted_drawer_ids.is_empty() {
             #[cfg(test)]
             self.run_mcp_ingest_side_effect_hook_for_test(McpIngestSideEffectStage::Repair);
@@ -9174,8 +9215,6 @@ impl MempalMcpServer {
             )?;
         }
 
-        // Pattern detection (P13) is best-effort, but lease loss still aborts
-        // ingest so a replaced writer generation cannot mutate the database.
         if config.patterns.enabled && !inserted_drawer_ids.is_empty() {
             #[cfg(test)]
             self.run_mcp_ingest_side_effect_hook_for_test(McpIngestSideEffectStage::Pattern);
@@ -9229,6 +9268,8 @@ impl MempalMcpServer {
                 .map_err(db_error)?,
             None => newly_created_drawer_ids,
         };
+        record_timing(&mut timings, "post_write_ms", post_write_started);
+        record_timing(&mut timings, "pipeline_ms", pipeline_started);
         Ok(Json(IngestResponse {
             drawer_id: response_drawer_id,
             drawer_ids: inserted_drawer_ids,
@@ -13613,6 +13654,7 @@ mod tests {
         acquire_ingest_worker_lifecycle_lock, global_observability_test_lock,
     };
 
+    mod admission_warning_stage_tests;
     mod context_scope_schema_tests;
     mod daemon_queue_lease_fence_tests;
     mod delete_busy_retry_836_tests;
@@ -14947,7 +14989,7 @@ quality_policy = "llm_required_for_keep"
         let (tempdir, db_path, server) = setup_server();
         let (listener, _socket_guard) =
             crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
-        let daemon = tokio::spawn(async move {
+        let daemon = async move {
             let (mut stream, _) = listener.accept().await.expect("accept daemon IPC");
             let request = crate::hook_ipc::read_enqueue_request(&mut stream)
                 .await
@@ -14959,28 +15001,36 @@ quality_policy = "llm_required_for_keep"
             .await
             .expect("write daemon IPC response");
             request
-        });
+        };
 
-        let response = server
-            .mempal_ingest_with_controls(
-                IngestRequest {
-                    content: "daemon ACK precedes queue visibility".to_string(),
-                    wing: "mcp".to_string(),
-                    room: Some("receipt".to_string()),
-                    wait: Some(true),
-                    wait_timeout_secs: Some(1),
-                    ..IngestRequest::default()
-                },
-                IngestControls {
-                    no_gate: true,
-                    bypass_novelty: true,
-                },
+        let scenario = async {
+            let (response, request) = tokio::join!(
+                server.mempal_ingest_with_controls(
+                    IngestRequest {
+                        content: "daemon ACK precedes queue visibility".to_string(),
+                        wing: "mcp".to_string(),
+                        room: Some("receipt".to_string()),
+                        wait: Some(true),
+                        wait_timeout_secs: Some(1),
+                        ..IngestRequest::default()
+                    },
+                    IngestControls {
+                        no_gate: true,
+                        bypass_novelty: true,
+                    },
+                ),
+                daemon,
+            );
+            (
+                response
+                    .expect("durable ACK should return a followable receipt")
+                    .0,
+                request,
             )
+        };
+        let (response, request) = tokio::time::timeout(Duration::from_secs(5), scenario)
             .await
-            .expect("durable ACK should return a followable receipt")
-            .0;
-
-        let request = daemon.await.expect("daemon IPC task");
+            .expect("daemon ACK visibility scenario must terminate within its fixture budget");
         let operation_id = response.operation_id.as_deref().expect("operation id");
         assert_eq!(
             operation_id,
@@ -16617,66 +16667,6 @@ pattern_boost = 0.2
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_ingest_admission_db_work_runs_off_runtime() {
-        let (_tempdir, _db_path, server) = setup_server();
-        let server = server.with_ingest_warning_snapshot_delay_for_test(Duration::from_millis(300));
-        let (ticks, ticker) = spawn_runtime_ticker();
-
-        let response = server
-            .mempal_ingest(Parameters(IngestRequest {
-                content: "offruntime ingest admission".to_string(),
-                wing: "mcp".to_string(),
-                room: Some("runtime".to_string()),
-                dry_run: Some(false),
-                wait: Some(false),
-                ..IngestRequest::default()
-            }))
-            .await
-            .expect("ingest")
-            .0;
-        ticker.abort();
-
-        assert_eq!(response.state, Some(IngestOperationState::Queued));
-        assert!(response.operation_id.is_some());
-        assert_runtime_ticked(&ticks, "mempal_ingest admission");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_ingest_admission_warning_uses_request_budget_and_returns_receipt() {
-        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
-        let (_tempdir, _db_path, server) = setup_server();
-        let server = server
-            .with_ingest_warning_snapshot_delay_for_test(Duration::from_millis(150))
-            .with_mcp_deadline_for_test(Duration::from_millis(500))
-            .with_daemon_writer_lease_check_error_for_test("skip unrelated lease probe");
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            server.mempal_ingest(Parameters(IngestRequest {
-                content: "bounded ingest admission".to_string(),
-                wing: "mcp".to_string(),
-                room: Some("deadline".to_string()),
-                dry_run: Some(false),
-                wait: Some(false),
-                ..IngestRequest::default()
-            })),
-        )
-        .await
-        .expect("MCP ingest should return before client timeout")
-        .expect("stale-index warning snapshot must preserve a durable queue receipt")
-        .0;
-
-        assert_eq!(result.state, Some(IngestOperationState::Queued));
-        assert!(result.operation_id.is_some());
-        assert!(!result.system_warnings.iter().any(|warning| {
-            warning.source == "mcp_timeout"
-                && warning
-                    .message
-                    .contains("stale vector index check exceeded")
-        }));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_ingest_replacement_target_retries_transient_sqlite_lock() {
         let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -16769,88 +16759,97 @@ pattern_boost = 0.2
     async fn test_mcp_ingest_wait_budget_includes_queue_admission() {
         let _observability_lock = global_observability_test_lock().lock_owned().await;
         let (_tempdir, db_path, server) = setup_server();
+        let admission_progress = Arc::new(Notify::new());
         let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
-            .with_blocking_delay(Duration::from_millis(1200));
+            .with_blocking_delay(Duration::from_millis(1200))
+            .with_blocking_started_for_test(Arc::clone(&admission_progress));
+        let async_queue_observer = async_queue.clone();
         let server = server
             .with_async_queue_for_test(async_queue)
             .with_daemon_writer_lease_check_error_for_test("skip unrelated lease probe");
+        server.ingest_worker_started.store(true, Ordering::SeqCst);
 
-        let response = tokio::time::timeout(
-            Duration::from_millis(1700),
-            server.mempal_ingest(Parameters(IngestRequest {
-                content: "slow queue admission should not extend MCP wait budget".to_string(),
-                wing: "mcp".to_string(),
-                room: Some("receipt".to_string()),
-                dry_run: Some(false),
-                wait: Some(true),
-                wait_timeout_secs: Some(1),
-                ..IngestRequest::default()
-            })),
-        )
-        .await
-        .expect("MCP ingest should return the queued receipt without a second slow status lookup")
-        .expect("slow queue admission should still return a receipt")
-        .0;
-
-        assert_eq!(response.state, Some(IngestOperationState::Queued));
-        assert!(response.timed_out);
-        assert!(response.operation_id.is_some());
-        assert!(response.created_drawer_ids.is_empty());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_ingest_scoped_zero_wait_skips_status_refresh_after_budget() {
-        let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
-        let (_tempdir, _db_path, server) = setup_server();
-        let server = server.with_operation_status_probe_delay_for_test(Duration::from_millis(500));
-
-        let response = tokio::time::timeout(
-            Duration::from_millis(250),
-            server.mempal_ingest_with_controls_scoped_worker(
-                IngestRequest {
-                    content: "scoped zero wait must not refresh status after budget".to_string(),
+        let admission_started = admission_progress.notified();
+        tokio::pin!(admission_started);
+        let request_server = server.clone();
+        let mut request = tokio::spawn(async move {
+            request_server
+                .mempal_ingest(Parameters(IngestRequest {
+                    content: "slow queue admission should not extend MCP wait budget".to_string(),
                     wing: "mcp".to_string(),
                     room: Some("receipt".to_string()),
                     dry_run: Some(false),
                     wait: Some(true),
-                    wait_timeout_secs: Some(0),
+                    wait_timeout_secs: Some(1),
                     ..IngestRequest::default()
-                },
-                IngestControls::default(),
-            ),
-        )
-        .await
-        .expect("scoped ingest must not run a status refresh after wait budget is exhausted")
-        .expect("scoped zero-wait ingest should return a receipt")
+                }))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), &mut admission_started)
+            .await
+            .expect("queue admission must start within the cleanup bound");
+        tokio::time::timeout(Duration::from_secs(5), admission_progress.notified())
+            .await
+            .expect("durable queue admission must finish within the cleanup bound");
+
+        let post_admission = tokio::time::timeout(Duration::from_millis(300), &mut request).await;
+        let returned_after_admission = post_admission.is_ok();
+        let response = match post_admission {
+            Ok(joined) => joined,
+            Err(_) => tokio::time::timeout(Duration::from_secs(5), &mut request)
+                .await
+                .expect("request must settle within the cleanup bound"),
+        }
+        .expect("request task must not panic")
+        .expect("slow queue admission should still return a receipt")
         .0;
 
+        assert!(
+            returned_after_admission,
+            "request must return promptly after durable admission without another status probe"
+        );
         assert_eq!(response.state, Some(IngestOperationState::Queued));
         assert!(response.timed_out);
+        assert!(response.created_drawer_ids.is_empty());
+        assert!(response.drawer_ids.is_empty());
+        assert!(response.drawer_id.is_empty());
         let operation_id = response
             .operation_id
             .as_deref()
-            .expect("zero-wait receipt must include operation id")
-            .to_string();
-        assert!(response.created_drawer_ids.is_empty());
+            .expect("queued response must include an operation id");
+        let record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(operation_id)
+            .expect("load admitted operation")
+            .expect("returned operation must be durable");
+        assert_eq!(record.id, operation_id);
+        assert_eq!(record.kind, INGEST_ASYNC_KIND);
+        assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
+        assert!(record.claimed_at.is_none());
         assert_eq!(
             server
                 .operation_status_json_within_probe_attempts
                 .load(Ordering::Relaxed),
             0,
-            "zero wait must not begin a bounded status probe"
+            "exhausted wait budget must skip the post-admission status probe"
         );
-
-        let status = server
-            .operation_status_json_within(&operation_id, Duration::from_millis(1))
-            .await
-            .expect("positive-budget status probe must time out cleanly");
-        assert!(status.is_none());
         assert_eq!(
-            server
-                .operation_status_json_within_probe_attempts
-                .load(Ordering::Relaxed),
-            1,
-            "positive-budget status probe must increment its observer"
+            async_queue_observer.available_blocking_permits_for_test(),
+            4
+        );
+        assert_eq!(
+            Database::open(&db_path)
+                .expect("open after queue admission")
+                .drawer_count()
+                .expect("drawer count"),
+            0
+        );
+        assert!(
+            Database::open(&db_path)
+                .expect("open lease status after queue admission")
+                .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+                .expect("read writer leases")
+                .is_empty(),
+            "queue-only admission must not hold a writer lease"
         );
     }
 
@@ -22905,6 +22904,7 @@ reject_on_contradiction = true
                     project_id: None,
                     wait: None,
                     wait_timeout_secs: None,
+                    operation_key: None,
                 })
                 .expect("serialize ingest request"),
             )

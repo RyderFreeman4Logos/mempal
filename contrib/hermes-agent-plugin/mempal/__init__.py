@@ -48,6 +48,8 @@ _PREFETCH_TOP_K = 5
 _TURN_STORAGE_MODE_TTL = 60.0
 _WRITE_QUEUE_MAX = 1000
 _WRITE_DRAIN_TIMEOUT = 10.0
+# One status probe: Hermes does not forward the caller's remaining deadline.
+_CONCLUDE_WAIT_TIMEOUT = 0.0
 _WRITE_RETRY_MAX = 3
 _WRITE_RETRY_DELAY = 2.0
 _PINNED_FACTS_TTL = 300.0
@@ -100,9 +102,11 @@ CONCLUDE_SCHEMA = {
         "type": "object",
         "properties": {
             "conclusion": {"type": "string", "description": "The fact to store."},
-            "operation_key": {"type": "string", "description": "Stable retry key from a pending response."},
+            # Provider strict-schema subsets differ; keep exact constraints in
+            # prose and enforce them with valid_control_token at admission.
+            "operation_key": {"type": "string", "description": "Caller-owned opaque key: 1-128 printable ASCII characters (U+0021-U+007E), no whitespace or control characters. New intent: new key, even for identical text. Timeout/cancel/retry: reuse the original key."},
         },
-        "required": ["conclusion"],
+        "required": ["conclusion", "operation_key"],
     },
 }
 
@@ -185,7 +189,7 @@ class MempalMemoryProvider:
         self._write_worker: Optional[threading.Thread] = None
         self._write_stop = threading.Event()
         self._write_drain_timeout = _WRITE_DRAIN_TIMEOUT
-        self._conclude_wait_timeout = 5.0
+        self._conclude_wait_timeout = _CONCLUDE_WAIT_TIMEOUT
         self._write_spool: Optional[WriteSpool] = None
         self._pinned_facts_cache: List[Dict[str, Any]] = []
         self._pinned_facts_fetched_at: float = 0.0

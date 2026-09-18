@@ -1,4 +1,5 @@
 import json
+import secrets
 import sqlite3
 import tempfile
 import threading
@@ -64,7 +65,7 @@ def _call_write(provider: RecordingProvider, caller: str, operation_key=None) ->
         provider._replay_spooled_write()
         return operation_key
     if caller == "conclude":
-        args = {"conclusion": "pending conclusion"}
+        args = {"conclusion": "pending conclusion", "operation_key": secrets.token_urlsafe(32)}
         if operation_key is not None:
             args["operation_key"] = operation_key
         result = json.loads(provider.handle_tool_call("mempal_conclude", args))
@@ -402,7 +403,7 @@ class ReplayReviewRegressionTests(unittest.TestCase):
                 provider.posts.clear()
                 fresh = json.loads(
                     provider.handle_tool_call(
-                        "mempal_conclude", {"conclusion": "fresh conclusion"}
+                        "mempal_conclude", {"operation_key": "fixture-405", "conclusion": "fresh conclusion"}
                     )
                 )
                 self.assertNotIn("result", fresh)

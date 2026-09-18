@@ -6221,6 +6221,7 @@ impl ResolvedStdinIngest {
             anchor_id: None,
             parent_anchor_id: None,
             cwd: self.cwd.as_ref().map(|path| path.display().to_string()),
+            operation_key: None,
         }
     }
 }

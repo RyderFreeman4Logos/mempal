@@ -89,10 +89,22 @@ Replaces mem0 with a fully local BM25 + vector hybrid backend — no cloud API c
 | `mempal_search` | Bounded hybrid/BM25 search via `/api/search`; partial/timeouts include redacted correlation and stage metadata |
 | `mempal_conclude` | Store a fact verbatim via a durable ingest receipt |
 
-`mempal_conclude` reports success only after the receipt reaches `completed`
-with a non-empty `drawer_id`. A pending response includes `operation_id` and
-`operation_key`; retry with that same `operation_key` to query or resume the
-same durable operation without creating a second drawer.
+`mempal_conclude` requires a caller-owned `operation_key` **before admission**.
+Use a new opaque key (1–128 printable ASCII characters, no whitespace or private
+content) for each intentional write, including identical text. After timeout or
+cancellation, recover the key from the original tool arguments and reuse it with
+the same conclusion and user/profile/project scope. Missing keys are rejected
+without writing; never generate a replacement key to retry an abandoned call.
+
+The default makes one status probe, then returns pending if work is unfinished.
+The durable spool keeps replaying; model work may take 240 seconds or longer.
+Only authoritative `completed` with a non-empty `drawer_id` means `Fact stored.`
+Pending/local admission/deferred responses do not. Retry the same key to read
+completion, including after provider restart. This is identity containment, not
+an end-to-end timeout guarantee: Hermes currently forwards neither remaining
+deadline nor cancellation to memory providers, and an in-flight HTTP call may
+outlive the caller. Final #1135 acceptance still requires that Hermes boundary
+and an authorized smoke of the actual operation, not a different completed write.
 
 ### Memory routing
 

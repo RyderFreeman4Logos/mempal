@@ -216,6 +216,7 @@ struct PreparedSpawn {
     setup_pipe: Pipe,
     setup_gate: Option<ChildSetupGate>,
     close_fds: Vec<RawFd>,
+    preserved_child_fds: Vec<RawFd>,
     failure_record: SetupFailureRecord,
 }
 
@@ -236,14 +237,12 @@ pub(super) fn decode_setup_record(bytes: [u8; SETUP_RECORD_BYTES]) -> (SetupStag
     (SetupStage::from_wire(record.stage), record.errno)
 }
 
-pub(super) fn spawn_owned(spec: SpawnSpec) -> io::Result<RawSpawn> {
+pub(super) fn spawn_owned(spec: SpawnSpec, deadline: Instant) -> io::Result<RawSpawn> {
     let prepared = PreparedSpawn::new(spec)?;
-    // SAFETY: the child branch immediately delegates to child_exec, whose post-fork path uses
-    // only async-signal-safe libc operations until execve or _exit; the parent retains `prepared`.
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    // SAFETY: the helper suppresses child-side Rust lock destruction; the child branch then
+    // delegates directly to child_exec, which uses only async-signal-safe libc operations until
+    // execve or _exit. The parent retains `prepared`.
+    let pid = unsafe { mempal::core::db_admission::fork_test_process(deadline)? };
     if pid == 0 {
         // SAFETY: this is the fork child and `prepared` remains valid in its copied address
         // space until child_exec replaces it with execve or terminates with _exit.
@@ -418,6 +417,19 @@ impl PreparedSpawn {
             }
         };
 
+        let mut preserved_child_fds = vec![
+            child_stdin,
+            child_stdout,
+            child_stderr,
+            setup_pipe.write.as_raw_fd(),
+        ];
+        if let Some(gate) = &spec.setup_gate {
+            preserved_child_fds.push(gate.ready_write.as_raw_fd());
+            preserved_child_fds.push(gate.release_read.as_raw_fd());
+        }
+        preserved_child_fds.sort_unstable();
+        preserved_child_fds.dedup();
+
         Ok(Self {
             executable,
             _argv: argv,
@@ -436,6 +448,7 @@ impl PreparedSpawn {
             setup_pipe,
             setup_gate: spec.setup_gate,
             close_fds,
+            preserved_child_fds,
             failure_record: SetupFailureRecord {
                 stage: 0,
                 padding: [0; 3],
@@ -454,6 +467,9 @@ unsafe fn child_exec(prepared: &PreparedSpawn) -> ! {
     unsafe {
         if libc::setpgid(0, 0) != 0 {
             child_fail(prepared, SetupStage::SetProcessGroup)
+        }
+        if !close_inherited_fds_except(&prepared.preserved_child_fds) {
+            child_fail(prepared, SetupStage::Exec)
         }
 
         if let Some(gate) = &prepared.setup_gate {
@@ -520,6 +536,29 @@ unsafe fn child_exec(prepared: &PreparedSpawn) -> ! {
         );
         child_fail(prepared, SetupStage::Exec)
     }
+}
+
+// SAFETY: call only in the post-fork child. `preserved` is sorted pre-fork and
+// every syscall operates only on the child's descriptor table.
+unsafe fn close_inherited_fds_except(preserved: &[RawFd]) -> bool {
+    let mut first = libc::STDERR_FILENO as u32 + 1;
+    for &preserved_fd in preserved {
+        if preserved_fd <= libc::STDERR_FILENO {
+            continue;
+        }
+        let preserved_fd = preserved_fd as u32;
+        if first < preserved_fd
+            // SAFETY: this branch runs only in the fork child and excludes every required fd.
+            && unsafe {
+                libc::syscall(libc::SYS_close_range, first, preserved_fd - 1, 0u32)
+            } != 0
+        {
+            return false;
+        }
+        first = preserved_fd.saturating_add(1);
+    }
+    // SAFETY: all required descriptors were excluded by the sorted gaps above.
+    unsafe { libc::syscall(libc::SYS_close_range, first, u32::MAX, 0u32) == 0 }
 }
 
 // SAFETY: call only from the post-fork child with a valid pre-fork `prepared` allocation; it

@@ -4,15 +4,10 @@ mod tests {
     use std::fs::File;
     use std::fs;
     use std::os::fd::AsFd;
-    use std::os::unix::fs::symlink;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
-
-    fn repo_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-    }
 
     fn wait_for_file(path: &Path, timeout: Duration, description: &str) {
         let deadline = Instant::now() + timeout;
@@ -678,82 +673,5 @@ mod tests {
             "cleanup must not depend on the escaped process retaining its parent"
         );
         assert_process_identity_gone_within(escaped, Duration::from_secs(1));
-    }
-    #[test]
-    fn rest_gate_fuser_diagnostic_cannot_outlive_lock_budget() {
-        let _process_lock = process_lifecycle_test_lock_blocking();
-        let fixture = tempfile::tempdir().expect("create fuser-timeout fixture");
-        let bin_dir = fixture.path().join("bin");
-        fs::create_dir(&bin_dir).expect("create fixture bin directory");
-        symlink(
-            repo_root().join("tests/fixtures/local-gate-command-proxy.sh"),
-            bin_dir.join("fuser"),
-        )
-        .expect("link fuser proxy");
-        let target = fixture.path().join("target");
-        fs::create_dir(&target).expect("create isolated target");
-        let target = fs::canonicalize(target).expect("canonical isolated target");
-        let mut lock_file = target.as_os_str().to_os_string();
-        lock_file.push(".lock");
-        let lock_file = PathBuf::from(lock_file);
-        let holder_ready_file = fixture.path().join("holder-ready");
-        let mut holder_command = Command::new("/bin/bash");
-        holder_command
-            .args([
-                "-c",
-                r#"
-                    exec {lock_fd}>"${LOCK_FILE:?}"
-                    flock "${lock_fd}"
-                    : >"${HOLDER_READY_FILE:?}"
-                    exec /bin/sleep 60
-                "#,
-            ])
-            .env("LOCK_FILE", &lock_file)
-            .env("HOLDER_READY_FILE", &holder_ready_file)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let _holder = GateChild::new(
-            spawn_in_own_session(&mut holder_command).expect("spawn isolated lock holder"),
-        )
-        .expect("capture lock holder identity");
-        wait_for_file(&holder_ready_file, Duration::from_secs(2), "lock holder");
-
-        let inherited_path = std::env::var_os("PATH").expect("PATH is set");
-        let path = std::env::join_paths(
-            std::iter::once(bin_dir).chain(std::env::split_paths(&inherited_path)),
-        )
-        .expect("construct fixture PATH");
-        let fuser_ready_file = fixture.path().join("fuser-ready");
-        let fuser_pid_file = fixture.path().join("fuser.pid");
-        let mut command = Command::new("/bin/bash");
-        command
-            .arg(repo_root().join("scripts/gates/rest-tests.sh"))
-            .current_dir(repo_root())
-            .env("PATH", path)
-            .env("REST_GATE_DRY_RUN", "1")
-            .env("REST_GATE_LOCK_TIMEOUT_SECS", "1")
-            .env("REST_GATE_TARGET_DIR", &target)
-            .env("REST_TEST_TARGETS_PER_BATCH", "999")
-            .env("REST_GATE_FUSER_NEVER_RETURN_READY_FILE", &fuser_ready_file)
-            .env("REST_GATE_FUSER_PID_FILE", &fuser_pid_file)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut gate =
-            GateChild::new(spawn_in_own_session(&mut command).expect("spawn isolated REST gate"))
-                .expect("capture isolated REST gate identity");
-        wait_for_file(&fuser_ready_file, Duration::from_secs(2), "stalled fuser");
-
-        let started = Instant::now();
-        let output = gate
-            .wait_with_timeout(Duration::from_secs(3))
-            .expect("reap REST gate");
-
-        assert_eq!(output.status.code(), Some(75));
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "the fuser diagnostic exceeded the advertised lock deadline: stderr={}",
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 }

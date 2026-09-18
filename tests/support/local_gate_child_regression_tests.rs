@@ -14,6 +14,41 @@ mod regression_tests {
         assert!(path.exists(), "{description} did not become ready");
     }
 
+    #[test]
+    fn direct_child_closing_output_keeps_identity_authority() {
+        let _process_lock = process_lifecycle_test_lock_blocking();
+        let fixture = tempfile::tempdir().expect("create closing-output fixture");
+        let closed = fixture.path().join("closed");
+        let mut command = Command::new("/bin/bash");
+        command
+            .args(["-c", "read -r _; exec >/dev/null 2>&1; : >\"$CLOSED\"; read -r _"])
+            .env("CLOSED", &closed)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = spawn_in_own_session(&mut command).expect("spawn direct child");
+        let root = capture_owned_child(child.child()).expect("capture direct child");
+        let mut tracked = Vec::new();
+        // The token is optional; direct-child authority must not depend on it.
+        refresh_owned_processes(child.child(), &root, &mut tracked, cleanup_deadline())
+            .expect("discover output holder before closure");
+        child
+            .child_mut()
+            .stdin
+            .as_mut()
+            .expect("child stdin")
+            .write_all(b"close\n")
+            .expect("request output closure");
+        wait_for_file(&closed, Duration::from_secs(2), "output closure");
+        assert!(root.is_running().expect("inspect live direct child"));
+        let refreshed =
+            refresh_owned_processes(child.child(), &root, &mut tracked, cleanup_deadline());
+        let cleanup = reap_owned_child(child);
+        cleanup.expect("reap direct child after output closure");
+        assert!(!root.is_running().expect("inspect reaped direct child"));
+        refreshed.expect("closed output must not revoke direct-child authority");
+    }
+
     fn escaped_identity(pid_file: &Path) -> RecordedProcessIdentity {
         let record = fs::read_to_string(pid_file).expect("read escaped descendant identity");
         let mut fields = record.split_ascii_whitespace();
@@ -253,29 +288,20 @@ mod regression_tests {
     }
 
     fn spawn_non_utf8_comm_process(ready_file: &Path) -> OwnedGateChild {
-        let mut command = Command::new("/usr/bin/python3");
+        let mut command = Command::new("/bin/bash");
         command
             .args([
                 "-c",
                 r#"
-import ctypes
-import os
-import time
-
-if ctypes.CDLL(None, use_errno=True).prctl(15, b"\xff", 0, 0, 0) != 0:
-    raise OSError(ctypes.get_errno(), "prctl(PR_SET_NAME) failed")
-pid = os.getpid()
-comm = open("/proc/self/comm", "rb").read()
-if comm != b"\xff\n":
-    raise RuntimeError(f"non-UTF-8 comm was not established: {comm!r}")
-fields = open(f"/proc/{pid}/stat", "rb").read().rpartition(b") ")[2].split()
-ready = os.environ["READY_FILE"]
-temporary = ready + ".tmp"
-with open(temporary, "xb") as marker:
-    marker.write(str(pid).encode() + b" " + fields[19] + b"\n")
-os.replace(temporary, ready)
-while True:
-    time.sleep(60)
+                    pid="${BASHPID}"
+                    stat="$(<"/proc/${pid}/stat")"
+                    fields="${stat##*) }"
+                    set -- ${fields}
+                    printf '\377' >"/proc/${pid}/comm"
+                    temporary="${READY_FILE:?}.tmp"
+                    printf '%s %s\n' "${pid}" "${20}" >"${temporary}"
+                    /bin/mv -- "${temporary}" "${READY_FILE}"
+                    kill -STOP "${pid}"
                 "#,
             ])
             .env("READY_FILE", ready_file)

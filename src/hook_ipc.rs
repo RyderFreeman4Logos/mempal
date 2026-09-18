@@ -193,12 +193,27 @@ pub(crate) fn enqueue_with_timeout(
         }
     };
 
-    runtime.block_on(async move {
-        match tokio::time::timeout(timeout, enqueue_once(&path, request)).await {
-            Ok(outcome) => outcome,
-            Err(_) => HookIpcClientOutcome::Fallback(HookIpcFallbackReason::Timeout),
-        }
-    })
+    // Opt in on this test thread only; exercise the real default wrapper's
+    // passed budget using virtual time without changing other socket tests.
+    #[cfg(test)]
+    if tests::CHECK_DEFAULT_TIMEOUT.replace(false) {
+        return runtime.block_on(tests::check_default_timeout(&path, request, timeout));
+    }
+
+    runtime.block_on(enqueue_before_timeout(&path, request, timeout))
+}
+
+// Keep the transport deadline shared by the synchronous client and virtual-time
+// contract tests; runtime construction is outside this async waiting budget.
+async fn enqueue_before_timeout(
+    path: &Path,
+    request: HookIpcEnqueueRequest,
+    timeout: Duration,
+) -> HookIpcClientOutcome {
+    match tokio::time::timeout(timeout, enqueue_once(path, request)).await {
+        Ok(outcome) => outcome,
+        Err(_) => HookIpcClientOutcome::Fallback(HookIpcFallbackReason::Timeout),
+    }
 }
 
 /// Probe the daemon's write transport without mutating its queue.
@@ -438,6 +453,67 @@ fn new_idempotency_key() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    std::thread_local! {
+        pub(super) static CHECK_DEFAULT_TIMEOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    #[test]
+    fn hook_ipc_timeout_uses_the_default_250ms_budget() {
+        assert_eq!(HOOK_IPC_TIMEOUT, Duration::from_millis(250));
+        let tmp = tempfile::tempdir().expect("socket fixture");
+        let _listener = std::os::unix::net::UnixListener::bind(socket_path(tmp.path()))
+            .expect("bind unanswered socket");
+        CHECK_DEFAULT_TIMEOUT.set(true);
+        assert_eq!(
+            enqueue_with_default_timeout(tmp.path(), HookIpcEnqueueRequest::new("fixture", "{}")),
+            HookIpcClientOutcome::Fallback(HookIpcFallbackReason::Timeout)
+        );
+        assert!(
+            !CHECK_DEFAULT_TIMEOUT.get(),
+            "default wrapper must reach transport"
+        );
+    }
+
+    pub(super) async fn check_default_timeout(
+        path: &Path,
+        request: HookIpcEnqueueRequest,
+        timeout: Duration,
+    ) -> HookIpcClientOutcome {
+        use std::task::Poll;
+        tokio::time::pause();
+        // Manual polling prevents idle-runtime auto-advance from hiding a
+        // longer timer. The duration comes from the production default wrapper.
+        let mut request = Box::pin(enqueue_before_timeout(path, request, timeout));
+        std::future::poll_fn(|cx| {
+            assert!(request.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_millis(249)).await;
+        std::future::poll_fn(|cx| {
+            assert!(
+                request.as_mut().poll(cx).is_pending(),
+                "must not expire early"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        // Tokio's millisecond timer resolution may round the exact boundary.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        std::future::poll_fn(|cx| {
+            assert_eq!(
+                request.as_mut().poll(cx),
+                Poll::Ready(HookIpcClientOutcome::Fallback(
+                    HookIpcFallbackReason::Timeout
+                )),
+                "deadline must not silently expand to 1-2 seconds"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        HookIpcClientOutcome::Fallback(HookIpcFallbackReason::Timeout)
+    }
 
     #[cfg(unix)]
     #[tokio::test]

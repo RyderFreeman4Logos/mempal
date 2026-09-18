@@ -780,4 +780,5 @@ fn process_lifecycle_test_lock_blocking() -> tokio::sync::MutexGuard<'static, ()
 
 include!("local_gate_child_tests.rs");
 include!("local_gate_child_regression_tests.rs");
+include!("local_gate_fuser_diagnostic_tests.rs");
 include!("local_gate_monitor_tests.rs");

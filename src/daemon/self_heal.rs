@@ -5,6 +5,10 @@ use std::sync::Arc;
 #[cfg(all(test, unix))]
 use std::sync::OnceLock;
 #[cfg(all(test, unix))]
+use std::sync::atomic::AtomicU8;
+#[cfg(all(test, unix))]
+use std::sync::atomic::AtomicU64;
+#[cfg(all(test, unix))]
 use std::sync::atomic::AtomicUsize;
 #[cfg(all(test, unix))]
 use std::sync::atomic::Ordering;
@@ -256,6 +260,102 @@ fn hook_ipc_handler_counts_for_test() -> (usize, usize) {
 static HOOK_IPC_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 #[cfg(all(test, unix))]
+const HOOK_IPC_ACK_REQUEST_READ: u8 = 1;
+#[cfg(all(test, unix))]
+const HOOK_IPC_ACK_BLOCKING_ENTER: u8 = 2;
+#[cfg(all(test, unix))]
+const HOOK_IPC_ACK_APPEND_RETURN: u8 = 3;
+#[cfg(all(test, unix))]
+const HOOK_IPC_ACK_RESPONSE_FLUSH: u8 = 4;
+#[cfg(all(test, unix))]
+const HOOK_IPC_ACK_BLOCKING_SUBMIT: u8 = 5;
+#[cfg(all(test, unix))]
+const HOOK_IPC_ACK_APPEND_RESUMED: u8 = 6;
+
+#[cfg(all(test, unix))]
+// Key checkpoints by request because unrelated persistence tests can overlap.
+static HOOK_IPC_ACK_OWNER: std::sync::Mutex<Option<(String, Instant)>> =
+    std::sync::Mutex::new(None);
+#[cfg(all(test, unix))]
+static HOOK_IPC_ACK_LAST: AtomicU8 = AtomicU8::new(0);
+#[cfg(all(test, unix))]
+static HOOK_IPC_ACK_NS: [AtomicU64; 6] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+#[cfg(all(test, unix))]
+fn reset_hook_ipc_ack_checkpoints_for_test(idempotency_key: &str) {
+    let mut owner = HOOK_IPC_ACK_OWNER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    HOOK_IPC_ACK_LAST.store(0, Ordering::SeqCst);
+    for slot in &HOOK_IPC_ACK_NS {
+        slot.store(0, Ordering::SeqCst);
+    }
+    *owner = Some((idempotency_key.to_owned(), Instant::now()));
+}
+
+#[cfg(all(test, unix))]
+fn mark_hook_ipc_ack_checkpoint_for_test(idempotency_key: &str, phase: u8) {
+    let owner = HOOK_IPC_ACK_OWNER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some((owner_key, origin)) = owner.as_ref() else {
+        return;
+    };
+    if owner_key != idempotency_key {
+        return;
+    }
+    let Some(idx) = usize::from(phase).checked_sub(1) else {
+        return;
+    };
+    if let Some(slot) = HOOK_IPC_ACK_NS.get(idx) {
+        let ns = u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        slot.store(ns, Ordering::SeqCst);
+        HOOK_IPC_ACK_LAST.store(phase, Ordering::SeqCst);
+    }
+}
+
+#[cfg(all(test, unix))]
+fn hook_ipc_ack_checkpoint_report_for_test() -> String {
+    let _owner = HOOK_IPC_ACK_OWNER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let last = HOOK_IPC_ACK_LAST.load(Ordering::SeqCst);
+    let last_name = match last {
+        HOOK_IPC_ACK_REQUEST_READ => "request_read",
+        HOOK_IPC_ACK_BLOCKING_ENTER => "blocking_closure_enter",
+        HOOK_IPC_ACK_APPEND_RETURN => "append_return",
+        HOOK_IPC_ACK_RESPONSE_FLUSH => "response_flush",
+        HOOK_IPC_ACK_BLOCKING_SUBMIT => "blocking_submit",
+        HOOK_IPC_ACK_APPEND_RESUMED => "append_resumed",
+        _ => "none",
+    };
+    let fmt = |phase: u8| {
+        let ns = HOOK_IPC_ACK_NS[usize::from(phase) - 1].load(Ordering::SeqCst);
+        if ns == 0 {
+            "none".to_string()
+        } else {
+            format!("{}ms", ns / 1_000_000)
+        }
+    };
+    format!(
+        "last={last_name} request_read={} blocking_closure_enter={} append_return={} response_flush={} blocking_submit={} append_resumed={}",
+        fmt(HOOK_IPC_ACK_REQUEST_READ),
+        fmt(HOOK_IPC_ACK_BLOCKING_ENTER),
+        fmt(HOOK_IPC_ACK_APPEND_RETURN),
+        fmt(HOOK_IPC_ACK_RESPONSE_FLUSH),
+        fmt(HOOK_IPC_ACK_BLOCKING_SUBMIT),
+        fmt(HOOK_IPC_ACK_APPEND_RESUMED)
+    )
+}
+
+#[cfg(all(test, unix))]
 async fn lock_hook_ipc_tests() -> (
     tokio::sync::MutexGuard<'static, ()>,
     tokio::sync::OwnedMutexGuard<()>,
@@ -303,8 +403,18 @@ async fn handle_hook_ipc_connection(
         crate::hook_ipc::read_request(&mut stream),
     )
     .await;
+    #[cfg(all(test, unix))]
+    let mut checkpoint_key = None;
     let response = match request_result {
         Ok(Ok(crate::hook_ipc::HookIpcRequest::Enqueue(request))) => {
+            #[cfg(all(test, unix))]
+            {
+                checkpoint_key = Some(request.idempotency_key.clone());
+                mark_hook_ipc_ack_checkpoint_for_test(
+                    &request.idempotency_key,
+                    HOOK_IPC_ACK_REQUEST_READ,
+                );
+            }
             crate::hook_ipc::HookIpcResponse::Enqueue(
                 persist_hook_ipc_request(&store, &spool, &write_observer, request).await,
             )
@@ -330,7 +440,12 @@ async fn handle_hook_ipc_connection(
         ),
     };
 
-    if let Err(error) = crate::hook_ipc::write_response(&mut stream, &response).await {
+    let write_result = crate::hook_ipc::write_response(&mut stream, &response).await;
+    #[cfg(all(test, unix))]
+    if let Some(checkpoint_key) = checkpoint_key.as_deref() {
+        mark_hook_ipc_ack_checkpoint_for_test(checkpoint_key, HOOK_IPC_ACK_RESPONSE_FLUSH);
+    }
+    if let Err(error) = write_result {
         if is_hook_ipc_peer_disconnect(&error) {
             tracing::debug!(?error, "hook IPC client disconnected before response");
         } else {
@@ -347,10 +462,32 @@ async fn persist_hook_ipc_request(
     request: crate::hook_ipc::HookIpcEnqueueRequest,
 ) -> crate::hook_ipc::HookIpcEnqueueResponse {
     let kind = request.kind.clone();
+    #[cfg(all(test, unix))]
+    let checkpoint_key = request.idempotency_key.clone();
     let append_result = {
         let spool = spool.clone();
-        tokio::task::spawn_blocking(move || spool.append(&request)).await
+        #[cfg(all(test, unix))]
+        mark_hook_ipc_ack_checkpoint_for_test(&checkpoint_key, HOOK_IPC_ACK_BLOCKING_SUBMIT);
+        #[cfg(all(test, unix))]
+        let blocking_checkpoint_key = checkpoint_key.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(all(test, unix))]
+            mark_hook_ipc_ack_checkpoint_for_test(
+                &blocking_checkpoint_key,
+                HOOK_IPC_ACK_BLOCKING_ENTER,
+            );
+            let result = spool.append(&request);
+            #[cfg(all(test, unix))]
+            mark_hook_ipc_ack_checkpoint_for_test(
+                &blocking_checkpoint_key,
+                HOOK_IPC_ACK_APPEND_RETURN,
+            );
+            result
+        })
+        .await
     };
+    #[cfg(all(test, unix))]
+    mark_hook_ipc_ack_checkpoint_for_test(&checkpoint_key, HOOK_IPC_ACK_APPEND_RESUMED);
     match append_result {
         Ok(Ok(_)) => {
             tracing::debug!(%kind, "fsynced hook IPC capture in ingress spool");

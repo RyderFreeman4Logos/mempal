@@ -31,7 +31,7 @@ pub(super) fn wait_output(
     child: DeadlineChild,
     deadline: Instant,
     started: Instant,
-    role: &'static str,
+    role: &str,
 ) -> Output {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -47,6 +47,33 @@ pub(super) fn wait_output(
         ),
         Err(error) => panic_supervision(role, error),
     }
+}
+
+#[rustfmt::skip]
+pub(super) fn timeout_role(started: Instant, spawn_us: u128, stdin_us: u128, queue_us: u128) -> String {
+    format!(
+        "ingest wait receipt spawn_us={spawn_us} stdin_us={stdin_us} queue_us={queue_us} wait_entry_us={}",
+        started.elapsed().as_micros()
+    )
+}
+
+#[test]
+fn wait_timeout_formatter_includes_numeric_phase_fields() {
+    let role = timeout_role(Instant::now(), 11, 22, 33);
+    let message = format!(
+        "{role} timed out after {:?}; kill_fence=true cleanup_errors=0; content omitted",
+        Duration::from_millis(8722)
+    );
+    assert!(
+        role.contains("spawn_us=11")
+            && role.contains("stdin_us=22")
+            && role.contains("queue_us=33")
+            && role.contains("wait_entry_us=")
+            && message.contains("ingest wait receipt")
+            && message.contains("timed out")
+            && message.contains("kill_fence=true"),
+        "timeout formatter must emit numeric phase fields: {message}"
+    );
 }
 
 fn checked_output(output: DeadlineOutput, role: &str) -> Output {
@@ -82,12 +109,24 @@ pub(super) fn cleanup_and_panic(mut child: DeadlineChild, started: Instant, role
 
 fn panic_supervision(role: &str, error: SupervisionError) -> ! {
     match error {
-        SupervisionError::CleanupIncomplete(cleanup) => panic!(
-            "{role} supervision cleanup incomplete: resources={:?} kill_fence={} cleanup_errors={}; content omitted",
-            cleanup.resources,
-            cleanup.report.kill_fence_sent,
-            cleanup.report.errors.len()
-        ),
+        SupervisionError::CleanupIncomplete(cleanup) => {
+            match cleanup.finish_output(CLEANUP_BUDGET) {
+                Ok(output) if output.timed_out => panic!(
+                    "{role} timed out before cleanup; timed_out=true kill_fence={} cleanup_errors={}; content omitted",
+                    output.cleanup.kill_fence_sent,
+                    output.cleanup.errors.len()
+                ),
+                Ok(_) => panic!(
+                    "{role} supervision failed after bounded cleanup; timed_out=false; content omitted"
+                ),
+                Err(cleanup) => panic!(
+                    "{role} supervision cleanup incomplete: resources={:?} kill_fence={} cleanup_errors={}; content omitted",
+                    cleanup.resources,
+                    cleanup.report.kill_fence_sent,
+                    cleanup.report.errors.len()
+                ),
+            }
+        }
         error => panic!("{role} supervision failed: {error}"),
     }
 }
@@ -105,6 +144,60 @@ fn early_exit_with_inherited_pipe_is_collected_without_waiting_for_descendant() 
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "an exited leader must retain its group anchor only through bounded descendant cleanup"
+    );
+}
+
+#[test]
+fn cleanup_continuation_reaps_owned_child_and_preserves_timeout_failure() {
+    let started = Instant::now();
+    let mut spec = SpawnSpec::new("/bin/sleep").expect("absolute sleep binary");
+    spec.arg("60");
+    let child = DeadlineChild::spawn(spec, Duration::from_secs(1))
+        .expect("spawn cleanup-continuation fixture");
+    let identity = child.identity();
+    let error = child
+        .wait_output(Duration::ZERO)
+        .expect_err("zero work budget must hand cleanup ownership to the caller");
+    let SupervisionError::CleanupIncomplete(cleanup) = error else {
+        panic!("zero work budget must produce incomplete cleanup ownership: {error:?}");
+    };
+    assert!(
+        cleanup.resources.stdout_pipe_open && cleanup.resources.stderr_pipe_open,
+        "fixture must reach cleanup continuation with capture pipes still owned"
+    );
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        panic_supervision(
+            "cleanup-continuation fixture",
+            SupervisionError::CleanupIncomplete(cleanup),
+        );
+    }))
+    .expect_err("work timeout must remain a failure after cleanup");
+    let diagnostic = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic");
+    assert!(
+        diagnostic.contains("timed out") && !diagnostic.contains("cleanup incomplete"),
+        "completed cleanup must preserve the work-timeout failure: {diagnostic}"
+    );
+    assert!(
+        !identity.still_refers_to_original_process(),
+        "completed output requires the exact leader to be reaped after its pipes close"
+    );
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(identity.pid, &raw mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    assert!(
+        started.elapsed() < CLEANUP_BUDGET + Duration::from_secs(1),
+        "cleanup continuation must remain bounded"
     );
 }
 

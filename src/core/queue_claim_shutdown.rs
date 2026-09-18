@@ -10,6 +10,11 @@ pub(super) type ClaimApprovalTestControl = (
         std::sync::mpsc::Sender<()>,
         std::sync::Arc<std::sync::Barrier>,
     )>,
+    Option<(
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<std::sync::Barrier>,
+        std::sync::Arc<std::sync::Once>,
+    )>,
 );
 
 struct ApprovedClaimOwner {
@@ -32,10 +37,11 @@ impl Drop for ApprovedClaimOwner {
 
 impl PendingMessageStore {
     /// Release only this physical owner's exact token after runtime teardown.
+    /// Bound SQLite busy wait so cancellation Drop cannot block on a held writer lock.
     fn release_owned_claim_after_cancellation(&self, claim: &ClaimedMessage) -> Result<()> {
         let mut cleanup = self.clone();
         cleanup.lifecycle_writer_lease = None;
-        cleanup.release_claim(claim)
+        cleanup.release_claim_with_busy_timeout(claim, Some(super::CLAIM_BUSY_TIMEOUT))
     }
 }
 
@@ -93,6 +99,13 @@ impl AsyncPendingMessageStore {
                     claim_ttl_secs,
                     &kind_filter,
                     || {
+                        #[cfg(any(test, feature = "db-test-seam"))]
+                        if let Some((_, _, Some((ready, gate, once)))) = &claim_approved {
+                            once.call_once(|| {
+                                ready.notify_waiters();
+                                gate.wait();
+                            });
+                        }
                         if let Some(ready_tx) = ready_tx.take() {
                             let _ = ready_tx.send(());
                         }
@@ -101,7 +114,7 @@ impl AsyncPendingMessageStore {
                             .and_then(|approval_rx| approval_rx.blocking_recv().ok())
                             .unwrap_or(false);
                         #[cfg(any(test, feature = "db-test-seam"))]
-                        if approved && let Some((approved, gate)) = &claim_approved {
+                        if approved && let Some((approved, gate, _)) = &claim_approved {
                             approved.notify_waiters();
                             if let Some((gate, _, _)) = gate {
                                 gate.wait();
@@ -112,7 +125,7 @@ impl AsyncPendingMessageStore {
                 );
                 #[cfg(any(test, feature = "db-test-seam"))]
                 if matches!(&result, Ok(Some(_)))
-                    && let Some((_, Some((_, committed, cleanup_gate)))) = &claim_approved
+                    && let Some((_, Some((_, committed, cleanup_gate)), _)) = &claim_approved
                 {
                     let _ = committed.send(());
                     cleanup_gate.wait();
@@ -139,6 +152,8 @@ impl AsyncPendingMessageStore {
         let approved = tokio::select! {
             biased;
             _ = shutdown_rx.changed() => false,
+            // Empty/error results skip approval and drop ready_tx on task exit.
+            // Receiver closure also wakes this arm; result_rx carries the outcome.
             ready = ready_rx => ready.is_ok() && !*shutdown_rx.borrow(),
         };
         let _ = approval_tx.send(approved);

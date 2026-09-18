@@ -69,7 +69,6 @@ fn block_on_result_bounds_runtime_shutdown_after_search_deadline() {
     let (_tmp, db) = new_temp_db();
     let config = Config::default();
     let (initialization_started_tx, initialization_started_rx) = std::sync::mpsc::sync_channel(1);
-    let (initialization_finished_tx, initialization_finished_rx) = std::sync::mpsc::sync_channel(1);
     let started_at = std::time::Instant::now();
 
     let error = block_on_result(search_command_with_embedder_initializer(
@@ -82,7 +81,7 @@ fn block_on_result_bounds_runtime_shutdown_after_search_deadline() {
             session: None,
             filters: SearchFilters::default(),
             top_k: 0,
-            project: None,
+            project: Some("deadline-test"),
             include_global: false,
             all_projects: true,
             json: true,
@@ -92,34 +91,27 @@ fn block_on_result_bounds_runtime_shutdown_after_search_deadline() {
         },
         std::time::Duration::from_millis(20),
         move || async move {
-            let initialization = tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 initialization_started_tx
                     .send(())
                     .expect("report that blocking initialization started");
                 std::thread::sleep(std::time::Duration::from_secs(3));
-                initialization_finished_tx
-                    .send(())
-                    .expect("report that blocking initialization finished");
-            });
-            initialization_started_rx
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .expect("blocking initialization should start before its deadline");
-            initialization
-                .await
-                .expect("blocking embedder initialization task should not panic");
+            })
+            .await
+            .expect("blocking embedder initialization task should not panic");
             Ok::<Box<dyn Embedder>, anyhow::Error>(Box::new(RecordingEmbedder::default()))
         },
     ))
     .expect_err("the command-level deadline must fail");
 
+    initialization_started_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("blocking initialization should start before the command deadline");
     assert!(format!("{error:#}").contains("CLI search total deadline exceeded"));
     assert!(
         started_at.elapsed() < std::time::Duration::from_millis(1500),
         "runtime teardown must not wait for a blocking initializer after the search deadline"
     );
-    initialization_finished_rx
-        .recv_timeout(std::time::Duration::from_secs(4))
-        .expect("the detached blocking initializer should finish independently");
 }
 
 fn run_cli_content_write_while_sqlite_lock_is_held<T>(

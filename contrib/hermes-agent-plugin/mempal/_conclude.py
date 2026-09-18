@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import secrets
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
@@ -29,6 +28,7 @@ class ConcludeResult:
 _TERMINAL_KINDS = {
     "operation_key_conflict",
     "invalid_control_fields",
+    "operation_key_required",
     "malformed_spool_row",
 }
 
@@ -103,10 +103,12 @@ def submit_conclusion(
     replay_allowed: Optional[Callable[[], bool]] = None,
 ) -> ConcludeResult:
     """Admit once and report success only after authoritative completion."""
-    if not valid_control_token(operation_key):
+    # Identity must survive a caller discarding this function's return.
+    if operation_key is None:
+        return ConcludeResult(False, _invalid_control_payload("operation_key_required"))
+    if not valid_control_token(operation_key, allow_none=False):
         return ConcludeResult(False, _invalid_control_payload())
-    retrying = operation_key is not None
-    key = operation_key or secrets.token_urlsafe(32)
+    key = operation_key
     if spool is None:
         return ConcludeResult(False, _retry_payload(
             "local_durable_admission_failed",
@@ -135,17 +137,8 @@ def submit_conclusion(
             classify_write_error(exc),
         ))
 
-    if not transport_allowed and not retrying:
-        return ConcludeResult(False, _retry_payload(
-            "durable_admission_deferred",
-            None,
-            key,
-            "local_admitted",
-            "breaker_open",
-        ))
-
     deadline = time.monotonic() + max(0.0, wait_timeout)
-    single_status_probe = retrying and not transport_allowed
+    single_status_probe = not transport_allowed
     operation_id: Optional[str] = None
     state = "local_admitted"
     write_admitted = False
@@ -236,11 +229,11 @@ def submit_conclusion(
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
-def _invalid_control_payload() -> Dict[str, Any]:
+def _invalid_control_payload(kind: str = "invalid_control_fields") -> Dict[str, Any]:
     return {
-        "error": "Memory request was rejected.",
+        "error": "Supply a unique operation_key before writing; reuse it after timeout or cancellation.",
         "error_details": {
-            "kind": "invalid_control_fields",
+            "kind": kind,
             "retry_safe": False,
         },
     }

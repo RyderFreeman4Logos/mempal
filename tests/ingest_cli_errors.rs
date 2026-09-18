@@ -26,11 +26,16 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 fn setup_home() -> TempDir {
+    setup_home_with_db().0
+}
+
+// Retain the admitted connection when setup needs further database work.
+fn setup_home_with_db() -> (TempDir, mempal::core::db::Database) {
     let tmp = TempDir::new().expect("tempdir");
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
-    mempal::core::db::Database::open(&mempal_home.join("palace.db")).expect("open db");
-    tmp
+    let db = mempal::core::db::Database::open(&mempal_home.join("palace.db")).expect("open db");
+    (tmp, db)
 }
 
 fn run_ingest(home: &Path, target: &str, wing: &str) -> Output {
@@ -86,12 +91,28 @@ fn run_ingest_stdin_bytes(home: &Path, payload: &[u8], args: &[&str]) -> Output 
     )
 }
 
-fn hold_daemon_writer_lease(home: &Path) -> mempal::core::types::RuntimeWriterLease {
-    let db =
-        mempal::core::db::Database::open(&home.join(".mempal").join("palace.db")).expect("open db");
+fn hold_daemon_writer_lease(
+    db: &mempal::core::db::Database,
+) -> mempal::core::types::RuntimeWriterLease {
     db.runtime_writer_lease_acquire("sqlite-writer", "daemon-owner", "daemon", 300, None)
         .expect("acquire daemon writer lease")
         .expect("daemon writer lease")
+}
+
+#[test]
+fn writer_lease_fixture_does_not_readmit_initialized_database() {
+    let (tmp, db) = setup_home_with_db();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tmp.path().join(".mempal/.palace.db.admission.lock"))
+        .expect("existing admission lock");
+    lock.lock().expect("own admission lock before fixture call");
+    // Keep this independent lock alive across the helper, including on panic.
+    // Lease setup should use its initialized connection, not register another.
+    let lease = hold_daemon_writer_lease(&db);
+    assert_eq!(lease.owner, "daemon-owner");
+    drop(lock);
 }
 
 fn write_embed_config(home: &Path, base_url: &str) {
@@ -730,8 +751,8 @@ fn test_ingest_stdin_rejects_format() {
 
 #[test]
 fn test_directory_ingest_respects_existing_writer_lease() {
-    let tmp = setup_home();
-    let _lease = hold_daemon_writer_lease(tmp.path());
+    let (tmp, db) = setup_home_with_db();
+    let _lease = hold_daemon_writer_lease(&db);
     let input_dir = tmp.path().join("input");
     fs::create_dir_all(&input_dir).expect("create input dir");
     fs::write(
@@ -755,15 +776,13 @@ fn test_directory_ingest_respects_existing_writer_lease() {
         stderr.contains("SQLite writer lease `sqlite-writer` is already held"),
         "{stderr}"
     );
-    let db = mempal::core::db::Database::open(&tmp.path().join(".mempal").join("palace.db"))
-        .expect("open db");
     assert_eq!(db.drawer_count().expect("drawer count"), 0);
 }
 
 #[test]
 fn test_stdin_non_wait_ingest_respects_existing_writer_lease() {
-    let tmp = setup_home();
-    let _lease = hold_daemon_writer_lease(tmp.path());
+    let (tmp, db) = setup_home_with_db();
+    let _lease = hold_daemon_writer_lease(&db);
     let payload = r#"{
         "content": "stdin direct lease conflict memory",
         "wing": "lease-wing",
@@ -781,8 +800,6 @@ fn test_stdin_non_wait_ingest_respects_existing_writer_lease() {
         stderr.contains("SQLite writer lease `sqlite-writer` is already held"),
         "{stderr}"
     );
-    let db = mempal::core::db::Database::open(&tmp.path().join(".mempal").join("palace.db"))
-        .expect("open db");
     assert_eq!(db.drawer_count().expect("drawer count"), 0);
 }
 

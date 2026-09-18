@@ -1,6 +1,8 @@
 mod common;
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -48,15 +50,7 @@ fn wait_for_scheduled_phase(child: &mut CapturedChild, db_path: &Path) -> String
                 child.diagnostics()
             );
         }
-        let phase = Database::open(db_path).ok().and_then(|db| {
-            db.conn()
-                .query_row(
-                    "SELECT phase FROM sleep_log ORDER BY created_at DESC, id DESC LIMIT 1",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok()
-        });
+        let phase = latest_scheduled_phase(db_path);
         if let Some(phase) = phase {
             return phase;
         }
@@ -68,8 +62,54 @@ fn wait_for_scheduled_phase(child: &mut CapturedChild, db_path: &Path) -> String
     );
 }
 
+fn latest_scheduled_phase(db_path: &Path) -> Option<String> {
+    Database::with_diagnostic_read_only(db_path, |db| {
+        db.conn()
+            .query_row(
+                "SELECT phase FROM sleep_log ORDER BY created_at DESC, id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+    })
+    .ok()
+    .flatten()
+}
+
+#[cfg(unix)]
+#[test]
+fn scheduled_phase_observer_does_not_use_profile_admission() {
+    let home = SocketTempDir::new().expect("short temporary home");
+    let db_path = home.path().join("palace.db");
+    let db = Database::open(&db_path).expect("initialize database");
+    db.conn()
+        .execute(
+            "INSERT INTO sleep_log (id, created_at, phase) VALUES ('observed', 'now', 'salience')",
+            [],
+        )
+        .expect("seed scheduled phase");
+    drop(db);
+
+    let lock_path = home.path().join(".palace.db.admission.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .expect("open admission lock");
+    // SAFETY: this test owns the file descriptor until `lock` is dropped.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    assert_eq!(
+        latest_scheduled_phase(&db_path).as_deref(),
+        Some("salience")
+    );
+}
+
 fn wait_for_diagnostic(child: &mut CapturedChild, marker: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    wait_for_diagnostic_until(child, marker, Instant::now() + Duration::from_secs(10));
+}
+
+fn wait_for_diagnostic_until(child: &mut CapturedChild, marker: &str, deadline: Instant) {
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().expect("poll daemon") {
             panic!(
@@ -193,8 +233,17 @@ phases = ["salience"]
     let mut daemon = spawn_daemon_with_cycle_block(home.path(), &log_path, Some(&cycle_block_path));
     wait_for_diagnostic(&mut daemon, "daemon embedded sleep cycle started");
 
+    let shutdown_deadline = Instant::now() + Duration::from_secs(3);
     daemon.signal_or_panic(libc::SIGTERM, "signal daemon during sleep cycle");
-    let status = wait_for_daemon_exit(&mut daemon, Duration::from_secs(3));
+    wait_for_diagnostic_until(
+        &mut daemon,
+        "daemon shutdown phase: signal-observed",
+        shutdown_deadline,
+    );
+    let status = wait_for_daemon_exit(
+        &mut daemon,
+        shutdown_deadline.saturating_duration_since(Instant::now()),
+    );
     let diagnostics = daemon.diagnostics();
     fs::remove_file(&cycle_block_path).expect("release blocked sleep cycle");
 
@@ -202,6 +251,20 @@ phases = ["salience"]
         panic!("daemon did not bound the active sleep cycle after SIGTERM\n{diagnostics}")
     });
     assert!(status.success(), "daemon shutdown failed: {status}");
+    for phase in [
+        "signal-observed",
+        "ingest-worker",
+        "sleep-scheduler",
+        "runtime-teardown",
+    ]
+    .into_iter()
+    .chain(cfg!(feature = "rest").then_some("rest-server"))
+    {
+        assert!(
+            diagnostics.contains(&format!("daemon shutdown phase: {phase}")),
+            "missing shutdown phase `{phase}`\n{diagnostics}"
+        );
+    }
 }
 
 #[cfg(unix)]

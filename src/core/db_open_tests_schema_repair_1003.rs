@@ -16,7 +16,7 @@ impl WriterLockHolder {
                 let conn = Connection::open(path)?;
                 conn.execute_batch("BEGIN IMMEDIATE;")?;
                 ready_tx.send(Ok::<_, rusqlite::Error>(())).ok();
-                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                release_rx.recv().expect("writer holder release signal");
                 conn.execute_batch("ROLLBACK;")
             })();
             if let Err(error) = result {

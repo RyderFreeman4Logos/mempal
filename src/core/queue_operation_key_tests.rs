@@ -178,7 +178,11 @@
                     .expect("idle ingest claim")
                     .is_none()
             );
-            assert_eq!(store.claim_connection_open_count(), 1);
+            assert_eq!(
+                store.claim_connection_open_count(),
+                0,
+                "empty-queue reader probe must not open a claim connection"
+            );
         }
 
         let ingest_id = store

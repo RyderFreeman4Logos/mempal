@@ -1,5 +1,7 @@
 #![warn(clippy::all)]
 
+extern crate self as mempal;
+
 pub mod aaak;
 pub mod adoption_analytics;
 pub mod algo;

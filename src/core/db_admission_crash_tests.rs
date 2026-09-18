@@ -1,6 +1,6 @@
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::db_admission::{
     AdmissionPaths, DbAdmissionConfig, DbAdmissionError, DbAdmissionRequest, DbHolderClass,
@@ -9,20 +9,23 @@ use super::db_admission::{
 use super::db_admission_fault_injection::{self as fault_injection, CrashPoint};
 use super::db_admission_lease::fail_next_holder_lease_unlink;
 
-// Test-only supervisor is shared with integration harnesses via path include (Rust 011).
-#[path = "db_admission_test_process.rs"]
-mod db_admission_test_process;
-
 const _: fn() = db_admission_test_process::reference_shared_test_api;
 
-use db_admission_test_process::{DeadlineChild, SpawnSpec, SupervisionError};
+use super::db_admission_test_process::{
+    self, DeadlineChild, SpawnSpec, SupervisionError, TestSetupGate,
+};
 
 const FIXTURE_CASE_ENV: &str = "MEMPAL_DB_ADMISSION_FIXTURE_CASE";
 const FIXTURE_DATABASE_ENV: &str = "MEMPAL_DB_ADMISSION_FIXTURE_DATABASE";
+const FORK_BARGING_FIXTURE_ENV: &str = "MEMPAL_FORK_BARGING_FIXTURE";
 const FIXTURE_TEST: &str = "core::db_admission_crash_tests::admission_crash_fixture";
 
 #[test]
 fn admission_crash_fixture() {
+    if std::env::var_os(FORK_BARGING_FIXTURE_ENV).is_some() {
+        run_fork_barging_fixture();
+        return;
+    }
     let Some(case) = std::env::var_os(FIXTURE_CASE_ENV) else {
         return;
     };
@@ -51,6 +54,184 @@ fn admission_crash_fixture() {
         }
     }
     panic!("configured crash point {point:?} was not reached");
+}
+
+#[test]
+fn waiting_fork_writer_blocks_new_admission_readers() {
+    let _fixture_guard = super::db::db_open_busy_fixture_lock().blocking_lock();
+    let executable = std::env::current_exe().expect("current unit-test executable");
+    let mut spec = SpawnSpec::new(executable).expect("absolute unit-test executable");
+    spec.args(["--exact", FIXTURE_TEST, "--nocapture", "--test-threads=1"])
+        .env(FORK_BARGING_FIXTURE_ENV, "1");
+
+    let output = DeadlineChild::output(spec, Duration::from_secs(5))
+        .expect("run isolated fork-barging fixture");
+    assert!(
+        output.success(),
+        "fork-barging fixture failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn run_fork_barging_fixture() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let first = super::db_admission_state::lock_state(&temp.path().join("first.lock"))
+        .expect("acquire first admission reader");
+    let (waiting_tx, waiting_rx) = std::sync::mpsc::sync_channel(1);
+    super::db_admission::test_signal_next_process_fork_wait(waiting_tx);
+
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let spec = SpawnSpec::new("/bin/true").expect("absolute true executable");
+            DeadlineChild::output(spec, Duration::from_secs(2))
+        });
+        waiting_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("fork writer did not report waiting behind the first reader");
+
+        let late_reader_started = Instant::now();
+        let late_reader =
+            super::db_admission_state::lock_state(&temp.path().join("late-reader.lock"));
+        let late_reader_elapsed = late_reader_started.elapsed();
+        let late_reader_error = match late_reader {
+            Ok(lock) => {
+                drop(lock);
+                None
+            }
+            Err(error) => Some(error),
+        };
+        drop(first);
+
+        let output = writer
+            .join()
+            .expect("fork writer thread")
+            .expect("fork writer output");
+        assert!(
+            output.success(),
+            "waiting fork writer did not make progress"
+        );
+        assert!(
+            late_reader_elapsed < Duration::from_secs(1),
+            "late reader exceeded its 250ms admission budget: {late_reader_elapsed:?}"
+        );
+        assert!(
+            matches!(
+                late_reader_error,
+                Some(DbAdmissionError::Busy {
+                    timeout_ms: 250,
+                    ..
+                })
+            ),
+            "a new admission reader barged while a fork writer was waiting"
+        );
+    });
+}
+
+#[test]
+fn fork_waits_for_admission_state_unlock_before_starting_child() {
+    let _fixture_guard = super::db::db_open_busy_fixture_lock().blocking_lock();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let lock_path = temp.path().join(".palace.db.admission.lock");
+    let state_lock = super::db_admission_state::lock_state(&lock_path)
+        .expect("lock admission state before fork");
+    let (gate, child_gate) = TestSetupGate::new().expect("create setup gate");
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            let mut spec = SpawnSpec::new("/bin/true").expect("absolute true executable");
+            spec.setup_gate(child_gate);
+            started_tx.send(()).expect("report launch start");
+            DeadlineChild::output(spec, Duration::from_secs(2))
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("launch worker started");
+
+        let blocked = gate
+            .wait_ready(Instant::now() + Duration::from_millis(50))
+            .expect_err("child started while admission state remained locked");
+        assert_eq!(blocked.kind(), std::io::ErrorKind::TimedOut);
+
+        drop(state_lock);
+        let ready_pid = gate
+            .wait_ready(Instant::now() + Duration::from_secs(1))
+            .expect("child starts after admission state unlock");
+        gate.release().expect("release setup gate");
+        let output = worker
+            .join()
+            .expect("launch worker")
+            .expect("released child output");
+        assert_eq!(output.identity.pid, ready_pid);
+        assert!(output.success());
+        assert!(!output.timed_out);
+        assert!(output.cleanup.kill_fence_sent);
+        assert!(output.cleanup.errors.is_empty(), "{:#?}", output.cleanup);
+        let mut status = 0;
+        // SAFETY: successful output means the supervisor already reaped this direct child; the
+        // WNOHANG probe verifies ownership cleanup without blocking or reaping another process.
+        assert_eq!(
+            unsafe { libc::waitpid(ready_pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    });
+}
+
+#[test]
+fn fork_fence_wait_honors_launch_deadline_without_starting_child() {
+    let _fixture_guard = super::db::db_open_busy_fixture_lock().blocking_lock();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let lock_path = temp.path().join(".palace.db.admission.lock");
+    let state_lock = super::db_admission_state::lock_state(&lock_path)
+        .expect("lock admission state before bounded launch");
+    let (gate, child_gate) = TestSetupGate::new().expect("create setup gate");
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            let mut spec = SpawnSpec::new("/bin/true").expect("absolute true executable");
+            spec.setup_gate(child_gate);
+            started_tx.send(()).expect("report bounded launch start");
+            let started = Instant::now();
+            let result = DeadlineChild::output(spec, Duration::from_millis(100));
+            finished_tx
+                .send((started.elapsed(), result))
+                .expect("report bounded launch result");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("bounded launch worker started");
+
+        let finished = finished_rx.recv_timeout(Duration::from_secs(1));
+        drop(state_lock);
+        worker.join().expect("bounded launch worker");
+        let (elapsed, result) = finished.expect(
+            "fork fence exceeded the existing launch deadline while admission state was locked",
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "bounded launch returned too slowly: {elapsed:?}"
+        );
+        let error = result.expect_err("expired fork fence must cancel before creating a child");
+        let SupervisionError::Io(error) = error else {
+            panic!("fork fence deadline returned the wrong error: {error:?}");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let gate_error = gate
+            .wait_ready(Instant::now() + Duration::from_millis(100))
+            .expect_err("deadline-expired launch unexpectedly created a child");
+        assert_eq!(gate_error.kind(), std::io::ErrorKind::UnexpectedEof);
+        drop(
+            super::db_admission_state::lock_state(&lock_path)
+                .expect("deadline cancellation released the fork fence"),
+        );
+    });
 }
 
 #[test]

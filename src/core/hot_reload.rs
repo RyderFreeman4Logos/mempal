@@ -1,23 +1,23 @@
 use std::collections::VecDeque;
-use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 
 use super::config::{CompiledPrivacyConfig, Config, ConfigError, ConfigSnapshotMeta};
+use super::hot_reload_linux::{HotReloadWatcher, file_signature};
 
 const MAX_EVENT_LOG: usize = 64;
 const MAX_PERSISTED_EVENT_LOG_BYTES: u64 = 64 * 1024;
 const HOT_RELOAD_EVENT_LOG_FILE: &str = "hot-reload-events.log";
 const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const WATCH_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(1);
 const HOT_RELOAD_EVENT_KIND_RESTART_REQUIRED: &str = "restart_required";
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -49,6 +49,7 @@ impl ConfigSnapshot {
 }
 
 enum WatchMessage {
+    Start,
     FileChanged,
     NotifyFailed,
     Stop,
@@ -88,27 +89,30 @@ struct RuntimeControl {
     stop: Arc<AtomicBool>,
     control_tx: mpsc::Sender<WatchMessage>,
     coordinator: thread::JoinHandle<()>,
-    poller: thread::JoinHandle<()>,
-    poller_thread: thread::Thread,
 }
 
+type StagedRuntime = (RuntimeControl, Result<Config, ConfigError>, Option<String>);
+
 impl RuntimeControl {
-    fn stop(self) {
+    fn request_stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.control_tx.send(WatchMessage::Stop);
-        self.poller_thread.unpark();
+    }
+
+    fn stop(self) {
+        self.request_stop();
         let _ = self.coordinator.join();
-        let _ = self.poller.join();
     }
 }
 
 pub struct HotReloadState {
     snapshot: ArcSwap<ConfigSnapshot>,
     runtime: Mutex<Option<RuntimeControl>>,
+    // One timed-out runtime; retries wait for its owned join.
+    cleanup: Mutex<Option<thread::JoinHandle<()>>>,
     event_log: Mutex<VecDeque<String>>,
     event_log_path: Mutex<Option<PathBuf>>,
     parse_attempts: AtomicUsize,
-    // harness-point: PR0 — counts successful reload applications (version changes)
     reload_count: Arc<AtomicUsize>,
     runtime_prototypes: ArcSwap<Vec<String>>,
     /// Incremented whenever a hot-reloadable LLM field changes (endpoint,
@@ -132,6 +136,7 @@ impl HotReloadState {
         Self {
             snapshot: ArcSwap::from_pointee(snapshot),
             runtime: Mutex::new(None),
+            cleanup: Mutex::new(None),
             event_log: Mutex::new(VecDeque::new()),
             event_log_path: Mutex::new(None),
             parse_attempts: AtomicUsize::new(0),
@@ -157,8 +162,33 @@ impl HotReloadState {
         path: &Path,
         emit_bootstrap_event_to_stderr: bool,
     ) -> Result<(), ConfigError> {
+        let mut runtime = self.runtime.lock().expect("runtime mutex poisoned");
+        let mut cleanup = self.cleanup.lock().expect("cleanup mutex poisoned");
+        if cleanup.as_ref().is_some_and(|worker| !worker.is_finished()) {
+            return Err(ConfigError::InvalidConfig(
+                "hot-reload watcher cleanup still pending".to_string(),
+            ));
+        }
+        if let Some(worker) = cleanup.take() {
+            let _ = worker.join();
+        }
+        drop(cleanup);
         let config = Config::load_from(path)?;
         let snapshot = ConfigSnapshot::from_config(config.clone())?;
+        let staged_runtime = if config.config_hot_reload.enabled {
+            install_sighup_handler_once();
+            Some(self.stage_runtime(path.to_path_buf(), &config)?)
+        } else {
+            None
+        };
+
+        if let Some(existing) = runtime.take() {
+            existing.stop();
+        }
+        #[cfg(unix)]
+        if staged_runtime.is_some() {
+            SIGHUP_PENDING.store(false, Ordering::SeqCst);
+        }
         self.snapshot.store(Arc::new(snapshot));
         *self
             .event_log_path
@@ -183,19 +213,13 @@ impl HotReloadState {
             emit_bootstrap_event_to_stderr,
         );
 
-        let mut runtime = self.runtime.lock().expect("runtime mutex poisoned");
-        if let Some(existing) = runtime.take() {
-            existing.stop();
-        }
-        if config.config_hot_reload.enabled {
-            install_sighup_handler_once();
-            #[cfg(unix)]
-            SIGHUP_PENDING.store(false, Ordering::SeqCst);
-            *runtime = Some(self.start_runtime(
-                path.to_path_buf(),
-                config.config_hot_reload.debounce_ms,
-                config.config_hot_reload.poll_fallback_secs,
-            ));
+        if let Some((staged, candidate, warning)) = staged_runtime {
+            if let Some(warning) = warning {
+                self.push_event(warning);
+            }
+            self.apply_reload(candidate);
+            let _ = staged.control_tx.send(WatchMessage::Start);
+            *runtime = Some(staged);
         }
 
         Ok(())
@@ -230,7 +254,6 @@ impl HotReloadState {
     }
 
     /// Number of successful reloads (version actually changed).
-    // harness-point: PR0
     pub fn reload_count(&self) -> usize {
         self.reload_count.load(Ordering::SeqCst)
     }
@@ -304,23 +327,22 @@ impl HotReloadState {
         *self.embed_gen_tx.borrow()
     }
 
-    /// Trigger a reload from the given path without going through the watcher.
-    /// Only for use in tests via `ConfigHandle::harness_reload_from_path`.
+    /// Test-only watcher bypass.
     #[doc(hidden)]
     pub fn reload_from_disk_for_test(&self, path: &Path) {
         self.reload_from_disk(path);
     }
 
-    /// Test-only: resets the snapshot, watcher runtime, event path/log, parse
-    /// attempts, and runtime prototypes without runtime-allowed merges.
-    /// Successful-reload and generation counters intentionally remain monotonic so
-    /// existing subscribers never move backward.
+    /// Test-only reset; reload and generation counters stay monotonic.
     #[doc(hidden)]
     pub fn harness_reset(&self) {
         if let Some(existing) = self.runtime.lock().expect("runtime mutex poisoned").take() {
             existing.stop();
         }
 
+        if let Some(worker) = self.cleanup.lock().expect("cleanup mutex poisoned").take() {
+            let _ = worker.join();
+        }
         let defaults = Config::default();
         let snapshot =
             ConfigSnapshot::from_config(defaults.clone()).expect("default config is valid");
@@ -355,67 +377,87 @@ impl HotReloadState {
             .clone()
     }
 
-    fn start_runtime(
-        &self,
-        path: PathBuf,
-        debounce_ms: u64,
-        poll_fallback_secs: u64,
-    ) -> RuntimeControl {
+    fn stage_runtime(&self, path: PathBuf, config: &Config) -> Result<StagedRuntime, ConfigError> {
         let stop = Arc::new(AtomicBool::new(false));
-        let fallback_poll_enabled = Arc::new(AtomicBool::new(false));
         let (control_tx, control_rx) = mpsc::channel::<WatchMessage>();
-        let notify_tx = control_tx.clone();
-        let poll_tx = control_tx.clone();
-        let start_failure_tx = control_tx.clone();
-        let stop_for_coordinator = Arc::clone(&stop);
-        let stop_for_poller = Arc::clone(&stop);
-        let poll_toggle = Arc::clone(&fallback_poll_enabled);
+        let startup_tx = control_tx.clone();
+        let worker_stop = Arc::clone(&stop);
         let state = global_hot_reload_state_arc();
-        let watch_path = path.clone();
-        let poll_path = path;
-        let debounce = Duration::from_millis(debounce_ms.max(1));
-        let poll_interval = Duration::from_secs(poll_fallback_secs.max(1));
-        let (ready_tx, ready_rx) = mpsc::channel::<()>();
-
+        let debounce = Duration::from_millis(config.config_hot_reload.debounce_ms.max(1));
+        let poll_interval = Duration::from_secs(config.config_hot_reload.poll_fallback_secs.max(1));
+        let (ready_tx, ready_rx) = mpsc::channel();
         let coordinator = thread::spawn(move || {
-            let file_name = watch_path.file_name().map(OsStr::to_os_string);
-            let watch_dir = watch_path
+            #[cfg(test)]
+            if !super::hot_reload_watch_gate::wait_before_watch(&worker_stop) {
+                return;
+            }
+            if worker_stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let watch_dir = path
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."));
-            let mut watcher = create_watcher(notify_tx, file_name.clone());
-
-            if let Some(active_watcher) = watcher.as_mut() {
-                if let Err(error) = active_watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
-                    state.push_event(format!(
-                        "config hot-reload: notify watch failed for {}: {error}",
-                        watch_dir.display()
-                    ));
-                    fallback_poll_enabled.store(true, Ordering::SeqCst);
-                    drop(watcher.take());
-                }
-            } else {
-                fallback_poll_enabled.store(true, Ordering::SeqCst);
+            let file_name = path.file_name().map(|name| name.to_os_string());
+            let registration = HotReloadWatcher::register(&watch_dir, file_name);
+            if worker_stop.load(Ordering::SeqCst) {
+                return;
             }
-
-            let _ = ready_tx.send(());
-
+            let warning = registration.as_ref().err().map(|error| {
+                format!(
+                    "config hot-reload: notify watch failed for {}: {error}",
+                    watch_dir.display()
+                )
+            });
+            let mut watcher = registration.ok();
+            #[cfg(test)]
+            super::hot_reload_watch_gate::mark_watch_registered();
+            // Baseline after watch registration.
+            #[cfg(test)]
+            super::hot_reload_watch_gate::wait_before_poll_baseline();
+            let mut previous = file_signature(&path);
+            let candidate = Config::load_from(&path);
+            if ready_tx.send((candidate, warning)).is_err()
+                || !matches!(control_rx.recv(), Ok(WatchMessage::Start))
+            {
+                return;
+            }
+            let mut last_poll = Instant::now();
             if std::env::var_os("MEMPAL_TEST_NOTIFY_FAIL_AFTER_START").is_some() {
-                let _ = start_failure_tx.send(WatchMessage::NotifyFailed);
+                let _ = startup_tx.send(WatchMessage::NotifyFailed);
             }
 
-            loop {
+            while !worker_stop.load(Ordering::SeqCst) {
                 let message = match control_rx.recv_timeout(SIGNAL_POLL_INTERVAL) {
                     Ok(message) => message,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let mut changed = match watcher.as_ref().map(HotReloadWatcher::changed) {
+                            Some(Ok(changed)) => changed,
+                            Some(Err(error)) => {
+                                drop(watcher.take());
+                                state.push_event(format!(
+                                    "config hot-reload: notify watcher crashed, falling back to poll: {error}"
+                                ));
+                                false
+                            }
+                            None => false,
+                        };
+                        if watcher.is_none() && last_poll.elapsed() >= poll_interval {
+                            last_poll = Instant::now();
+                            let current = file_signature(&path);
+                            changed |= current != previous;
+                            previous = current;
+                        }
                         #[cfg(unix)]
-                        if SIGHUP_PENDING.swap(false, Ordering::SeqCst) {
+                        if changed || SIGHUP_PENDING.swap(false, Ordering::SeqCst) {
                             WatchMessage::FileChanged
                         } else {
                             continue;
                         }
                         #[cfg(not(unix))]
-                        {
+                        if changed {
+                            WatchMessage::FileChanged
+                        } else {
                             continue;
                         }
                     }
@@ -423,9 +465,9 @@ impl HotReloadState {
                 };
                 match message {
                     WatchMessage::Stop => break,
+                    WatchMessage::Start => continue,
                     WatchMessage::NotifyFailed => {
-                        drop(watcher.take());
-                        if !fallback_poll_enabled.swap(true, Ordering::SeqCst) {
+                        if watcher.take().is_some() {
                             state.push_event(
                                 "config hot-reload: notify watcher crashed, falling back to poll"
                                     .to_string(),
@@ -437,59 +479,49 @@ impl HotReloadState {
                             match next {
                                 WatchMessage::FileChanged => {}
                                 WatchMessage::NotifyFailed => {
-                                    drop(watcher.take());
-                                    if !fallback_poll_enabled.swap(true, Ordering::SeqCst) {
+                                    if watcher.take().is_some() {
                                         state.push_event("config hot-reload: notify watcher crashed, falling back to poll".to_string());
                                     }
                                 }
                                 WatchMessage::Stop => return,
+                                WatchMessage::Start => {}
                             }
                         }
-                        if stop_for_coordinator.load(Ordering::SeqCst) {
+                        if worker_stop.load(Ordering::SeqCst) {
                             break;
                         }
-                        state.reload_from_disk(&watch_path);
+                        previous = file_signature(&path);
+                        state.reload_from_disk(&path);
                     }
                 }
             }
         });
 
-        let poller = thread::spawn(move || {
-            let mut previous = file_signature(&poll_path);
-            while !stop_for_poller.load(Ordering::SeqCst) {
-                thread::park_timeout(poll_interval);
-                if stop_for_poller.load(Ordering::SeqCst) {
-                    break;
-                }
-                if !poll_toggle.load(Ordering::SeqCst) {
-                    previous = file_signature(&poll_path);
-                    continue;
-                }
-
-                let current = file_signature(&poll_path);
-                if current != previous {
-                    previous = current;
-                    let _ = poll_tx.send(WatchMessage::FileChanged);
-                }
-            }
-        });
-        let poller_thread = poller.thread().clone();
-
-        let _ = ready_rx.recv_timeout(Duration::from_secs(1));
-
-        RuntimeControl {
+        let runtime = RuntimeControl {
             stop,
             control_tx,
             coordinator,
-            poller,
-            poller_thread,
-        }
+        };
+        let Ok((candidate, warning)) = ready_rx.recv_timeout(WATCH_REGISTRATION_TIMEOUT) else {
+            runtime.request_stop();
+            // Deferred cleanup owns blocked registration IO and its join.
+            *self.cleanup.lock().expect("cleanup mutex poisoned") =
+                Some(thread::spawn(move || runtime.stop()));
+            return Err(ConfigError::InvalidConfig(
+                "hot-reload watcher registration timed out".to_string(),
+            ));
+        };
+        Ok((runtime, candidate, warning))
     }
 
     fn reload_from_disk(&self, path: &Path) {
         self.parse_attempts.fetch_add(1, Ordering::SeqCst);
+        self.apply_reload(Config::load_from(path));
+    }
+
+    fn apply_reload(&self, candidate: Result<Config, ConfigError>) {
         let previous = self.snapshot.load_full();
-        let candidate = match Config::load_from(path) {
+        let candidate = match candidate {
             Ok(config) => config,
             Err(error) => {
                 self.push_event(format!(
@@ -567,7 +599,6 @@ impl HotReloadState {
             }
         };
         self.snapshot.store(Arc::new(next_snapshot));
-        // harness-point: PR0 — increment reload counter on successful version change
         self.reload_count.fetch_add(1, Ordering::SeqCst);
 
         // Notify LLM workers when any hot-reloadable LLM field changes so they
@@ -752,43 +783,6 @@ fn process_is_running(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn process_is_running(pid: u32) -> bool {
     pid == std::process::id()
-}
-
-fn create_watcher(
-    tx: mpsc::Sender<WatchMessage>,
-    file_name: Option<OsString>,
-) -> Option<RecommendedWatcher> {
-    notify::recommended_watcher(move |result: notify::Result<Event>| match result {
-        Ok(event) if should_reload_event(&event, file_name.as_deref()) => {
-            let _ = tx.send(WatchMessage::FileChanged);
-        }
-        Ok(_) => {}
-        Err(_) => {
-            let _ = tx.send(WatchMessage::NotifyFailed);
-        }
-    })
-    .ok()
-}
-
-fn should_reload_event(event: &Event, file_name: Option<&OsStr>) -> bool {
-    if !matches!(
-        event.kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any
-    ) {
-        return false;
-    }
-
-    event.paths.iter().any(|path| match file_name {
-        Some(name) => path.file_name() == Some(name),
-        None => true,
-    })
-}
-
-fn file_signature(path: &Path) -> Option<(u64, u64)> {
-    let metadata = std::fs::metadata(path).ok()?;
-    let modified = metadata.modified().ok()?;
-    let millis = modified.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
-    Some((millis, metadata.len()))
 }
 
 fn now_unix_ms() -> u64 {
