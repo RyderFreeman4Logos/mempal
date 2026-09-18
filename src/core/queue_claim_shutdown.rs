@@ -37,10 +37,11 @@ impl Drop for ApprovedClaimOwner {
 
 impl PendingMessageStore {
     /// Release only this physical owner's exact token after runtime teardown.
+    /// Bound SQLite busy wait so cancellation Drop cannot block on a held writer lock.
     fn release_owned_claim_after_cancellation(&self, claim: &ClaimedMessage) -> Result<()> {
         let mut cleanup = self.clone();
         cleanup.lifecycle_writer_lease = None;
-        cleanup.release_claim(claim)
+        cleanup.release_claim_with_busy_timeout(claim, Some(super::CLAIM_BUSY_TIMEOUT))
     }
 }
 

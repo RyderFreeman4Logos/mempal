@@ -143,3 +143,117 @@ fn test_actual_runtime_shutdown_releases_late_approved_claim() {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
+
+#[test]
+fn test_actual_runtime_shutdown_drop_does_not_block_under_held_sqlite_lock() {
+    let _worker_lifecycle_lock =
+        crate::observability::test_support::acquire_ingest_worker_lifecycle_lock_blocking();
+    let (_tempdir, db_path, server) = setup_server();
+    let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
+    let operation_id = queue
+        .enqueue(INGEST_ASYNC_KIND, "{}")
+        .expect("enqueue operation");
+    let db = crate::core::db::Database::open(&db_path).expect("open lease owner");
+    let lease = db
+        .runtime_writer_lease_acquire(
+            "sqlite-writer",
+            "runtime-shutdown-lock-test",
+            "daemon",
+            120,
+            None,
+        )
+        .expect("acquire runtime writer lease")
+        .expect("runtime writer lease available");
+    let claim_approved = Arc::new(tokio::sync::Notify::new());
+    let claim_gate = Arc::new(std::sync::Barrier::new(2));
+    let cleanup_gate = Arc::new(std::sync::Barrier::new(2));
+    let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+    let async_queue = AsyncPendingMessageStore::from_store(queue.clone())
+        .with_lifecycle_writer_lease(lease.clone())
+        .with_claim_approved_for_test((
+            Arc::clone(&claim_approved),
+            Some((
+                Arc::clone(&claim_gate),
+                committed_tx,
+                Arc::clone(&cleanup_gate),
+            )),
+            None,
+        ));
+    let verification_queue = async_queue.clone();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build private daemon-style runtime");
+    runtime.block_on(async {
+        let approved = claim_approved.notified();
+        let handle = server
+            .with_async_queue_for_test(async_queue)
+            .spawn_scoped_ingest_drain_worker();
+        tokio::time::timeout(Duration::from_secs(1), approved)
+            .await
+            .expect("claim approval did not reach the blocking owner");
+        handle
+            .shutdown_and_drain_with_budget(Some(Duration::ZERO))
+            .await;
+        assert_eq!(queue.reclaim_stale(0).expect("one-shot shutdown reclaim"), 0);
+    });
+    runtime.shutdown_timeout(Duration::ZERO);
+
+    claim_gate.wait();
+    committed_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("blocking claim did not commit after runtime shutdown");
+    assert!(
+        db.runtime_writer_lease_release(&lease)
+            .expect("release runtime writer lease before owner cleanup"),
+        "runtime writer lease must remain owned until explicit teardown"
+    );
+    let lock = rusqlite::Connection::open(&db_path).expect("open lock holder");
+    lock.execute_batch("BEGIN IMMEDIATE")
+        .expect("hold SQLite writer lock through Drop cleanup");
+    let cleanup_started = std::time::Instant::now();
+    cleanup_gate.wait();
+    let permit_deadline = cleanup_started + Duration::from_millis(300);
+    loop {
+        if verification_queue.available_blocking_permits_for_test() == 4 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < permit_deadline,
+            "cancellation Drop blocked beyond 300ms owner budget under held SQLite lock"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        cleanup_started.elapsed() <= Duration::from_millis(300),
+        "Drop cleanup must finish within 300ms while a SQLite writer lock is held"
+    );
+    assert_eq!(
+        verification_queue.available_blocking_permits_for_test(),
+        4,
+        "all 4 blocking permits must return within 300ms"
+    );
+
+    let record = queue
+        .operation_status(&operation_id)
+        .expect("load claimed operation")
+        .expect("operation remains durable");
+    assert_eq!(record.op_state, IngestOperationState::Running.as_str());
+    assert!(record.claimed_at.is_some());
+    assert!(record.completed_at.is_none());
+
+    lock.execute_batch("ROLLBACK")
+        .expect("release SQLite writer lock after Drop cleanup");
+    let leftover = queue
+        .claim_next_by_kind(
+            "verification-worker",
+            INGEST_CLAIM_TTL_SECS,
+            INGEST_ASYNC_KIND,
+        )
+        .expect("verification claim");
+    assert!(
+        leftover.is_none(),
+        "original owner still holds the claim token; second worker must not consume it: {leftover:?}"
+    );
+}
