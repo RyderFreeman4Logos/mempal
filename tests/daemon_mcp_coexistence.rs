@@ -209,7 +209,11 @@ printf '%s\n' '{'
 while IFS= read -r _; do :; done"#,
         ])
         .env("MEMPAL_DESCENDANT_PID_FILE", descendant_pid_path);
-    McpStdio::spawn_command(&mut command)
+    let mut client = McpStdio::spawn_command(&mut command)?;
+    wait_for_fixture_marker(descendant_pid_path, "malformed MCP descendant identity")?;
+    let identity = read_recorded_process_identity(descendant_pid_path)?;
+    client.track_process(identity.pid, identity.start_time_ticks)?;
+    Ok(client)
 }
 
 fn spawn_graceful_mcp_with_descendant(descendant_pid_path: &Path) -> Result<McpStdio> {
@@ -229,7 +233,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
 IFS= read -r _"#,
         ])
         .env("MEMPAL_DESCENDANT_PID_FILE", descendant_pid_path);
-    McpStdio::spawn_command(&mut command)
+    let mut client = McpStdio::spawn_command(&mut command)?;
+    wait_for_fixture_marker(descendant_pid_path, "graceful MCP descendant identity")?;
+    let identity = read_recorded_process_identity(descendant_pid_path)?;
+    client.track_process(identity.pid, identity.start_time_ticks)?;
+    Ok(client)
 }
 
 fn read_recorded_process_identity(path: &Path) -> Result<RecordedProcessIdentity> {
