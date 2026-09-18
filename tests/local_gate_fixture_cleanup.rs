@@ -508,6 +508,9 @@ def run_case(exchange_descendant):
         root = os.path.join(base, "owned")
         held = os.path.join(base, "held")
         victim = os.path.join(base, "victim")
+        exchange_marker = os.path.join(base, "exchange-complete")
+        exchange_token = "descendant" if exchange_descendant else "root"
+        assert not os.path.lexists(exchange_marker)
         populated(root, "owned-content")
         if exchange_descendant:
             os.mkdir(os.path.join(root, "child"), 0o700)
@@ -516,10 +519,8 @@ def run_case(exchange_descendant):
         populated(victim, "victim-content")
         identity = module.capture_fixture_identity(root)
         real_check = module.fixture_tree_stays_on_mount
-        exchanged = False
 
         def check_then_exchange(path, dev, check_cleanup):
-            nonlocal exchanged
             result = real_check(path, dev, check_cleanup)
             if exchange_descendant:
                 os.rename(os.path.join(root, "child"), held)
@@ -527,7 +528,10 @@ def run_case(exchange_descendant):
             else:
                 os.rename(root, held)
                 os.rename(victim, root)
-            exchanged = True
+            with open(exchange_marker, "x", encoding="utf-8") as marker:
+                marker.write(exchange_token)
+                marker.flush()
+                os.fsync(marker.fileno())
             return result
 
         module.fixture_tree_stays_on_mount = check_then_exchange
@@ -538,7 +542,7 @@ def run_case(exchange_descendant):
 
         substitute = os.path.join(root, "child") if exchange_descendant else root
         return (
-            exchanged,
+            open(exchange_marker, encoding="utf-8").read() == exchange_token,
             not removed,
             os.path.exists(os.path.join(substitute, "victim-content")),
             os.path.exists(held),
@@ -586,9 +590,17 @@ def run_case(kind):
         root = os.path.join(base, "owned")
         held = os.path.join(base, "held")
         victim = os.path.join(base, "victim")
+        exchange_marker = os.path.join(base, "exchange-complete")
+        assert not os.path.lexists(exchange_marker)
         os.mkdir(root, 0o700)
         identity = module.capture_fixture_identity(root)
         exchanged = False
+
+        def record_exchange():
+            with open(exchange_marker, "x", encoding="utf-8") as marker:
+                marker.write(kind)
+                marker.flush()
+                os.fsync(marker.fileno())
 
         if kind == "file":
             owned = os.path.join(root, "leaf")
@@ -605,6 +617,7 @@ def run_case(kind):
                 if not exchanged:
                     os.rename(owned, held)
                     os.rename(victim, owned)
+                    record_exchange()
                     exchanged = True
                 return real_remove(name, dir_fd=dir_fd)
 
@@ -624,6 +637,7 @@ def run_case(kind):
                 if not exchanged and name == final_name:
                     os.rename(owned, held)
                     os.rename(victim, owned)
+                    record_exchange()
                     exchanged = True
                 return real_remove(name, dir_fd=dir_fd)
 
@@ -633,6 +647,7 @@ def run_case(kind):
             removed = module.remove_owned_root(identity, module.time.monotonic() + 5, 0)
             owned_links = os.fstat(owned_fd).st_nlink
             victim_links = os.fstat(victim_fd).st_nlink
+            exchange_observed = open(exchange_marker, encoding="utf-8").read() == kind
         finally:
             if kind == "file":
                 module.os.unlink = real_remove
@@ -641,7 +656,7 @@ def run_case(kind):
             os.close(owned_fd)
             os.close(victim_fd)
     assert not os.path.lexists(base), base
-    return exchanged, removed, owned_links, victim_links
+    return exchange_observed, removed, owned_links, victim_links
 
 # These are counterexamples for the explicitly unsupported adversarial same-UID
 # threat, not safety-pass assertions. The original inode survives and the
@@ -708,6 +723,7 @@ else:
 '''
 
 identity_module = sys.modules["fixture_cleanup_identity"]
+cleanup_worker_module = sys.modules["fixture_cleanup_worker"]
 if mode == "wide":
     identity_module.MAX_FIXTURE_ENTRIES = 8
 elif mode == "deadline":
@@ -717,13 +733,13 @@ elif mode == "deadline":
         return real_snapshot(*args)
     module.fixture_tree_stays_on_mount = delayed_snapshot
 elif mode == "signal":
-    real_remove = module._remove_snapshot
+    real_remove = cleanup_worker_module._remove_snapshot
     def blocked_remove(*args):
         open(ready, "wb").close()
         while not os.path.exists(release):
             time.sleep(0.01)
         return real_remove(*args)
-    module._remove_snapshot = blocked_remove
+    cleanup_worker_module._remove_snapshot = blocked_remove
     def interrupt_cleanup():
         deadline = time.monotonic() + 5
         while not os.path.exists(ready) and time.monotonic() < deadline:

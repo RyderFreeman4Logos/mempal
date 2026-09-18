@@ -15,26 +15,20 @@ import os
 import select
 import shlex
 import signal
-import stat
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fixture_cleanup_identity import (  # noqa: E402
     FixtureIdentity,
-    TreeSnapshot,
     capture_fixture_identity,
-    entry_identity as _entry_identity,
-    fixture_identity_matches,
     fixture_tree_stays_on_mount,
-    mount_id as _mount_id,
-    parent_path as _parent_path,
 )
+from fixture_cleanup_worker import remove_owned_root as run_cleanup_worker  # noqa: E402
 
 
 PR_SET_CHILD_SUBREAPER = 36
@@ -567,58 +561,6 @@ def parse_positive_seconds(name: str, default: str) -> float:
     return float(int(value))
 
 
-def _remove_snapshot(
-    directory_fd: int,
-    relative: tuple[str, ...],
-    snapshot: TreeSnapshot,
-    removed_links: dict[tuple[int, int, int], int],
-    check_cleanup: Callable[[], None],
-) -> None:
-    check_cleanup()
-    expected = snapshot[relative]
-    names = os.listdir(directory_fd)
-    check_cleanup()
-    if set(names) != set(expected):
-        raise OSError(errno.EBUSY, "fixture tree entries changed during cleanup")
-    for name in sorted(names):
-        check_cleanup()
-        captured = expected[name]
-        inode = captured[:3]
-        removed = removed_links.get(inode, 0)
-        expected_live = (*inode, captured[3] - removed)
-        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if _entry_identity(current) != expected_live:
-            raise OSError(errno.EBUSY, "fixture tree entry identity changed during cleanup")
-        if stat.S_ISDIR(current.st_mode):
-            child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW |
-                               os.O_CLOEXEC, dir_fd=directory_fd)
-            try:
-                if _entry_identity(os.fstat(child_fd)) != expected_live:
-                    raise OSError(errno.EBUSY, "fixture directory changed while opening")
-                _remove_snapshot(
-                    child_fd, relative + (name,), snapshot, removed_links, check_cleanup
-                )
-                if _entry_identity(
-                    os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                ) != _entry_identity(os.fstat(child_fd)):
-                    raise OSError(errno.EBUSY, "fixture directory changed before removal")
-                os.rmdir(name, dir_fd=directory_fd)
-            finally:
-                os.close(child_fd)
-        else:
-            leaf_fd = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
-                              dir_fd=directory_fd)
-            try:
-                if _entry_identity(os.fstat(leaf_fd)) != expected_live:
-                    raise OSError(errno.EBUSY, "fixture entry changed while opening")
-                os.unlink(name, dir_fd=directory_fd)
-                if os.fstat(leaf_fd).st_nlink != expected_live[3] - 1:
-                    raise OSError(errno.EBUSY, "fixture entry changed during final removal")
-                removed_links[inode] = removed + 1
-            finally:
-                os.close(leaf_fd)
-
-
 def allocate_fixture_root() -> FixtureIdentity:
     parent = os.environ.get("TMPDIR") or os.environ.get("TMP") or os.environ.get("TEMP")
     if not parent:
@@ -640,70 +582,13 @@ def remove_owned_root(
     deadline: float,
     signal_generation: int,
 ) -> bool:
-    # ponytail: Unix UID is the trust boundary; callers must quiesce same-UID fixture
-    # mutation. These checks fail closed on observed drift, but only a kernel-enforced
-    # credential/LSM/private-backing boundary can prevent a final pathname exchange.
-    parent_fd = root_fd = None
-
-    def check_cleanup() -> None:
-        if _signal_generation != signal_generation:
-            raise OSError(errno.EINTR, "fixture cleanup cancelled")
-        if time.monotonic() >= deadline:
-            raise OSError(errno.ETIMEDOUT, "fixture cleanup deadline exceeded")
-
-    try:
-        check_cleanup()
-        parent_fd = os.open(
-            _parent_path(identity.path), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
-        )
-        parent_st = os.fstat(parent_fd)
-        if (
-            (parent_st.st_dev, parent_st.st_ino) != identity.parent
-            or _mount_id(parent_fd) != identity.mount_id
-        ):
-            raise OSError(errno.EBUSY, "fixture parent identity changed")
-        name = os.path.basename(identity.path.rstrip("/"))
-        root_fd = os.open(
-            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-            dir_fd=parent_fd,
-        )
-        root_st = os.fstat(root_fd)
-        if (
-            root_st.st_dev,
-            root_st.st_ino,
-            root_st.st_uid,
-            stat.S_IMODE(root_st.st_mode),
-        ) != (identity.dev, identity.ino, identity.uid, identity.mode):
-            raise OSError(errno.EBUSY, "fixture root identity changed")
-        if _mount_id(root_fd) != identity.mount_id:
-            raise OSError(errno.EBUSY, "fixture root mount identity changed")
-        snapshot = fixture_tree_stays_on_mount(root_fd, identity.mount_id, check_cleanup)
-        if snapshot is None:
-            raise OSError(errno.EBUSY, "fixture root contains a mount or unreadable entry")
-        if not fixture_identity_matches(identity.path, identity):
-            raise OSError(errno.EBUSY, "fixture root identity changed before removal")
-        check_cleanup()
-        _remove_snapshot(root_fd, (), snapshot, {}, check_cleanup)
-        check_cleanup()
-        if _entry_identity(
-            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        ) != _entry_identity(os.fstat(root_fd)):
-            raise OSError(errno.EBUSY, "fixture root identity changed before removal")
-        os.rmdir(name, dir_fd=parent_fd)
-        if os.fstat(root_fd).st_nlink != 0:
-            raise OSError(errno.EBUSY, "fixture root changed during final removal")
-    except (OSError, RecursionError) as error:
-        print(f"failed to remove fixture root {identity.path}: {error}", file=sys.stderr)
-        return False
-    finally:
-        if root_fd is not None:
-            os.close(root_fd)
-        if parent_fd is not None:
-            os.close(parent_fd)
-    if os.path.lexists(identity.path):
-        print(f"fixture root still present: {identity.path}", file=sys.stderr)
-        return False
-    return True
+    return run_cleanup_worker(
+        identity,
+        deadline,
+        lambda: _signal_generation != signal_generation,
+        POLL_INTERVAL,
+        fixture_tree_stays_on_mount,
+    )
 
 
 def retain_fixture_root(identity: FixtureIdentity, reason: str) -> int:

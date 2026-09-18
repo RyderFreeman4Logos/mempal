@@ -144,36 +144,40 @@ def fixture_tree_stays_on_mount(
         children: dict[str, tuple[int, int, int, int]] = {}
         snapshot[relative] = children
         try:
-            names = os.listdir(directory_fd)
+            with os.scandir(directory_fd) as entries:
+                iterator = iter(entries)
+                while True:
+                    check_cleanup()
+                    try:
+                        name = next(iterator).name
+                    except StopIteration:
+                        break
+                    entry_count += 1
+                    if entry_count > MAX_FIXTURE_ENTRIES:
+                        return False
+                    entry_fd = None
+                    try:
+                        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        flags = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
+                        if stat.S_ISDIR(metadata.st_mode):
+                            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                        entry_fd = os.open(name, flags, dir_fd=directory_fd)
+                        if entry_identity(os.fstat(entry_fd)) != entry_identity(metadata):
+                            return False
+                        children[name] = entry_identity(metadata)
+                        if mount_id(entry_fd) != expected_mount_id:
+                            return False
+                        if stat.S_ISDIR(metadata.st_mode) and not capture(
+                            entry_fd, relative + (name,), depth + 1
+                        ):
+                            return False
+                    except OSError:
+                        return False
+                    finally:
+                        if entry_fd is not None:
+                            os.close(entry_fd)
         except OSError:
             return False
-        check_cleanup()
-        entry_count += len(names)
-        if entry_count > MAX_FIXTURE_ENTRIES:
-            return False
-        for name in names:
-            check_cleanup()
-            entry_fd = None
-            try:
-                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                flags = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
-                if stat.S_ISDIR(metadata.st_mode):
-                    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-                entry_fd = os.open(name, flags, dir_fd=directory_fd)
-                if entry_identity(os.fstat(entry_fd)) != entry_identity(metadata):
-                    return False
-                children[name] = entry_identity(metadata)
-                if mount_id(entry_fd) != expected_mount_id:
-                    return False
-                if stat.S_ISDIR(metadata.st_mode) and not capture(
-                    entry_fd, relative + (name,), depth + 1
-                ):
-                    return False
-            except OSError:
-                return False
-            finally:
-                if entry_fd is not None:
-                    os.close(entry_fd)
         return True
 
     try:
