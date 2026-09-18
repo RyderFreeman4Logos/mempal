@@ -12,7 +12,7 @@ async fn test_scoped_ingest_shutdown_keeps_approved_claim_owner() {
     let claim_approved = Arc::new(tokio::sync::Notify::new());
     let approved = claim_approved.notified();
     let async_queue = AsyncPendingMessageStore::from_store(queue.clone())
-        .with_claim_approved_for_test((Arc::clone(&claim_approved), None));
+        .with_claim_approved_for_test((Arc::clone(&claim_approved), None, None));
     let verification_queue = async_queue.clone();
     let handle = server
         .with_async_queue_for_test(async_queue)
@@ -93,6 +93,7 @@ fn test_actual_runtime_shutdown_releases_late_approved_claim() {
                 committed_tx,
                 Arc::clone(&cleanup_gate),
             )),
+            None,
         ));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

@@ -73,7 +73,7 @@ async fn test_idle_claim_does_not_take_shutdown_ownership() {
     let queue = AsyncPendingMessageStore::from_store(
         crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path),
     )
-    .with_claim_approved_for_test((Arc::clone(&approval), None));
+    .with_claim_approved_for_test((Arc::clone(&approval), None, None));
     let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     let claim = tokio::time::timeout(
@@ -125,21 +125,49 @@ async fn test_scoped_ingest_shutdown_cancels_blocked_claim_without_late_mutation
     let operation_id = queue
         .enqueue(INGEST_ASYNC_KIND, "{}")
         .expect("enqueue operation");
-    let claim_started = Arc::new(tokio::sync::Notify::new());
-    let started = claim_started.notified();
+    let approval_ready = Arc::new(tokio::sync::Notify::new());
+    let approval_ready_wait = approval_ready.notified();
+    tokio::pin!(approval_ready_wait);
+    approval_ready_wait.as_mut().enable();
+    let approval_gate = Arc::new(std::sync::Barrier::new(2));
+    let claim_approved = Arc::new(tokio::sync::Notify::new());
     let async_queue = AsyncPendingMessageStore::from_store(queue.clone())
-        .with_claim_blocking_delay(Duration::from_millis(200))
-        .with_blocking_started_for_test(Arc::clone(&claim_started));
+        .with_claim_approved_for_test((
+            claim_approved,
+            None,
+            Some((
+                Arc::clone(&approval_ready),
+                Arc::clone(&approval_gate),
+                Arc::new(std::sync::Once::new()),
+            )),
+        ));
     let verification_queue = async_queue.clone();
+    assert_eq!(
+        verification_queue.claim_connection_open_count_for_test(),
+        0,
+        "claim cache must start fresh"
+    );
     let handle = server
         .with_async_queue_for_test(async_queue)
         .spawn_scoped_ingest_drain_worker();
 
-    tokio::time::timeout(Duration::from_secs(1), started)
+    tokio::time::timeout(Duration::from_secs(1), approval_ready_wait)
         .await
-        .expect("worker did not enter blocked claim");
+        .expect("worker did not reach the claim approval fence");
+    handle.request_shutdown();
+    approval_gate.wait();
     let shutdown = tokio::time::timeout(Duration::from_millis(100), handle.shutdown_and_drain())
         .await;
+    let permits_returned = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            let available = verification_queue.available_blocking_permits_for_test();
+            if available == 4 {
+                break available;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
 
     let late_mutation = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
@@ -160,6 +188,15 @@ async fn test_scoped_ingest_shutdown_cancels_blocked_claim_without_late_mutation
     assert!(
         late_mutation.is_err(),
         "blocked claim mutated after scoped worker shutdown: {late_mutation:?}"
+    );
+    assert_eq!(
+        verification_queue.claim_connection_open_count_for_test(),
+        0,
+        "shutdown before approval must skip claim admission/open/PRAGMA"
+    );
+    assert_eq!(
+        permits_returned.expect("shutdown did not promptly return the blocking permit"),
+        4
     );
 
     let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);

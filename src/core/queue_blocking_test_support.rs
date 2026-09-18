@@ -18,4 +18,8 @@ impl AsyncPendingMessageStore {
     pub(crate) fn available_blocking_permits_for_test(&self) -> usize {
         self.permits.available_permits()
     }
+
+    pub(crate) fn claim_connection_open_count_for_test(&self) -> usize {
+        self.inner.claim_connection_open_count()
+    }
 }
