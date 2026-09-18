@@ -349,6 +349,12 @@ class Supervisor:
             unknown = True
         return live, unknown
 
+    def _cleanup_cleared(self, proved: bool) -> bool:
+        snapshots = self.discover()
+        self.reap_owned_children()
+        live, unknown = self.live_status(snapshots)
+        return not live and not unknown and proved
+
     def cleanup(self) -> bool:
         self.cleanup_deadline = time.monotonic() + (2 * self.grace)
         snapshots = self.discover()
@@ -362,7 +368,7 @@ class Supervisor:
             self.reap_owned_children()
             live, unknown = self.live_status(snapshots)
             if not live and not unknown and term_proved:
-                return True
+                return self._cleanup_cleared(term_proved)
             time.sleep(min(POLL_INTERVAL, max(0.0, term_deadline - time.monotonic())))
 
         snapshots = self.discover()
@@ -376,13 +382,10 @@ class Supervisor:
             self.reap_owned_children()
             live, unknown = self.live_status(snapshots)
             if not live and not unknown and kill_proved:
-                return True
+                return self._cleanup_cleared(kill_proved)
             time.sleep(min(POLL_INTERVAL, max(0.0, kill_deadline - time.monotonic())))
 
-        snapshots = self.discover()
-        self.reap_owned_children()
-        live, unknown = self.live_status(snapshots)
-        return not live and not unknown and kill_proved
+        return self._cleanup_cleared(kill_proved)
 
     def process_context(self, snapshots: dict[int, Snapshot]) -> None:
         print("process tree:", file=sys.stderr)
