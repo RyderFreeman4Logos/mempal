@@ -91,6 +91,8 @@ struct RuntimeControl {
     coordinator: thread::JoinHandle<()>,
 }
 
+type StagedRuntime = (RuntimeControl, Result<Config, ConfigError>, Option<String>);
+
 impl RuntimeControl {
     fn request_stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -173,6 +175,20 @@ impl HotReloadState {
         drop(cleanup);
         let config = Config::load_from(path)?;
         let snapshot = ConfigSnapshot::from_config(config.clone())?;
+        let staged_runtime = if config.config_hot_reload.enabled {
+            install_sighup_handler_once();
+            Some(self.stage_runtime(path.to_path_buf(), &config)?)
+        } else {
+            None
+        };
+
+        if let Some(existing) = runtime.take() {
+            existing.stop();
+        }
+        #[cfg(unix)]
+        if staged_runtime.is_some() {
+            SIGHUP_PENDING.store(false, Ordering::SeqCst);
+        }
         self.snapshot.store(Arc::new(snapshot));
         *self
             .event_log_path
@@ -197,18 +213,13 @@ impl HotReloadState {
             emit_bootstrap_event_to_stderr,
         );
 
-        if let Some(existing) = runtime.take() {
-            existing.stop();
-        }
-        if config.config_hot_reload.enabled {
-            install_sighup_handler_once();
-            #[cfg(unix)]
-            SIGHUP_PENDING.store(false, Ordering::SeqCst);
-            *runtime = Some(self.start_runtime(
-                path.to_path_buf(),
-                config.config_hot_reload.debounce_ms,
-                config.config_hot_reload.poll_fallback_secs,
-            )?);
+        if let Some((staged, candidate, warning)) = staged_runtime {
+            if let Some(warning) = warning {
+                self.push_event(warning);
+            }
+            self.apply_reload(candidate);
+            let _ = staged.control_tx.send(WatchMessage::Start);
+            *runtime = Some(staged);
         }
 
         Ok(())
@@ -316,17 +327,13 @@ impl HotReloadState {
         *self.embed_gen_tx.borrow()
     }
 
-    /// Trigger a reload from the given path without going through the watcher.
-    /// Only for use in tests via `ConfigHandle::harness_reload_from_path`.
+    /// Test-only watcher bypass.
     #[doc(hidden)]
     pub fn reload_from_disk_for_test(&self, path: &Path) {
         self.reload_from_disk(path);
     }
 
-    /// Test-only: resets the snapshot, watcher runtime, event path/log, parse
-    /// attempts, and runtime prototypes without runtime-allowed merges.
-    /// Successful-reload and generation counters intentionally remain monotonic so
-    /// existing subscribers never move backward.
+    /// Test-only reset; reload and generation counters stay monotonic.
     #[doc(hidden)]
     pub fn harness_reset(&self) {
         if let Some(existing) = self.runtime.lock().expect("runtime mutex poisoned").take() {
@@ -370,19 +377,14 @@ impl HotReloadState {
             .clone()
     }
 
-    fn start_runtime(
-        &self,
-        path: PathBuf,
-        debounce_ms: u64,
-        poll_fallback_secs: u64,
-    ) -> Result<RuntimeControl, ConfigError> {
+    fn stage_runtime(&self, path: PathBuf, config: &Config) -> Result<StagedRuntime, ConfigError> {
         let stop = Arc::new(AtomicBool::new(false));
         let (control_tx, control_rx) = mpsc::channel::<WatchMessage>();
         let startup_tx = control_tx.clone();
         let worker_stop = Arc::clone(&stop);
         let state = global_hot_reload_state_arc();
-        let debounce = Duration::from_millis(debounce_ms.max(1));
-        let poll_interval = Duration::from_secs(poll_fallback_secs.max(1));
+        let debounce = Duration::from_millis(config.config_hot_reload.debounce_ms.max(1));
+        let poll_interval = Duration::from_secs(config.config_hot_reload.poll_fallback_secs.max(1));
         let (ready_tx, ready_rx) = mpsc::channel();
         let coordinator = thread::spawn(move || {
             #[cfg(test)]
@@ -410,7 +412,7 @@ impl HotReloadState {
             let mut watcher = registration.ok();
             #[cfg(test)]
             super::hot_reload_watch_gate::mark_watch_registered();
-            // Re-read after watch(): the bootstrap snapshot predates registration.
+            // Baseline after watch registration.
             #[cfg(test)]
             super::hot_reload_watch_gate::wait_before_poll_baseline();
             let mut previous = file_signature(&path);
@@ -502,20 +504,14 @@ impl HotReloadState {
         };
         let Ok((candidate, warning)) = ready_rx.recv_timeout(WATCH_REGISTRATION_TIMEOUT) else {
             runtime.request_stop();
-            // Own one join and reject retries until kernel IO returns; Rust cannot
-            // cancel blocked threads or guarantee their completion deadline.
+            // Deferred cleanup owns blocked registration IO and its join.
             *self.cleanup.lock().expect("cleanup mutex poisoned") =
                 Some(thread::spawn(move || runtime.stop()));
             return Err(ConfigError::InvalidConfig(
                 "hot-reload watcher registration timed out".to_string(),
             ));
         };
-        if let Some(warning) = warning {
-            self.push_event(warning);
-        }
-        self.apply_reload(candidate);
-        let _ = runtime.control_tx.send(WatchMessage::Start);
-        Ok(runtime)
+        Ok((runtime, candidate, warning))
     }
 
     fn reload_from_disk(&self, path: &Path) {

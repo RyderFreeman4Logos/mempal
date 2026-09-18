@@ -282,6 +282,80 @@ strict_project_isolation = false
 }
 
 #[tokio::test]
+async fn failed_registration_preserves_previous_runtime_projection() {
+    let lock = super::config::global_config_test_lock();
+    let _lock = lock.lock().await;
+    ConfigHandle::harness_reset();
+    let tmp = TempDir::new().expect("config tempdir");
+    let previous_dir = tmp.path().join("previous");
+    let candidate_dir = tmp.path().join("candidate");
+    fs::create_dir_all(&previous_dir).expect("previous config directory");
+    fs::create_dir_all(&candidate_dir).expect("candidate config directory");
+    let previous_path = previous_dir.join("config.toml");
+    let candidate_path = candidate_dir.join("config.toml");
+    fs::write(
+        &previous_path,
+        r#"
+[config_hot_reload]
+enabled = true
+debounce_ms = 10
+poll_fallback_secs = 1
+[search]
+strict_project_isolation = false
+[ingest_gating.embedding_classifier]
+prototypes = ["previous"]
+"#,
+    )
+    .expect("write previous config");
+    fs::write(
+        &candidate_path,
+        r#"
+[config_hot_reload]
+enabled = true
+debounce_ms = 10
+poll_fallback_secs = 1
+[search]
+strict_project_isolation = true
+[ingest_gating.embedding_classifier]
+prototypes = ["candidate"]
+"#,
+    )
+    .expect("write candidate config");
+    ConfigHandle::bootstrap(&previous_path).expect("bootstrap previous runtime");
+    let previous_meta = ConfigHandle::snapshot_meta();
+    let previous_events = ConfigHandle::recent_events();
+    let previous_event_path = ConfigHandle::harness_event_log_path();
+    let previous_prototypes = ConfigHandle::runtime_prototypes();
+    assert!(ConfigHandle::harness_runtime_active());
+
+    let mut gate = FileGate::arm_non_cooperative();
+    let (done_tx, done_rx) = mpsc::channel();
+    gate.worker = Some(thread::spawn(move || {
+        let result = ConfigHandle::bootstrap(&candidate_path).map_err(|error| error.to_string());
+        let _ = done_tx.send(result);
+    }));
+    assert!(
+        wait_until(Duration::from_secs(2), || gate.entered()),
+        "candidate watcher never reached the registration gate"
+    );
+    let error = done_rx
+        .recv_timeout(Duration::from_millis(1500))
+        .expect("candidate bootstrap must fail boundedly")
+        .expect_err("blocked candidate bootstrap must fail");
+    assert!(error.contains("watcher registration timed out"));
+
+    assert_eq!(ConfigHandle::snapshot_meta(), previous_meta);
+    assert!(!ConfigHandle::current().search.strict_project_isolation);
+    assert_eq!(ConfigHandle::runtime_prototypes(), previous_prototypes);
+    assert_eq!(ConfigHandle::recent_events(), previous_events);
+    assert_eq!(ConfigHandle::harness_event_log_path(), previous_event_path);
+    assert!(
+        ConfigHandle::harness_runtime_active(),
+        "failed candidate registration stopped the previous runtime"
+    );
+}
+
+#[tokio::test]
 async fn bootstrap_waits_until_poll_fallback_baseline_completes() {
     let lock = super::config::global_config_test_lock();
     let _lock = lock.lock().await;
