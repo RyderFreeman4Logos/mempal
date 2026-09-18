@@ -39,6 +39,12 @@ case "${0##*/}" in
         ;;
     fuser)
         if [[ -n "${REST_GATE_FUSER_NEVER_RETURN_READY_FILE:-}" ]]; then
+            if [[ -n "${REST_GATE_FUSER_ENTRY_FILE:-}" ]]; then
+                : >"${REST_GATE_FUSER_ENTRY_FILE}"
+            fi
+            if [[ -n "${REST_GATE_FUSER_DELAY_BEFORE_READY_SECS:-}" ]]; then
+                sleep "${REST_GATE_FUSER_DELAY_BEFORE_READY_SECS}"
+            fi
             : >"${REST_GATE_FUSER_NEVER_RETURN_READY_FILE}"
             printf '%s\n' "${BASHPID}" >"${REST_GATE_FUSER_PID_FILE:?}"
             exec /bin/sleep 60
