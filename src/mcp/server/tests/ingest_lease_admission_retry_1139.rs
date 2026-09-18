@@ -327,7 +327,7 @@ async fn test_scoped_ingest_timely_lease_failure_returns_error_and_releases_clai
 async fn test_owned_scoped_ingest_lease_acquire_uses_original_deadline() {
     let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
     let (_tempdir, db_path, mut server) = setup_server();
-    let (queue, async_queue, operation_id, claim) = claimed_test_ingest(
+    let (_queue, async_queue, operation_id, claim) = claimed_test_ingest(
         &server,
         &db_path,
         "worker-owned-deadline",
@@ -348,6 +348,7 @@ async fn test_owned_scoped_ingest_lease_acquire_uses_original_deadline() {
             .expect("release lease-open");
         Ok(())
     }));
+    let completion_server = server.clone();
     let processing = tokio::spawn(async move {
         server
             .process_ingest_claim_with_owned_task_budget(
@@ -386,29 +387,21 @@ async fn test_owned_scoped_ingest_lease_acquire_uses_original_deadline() {
         drawers_before_release, 0,
         "timed-out acquire wrote before return"
     );
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let record = queue
-                .operation_status(&operation_id)
-                .expect("load operation")
-                .expect("operation exists");
-            if record.op_state == IngestOperationState::Queued.as_str()
-                && record.claimed_at.is_none()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
+    let completed = tokio::time::timeout(
+        Duration::from_secs(3),
+        completion_server.wait_for_operation_completion(&operation_id),
+    )
     .await
-    .expect("late acquire must release its claim without durable work");
+    .expect("late acquire must retain its detached completion owner")
+    .expect("late acquire must persist a terminal receipt");
+    assert_eq!(completed.state, Some(IngestOperationState::Completed));
     assert_eq!(
         Database::open(&db_path)
             .expect("open after late acquire")
             .drawer_count()
             .expect("drawer count after late acquire"),
-        0,
-        "a queued timeout must not conceal durable completion"
+        1,
+        "the response deadline must not abandon admitted owned work"
     );
 }
 
@@ -610,6 +603,101 @@ async fn test_owned_scoped_ingest_caller_abort_retains_claim_owner_during_acquir
     })
     .await
     .expect("owned task must release the writer lease");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_owned_scoped_ingest_caller_abort_after_budget_keeps_completion_owner() {
+    let _worker_lifecycle_lock = acquire_ingest_worker_lifecycle_lock().await;
+    let (_tempdir, db_path, mut server) = setup_server();
+    let (queue, async_queue, operation_id, claim) = claimed_test_ingest(
+        &server,
+        &db_path,
+        "worker-owned-late-cancel",
+        "late lease acquisition after caller cancellation must keep its completion owner",
+    )
+    .await;
+    let completion_server = server.clone();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    server.ingest_writer_lease_open_hook = Some(Arc::new(move |_| {
+        entered_tx.send(()).expect("report lease-open entry");
+        release_rx
+            .lock()
+            .expect("lease-open release receiver")
+            .take()
+            .expect("lease-open release receiver used once")
+            .recv()
+            .expect("release lease-open");
+        Ok(())
+    }));
+    let processing_budget = Duration::from_millis(20);
+    let caller = tokio::spawn(async move {
+        server
+            .process_ingest_claim_with_owned_task_budget(
+                &async_queue,
+                "worker-owned-late-cancel",
+                claim,
+                processing_budget,
+            )
+            .await
+    });
+    let entered_at = tokio::task::spawn_blocking(move || {
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("lease-open must start");
+        Instant::now()
+    })
+    .await
+    .expect("lease-open observer must not panic");
+    caller.abort();
+    assert!(
+        caller
+            .await
+            .expect_err("caller task must be cancelled")
+            .is_cancelled()
+    );
+
+    // The open hook is a hard fence: crossing one full processing budget after
+    // entry guarantees that the eventual successful acquire is late.
+    assert!(
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(entered_at + processing_budget),
+            std::future::pending::<()>(),
+        )
+        .await
+        .is_err(),
+        "deadline fence unexpectedly completed"
+    );
+    release_tx.send(()).expect("release late lease-open");
+
+    let completed = tokio::time::timeout(
+        Duration::from_secs(3),
+        completion_server.wait_for_operation_completion(&operation_id),
+    )
+    .await
+    .expect("late owned task must finish without waiting for the 300-second claim TTL")
+    .expect("late owned task must persist a terminal receipt");
+    assert_eq!(completed.state, Some(IngestOperationState::Completed));
+    let record = queue
+        .operation_status(&operation_id)
+        .expect("load completed operation")
+        .expect("completed operation remains queryable");
+    assert_eq!(record.op_state, IngestOperationState::Completed.as_str());
+    assert!(record.completed_at.is_some());
+    assert_eq!(
+        Database::open(&db_path)
+            .expect("open after late owned completion")
+            .drawer_count()
+            .expect("drawer count after late owned completion"),
+        1,
+        "the detached owner must commit exactly one terminal ingest effect"
+    );
+    let stats = queue
+        .stats()
+        .expect("queue stats after late owned completion");
+    assert_eq!(stats.pending, 0);
+    assert_eq!(stats.claimed, 0);
 }
 
 #[tokio::test(flavor = "current_thread")]

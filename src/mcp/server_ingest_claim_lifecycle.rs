@@ -130,24 +130,6 @@ impl MempalMcpServer {
             };
             Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
 
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                let released = match writer_lease {
-                    Some(writer_lease) => writer_lease.release().await,
-                    None => Ok(()),
-                };
-                let claim_released = Self::release_claim_with_lock_retry(
-                    &scoped_queue,
-                    claim,
-                    scoped_worker.daemon_write_observer.as_ref(),
-                )
-                .await
-                .context("failed to release scoped ingest claim after request deadline");
-                claim_released?;
-                released?;
-                return Ok(ScopedIngestProcessResult::TimedOut);
-            }
-
             if let Some(ref lease) = writer_lease {
                 scoped_worker.external_ingest_writer_lease = Some(lease.lease().clone());
             }
